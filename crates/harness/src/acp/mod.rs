@@ -59,6 +59,11 @@ use subagent_devin::DevinTracker;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hermes's Python cold start (plugin discovery, env load, provider clients)
+/// takes ~18s before `session/new` answers — verified live. A 10s probe can
+/// never succeed, silently degrading the picker to the static catalog.
+const HERMES_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Per-agent configuration: which binary to spawn and what to tell the picker.
 struct AcpAgentSpec {
     id: HarnessId,
@@ -107,6 +112,11 @@ struct AcpAgentSpec {
     /// non-response on some machines). The prompt response stays as the
     /// fallback; whichever lands first settles the turn, exactly once.
     prompt_complete_extension: bool,
+    /// Bound on the model-picker's initialize → session/new probe. `None`
+    /// uses [`DEFAULT_MODEL_DISCOVERY_TIMEOUT`]; agents with a heavy cold
+    /// start (Hermes's plugin loader) need a longer budget or the probe can
+    /// only ever fall back to the static catalog.
+    model_discovery_timeout: Option<Duration>,
     /// Bound on prompt-send → FIRST sign of life on the wire. `None`
     /// disables. Grok's healthy runs acknowledge a prompt within
     /// milliseconds (queue bookkeeping precedes any model work), so total
@@ -210,17 +220,33 @@ fn grok_spec() -> AcpAgentSpec {
              `curl -fsSL https://x.ai/cli/install.sh | bash` or \
              `npm install -g @xai-official/grok`; set GROK_EXECUTABLE to override)",
         models: || {
-            vec![Model {
-                id: "grok-4.5".into(),
-                label: "Grok 4.5".into(),
-                description: Some("xAI's coding model — 500k context".into()),
-                reasoning_levels: vec![
-                    ReasoningLevel::Low,
-                    ReasoningLevel::Medium,
-                    ReasoningLevel::High,
-                ],
-                options: Vec::new(),
-            }]
+            // Static fallback when the session probe fails. Ids verified live
+            // against grok 0.2.102's session/new catalog.
+            vec![
+                Model {
+                    id: "grok-4.6".into(),
+                    label: "Grok 4.6".into(),
+                    description: Some("xAI's frontier coding model — 500k context".into()),
+                    reasoning_levels: vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                        ReasoningLevel::XHigh,
+                    ],
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "grok-4.5".into(),
+                    label: "Grok 4.5".into(),
+                    description: Some("xAI's coding model — 500k context".into()),
+                    reasoning_levels: vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::Medium,
+                        ReasoningLevel::High,
+                    ],
+                    options: Vec::new(),
+                },
+            ]
         },
         // No `_session/steering` extension: steers deliver at turn boundaries.
         steering_mode: SteeringMode::TurnBoundary,
@@ -234,6 +260,7 @@ fn grok_spec() -> AcpAgentSpec {
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
+        model_discovery_timeout: None,
         // Verified live (1.0.4): the notification fires with the echoed
         // `_meta.promptId`, just ahead of the RPC response.
         prompt_complete_extension: true,
@@ -331,6 +358,7 @@ fn devin_spec() -> AcpAgentSpec {
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
+        model_discovery_timeout: None,
         prompt_complete_extension: false,
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
@@ -370,26 +398,19 @@ fn hermes_spec() -> AcpAgentSpec {
              `cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'` for the ACP \
              server; set HERMES_EXECUTABLE to override)",
         // Hermes derives its model list from the providers the user has
-        // authenticated (`hermes model`); these are the Nous flagships every
-        // portal account gets. Ids the agent doesn't advertise are skipped by
-        // the config-option set, falling back to the agent's own default.
+        // authenticated (`hermes model`) — 100+ `provider:model` ids across
+        // nous/openrouter/opencode-free, all discovered live. The static
+        // fallback is the catalog's own currentModelId, verified live
+        // (Hermes Agent v0.21.0); anything else risks naming a model the
+        // agent doesn't advertise.
         models: || {
-            vec![
-                Model {
-                    id: "hermes-4-405b".into(),
-                    label: "Hermes 4 405B".into(),
-                    description: Some("Nous Research's hybrid-reasoning flagship".into()),
-                    reasoning_levels: Vec::new(),
-                    options: Vec::new(),
-                },
-                Model {
-                    id: "hermes-4-70b".into(),
-                    label: "Hermes 4 70B".into(),
-                    description: Some("Faster Hermes 4 — same post-training, 70B".into()),
-                    reasoning_levels: Vec::new(),
-                    options: Vec::new(),
-                },
-            ]
+            vec![Model {
+                id: "nous:tencent/hy3:free".into(),
+                label: "Nous Portal · tencent/hy3:free".into(),
+                description: Some("Hermes's default provider model".into()),
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            }]
         },
         // No `_session/steering` extension: steers deliver at turn boundaries.
         steering_mode: SteeringMode::TurnBoundary,
@@ -399,6 +420,10 @@ fn hermes_spec() -> AcpAgentSpec {
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
+        // The Python cold start (56 plugins, env load, provider clients)
+        // takes ~18s before session/new answers — the shared 10s probe can
+        // never succeed, so the picker would always show the static row.
+        model_discovery_timeout: Some(HERMES_MODEL_DISCOVERY_TIMEOUT),
         prompt_complete_extension: false,
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
@@ -455,6 +480,7 @@ fn pi_spec() -> AcpAgentSpec {
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
+        model_discovery_timeout: None,
         prompt_complete_extension: false,
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
@@ -542,6 +568,9 @@ pub struct AcpHarness {
 
 impl AcpHarness {
     fn with_spec(spec: AcpAgentSpec) -> Self {
+        let model_discovery_timeout = spec
+            .model_discovery_timeout
+            .unwrap_or(DEFAULT_MODEL_DISCOVERY_TIMEOUT);
         Self {
             spec,
             executable: None,
@@ -552,7 +581,7 @@ impl AcpHarness {
             // (session/load replays from disk), so a hang past this is a
             // wedged agent, not a slow one.
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
-            model_discovery_timeout: DEFAULT_MODEL_DISCOVERY_TIMEOUT,
+            model_discovery_timeout,
             commands: tokio::sync::OnceCell::new(),
             models_cache: tokio::sync::OnceCell::new(),
             models_probe: tokio::sync::Mutex::new(()),
@@ -778,7 +807,7 @@ impl AcpHarness {
                 .await?;
             let mut commands = scan_available_commands(&init);
             if commands.is_empty() {
-                let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+                let cwd = discovery_cwd();
                 let session = client
                     .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                     .await;
@@ -814,7 +843,9 @@ impl AcpHarness {
             }
             Ok::<Vec<SlashCommand>, HarnessError>(commands)
         };
-        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        // Same cold-start bound as model discovery — a slow-booting agent
+        // (Hermes's plugin loader) can't answer session/new inside 10s.
+        let result = tokio::time::timeout(self.model_discovery_timeout, discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
@@ -840,7 +871,7 @@ impl AcpHarness {
             client
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
-            let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            let cwd = discovery_cwd();
             let session = client
                 .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                 .await?;
@@ -905,7 +936,7 @@ fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
 /// option outside mode/model/thought_level becomes a `ModelOption` — so
 /// unmatched models keep fast mode etc.; the catalog only enriches matched
 /// ids with label/description/per-model ladders.
-fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model> {
+pub(crate) fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model> {
     let config_options = session_response
         .get("configOptions")
         .and_then(Value::as_array)
@@ -944,7 +975,8 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
     let build = |id: &str,
                  name: Option<&str>,
                  description: Option<&str>,
-                 options: Vec<ModelOption>|
+                 options: Vec<ModelOption>,
+                 wire_levels: Option<Vec<ReasoningLevel>>|
      -> Model {
         let exact = exact(id);
         let aliased = if exact.is_none() { alias(id) } else { None };
@@ -964,7 +996,12 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 .or_else(|| known.and_then(|m| m.description.clone())),
             reasoning_levels: match known.filter(|m| !m.reasoning_levels.is_empty()) {
                 Some(m) => m.reasoning_levels.clone(),
-                None => ladder.clone(),
+                // Per-model `_meta.reasoningEfforts` (grok 0.2.x) beats the
+                // session-wide thought_level ladder when the catalog has no
+                // curated row for this id.
+                None => wire_levels
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or_else(|| ladder.clone()),
             },
             options,
         }
@@ -1018,6 +1055,7 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                             .filter(|n| !n.is_empty()),
                         description,
                         options,
+                        None,
                     ));
                 }
                 if raw_ids
@@ -1026,7 +1064,7 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 {
                     options.push(crate::claude::catalog::context_window());
                 }
-                Some(build(id, name, description, options))
+                Some(build(id, name, description, options, None))
             })
             .collect();
     }
@@ -1042,11 +1080,33 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
         .iter()
         .filter_map(|m| {
             let id = m.get("modelId").and_then(Value::as_str)?;
+            // Per-model effort ladder (grok's availableModels carry
+            // `_meta.reasoningEfforts`) — normalize to zeron's ascending
+            // order, deduped.
+            let mut wire_levels: Vec<ReasoningLevel> = m
+                .get("_meta")
+                .and_then(|meta| meta.get("reasoningEfforts"))
+                .and_then(Value::as_array)
+                .map(|efforts| {
+                    efforts
+                        .iter()
+                        .filter_map(|e| {
+                            e.get("value")
+                                .and_then(Value::as_str)
+                                .or_else(|| e.get("id").and_then(Value::as_str))
+                        })
+                        .filter_map(reasoning_from_value)
+                        .collect()
+                })
+                .unwrap_or_default();
+            wire_levels.sort();
+            wire_levels.dedup();
             Some(build(
                 id,
                 m.get("name").and_then(Value::as_str),
                 m.get("description").and_then(Value::as_str),
                 exact(id).map(|k| k.options.clone()).unwrap_or_default(),
+                Some(wire_levels),
             ))
         })
         .collect()
@@ -1266,7 +1326,20 @@ struct Session {
     stderr_tail: crate::StderrTail,
 }
 
-fn initialize_params(harness: HarnessId) -> Value {
+/// The scratch cwd for discovery `session/new` calls: the user's home on any
+/// platform. `HOME` alone is NOT enough — Windows GUI launches leave it unset
+/// and a bare "/" reads as NOT absolute to Windows agents (grok rejects the
+/// session with "Path is not absolute: /"), silently failing every probe.
+/// `crate::home_dir` covers USERPROFILE; the process's own cwd is the
+/// always-absolute last resort.
+pub(crate) fn discovery_cwd() -> String {
+    crate::home_dir()
+        .or_else(|| std::env::current_dir().ok())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/".into())
+}
+
+pub(crate) fn initialize_params(harness: HarnessId) -> Value {
     let mut capabilities = json!({
         "fs": { "readTextFile": false, "writeTextFile": false },
         "terminal": false,
@@ -1959,7 +2032,16 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
+        // ACP's session/new mcpServers are stdio-only — the app stamps local
+        // runs with the loopback browser bridge, which the `zeron
+        // browser-bridge` shim subprocess fronts over stdio. Discovery
+        // probes keep the empty list.
+        let session_params = json!({
+            "cwd": request.cwd,
+            "mcpServers": crate::browser_bridge_acp_server(&request)
+                .into_iter()
+                .collect::<Vec<_>>(),
+        });
         let (session_id, mut session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
@@ -3497,5 +3579,76 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "compact");
         assert!(scan_available_commands(&json!({ "protocolVersion": 1 })).is_empty());
+    }
+
+    #[test]
+    fn discovery_cwd_is_absolute_on_this_platform() {
+        // Regression: `std::env::var("HOME").unwrap_or("/")` produced "/" on
+        // Windows GUI launches (HOME unset) — grok's session/new rejects it
+        // outright ("Path is not absolute: /") and the picker silently fell
+        // back to the static catalog.
+        let cwd = discovery_cwd();
+        assert!(
+            std::path::Path::new(&cwd).is_absolute(),
+            "discovery cwd {cwd:?} is not absolute"
+        );
+    }
+
+    #[test]
+    fn models_pick_up_per_model_reasoning_efforts_from_the_wire() {
+        // grok 0.2.x shape: availableModels entries carry
+        // `_meta.reasoningEfforts`; there is no thought_level config option.
+        let response = json!({
+            "sessionId": "s-1",
+            "models": {
+                "currentModelId": "grok-4.6",
+                "availableModels": [
+                    {
+                        "modelId": "grok-4.6",
+                        "name": "Grok 4.6",
+                        "_meta": {
+                            "reasoningEfforts": [
+                                { "id": "xhigh" }, { "id": "high" },
+                                { "id": "medium" }, { "id": "low" },
+                            ],
+                        },
+                    },
+                    {
+                        "modelId": "grok-4.5",
+                        "name": "Grok 4.5",
+                        "_meta": {
+                            "reasoningEfforts": [
+                                { "id": "high" }, { "id": "medium" }, { "id": "low" },
+                            ],
+                        },
+                    },
+                ],
+            },
+        });
+        let models = models_from_session(&response, &[]);
+        assert_eq!(models.len(), 2);
+        // Normalized to zeron's ascending ladder order.
+        assert_eq!(
+            models[0].reasoning_levels,
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+            ]
+        );
+        assert_eq!(
+            models[1].reasoning_levels,
+            vec![ReasoningLevel::Low, ReasoningLevel::Medium, ReasoningLevel::High]
+        );
+    }
+
+    #[test]
+    fn hermes_probe_budget_covers_its_cold_start() {
+        // The Python agent spends ~18s in plugin/env/provider init before
+        // session/new answers (verified live) — a shared 10s probe could
+        // only ever fall back to the static catalog.
+        assert!(AcpHarness::hermes().model_discovery_timeout > DEFAULT_MODEL_DISCOVERY_TIMEOUT);
+        assert!(AcpHarness::grok().model_discovery_timeout == DEFAULT_MODEL_DISCOVERY_TIMEOUT);
     }
 }

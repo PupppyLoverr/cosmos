@@ -258,12 +258,18 @@ impl OpencodeHarness {
 
     /// Boot (or attach to) a server for a run/probe. Probes have no chat cwd:
     /// they boot in the user's home, where global provider config lives.
-    async fn server(&self, cwd: Option<&str>) -> Result<Server, HarnessError> {
+    /// `bridge` is the run's embedded-browser endpoint — env-var only;
+    /// opencode's MCP config lives in files we don't touch.
+    async fn server(
+        &self,
+        cwd: Option<&str>,
+        bridge: Option<&str>,
+    ) -> Result<Server, HarnessError> {
         if let Some(base) = &self.base_url {
             return Ok(Server::attached(base.clone()));
         }
         let exe = self.resolve_executable()?;
-        Server::spawn(&exe, cwd, self.startup_timeout).await
+        Server::spawn(&exe, cwd, self.startup_timeout, bridge).await
     }
 
     /// One short-lived server answers both discovery calls; each cache keeps
@@ -274,7 +280,7 @@ impl OpencodeHarness {
         if let Some(models) = self.models_cache.get() {
             return Ok(models.clone());
         }
-        let mut server = self.server(None).await?;
+        let mut server = self.server(None, None).await?;
         let result = async {
             let providers: ProviderCatalog = server.get("/provider", None).await?;
             let models = models_from_providers(&providers);
@@ -299,7 +305,7 @@ impl OpencodeHarness {
         if let Some(commands) = self.commands_cache.get() {
             return Ok(commands.clone());
         }
-        let mut server = self.server(None).await?;
+        let mut server = self.server(None, None).await?;
         let result = server
             .get_json("/command", None)
             .await
@@ -365,7 +371,9 @@ impl Harness for OpencodeHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let cwd = (!request.cwd.is_empty()).then(|| request.cwd.clone());
-        let server = self.server(cwd.as_deref()).await?;
+        let server = self
+            .server(cwd.as_deref(), crate::browser_bridge_url(&request))
+            .await?;
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             server,
@@ -413,6 +421,7 @@ impl Server {
         exe: &std::path::Path,
         cwd: Option<&str>,
         startup: Duration,
+        bridge: Option<&str>,
     ) -> Result<Self, HarnessError> {
         let port = free_localhost_port().ok_or_else(|| {
             HarnessError::Protocol("no free localhost port for opencode serve".into())
@@ -426,6 +435,9 @@ impl Server {
             .arg("127.0.0.1")
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .env("OPENCODE_CLIENT", "zeron");
+        if let Some(url) = bridge {
+            cmd.env(crate::BROWSER_BRIDGE_ENV, url);
+        }
         crate::compose_child_path(&mut cmd, exe);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);

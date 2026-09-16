@@ -2822,7 +2822,7 @@ impl Transcript {
     }
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        Self::build(state, None, true, cx)
+        Self::build(state, None, true, true, cx)
     }
 
     /// A read-only transcript over one SUBAGENT doc (right-pane tab). The
@@ -2837,29 +2837,40 @@ impl Transcript {
         follow: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(state, Some(doc_id), follow, cx)
+        Self::build(state, Some(doc_id), follow, false, cx)
+    }
+
+    /// A live CONVERSATION inside the right pane (side chat): the doc id is a
+    /// real chat id, so the surface gets the primary layout — bottom-anchored
+    /// with the tail pin — plus this conversation's optimistic echoes and its
+    /// real session-row indicator instead of the subagent heuristics.
+    pub fn for_side_chat(state: Entity<AppState>, doc_id: String, cx: &mut Context<Self>) -> Self {
+        Self::build(state, Some(doc_id), true, true, cx)
     }
 
     fn build(
         state: Entity<AppState>,
         doc_override: Option<String>,
         follow: bool,
+        chat_layout: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         // FollowMode stays Normal: the tail pin is ours (a per-frame spring),
         // not the list's per-layout hard snap.
         //
-        // Override instances align TOP: a subagent transcript reads like a
-        // fresh notes page — entries anchored at the top, streaming growing
-        // into the empty space below, never rising from the pane's bottom.
-        // Top alignment gets that structurally (a short list rests at the
-        // top with no reservation pad), and the PIN machinery still runs on
-        // top of it for end-follow: the spring is purely distance-based, and
-        // the glue trap it was built around is Bottom-only — layout
+        // Subagent override instances align TOP: a subagent transcript reads
+        // like a fresh notes page — entries anchored at the top, streaming
+        // growing into the empty space below, never rising from the pane's
+        // bottom. Top alignment gets that structurally (a short list rests at
+        // the top with no reservation pad), and the PIN machinery still runs
+        // on top of it for end-follow: the spring is purely distance-based,
+        // and the glue trap it was built around is Bottom-only — layout
         // materializes a Top list's past-end offset to a CONCRETE position
         // every frame (gpui list.rs: only `Bottom` re-glues to the `None`
         // sentinel), so a parked spring can't re-glue and hard-track growth.
-        let alignment = if doc_override.is_some() {
+        // A side-chat doc keeps Bottom: its surface has a composer, so the
+        // transcript anchors where the conversation continues.
+        let alignment = if doc_override.is_some() && !chat_layout {
             ListAlignment::Top
         } else {
             ListAlignment::Bottom
@@ -3986,8 +3997,20 @@ impl Transcript {
             let s = self.state.read(cx);
             match &self.doc_override {
                 // Pinned to a subagent doc: `selected` equals `chat_id` by
-                // construction, so the attach/reset branch below never fires,
-                // and echoes stay empty (nothing is ever sent from here).
+                // construction, so the attach/reset branch below never fires.
+                // A side chat bound to the selected chat renders the primary
+                // feed — honor ITS replay state so a still-loading
+                // transcript doesn't flash stale rows here.
+                Some(doc_id) if s.selected_chat.as_deref() == Some(doc_id.as_str()) => {
+                    let replay = if !s.transcript_replayed {
+                        TranscriptReplayState::Pending
+                    } else if s.transcript.is_empty() {
+                        TranscriptReplayState::Empty
+                    } else {
+                        TranscriptReplayState::Populated
+                    };
+                    (Some(doc_id.clone()), replay)
+                }
                 Some(doc_id) => (Some(doc_id.clone()), TranscriptReplayState::Populated),
                 None => {
                     let replay = if !s.transcript_replayed {
@@ -4105,16 +4128,25 @@ impl Transcript {
             let state = self.state.clone();
             let state = state.read(cx);
             let entries = match &self.doc_override {
+                // A side chat bound to the SELECTED chat reads the primary
+                // feed — already live, no second subscription needed.
+                Some(doc_id) if state.selected_chat.as_deref() == Some(doc_id.as_str()) => {
+                    state.transcript.as_slice()
+                }
                 Some(doc_id) => state.sub_transcript(doc_id),
                 None => state.transcript.as_slice(),
             };
             for entry in entries {
                 new_rows.extend(self.rows_for(entry, false));
             }
-            if self.doc_override.is_none() {
-                for echo in state.pending_echoes() {
-                    new_rows.extend(self.rows_for(echo, true));
-                }
+            // A side-chat doc carries real echoes (its surface sends);
+            // a subagent doc's map stays empty.
+            let echoes = match &self.doc_override {
+                Some(doc_id) => state.echoes_for(doc_id),
+                None => state.pending_echoes(),
+            };
+            for echo in echoes {
+                new_rows.extend(self.rows_for(echo, true));
             }
             (
                 entries.is_empty(),
@@ -4620,15 +4652,17 @@ impl Transcript {
     /// device (uploads targeted it) plus this device (zeron's
     /// `uniqueIds([attachmentDeviceId, m.device_id])`).
     fn attachment_device_ids(&self, cx: &Context<Self>) -> Vec<String> {
-        // `selected_chat_row` belongs to the PRIMARY transcript's chat — an
-        // override instance has no chat row, so it claims no devices (its
-        // thumbnails degrade to placeholders instead of guessing).
-        if self.doc_override.is_some() {
-            return Vec::new();
-        }
         let state = self.state.read(cx);
+        // `selected_chat_row` belongs to the PRIMARY transcript's chat. A
+        // side-chat override names a real chat — claim ITS host device; a
+        // subagent doc has no chat row, so it claims no devices (its
+        // thumbnails degrade to placeholders instead of guessing).
+        let chat_row = match &self.doc_override {
+            Some(doc_id) => state.chat_row(doc_id),
+            None => state.selected_chat_row(),
+        };
         let mut ids = Vec::new();
-        if let Some(chat) = state.selected_chat_row() {
+        if let Some(chat) = chat_row {
             ids.push(chat.device_id.clone());
         }
         if let Some(local) = state.local_device_id.clone()
@@ -5284,27 +5318,20 @@ impl Transcript {
 
     fn render_working_trailer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let now = chrono::Utc::now();
-        let (sending, queued, elapsed_secs, seed) = if let Some(doc_id) = &self.doc_override {
-            // A subagent doc has no Session row — `indicator_for` would read
-            // the PARENT chat's live state into this tab. Liveness rides the
-            // doc itself instead: the sink's assistant entry streams until
-            // the subagent settles (run teardown finalizes abandoned sinks),
-            // and a trailing USER entry is a steer still awaiting its reply
-            // segment. Frozen snapshots never spin, whatever they claim.
-            if !self.doc_live {
-                return None;
+        // Which conversation the trailer reports on: the primary's selection,
+        // a side chat's bound conversation (its doc id IS a chat id — drive
+        // it off the real Session row exactly like the primary), or a
+        // subagent doc, which has no session row and gets the doc heuristic.
+        let live_chat_id = match &self.doc_override {
+            Some(doc_id) => {
+                if !self.doc_live {
+                    return None;
+                }
+                self.state.read(cx).chat_row(doc_id).map(|_| doc_id.clone())
             }
-            let state = self.state.read(cx);
-            let last = state.sub_transcript(doc_id).last()?;
-            let live =
-                last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User;
-            if !live {
-                return None;
-            }
-            let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
-            (false, false, elapsed, flavour_seed(doc_id))
-        } else {
-            let chat_id = self.chat_id.clone()?;
+            None => self.chat_id.clone(),
+        };
+        let (sending, queued, elapsed_secs, seed) = if let Some(chat_id) = live_chat_id {
             // Failed-send state first: past the grace window the trailer IS
             // the retry affordance, whatever the indicator fell back to.
             if self.state.read(cx).send_undelivered(&chat_id, now) {
@@ -5350,6 +5377,25 @@ impl Transcript {
                 (sending, queued, elapsed)
             };
             (sending, queued, elapsed, flavour_seed(&chat_id))
+        } else if let Some(doc_id) = &self.doc_override {
+            // A subagent doc has no Session row — `indicator_for` would read
+            // the PARENT chat's live state into this tab. Liveness rides the
+            // doc itself instead: the sink's assistant entry streams until
+            // the subagent settles (run teardown finalizes abandoned sinks),
+            // and a trailing USER entry is a steer still awaiting its reply
+            // segment. Frozen snapshots never spin, whatever they claim
+            // (`doc_live` was checked above).
+            let state = self.state.read(cx);
+            let last = state.sub_transcript(doc_id).last()?;
+            let live =
+                last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User;
+            if !live {
+                return None;
+            }
+            let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
+            (false, false, elapsed, flavour_seed(doc_id))
+        } else {
+            return None;
         };
         let word = if queued {
             "Queued — will send automatically"

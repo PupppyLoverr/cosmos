@@ -11,6 +11,7 @@ use linux as native;
 use macos as native;
 #[cfg(target_os = "windows")]
 use windows as native;
+pub mod bridge;
 pub mod model;
 mod view;
 
@@ -97,6 +98,16 @@ pub struct BrowserSurface {
     #[cfg(target_os = "macos")]
     resize_inset: gpui::Pixels,
     _input_sub: Subscription,
+    /// FIFO replies for `evaluate` — every platform answers evaluations in
+    /// submission order, so a drained queue is enough to pair them up.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    eval_waiters: std::collections::VecDeque<tokio::sync::oneshot::Sender<serde_json::Value>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    shot_waiters: std::collections::VecDeque<tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>>,
+    /// Element-pick → comment → screenshot → composer staging.
+    annotate: Option<Annotate>,
+    /// The shell's composer — where annotated screenshots land.
+    composer: Option<gpui::WeakEntity<crate::composer::Composer>>,
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     native: Option<native::NativePage>,
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -173,6 +184,12 @@ impl BrowserSurface {
             #[cfg(target_os = "macos")]
             resize_inset: gpui::px(0.0),
             _input_sub: input_sub,
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            eval_waiters: Default::default(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            shot_waiters: Default::default(),
+            annotate: None,
+            composer: None,
             #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             native: None,
             #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -359,7 +376,7 @@ impl BrowserSurface {
         self.navigate(&url, window, cx);
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         if let Some(native) = &self.native {
             if self.page.error.is_some() {
@@ -387,13 +404,289 @@ impl BrowserSurface {
         }
     }
 
-    fn history(&mut self, forward: bool) {
+    pub fn history(&mut self, forward: bool) {
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         if let Some(native) = &self.native {
             native.history(forward);
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         let _ = forward;
+    }
+
+    pub fn set_composer(&mut self, composer: gpui::WeakEntity<crate::composer::Composer>) {
+        self.composer = Some(composer);
+    }
+
+    /// Run a JavaScript expression in the live page and answer with its JSON
+    /// value. The reply resolves `{ok:true, v:<result>}` or
+    /// `{ok:false, e:<error>}` — every platform funnels the return value
+    /// through a JSON string so types survive the native boundary.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    pub fn evaluate(
+        &mut self,
+        expression: &str,
+        reply: tokio::sync::oneshot::Sender<serde_json::Value>,
+    ) {
+        let Some(native) = &self.native else {
+            let _ = reply.send(serde_json::json!({"ok":false,"e":"No page is loaded"}));
+            return;
+        };
+        self.eval_waiters.push_back(reply);
+        let script = format!(
+            "(()=>{{try{{var v=({expression});return JSON.stringify({{ok:true,v:v===undefined?null:v}})}}catch(e){{return JSON.stringify({{ok:false,e:String(e)}})}}}})()"
+        );
+        native.evaluate(&script);
+    }
+
+    /// Evaluate without waiting for the result (teardown hooks, labels).
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn evaluate_detached(&mut self, expression: &str) {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        self.evaluate(expression, tx);
+    }
+
+    /// PNG bytes of the visible page. macOS/Windows snapshot the native
+    /// view; Linux re-encodes the latest composited frame.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    pub fn screenshot(&mut self, reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>) {
+        #[cfg(target_os = "linux")]
+        {
+            let result = self
+                .native
+                .as_ref()
+                .ok_or_else(|| "No page is loaded".to_string())
+                .and_then(|native| native.screenshot());
+            let _ = reply.send(result);
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let Some(native) = &self.native else {
+                let _ = reply.send(Err("No page is loaded".into()));
+                return;
+            };
+            self.shot_waiters.push_back(reply);
+            native.screenshot();
+        }
+    }
+
+    /// Platforms without an embedded page answer eval/screenshot with a
+    /// clear error so bridge callers degrade instead of hanging.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    pub fn evaluate(
+        &mut self,
+        _expression: &str,
+        reply: tokio::sync::oneshot::Sender<serde_json::Value>,
+    ) {
+        let _ = reply.send(
+            serde_json::json!({"ok":false,"e":"Embedded browser is not available on this platform"}),
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    pub fn screenshot(&mut self, reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>) {
+        let _ = reply.send(Err(
+            "Embedded browser is not available on this platform".into()
+        ));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn handle_eval_result(&mut self, value: serde_json::Value) {
+        if let Some(reply) = self.eval_waiters.pop_front() {
+            let _ = reply.send(value);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn handle_screenshot(&mut self, result: Result<Vec<u8>, String>) {
+        if let Some(reply) = self.shot_waiters.pop_front() {
+            let _ = reply.send(result);
+        }
+    }
+
+    /// A navigation replaces the document: any injected overlay and pick
+    /// state are gone, so annotate mode ends with the page it ran on.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn annotate_on_navigation(&mut self, cx: &mut Context<Self>) {
+        if self.annotate.is_some() {
+            self.annotate_cancel(cx);
+        }
+    }
+
+    /// Toggle element-annotate mode: the page gets a hover highlight; a
+    /// click freezes the pick and opens the comment bar; Enter captures a
+    /// screenshot (highlight + comment included) and stages it — plus a
+    /// note naming the element — into the composer.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    pub fn toggle_annotate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.annotate.is_some() {
+            self.annotate_cancel(cx);
+            return;
+        }
+        if self.native.is_none() || self.page.url.is_none() {
+            return;
+        }
+        let input = cx.new(|cx| {
+            ComposerInput::with_context(
+                "Comment on this element — Enter captures",
+                "PaletteSearch",
+                cx,
+            )
+            .with_text_metrics(11.0, 16.0)
+            .with_single_line()
+        });
+        self.evaluate_detached(ANNOTATE_ENTER);
+        let poll = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let Ok(()) = this.update_in(cx, |this, _, _| {
+                    this.evaluate("({p:window.__z9pick||null,e:window.__z9esc===true})", tx);
+                }) else {
+                    return;
+                };
+                use futures::FutureExt;
+                let result = futures::select! {
+                    r = rx.fuse() => r.ok(),
+                    // A dropped native reply would otherwise stall the poll
+                    // forever; two seconds is far past any real evaluation.
+                    _ = cx
+                        .background_executor()
+                        .timer(std::time::Duration::from_secs(2))
+                        .fuse() => None,
+                };
+                let Some(serde_json::Value::Object(envelope)) = result else {
+                    continue;
+                };
+                let Some(value) = envelope.get("v") else {
+                    continue;
+                };
+                if value.get("e").and_then(|e| e.as_bool()).unwrap_or(false) {
+                    let _ = this.update_in(cx, |this, _, cx| this.annotate_cancel(cx));
+                    return;
+                }
+                if let Some(pick) = value.get("p").filter(|p| p.is_object()) {
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            this.annotate_pick(pick.clone(), window, cx)
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let still = this
+                    .update_in(cx, |this, _, _| this.annotate.is_some())
+                    .unwrap_or(false);
+                if !still {
+                    return;
+                }
+            }
+        });
+        self.annotate = Some(Annotate {
+            input,
+            picked: None,
+            _poll: poll,
+        });
+        cx.notify();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn annotate_pick(
+        &mut self,
+        pick: serde_json::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(annotate) = &mut self.annotate else {
+            return;
+        };
+        annotate.picked = Some(pick);
+        let focus = annotate.input.focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Drop the injected overlay and close the comment bar without staging.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    pub fn annotate_cancel(&mut self, cx: &mut Context<Self>) {
+        if self.annotate.take().is_some() {
+            self.evaluate_detached(ANNOTATE_EXIT);
+            cx.notify();
+        }
+    }
+
+    /// Screenshot the page with the highlight and the comment label still
+    /// on it, then stage the PNG and a note naming the element into the
+    /// composer so the agent sees both the picture and the pointer.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    fn annotate_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(annotate) = &mut self.annotate else {
+            return;
+        };
+        let comment = annotate.input.read(cx).text().trim().to_string();
+        let Some(picked) = annotate.picked.clone() else {
+            // No element picked yet — keep the mode, keep the comment draft.
+            return;
+        };
+        let selector = picked
+            .get("selector")
+            .and_then(|s| s.as_str())
+            .unwrap_or("element")
+            .to_string();
+        let element_text = picked
+            .get("text")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect::<String>();
+        let page_url = self.page.url.clone().unwrap_or_default();
+        // Render the comment onto the page next to the highlight so the
+        // capture itself carries the user's words.
+        self.evaluate_detached(&format!(
+            "window.__z9label&&window.__z9label({})",
+            serde_json::json!(comment)
+        ));
+        let composer = self.composer.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.screenshot(tx);
+        let selector_note = selector.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            // Give the label paint a beat before the snapshot lands.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(120))
+                .await;
+            use futures::FutureExt;
+            let bytes = futures::select! {
+                r = rx.fuse() => r.ok(),
+                _ = cx
+                    .background_executor()
+                    .timer(std::time::Duration::from_secs(5))
+                    .fuse() => None,
+            };
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.annotate_cancel(cx);
+            });
+            let Some(Ok(png)) = bytes else {
+                return;
+            };
+            let note = if comment.is_empty() {
+                format!("Annotated element `{selector_note}` on {page_url}: {element_text}")
+            } else {
+                format!("{comment}\n\nAnnotated `{selector_note}` on {page_url}: {element_text}")
+            };
+            let Some(composer) = composer.and_then(|c| c.upgrade()) else {
+                return;
+            };
+            let _ = cx.update(|_, cx| {
+                composer.update(cx, |composer, cx| {
+                    composer.stage_browser_capture(note, png, cx);
+                })
+            });
+        })
+        .detach();
     }
 
     /// Explicitly close even if an async callback temporarily retains an entity.
@@ -467,6 +760,9 @@ impl BrowserSurface {
                 if finished && let Some(url) = &page.url {
                     native.discover_favicon(url.clone());
                 }
+                if page.url != self.page.url {
+                    self.annotate_on_navigation(cx);
+                }
                 if page != self.page {
                     self.page = page;
                     cx.emit(BrowserEvent::Changed);
@@ -486,6 +782,8 @@ impl BrowserSurface {
                     });
                 }
             }
+            native::NativeEvent::EvalResult(value) => self.handle_eval_result(value),
+            native::NativeEvent::Screenshot(result) => self.handle_screenshot(result),
             native::NativeEvent::Favicon { page, url } => {
                 if self.page.url.as_deref() != Some(&page) || !model::allowed_navigation(&url) {
                     return;
@@ -575,6 +873,9 @@ impl BrowserSurface {
                     self.address_edited = false;
                 }
                 native.present(self.presentation);
+                if page.url != self.page.url {
+                    self.annotate_on_navigation(cx);
+                }
                 if page != self.page {
                     self.page = page;
                     cx.emit(BrowserEvent::Changed);
@@ -594,9 +895,87 @@ impl BrowserSurface {
                     });
                 }
             }
+            native::NativeEvent::EvalResult(value) => self.handle_eval_result(value),
+            native::NativeEvent::Screenshot(result) => self.handle_screenshot(result),
         }
     }
 }
+
+/// Element-annotate session state: the comment field, the picked element,
+/// and the pick-poll task that ends when annotate mode does.
+struct Annotate {
+    input: Entity<ComposerInput>,
+    picked: Option<serde_json::Value>,
+    _poll: gpui::Task<()>,
+}
+
+/// Every platform returns the evaluated script's *string* result — the
+/// caller-side wrapper JSON-encodes the real value into that string, so the
+/// native boundary only ever ferries text. Windows and Linux then JSON-wrap
+/// the string once more (wry's callback / `jsc_value_to_json`), which is why
+/// decoding unwraps string layers until a structured value appears.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn decode_eval(raw: &str) -> serde_json::Value {
+    let mut value = serde_json::from_str::<serde_json::Value>(raw)
+        .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+    while let serde_json::Value::String(inner) = &value {
+        match serde_json::from_str::<serde_json::Value>(inner) {
+            Ok(deeper) => value = deeper,
+            Err(_) => break,
+        }
+    }
+    value
+}
+
+/// Injected element picker. Kept name-scoped under `__z9*` so page globals
+/// never collide. `__z9pick` carries the last pick (null until clicked),
+/// `__z9esc` reports an in-page Escape, `__z9label` rewrites the comment
+/// chip before capture, and `__z9off` removes everything.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+const ANNOTATE_ENTER: &str = r#"(() => {
+  if (window.__z9a) return true;
+  window.__z9a = true; window.__z9pick = null; window.__z9esc = false;
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;z-index:2147483646;pointer-events:none;border:2px solid #4f8cff;background:rgba(79,140,255,0.12);border-radius:3px;display:none;box-sizing:border-box';
+  const tip = document.createElement('div');
+  tip.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;background:#1c1f26;color:#e6e8ee;font:11px/1.5 system-ui,sans-serif;padding:3px 8px;border-radius:5px;display:none;max-width:70vw;white-space:pre-wrap;box-shadow:0 2px 10px rgba(0,0,0,.35)';
+  document.documentElement.append(box, tip);
+  let el = null;
+  const name = t => t.tagName.toLowerCase() + (t.id ? '#' + t.id : (t.className && typeof t.className === 'string' ? '.' + t.className.trim().split(/\s+/).slice(0, 3).join('.') : ''));
+  const place = t => {
+    const r = t.getBoundingClientRect();
+    Object.assign(box.style, { display: 'block', left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+    Object.assign(tip.style, { display: 'block', left: Math.min(r.left, innerWidth - 180) + 'px', top: Math.max(4, r.top - 30) + 'px' });
+  };
+  const pick = t => {
+    const r = t.getBoundingClientRect();
+    return { selector: name(t), tag: t.tagName.toLowerCase(), id: t.id || null,
+      text: (t.innerText || t.value || t.alt || '').trim().slice(0, 300),
+      rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) } };
+  };
+  const move = e => { el = e.target; if (el instanceof Element) { place(el); tip.textContent = name(el); } };
+  const eat = e => { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); };
+  const click = e => { eat(e); if (el) { window.__z9pick = pick(el); place(el); tip.textContent = name(el); } };
+  const key = e => { if (e.key === 'Escape') { eat(e); window.__z9esc = true; } };
+  window.__z9label = c => { if (el) { tip.textContent = name(el) + (c ? ' — ' + c : ''); } };
+  window.__z9off = () => {
+    removeEventListener('mousemove', move, true);
+    removeEventListener('click', click, true);
+    removeEventListener('keydown', key, true);
+    for (const t of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'dblclick', 'submit']) removeEventListener(t, eat, true);
+    box.remove(); tip.remove();
+    window.__z9a = false; window.__z9pick = null; window.__z9esc = false;
+  };
+  addEventListener('mousemove', move, true);
+  addEventListener('click', click, true);
+  addEventListener('keydown', key, true);
+  for (const t of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'dblclick', 'submit']) addEventListener(t, eat, true);
+  return true;
+})()"#;
+
+/// Removes the picker overlay and resets the pick globals.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+const ANNOTATE_EXIT: &str = "(window.__z9off&&window.__z9off(),true)";
 
 #[cfg(feature = "browser-fixture")]
 impl BrowserSurface {

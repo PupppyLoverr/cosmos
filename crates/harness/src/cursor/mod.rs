@@ -58,6 +58,9 @@ use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_ch
 const CURSOR_SDK_PIN: &str = "@cursor/sdk@1.0.28";
 const SHIM_NAME: &str = "zeron-cursor-shim.mjs";
 const SHIM_SOURCE: &str = include_str!("shim.mjs");
+/// Bound on the `cursor-agent acp` initialize → session/new catalog probe —
+/// the CLI's ACP mode loads its plugin stack before answering.
+const CLI_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn cursor_cli_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -81,6 +84,8 @@ fn cursor_cli_paths() -> Vec<PathBuf> {
 pub struct CursorHarness {
     /// Test seam: run this program AS the shim instead of node+managed SDK.
     executable: Option<PathBuf>,
+    /// Test seam: run this binary AS `cursor-agent` for the ACP catalog probe.
+    agent_executable: Option<PathBuf>,
     interrupt_grace: Duration,
     kill_grace: Duration,
     /// Discovery cache: only a successful, non-empty catalog is cached, so a
@@ -92,6 +97,7 @@ impl Default for CursorHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            agent_executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             models_cache: tokio::sync::OnceCell::new(),
@@ -109,14 +115,42 @@ impl CursorHarness {
         self
     }
 
+    /// Test seam: the binary `discover_models_cli` spawns as `cursor-agent acp`.
+    #[doc(hidden)]
+    pub fn with_agent_executable(mut self, path: impl Into<PathBuf>) -> Self {
+        self.agent_executable = Some(path.into());
+        self
+    }
+
     pub fn with_graces(mut self, interrupt_grace: Duration, kill_grace: Duration) -> Self {
         self.interrupt_grace = interrupt_grace;
         self.kill_grace = kill_grace;
         self
     }
 
-    /// Spawn the shim in models mode and map its one catalog frame.
+    /// Live catalog, two sources. The SDK's `models.list()` carries typed
+    /// parameter metadata (effort/context/fast dropdowns) but needs the SDK's
+    /// OWN login — separate from `cursor-agent login` (verified live: the
+    /// probe fails with "API key is required" on a CLI-authed machine). The
+    /// CLI's own `acp` server advertises the same account's catalog on
+    /// `session/new` under the CLI login [`installed`](Self::installed)
+    /// already gates on — that probe is the fallback. A shim that isn't
+    /// installed yet is warmed in the background: a picker open must never
+    /// block on npm.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
+        if self.shim_ready() {
+            match self.discover_models_sdk().await {
+                Ok(models) if !models.is_empty() => return Ok(models),
+                _ => {}
+            }
+        } else {
+            Self::prewarm_shim();
+        }
+        self.discover_models_cli().await
+    }
+
+    /// Spawn the shim in models mode and map its one catalog frame.
+    async fn discover_models_sdk(&self) -> Result<Vec<Model>, HarnessError> {
         let (exe, args) = self.resolve_shim().await?;
         let mut cmd = Command::new(&exe);
         cmd.args(&args);
@@ -165,6 +199,122 @@ impl CursorHarness {
                 .await?;
         crate::adapter_install::launch_for_entry(&shim)
     }
+
+    /// True when the SDK shim is already on disk (or an override path is
+    /// set) — the SDK probe then doesn't install anything. The managed
+    /// install is `npm install` work a picker wait must never block on.
+    fn shim_ready(&self) -> bool {
+        self.executable.is_some()
+            || std::env::var_os("CURSOR_SDK_SHIM_EXECUTABLE").is_some_and(|v| !v.is_empty())
+            || crate::adapter_install::installed_shim(
+                &crate::adapter_install::NpmPin::parse(CURSOR_SDK_PIN),
+                SHIM_NAME,
+                SHIM_SOURCE,
+            )
+            .is_some()
+    }
+
+    /// Kick the managed shim install without awaiting it — a later probe (or
+    /// run) picks up the SDK catalog once npm lands.
+    fn prewarm_shim() {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let pin = crate::adapter_install::NpmPin::parse(CURSOR_SDK_PIN);
+        handle.spawn(async move {
+            if let Err(err) =
+                crate::adapter_install::ensure_installed_shim(pin, "Cursor", SHIM_NAME, SHIM_SOURCE)
+                    .await
+            {
+                tracing::debug!(target: "zeron_harness::cursor", error = %err, "shim preinstall failed");
+            }
+        });
+    }
+
+    /// The `cursor-agent` binary: test seam, env override, then PATH/known
+    /// install dirs — the same resolution [`installed`](Self::installed)
+    /// uses.
+    fn resolve_agent(&self) -> Result<PathBuf, HarnessError> {
+        if let Some(agent) = &self.agent_executable {
+            return Ok(agent.clone());
+        }
+        if let Some(agent) = std::env::var_os("CURSOR_AGENT_EXECUTABLE")
+            && !agent.is_empty()
+        {
+            return Ok(PathBuf::from(agent));
+        }
+        crate::acp::find_on_paths("cursor-agent", cursor_cli_paths())
+            .ok_or_else(|| HarnessError::NotInstalled("cursor-agent".into()))
+    }
+
+    /// `cursor-agent acp` catalog probe: initialize → `session/new`, whose
+    /// response advertises the account's models on `configOptions` (and the
+    /// legacy `models` state). Uses the CLI's own login — no SDK credential.
+    async fn discover_models_cli(&self) -> Result<Vec<Model>, HarnessError> {
+        let agent = self.resolve_agent()?;
+        let mut cmd = Command::new(&agent);
+        cmd.arg("acp");
+        crate::compose_child_path(&mut cmd, &agent);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                HarnessError::NotInstalled(agent.display().to_string())
+            } else {
+                HarnessError::Io(e)
+            }
+        })?;
+        let stderr_tail = crate::StderrTail::default();
+        if let Some(stderr) = child.stderr.take() {
+            let tail = stderr_tail.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "zeron_harness::cursor", "stderr: {line}");
+                    tail.push(&line);
+                }
+            });
+        }
+        let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
+            (Some(stdin), Some(stdout)) => crate::jsonrpc::RpcClient::new(stdin, stdout),
+            _ => {
+                shutdown_child(&mut child, self.kill_grace).await;
+                return Err(HarnessError::Protocol(
+                    "cursor-agent acp stdio unavailable".into(),
+                ));
+            }
+        };
+        let discovery = async {
+            client
+                .request("initialize", crate::acp::initialize_params(HarnessId::Cursor))
+                .await?;
+            let session = client
+                .request(
+                    "session/new",
+                    json!({ "cwd": crate::acp::discovery_cwd(), "mcpServers": [] }),
+                )
+                .await?;
+            Ok::<_, HarnessError>(cli_session_models(&session))
+        };
+        let result = tokio::time::timeout(CLI_DISCOVERY_TIMEOUT, discovery).await;
+        shutdown_child(&mut child, self.kill_grace).await;
+        match result {
+            Ok(inner) => inner,
+            Err(_) => {
+                let mut error = format!(
+                    "cursor-agent acp model discovery did not complete within {}s",
+                    CLI_DISCOVERY_TIMEOUT.as_secs()
+                );
+                if let Some(stderr) = stderr_tail.snapshot() {
+                    error.push_str("; stderr: ");
+                    error.push_str(&stderr);
+                }
+                Err(HarnessError::Protocol(error))
+            }
+        }
+    }
 }
 
 /// A ready-to-spawn command for the shim's LOGIN mode: the SDK's PKCE
@@ -204,6 +354,8 @@ impl Harness for CursorHarness {
     /// install zeron performs on demand).
     fn installed(&self) -> bool {
         self.executable.is_some()
+            || self.agent_executable.is_some()
+            || std::env::var_os("CURSOR_AGENT_EXECUTABLE").is_some_and(|v| !v.is_empty())
             || crate::acp::find_on_paths("cursor-agent", cursor_cli_paths()).is_some()
     }
     /// Done is the SDK run's terminal result, for every turn shape.
@@ -211,10 +363,9 @@ impl Harness for CursorHarness {
         true
     }
 
-    /// Live catalog via the shim's models mode (`Cursor.models.list()` —
-    /// public, no auth; verified live on 1.0.28). Falls back to a minimal
-    /// static pair when the probe fails, UNCACHED so the next picker open
-    /// retries.
+    /// Live catalog via [`Self::discover_models`] (SDK first, then the
+    /// `cursor-agent acp` session catalog). Falls back to a minimal static
+    /// pair when both probes fail, UNCACHED so the next picker open retries.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         if let Some(models) = self.models_cache.get() {
             return Ok(models.clone());
@@ -414,6 +565,91 @@ fn map_model_items(items: &Value) -> Vec<Model> {
             })
         })
         .collect()
+}
+
+/// The `cursor-agent acp` session catalog → picker rows. Model values arrive
+/// composed as `base[param=value,…]` — exactly the SDK's `{id, params}`
+/// spelled flat, which the shim splits back out at run time (`shim.mjs`
+/// `modelSelection`). The shared ACP parser folds the `default[]` Auto alias
+/// out as a duplicate; restore it as `auto` so Cursor's flagship pick stays
+/// first under the id the backend actually resolves.
+fn cli_session_models(session: &Value) -> Vec<Model> {
+    let mut models = crate::acp::models_from_session(session, &[]);
+    for model in &mut models {
+        model.label = display_label(&model.label);
+    }
+    if advertises_auto(session) {
+        models.insert(
+            0,
+            Model {
+                id: "auto".into(),
+                label: "Auto".into(),
+                description: Some("Cursor picks the model per request".into()),
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            },
+        );
+    }
+    models
+}
+
+/// Whether the session's model catalog carries the `default[]` Auto alias —
+/// either the `configOptions` model select's values or the legacy
+/// `models.availableModels` list.
+fn advertises_auto(session: &Value) -> bool {
+    let in_config = session
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .is_some_and(|opts| {
+            opts.iter()
+                .filter(|o| o.get("category").and_then(Value::as_str) == Some("model"))
+                .filter_map(|o| o.get("options").and_then(Value::as_array))
+                .flatten()
+                .any(|o| o.get("value").and_then(Value::as_str) == Some("default[]"))
+        });
+    in_config
+        || session
+            .get("models")
+            .and_then(|m| m.get("availableModels"))
+            .and_then(Value::as_array)
+            .is_some_and(|models| {
+                models
+                    .iter()
+                    .any(|m| m.get("modelId").and_then(Value::as_str) == Some("default[]"))
+            })
+}
+
+/// A picker label for a raw model id, the CLI catalog's `name` being the
+/// bare id: "claude-opus-4-8" → "Claude Opus 4.8" (adjacent digit tokens
+/// rejoin as version numbers), "gpt-5.6-sol" → "GPT 5.6 Sol".
+fn display_label(id: &str) -> String {
+    const ACRONYMS: &[&str] = &["gpt", "glm"];
+    let mut words: Vec<String> = Vec::new();
+    for tok in id.split('-') {
+        if tok.is_empty() {
+            continue;
+        }
+        if tok.chars().all(|c| c.is_ascii_digit())
+            && words
+                .last()
+                .is_some_and(|w| w.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        {
+            let last = words.last_mut().expect("non-empty words");
+            last.push('.');
+            last.push_str(tok);
+            continue;
+        }
+        words.push(if ACRONYMS.contains(&tok) {
+            tok.to_uppercase()
+        } else {
+            let mut chars = tok.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => String::new(),
+            }
+        });
+    }
+    words.join(" ")
 }
 
 async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<String>) {

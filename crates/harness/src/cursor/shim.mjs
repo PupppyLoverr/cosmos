@@ -268,16 +268,31 @@ async function runTurn(prompt) {
 // effort / fast / optimize_for — ids from the discovered catalog). Legacy
 // sessions may still carry the pre-discovery static option ("optimizeFor",
 // choice "speed") — translate rather than send an id the backend never knew.
+// The picker's model id may itself arrive composed — "claude-opus-5[
+// thinking=true,effort=high]" is {id, params} spelled flat by the CLI's ACP
+// catalog; split the bracket back out (an empty one, "default[]", is the
+// Auto alias and carries no params).
 function modelSelection(msg) {
-  const id = msg.model || "auto";
+  let id = msg.model || "auto";
   const params = [];
+  const bracket = /^(.*)\[([^\]]*)\]$/.exec(id);
+  if (bracket) {
+    id = bracket[1] || "auto";
+    for (const pair of bracket[2].split(",")) {
+      const eq = pair.indexOf("=");
+      if (eq <= 0) continue;
+      const pid = pair.slice(0, eq).trim();
+      const value = pair.slice(eq + 1).trim();
+      if (pid && value) params.push({ id: pid, value });
+    }
+  }
   for (const [key, value] of Object.entries(msg.modelOptions ?? {})) {
     if (typeof value !== "string" || !value) continue;
-    if (key === "optimizeFor") {
-      params.push({ id: "optimize_for", value: value === "speed" ? "cost" : value });
-    } else {
-      params.push({ id: key, value });
-    }
+    const pid = key === "optimizeFor" ? "optimize_for" : key;
+    const v = key === "optimizeFor" && value === "speed" ? "cost" : value;
+    const at = params.findIndex((p) => p.id === pid);
+    if (at >= 0) params[at].value = v;
+    else params.push({ id: pid, value: v });
   }
   return params.length ? { id, params } : { id };
 }

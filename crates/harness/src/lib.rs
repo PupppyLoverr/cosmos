@@ -386,6 +386,42 @@ pub(crate) fn crash_message(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Embedded-browser bridge (shared by every driver)
+// ---------------------------------------------------------------------------
+
+/// Env var every spawned harness gets when the run carries the
+/// embedded-browser bridge endpoint. Uniform fallback for harnesses without
+/// an injectable MCP channel — the bridge speaks plain JSON-RPC POSTs, so a
+/// shell plus curl can still drive it.
+pub const BROWSER_BRIDGE_ENV: &str = "ZERON_BROWSER_MCP";
+
+/// The run's bridge endpoint, if the UI stamped one (local chats only).
+pub(crate) fn browser_bridge_url(request: &RunRequest) -> Option<&str> {
+    zeron_proto::browser_bridge_url(request)
+}
+
+/// ACP `session/new` `mcpServers` entry pointing at the stdio shim this
+/// binary exposes (`zeron browser-bridge --url …`). `None` when the run
+/// carries no stamp or the executable path can't resolve.
+pub(crate) fn browser_bridge_acp_server(request: &RunRequest) -> Option<serde_json::Value> {
+    let url = browser_bridge_url(request)?;
+    let exe = std::env::current_exe().ok()?;
+    Some(serde_json::json!({
+        "name": "zeron-browser",
+        "command": exe,
+        "args": ["browser-bridge", "--url", url],
+        "env": [],
+    }))
+}
+
+/// Set the fallback env var on a spawned child when the run is stamped.
+pub(crate) fn browser_bridge_env(cmd: &mut tokio::process::Command, request: &RunRequest) {
+    if let Some(url) = browser_bridge_url(request) {
+        cmd.env(BROWSER_BRIDGE_ENV, url);
+    }
+}
+
 pub use acp::AcpHarness;
 pub use amp::AmpHarness;
 pub use antigravity::AntigravityHarness;

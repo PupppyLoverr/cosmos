@@ -47,6 +47,7 @@ pub mod queue;
 pub mod rail;
 pub mod settings;
 pub mod shell;
+pub mod side_chat;
 pub mod sound;
 pub mod state;
 pub(crate) mod surface_chrome;

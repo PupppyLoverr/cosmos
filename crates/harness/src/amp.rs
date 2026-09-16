@@ -187,6 +187,14 @@ impl AmpHarness {
         if request.auto_approve {
             cmd.arg("--dangerously-allow-all");
         }
+        // The app stamps local runs with the loopback embedded-browser
+        // bridge; amp's `--mcp-config` takes a server-name → config map
+        // (`url` for remote servers) and outranks settings-file servers.
+        if let Some(url) = crate::browser_bridge_url(request) {
+            cmd.arg("--mcp-config")
+                .arg(serde_json::json!({"zeron-browser": {"url": url}}).to_string());
+            cmd.env(crate::BROWSER_BRIDGE_ENV, url);
+        }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }

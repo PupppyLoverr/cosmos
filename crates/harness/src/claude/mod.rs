@@ -215,6 +215,21 @@ impl ClaudeHarness {
             cmd.arg("--settings");
             cmd.arg(Value::Object(settings).to_string());
         }
+        // The app stamps local runs with the loopback embedded-browser
+        // bridge; `--mcp-config` merges alongside the user's own servers
+        // (strict mode stays title-only), and the env var is the uniform
+        // fallback every harness gets.
+        if let Some(url) = crate::browser_bridge_url(request) {
+            cmd.arg("--mcp-config").arg(
+                serde_json::json!({
+                    "mcpServers": {
+                        "zeron-browser": {"type": "http", "url": url}
+                    }
+                })
+                .to_string(),
+            );
+            cmd.env(crate::BROWSER_BRIDGE_ENV, url);
+        }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }

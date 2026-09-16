@@ -22,6 +22,8 @@ pub enum NativeEvent {
     NewTab(String),
     Clipboard(String),
     Menu(Value),
+    /// A `{"cmd":"eval"}` result — the page's JSON-encoded return value.
+    EvalResult(Value),
 }
 
 #[derive(Clone, Default)]
@@ -46,7 +48,7 @@ struct Route {
     state: Mutex<PageState>,
     frame: Mutex<Option<(Arc<RenderImage>, f32)>>,
     input: Mutex<Value>,
-    #[cfg(feature = "browser-fixture")]
+    /// Latest eval result, also surfaced as `NativeEvent::EvalResult`.
     evaluation: Mutex<Option<Value>>,
 }
 
@@ -140,16 +142,22 @@ impl BrowserData {
                         b'M' => {let Ok(menu)=serde_json::from_slice(&data) else {continue;};NativeEvent::Menu(menu)}
                         b'C' => NativeEvent::Clipboard(String::from_utf8_lossy(&data).into_owned()),
                         b'N' => NativeEvent::NewTab(String::from_utf8_lossy(&data).into_owned()),
-                        #[cfg(feature = "browser-fixture")]
-                        b'J' => { *route.evaluation.lock().unwrap() = serde_json::from_slice(&data).ok(); continue; }
+                        b'J' => {
+                            let value = serde_json::from_slice::<Value>(&data).ok();
+                            *route.evaluation.lock().unwrap() = value.clone();
+                            match value {
+                                Some(value) => NativeEvent::EvalResult(value),
+                                None => continue,
+                            }
+                        }
                         _ => continue,
                     };
                     // At most one latest frame is retained per page. A busy UI
                     // never accumulates video frames or blocks the engine.
-                    match event {
-                        NativeEvent::NewTab(_) | NativeEvent::Clipboard(_) | NativeEvent::Menu(_) => { let _ = route.tx.blocking_send(event); }
-                        _ => { let _ = route.tx.try_send(event); }
-                    }
+                    // A dropped reply would strand its waiter (eval results
+                    // pair FIFO), so nothing here blocks on a full channel —
+                    // awaiters time out instead of hanging.
+                    let _ = route.tx.try_send(event);
                 }
             })();
             if result.is_err() {
@@ -210,7 +218,6 @@ impl NativePage {
             state: Mutex::default(),
             frame: Mutex::default(),
             input: Mutex::new(json!({})),
-            #[cfg(feature = "browser-fixture")]
             evaluation: Mutex::default(),
         });
         worker
@@ -288,10 +295,35 @@ impl NativePage {
     pub fn command(&self, value: Value) {
         let _ = self.worker.send(self.id, value);
     }
-    #[cfg(feature = "browser-fixture")]
+    /// Runs `script` in the page; the result arrives as
+    /// `NativeEvent::EvalResult` in submission order.
     pub fn evaluate(&self, script: &str) {
         *self.route.evaluation.lock().unwrap() = None;
         self.command(json!({"cmd":"eval","script":script}));
+    }
+    /// PNG bytes of the last composited frame — the offscreen render IS
+    /// the page image, so a capture is a re-encode, not a new draw.
+    pub fn screenshot(&self) -> Result<Vec<u8>, String> {
+        let image = self
+            .image
+            .as_ref()
+            .ok_or_else(|| "No page frame has been captured yet".to_string())?;
+        let size = image.size(0);
+        let (width, height) = (size.width.0, size.height.0);
+        let bytes = image
+            .as_bytes(0)
+            .ok_or_else(|| "The page frame is not readable".to_string())?;
+        let mut png = Vec::new();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut png);
+        image::ImageEncoder::write_image(
+            &mut encoder,
+            bytes,
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| format!("Could not encode the page capture: {e}"))?;
+        Ok(png)
     }
     #[cfg(feature = "browser-fixture")]
     pub fn evaluation(&self) -> Option<Value> {
@@ -358,11 +390,15 @@ impl super::BrowserSurface {
                     }
                     self.address_edited = false;
                 }
+                if page.url != self.page.url {
+                    self.annotate_on_navigation(cx);
+                }
                 if page != self.page {
                     self.page = page;
                     cx.emit(super::BrowserEvent::Changed);
                 }
             }
+            NativeEvent::EvalResult(value) => self.handle_eval_result(value),
         }
         cx.notify();
     }

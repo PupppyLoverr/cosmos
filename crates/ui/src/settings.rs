@@ -615,7 +615,8 @@ pub struct UiSettings {
     pub files_show_all: bool,
     /// Interactive identity overlay; imported themes default to their own accent.
     pub accent: zeron_theme::AccentSelection,
-    /// Glass policy, independent from the selected appearance, theme, and accent.
+    /// Material policy — glass/acrylic/normal — independent from the selected
+    /// appearance, theme, and accent.
     pub surface: zeron_theme::SurfacePreference,
     /// Optional device-local artwork behind the blank new-thread composer.
     #[serde(skip_serializing_if = "Option::is_none")]

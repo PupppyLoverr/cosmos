@@ -45,6 +45,14 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Stdio MCP front for the headed app's embedded-browser bridge. Agent
+    /// harnesses without an HTTP-MCP channel (ACP agents) spawn this as a
+    /// server subprocess — stdout is protocol traffic, so it skips logging.
+    BrowserBridge {
+        /// Loopback MCP endpoint stamped on the run request.
+        #[arg(long)]
+        url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -105,6 +113,11 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // MCP stdio servers speak JSON-RPC on stdout — dispatch before the
+    // tracing layer (which writes to stdout) installs.
+    if let Some(Command::BrowserBridge { url }) = &cli.command {
+        return zeron_ui::browser::bridge::serve_stdio(url);
+    }
     // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
     // overrides either).
     // loro's internal block-encode diagnostics log at info and flood
@@ -196,6 +209,9 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(update_cli::update(&edge_url_from_env(), check))
+        }
+        Some(Command::BrowserBridge { .. }) => {
+            unreachable!("browser-bridge dispatches before tracing init")
         }
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),

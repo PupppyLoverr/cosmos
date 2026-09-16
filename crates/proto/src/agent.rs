@@ -94,6 +94,22 @@ pub struct ModelOptionChoice {
     pub label: String,
 }
 
+/// `RunRequest.model_options` key carrying the embedded-browser bridge
+/// endpoint (`{"url": "http://127.0.0.1:<port>/mcp/<token>"}`). The UI stamps
+/// it on local-host runs only — the loopback URL is meaningless on a remote
+/// host — and title-only runs drop `model_options` entirely, so discovery
+/// probes never see it.
+pub const BROWSER_BRIDGE_OPTION: &str = "zeron_browser_bridge";
+
+/// The bridge endpoint URL for this run, if the UI stamped one.
+pub fn browser_bridge_url(request: &RunRequest) -> Option<&str> {
+    request
+        .model_options
+        .get(BROWSER_BRIDGE_OPTION)
+        .and_then(|v| v.get("url"))
+        .and_then(serde_json::Value::as_str)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRequest {

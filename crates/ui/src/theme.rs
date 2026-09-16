@@ -894,8 +894,18 @@ impl Theme {
     /// wgpu platforms keep opaque floats until tested). The window chrome
     /// itself stays opaque off macOS either way.
     pub fn is_frost(&self) -> bool {
-        self.surface_treatment == SurfaceTreatment::Frosted
-            && cfg!(any(target_os = "macos", target_os = "linux"))
+        matches!(
+            self.surface_treatment,
+            SurfaceTreatment::Frosted | SurfaceTreatment::Acrylic
+        ) && cfg!(any(target_os = "macos", target_os = "linux"))
+    }
+
+    /// The denser, more matte translucent treatment. On platforms without
+    /// scene blur it still paints as a heavier translucent surface over the
+    /// app-owned backdrop — visibly distinct from glass, quieter over busy
+    /// imagery.
+    pub fn is_acrylic(&self) -> bool {
+        self.surface_treatment == SurfaceTreatment::Acrylic
     }
 
     /// Theme-owned hover wash for chrome that sits on glass (sidebar rows,
@@ -909,11 +919,19 @@ impl Theme {
     /// [`crate::frost::frosted`]). Light coverage stays heavier because dark
     /// text is more vulnerable to unpredictable content behind a popover.
     pub fn glass_overlay(&self) -> Hsla {
-        let base = match self.appearance {
-            Appearance::Dark => self.surface_overlay.opacity(0.50),
-            Appearance::Light => self.surface_overlay.opacity(0.85),
+        let base = match (self.appearance, self.is_acrylic()) {
+            (Appearance::Dark, false) => self.surface_overlay.opacity(0.50),
+            (Appearance::Light, false) => self.surface_overlay.opacity(0.85),
+            // Acrylic: denser, more matte coverage — busy backdrops stay
+            // quiet, and the near-solid tint stays legible even on platforms
+            // where the scene blur isn't rasterized.
+            (Appearance::Dark, true) => self.surface_overlay.opacity(0.80),
+            (Appearance::Light, true) => self.surface_overlay.opacity(0.94),
         };
-        if !self.is_frost() {
+        // Frost tints only transluce where the blur runs; acrylic opts into
+        // tint-only translucency too — its coverage is dense enough to be
+        // safe over sharp content.
+        if !self.is_frost() && !self.is_acrylic() {
             return self.surface_overlay;
         }
         self.surface_overlay
@@ -958,11 +976,13 @@ impl Theme {
     /// color while hiding the transcript and overlapping surfaces underneath.
     /// Frosted surfaces retain their translucent, contrast-checked tint.
     pub fn input_glass_bg(&self) -> Hsla {
-        if !self.is_frost() {
+        if !self.is_frost() && !self.is_acrylic() {
             return flatten(self.input_bg, self.bg);
         }
         let base = if matches!(self.appearance, Appearance::Light) {
-            0.30
+            if self.is_acrylic() { 0.62 } else { 0.30 }
+        } else if self.is_acrylic() {
+            self.input_bg.a.max(0.72)
         } else {
             self.input_bg.a
         };
@@ -976,12 +996,13 @@ impl Theme {
     /// frosted blur (user report), so glass thins it to a translucent tint;
     /// opaque platforms keep the true card tone.
     pub fn card_glass_bg(&self) -> Hsla {
-        if !self.is_frost() {
+        if !self.is_frost() && !self.is_acrylic() {
             return self.surface;
         }
+        let base = if self.is_acrylic() { 0.62 } else { 0.40 };
         let window = flatten(self.glass(), self.adverse_backdrop());
         self.surface
-            .opacity(self.contrast_checked_tint_alpha(self.surface, 0.40, window))
+            .opacity(self.contrast_checked_tint_alpha(self.surface, base, window))
     }
 
     /// The standard modal backdrop — see [`scrim`].

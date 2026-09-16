@@ -292,6 +292,44 @@ async fn shim_crash_mid_run_reports_stderr_tail() {
     }
 }
 
+fn acp_fixture_path() -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-cursor-acp.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    }
+    path
+}
+
+/// A dead SDK shim must not lose the catalog — the `cursor-agent acp`
+/// session advertises it under the CLI's own login (the SDK's separate
+/// credential is what the probe usually lacks).
+#[tokio::test]
+async fn model_discovery_falls_back_to_cursor_agent_acp() {
+    let harness = CursorHarness::new()
+        .with_executable(PathBuf::from("/nonexistent/cursor-shim.mjs"))
+        .with_agent_executable(acp_fixture_path());
+    let models = harness.models().await.expect("models");
+    assert_eq!(models.len(), 3, "{models:?}");
+    // The default[] Auto alias folds back to the flagship pick under the id
+    // the backend resolves.
+    assert_eq!(models[0].id, "auto");
+    assert_eq!(models[0].label, "Auto");
+    // Composed `base[param=value,…]` ids pass through verbatim — the shim
+    // splits the bracket back into {id, params} at run time.
+    assert_eq!(models[1].id, "grok-4.6[effort=high,fast=true]");
+    assert_eq!(models[1].label, "Grok 4.6");
+    assert_eq!(
+        models[2].id,
+        "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]"
+    );
+    assert_eq!(models[2].label, "Claude Opus 5");
+}
+
 #[tokio::test]
 async fn model_discovery_maps_the_live_catalog() {
     let models = harness().models().await.expect("models");

@@ -358,6 +358,11 @@ impl AntigravityHarness {
         if let Some(resume) = &request.resume {
             cmd.args(["--conversation", resume]);
         }
+        // agy has no per-invocation MCP flag (config files only, and writing
+        // the user's is out of scope) — the env var is the documented seam:
+        // the bridge speaks plain JSON-RPC POSTs, so the agent can drive it
+        // through any shell.
+        crate::browser_bridge_env(&mut cmd, request);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }

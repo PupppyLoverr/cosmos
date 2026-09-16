@@ -27,5 +27,9 @@ tracing-subscriber.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 mimalloc.workspace = true
 
+# Embeds dist/windows/zeron.ico as icon resource 1 (see build.rs).
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "3"
+
 [dev-dependencies]
 tempfile.workspace = true

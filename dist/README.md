@@ -1,5 +1,24 @@
 # Packaging
 
+## Icons
+
+All platform icons are generated from one square source PNG by:
+
+```sh
+node scripts/generate-icons.mjs <source.png>
+```
+
+(self-contained Node — no deps). It writes:
+
+- `dist/zeron.png` — 1024² squircle tile → Linux hicolor icon
+- `dist/macos/icon-1024.png` — 824² squircle + margins + shadow → `zeron.icns`
+- `dist/windows/zeron.ico` — multi-size (16–256) icon → embedded into `zeron.exe`
+  by `apps/zeron/build.rs` as resource ID 1 (file icon, taskbar, shortcuts) and
+  used as the Inno Setup installer icon (`SetupIconFile`)
+- `apps/ios/.../AppIcon1024.png` — iOS app icon (opaque; OS applies the mask)
+- `apps/landing/public/assets/zeron-{app-icon,favicon-v3}.png` — site marks
+- `dist/zeron.svg` — the mark is raster; the svg wraps a 512px render
+
 ## Linux (implemented)
 
 ```sh
@@ -16,6 +35,18 @@ Produces `target/package/zeron-<version>-linux-<arch>.tar.gz` containing:
 
 The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 `strip = "symbols"` for distribution builds.
+
+## Windows
+
+```powershell
+scripts/package-windows.ps1            # → zip (+ Zeron-Setup-<arch>.exe when Inno is installed)
+```
+
+`apps/zeron/build.rs` embeds `dist/windows/zeron.ico` into `zeron.exe` via
+`embed-resource` (resource ID 1 — gpui loads it for the window icon, Explorer
+for the file icon). The Inno installer uses the same .ico as `SetupIconFile`,
+so the portable exe, installer, shortcuts, and uninstall entry all carry the
+icon with no extra files shipped.
 
 ## macOS
 

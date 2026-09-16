@@ -11712,6 +11712,7 @@ version = "0.2.65"
 dependencies = [
  "anyhow",
  "clap",
+ "embed-resource",
  "libc",
  "mimalloc",
  "serde_json",
@@ -11980,6 +11981,7 @@ dependencies = [
  "usvg",
  "uuid",
  "webview2-com",
+ "windows 0.61.3",
  "windows-core 0.61.2",
  "wry",
  "x11rb 0.14.0",

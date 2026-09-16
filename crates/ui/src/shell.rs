@@ -450,8 +450,8 @@ fn right_pane_takeover_width(viewport: f32, sidebar: f32) -> f32 {
 }
 
 /// One right-pane surface tab: a workspace browser, an individual workspace
-/// file editor, a Git diff or history page, an embedded terminal, or a
-/// subagent transcript. `Picker` is the empty surface chooser.
+/// file editor, a Git diff or history page, an embedded terminal, a side
+/// chat, or a subagent transcript. `Picker` is the empty surface chooser.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RightSurface {
     #[default]
@@ -461,6 +461,9 @@ pub enum RightSurface {
     Browser(u64),
     Diff(u64),
     Terminal(u64),
+    /// A live conversation docked in the pane — transcript plus a slim
+    /// composer that sends to its bound chat (`Shell::side_chats`).
+    SideChat(u64),
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
@@ -1364,11 +1367,21 @@ pub struct Shell {
     /// [`Transcript`] pinned to its subagent doc.
     subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
     subagent_seq: u64,
+    /// Side-chat surfaces by id — each tab a [`crate::side_chat::SideChat`]
+    /// bound to one conversation, with its own slim composer.
+    side_chats: std::collections::HashMap<u64, Entity<crate::side_chat::SideChat>>,
+    side_chat_subs: std::collections::HashMap<u64, Subscription>,
+    side_chat_seq: u64,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
     browser_context: crate::browser::BrowserContext,
     browser_profile: Option<String>,
+    /// Loopback MCP endpoint agents use to drive the embedded browser —
+    /// keeping the struct alive keeps the listener task running; the drain
+    /// task hops tool calls onto this shell's UI thread.
+    _browser_bridge: Option<crate::browser::bridge::BrowserBridge>,
+    _browser_bridge_drain: Option<gpui::Task<()>>,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -1700,6 +1713,34 @@ impl Shell {
             shell: shell.downgrade(),
             _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
         });
+        // The loopback browser bridge: agents on local sessions get this URL
+        // stamped onto their run request (see Composer::send) and drive the
+        // embedded tabs through it. Tool calls hop to this shell's window.
+        let (browser_bridge, _browser_bridge_drain) =
+            match crate::browser::bridge::BrowserBridge::start(cx) {
+                Some((bridge, mut requests)) => {
+                    state.update(cx, |state, _| {
+                        state.browser_bridge = Some(bridge.info.clone());
+                    });
+                    let drain = cx.spawn(async move |this, cx| {
+                        while let Some(request) = requests.recv().await {
+                            // A gone window drops the request unanswered —
+                            // the caller's timeout reports it cleanly.
+                            let _ = this.update_in(cx, |shell, window, cx| {
+                                shell.bridge_dispatch(
+                                    request.tool,
+                                    request.args,
+                                    request.reply,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }
+                    });
+                    (Some(bridge), Some(drain))
+                }
+                None => (None, None),
+            };
         Self {
             state,
             sidebar_pane,
@@ -1734,11 +1775,16 @@ impl Shell {
             diff_seq: 0,
             subagent_tabs: std::collections::HashMap::new(),
             subagent_seq: 0,
+            side_chats: std::collections::HashMap::new(),
+            side_chat_subs: std::collections::HashMap::new(),
+            side_chat_seq: 0,
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
             browser_context: crate::browser::BrowserContext::default(),
             browser_profile: None,
+            _browser_bridge: browser_bridge,
+            _browser_bridge_drain,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
@@ -2382,6 +2428,10 @@ impl Shell {
                     .subagent_tabs
                     .get(id)
                     .map(|tab| (*surface, tab.title.clone(), false, None)),
+                RightSurface::SideChat(id) => self
+                    .side_chats
+                    .get(id)
+                    .map(|side| (*surface, side.read(cx).title(cx), false, None)),
                 RightSurface::Browser(id) => self.browsers.get(id).map(|browser| {
                     let browser = browser.read(cx);
                     (
@@ -2411,6 +2461,7 @@ impl Shell {
             | RightSurface::Diff(_)
             | RightSurface::Terminal(_)
             | RightSurface::Subagent(_)
+            | RightSurface::SideChat(_)
             | RightSurface::Browser(_) => {
                 return None;
             }
@@ -2514,7 +2565,7 @@ impl Shell {
             // The tab's feed (watch or snapshot) runs from open to close —
             // activation needs no revalidation.
             RightSurface::Subagent(_) | RightSurface::Browser(_) => {}
-            RightSurface::Picker => {}
+            RightSurface::SideChat(_) | RightSurface::Picker => {}
         }
         cx.notify();
     }
@@ -2691,6 +2742,9 @@ impl Shell {
         let browser = cx.new(|cx| {
             crate::browser::BrowserSurface::new(self.browser_context.clone(), remote, window, cx)
         });
+        browser.update(cx, |browser, _| {
+            browser.set_composer(self.composer.downgrade())
+        });
         if let Some(handle) = self.state.read(cx).engine().cloned() {
             let chat_id = self.active_chat.clone();
             browser.update(cx, |browser, cx| {
@@ -2726,6 +2780,206 @@ impl Shell {
                 browser.navigate(&url, window, cx);
             } else {
                 browser.focus_address(window, cx);
+            }
+        });
+    }
+
+    /// One `tools/call` from the loopback bridge, on this shell's UI thread.
+    /// Every path answers `reply` — a dropped request only happens when the
+    /// window itself is gone, which the caller's timeout reports.
+    fn bridge_dispatch(
+        &mut self,
+        tool: String,
+        args: serde_json::Value,
+        reply: tokio::sync::oneshot::Sender<Result<crate::browser::bridge::BridgeReply, String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::browser::bridge::BridgeReply;
+        if tool == "browser_tabs" {
+            let active = match self.resolved_right_active(cx) {
+                RightSurface::Browser(id) => Some(id),
+                _ => None,
+            };
+            let tabs: Vec<serde_json::Value> = self
+                .browsers
+                .iter()
+                .map(|(id, browser)| {
+                    let browser = browser.read(cx);
+                    serde_json::json!({
+                        "tab": id,
+                        "url": browser.page.url,
+                        "title": browser.page.title,
+                        "active": active == Some(*id),
+                    })
+                })
+                .collect();
+            let _ = reply.send(Ok(BridgeReply::text(
+                serde_json::to_string_pretty(&tabs).unwrap_or_default(),
+            )));
+            return;
+        }
+        if tool == "browser_open" {
+            let Some(url) = args.get("url").and_then(|v| v.as_str()) else {
+                let _ = reply.send(Err("browser_open requires a url".into()));
+                return;
+            };
+            if !crate::browser::model::allowed_navigation(url) {
+                let _ = reply.send(Err("Only http and https pages can be opened".into()));
+                return;
+            }
+            self.add_browser_surface(Some(url.to_string()), window, cx);
+            let _ = reply.send(Ok(BridgeReply::text(format!("Opened {url}"))));
+            return;
+        }
+        // Target: an explicit `tab` id, else the visible browser, else the
+        // only browser when there's exactly one.
+        let target = args
+            .get("tab")
+            .and_then(|v| v.as_u64())
+            .or_else(|| match self.resolved_right_active(cx) {
+                RightSurface::Browser(id) => Some(id),
+                _ => None,
+            })
+            .or_else(|| {
+                (self.browsers.len() == 1)
+                    .then(|| self.browsers.keys().next().copied())
+                    .flatten()
+            });
+        let Some(id) = target else {
+            let _ = reply.send(Err(if self.browsers.is_empty() {
+                "No embedded browser tab is open. Open one with browser_open.".into()
+            } else {
+                "More than one browser tab is open — pass `tab` from browser_tabs.".into()
+            }));
+            return;
+        };
+        let Some(browser) = self.browsers.get(&id).cloned() else {
+            let _ = reply.send(Err("That browser tab no longer exists.".into()));
+            return;
+        };
+        browser.update(cx, |browser, cx| match tool.as_str() {
+            "browser_navigate" => match args.get("url").and_then(|v| v.as_str()) {
+                Some(url) => {
+                    browser.navigate(url, window, cx);
+                    let _ = reply.send(Ok(BridgeReply::text(format!("Navigated to {url}"))));
+                }
+                None => {
+                    let _ = reply.send(Err("browser_navigate requires a url".into()));
+                }
+            },
+            "browser_reload" => {
+                browser.reload(cx);
+                let _ = reply.send(Ok(BridgeReply::text("Reloaded the page.")));
+            }
+            "browser_back" => {
+                browser.history(false);
+                let _ = reply.send(Ok(BridgeReply::text("Went back.")));
+            }
+            "browser_forward" => {
+                browser.history(true);
+                let _ = reply.send(Ok(BridgeReply::text("Went forward.")));
+            }
+            "browser_state" => {
+                let page = &browser.page;
+                let _ = reply.send(Ok(BridgeReply::text(
+                    serde_json::json!({
+                        "tab": id,
+                        "url": page.url,
+                        "title": page.title,
+                        "loading": page.loading,
+                        "canGoBack": page.can_back,
+                        "canGoForward": page.can_forward,
+                    })
+                    .to_string(),
+                )));
+            }
+            "browser_screenshot" => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                browser.screenshot(tx);
+                cx.spawn(async move |_, _| {
+                    let result = match rx.await {
+                        Ok(Ok(png)) => Ok(BridgeReply {
+                            text: None,
+                            image: Some(png),
+                        }),
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => Err("The page capture did not answer".into()),
+                    };
+                    let _ = reply.send(result);
+                })
+                .detach();
+            }
+            _ => {
+                let expression = match tool.as_str() {
+                    "browser_evaluate" => args
+                        .get("script")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    "browser_click" => args
+                        .get("selector")
+                        .and_then(|v| v.as_str())
+                        .map(|selector| {
+                            format!(
+                                "(()=>{{const e=document.querySelector({sel});if(!e)return{{ok:false,e:'element not found'}};e.scrollIntoView({{block:'center',inline:'center'}});e.click();return{{ok:true,tag:e.tagName.toLowerCase()}}}})()",
+                                sel = serde_json::json!(selector)
+                            )
+                        }),
+                    "browser_type" => match (
+                        args.get("selector").and_then(|v| v.as_str()),
+                        args.get("text").and_then(|v| v.as_str()),
+                    ) {
+                        (Some(selector), Some(text)) => Some(format!(
+                            "(()=>{{const e=document.querySelector({sel});if(!e)return{{ok:false,e:'element not found'}};e.focus();const d=Object.getOwnPropertyDescriptor(e.__proto__,'value');if(d&&d.set)d.set.call(e,{text});else e.value={text};e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));return{{ok:true}}}})()",
+                            sel = serde_json::json!(selector),
+                            text = serde_json::json!(text)
+                        )),
+                        _ => None,
+                    },
+                    "browser_scroll" => {
+                        let x = args.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let y = args.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        Some(format!(
+                            "(window.scrollBy({x},{y}),{{ok:true,scrollX:window.scrollX,scrollY:window.scrollY}})"
+                        ))
+                    }
+                    "browser_text" => Some(
+                        "(document.body?document.body.innerText.slice(0,20000):'')".to_string(),
+                    ),
+                    _ => None,
+                };
+                let Some(expression) = expression else {
+                    let _ = reply.send(Err(format!("Bad arguments for {tool}")));
+                    return;
+                };
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                browser.evaluate(&expression, tx);
+                cx.spawn(async move |_, _| {
+                    let result = match rx.await {
+                        Ok(value) => {
+                            if value.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                                Ok(BridgeReply::text(
+                                    value
+                                        .get("v")
+                                        .map(|v| match v {
+                                            serde_json::Value::String(s) => s.clone(),
+                                            other => other.to_string(),
+                                        })
+                                        .unwrap_or_else(|| "null".to_string()),
+                                ))
+                            } else {
+                                Err(value
+                                    .get("e")
+                                    .and_then(|e| e.as_str())
+                                    .unwrap_or("The script failed")
+                                    .to_string())
+                            }
+                        }
+                        Err(_) => Err("The page did not answer".into()),
+                    };
+                    let _ = reply.send(result);
+                })
+                .detach();
             }
         });
     }
@@ -2798,6 +3052,55 @@ impl Shell {
         push_unique_right_surface(tabs, RightSurface::Files);
         self.set_right_active(RightSurface::Files, cx);
         self.focus_right_file_editor(RightSurface::Files, window, cx);
+    }
+
+    /// The picker's Side Chat card / the `+` menu's Side Chat row: a fresh
+    /// side-chat tab each click (several conversations can sit docked at
+    /// once). The tab binds the panel's own chat by default — the header
+    /// switcher rebinds it to any conversation.
+    fn add_side_chat_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.side_chat_seq += 1;
+        let id = self.side_chat_seq;
+        let side_chat = cx.new(|cx| crate::side_chat::SideChat::new(self.state.clone(), cx));
+        let sub = cx.subscribe_in(
+            &side_chat,
+            window,
+            move |this: &mut Self, _, event, _window, cx| match event {
+                crate::side_chat::SideChatEvent::DocReleased { doc_id } => {
+                    this.maybe_unwatch_doc(doc_id, cx);
+                }
+            },
+        );
+        side_chat.update(cx, |side, cx| {
+            // No active conversation → the surface opens on its
+            // pick-a-conversation empty state instead of doing nothing.
+            if !self.active_chat.is_empty() {
+                side.bind(self.active_chat.clone(), cx);
+            }
+            side.focus_input(window, cx);
+        });
+        self.side_chats.insert(id, side_chat);
+        self.side_chat_subs.insert(id, sub);
+        let key = self.panel_key(cx);
+        self.right_tabs
+            .entry(key)
+            .or_default()
+            .push(RightSurface::SideChat(id));
+        self.set_right_active(RightSurface::SideChat(id), cx);
+    }
+
+    /// Release a watched doc once no surface still holds it — the same
+    /// teardown the subagent-tab close performs, shared between side chats
+    /// and subagent tabs.
+    fn maybe_unwatch_doc(&mut self, doc_id: &str, cx: &mut Context<Self>) {
+        let held = self.subagent_tabs.values().any(|tab| tab.doc_id == doc_id)
+            || self
+                .side_chats
+                .values()
+                .any(|side| side.read(cx).watched_doc() == Some(doc_id));
+        if !held {
+            self.state.update(cx, |s, _| s.unwatch_subagent_doc(doc_id));
+        }
     }
 
     /// Open a workspace file as a first-class right-pane tab. Every editor is
@@ -3159,8 +3462,21 @@ impl Shell {
                 // Unwatch drops the watch task — that cancels the engine-side
                 // watch and unpins the subagent doc from the engine LRU.
                 if let Some(tab) = self.subagent_tabs.remove(&id) {
-                    self.state
-                        .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
+                    self.maybe_unwatch_doc(&tab.doc_id.clone(), cx);
+                }
+            }
+            RightSurface::SideChat(id) => {
+                if let Some(side) = self.side_chats.remove(&id) {
+                    // Retire this surface's optimistic echoes first, then
+                    // release its doc watch once nothing else holds it.
+                    let doc = side.update(cx, |side, cx| {
+                        side.close(cx);
+                        side.watched_doc().map(str::to_string)
+                    });
+                    self.side_chat_subs.remove(&id);
+                    if let Some(doc) = doc {
+                        self.maybe_unwatch_doc(&doc, cx);
+                    }
                 }
             }
             RightSurface::Picker => {}
@@ -4767,13 +5083,23 @@ impl Shell {
         match self.route {
             Route::Chat => self.render_session_title_bar(cx),
             Route::Settings(_) => {
+                // The Drag hitbox covers only the content box between the
+                // pads — the left pad sits under the control cluster, the
+                // right under the caption buttons, and on Windows any Drag
+                // hitbox beneath a control swallows its clicks (HTCAPTION
+                // wins by geometry, not by paint order).
                 let inner = div()
                     .size_full()
                     .flex()
                     .items_center()
                     .pt(px(Theme::TITLEBAR_TOP_PAD))
                     .pl(px(self.title_bar_content_start()))
-                    .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)));
+                    .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)))
+                    .child(
+                        div()
+                            .size_full()
+                            .window_control_area(WindowControlArea::Drag),
+                    );
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
                 self.titlebar_drag_region("settings-header-titlebar", bar, cx)
                     .into_any_element()
@@ -4782,9 +5108,16 @@ impl Shell {
     }
 
     /// Make a titlebar strip drag the window — zed's platform-titlebar
-    /// pattern (zeron's `.drag` region): mark it a [`WindowControlArea::Drag`]
-    /// (macOS app-owned titlebar), hand the drag to the compositor once the
-    /// pointer moves with the button down, and double-click zooms.
+    /// pattern (zeron's `.drag` region): hand the drag to the compositor once
+    /// the pointer moves with the button down, and double-click zooms.
+    ///
+    /// The strip itself must NOT be a [`WindowControlArea::Drag`]: on Windows
+    /// the `WM_NCHITTEST` callback answers HTCAPTION for ANY control-area
+    /// hitbox containing the cursor — paint order and children don't matter —
+    /// so a Drag hitbox spanning the bar swallows every click inside it (tab
+    /// close buttons, the `+` menu, even the caption cluster). Native drag
+    /// surfaces instead live on dedicated gap elements via
+    /// [`titlebar_drag_zone`], which contain no interactive children.
     fn titlebar_drag_region(
         &self,
         id: &'static str,
@@ -4792,7 +5125,6 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         el.id(id)
-            .window_control_area(WindowControlArea::Drag)
             .on_mouse_down_out(cx.listener(|this, _, _, _| this.titlebar_should_move = false))
             .on_mouse_up(
                 MouseButton::Left,
@@ -7905,6 +8237,36 @@ impl Shell {
                         .children(pill)
                         .into_any_element()
                 }
+                RightSurface::SideChat(id) if self.side_chats.contains_key(&id) => {
+                    let side = self.side_chats.get(&id).expect("checked").clone();
+                    // Same jump-pill rule as the subagent surface, raised to
+                    // clear the side chat's own input bar.
+                    let pill = side
+                        .read(cx)
+                        .transcript_entity()
+                        .and_then(|t| t.read(cx).jump_button_shown().then(|| t.clone()))
+                        .map(|transcript| {
+                            div()
+                                .absolute()
+                                .bottom(px(64.0))
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .justify_center()
+                                .child(self.jump_pill(
+                                    "side-chat-jump-to-bottom",
+                                    "side-chat-jump-pill",
+                                    transcript,
+                                    cx,
+                                ))
+                        });
+                    div()
+                        .size_full()
+                        .relative()
+                        .child(side)
+                        .children(pill)
+                        .into_any_element()
+                }
                 _ => self.render_surface_picker(cx),
             }
         } else {
@@ -8013,6 +8375,16 @@ impl Shell {
                                 this.add_terminal_surface(cx);
                             }),
                         ),
+                    )
+                    .child(
+                        row(
+                            "surface-card-side-chat",
+                            icons::CHAT_ROUND_LINE,
+                            "Side Chat",
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.add_side_chat_surface(window, cx);
+                        })),
                     )
                     // Git surfaces only where there IS git — the pane itself
                     // no longer gates on it (terminals work anywhere).
@@ -8215,6 +8587,7 @@ impl Shell {
                     })
                     .unwrap_or(icons::LIST),
                 RightSurface::Subagent(_) => icons::BOT,
+                RightSurface::SideChat(_) => icons::CHAT_ROUND_LINE,
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
                 RightSurface::Picker => icons::PLUS,
@@ -8292,7 +8665,17 @@ impl Shell {
                 .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                     window.prevent_default()
                 })
-                .when(is_active, |el| el.bg(crate::theme::wash(0.10)))
+                // Active tab reads as a capsule: hairline rim + stronger
+                // wash. The border sits on EVERY chip (transparent when
+                // inactive) so widths stay uniform — the drag/drop slot
+                // math assumes it.
+                .border_1()
+                .border_color(if is_active {
+                    crate::theme::hairline(0.14)
+                } else {
+                    gpui::transparent_black()
+                })
+                .when(is_active, |el| el.bg(crate::theme::wash(0.12)))
                 .when(!is_active, |el| {
                     el.hover(|s| s.bg(crate::theme::wash(0.06)))
                 })
@@ -8531,6 +8914,20 @@ impl Shell {
                                         .text_color(theme.text_muted),
                                 )
                                 .child(SharedString::from("Terminal")),
+                        )
+                        .child(
+                            popover::menu_row(&theme, false, "right-plus-side-chat")
+                                .id("right-plus-side-chat-row")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.add_side_chat_surface(window, cx);
+                                    this.close_right_plus(cx);
+                                }))
+                                .child(
+                                    icon(icons::CHAT_ROUND_LINE)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Side Chat")),
                         )
                         .when(self.space_git_detected(cx), |menu| {
                             menu.child(
@@ -9870,10 +10267,16 @@ impl Render for Shell {
                         .absolute()
                         .top_0()
                         .left_0()
-                        .right_0()
+                        // Clear the caption cluster: on Windows a Drag hitbox
+                        // under the min/max/close buttons answers HTCAPTION
+                        // and swallows their clicks — the caption zones carry
+                        // their own control areas but this strip paints first
+                        // and would win the first-match lookup.
+                        .right(px(self.titlebar_right_pad(0.0)))
                         .h(px(Theme::TITLEBAR_HEIGHT)),
                     cx,
-                ),
+                )
+                .window_control_area(WindowControlArea::Drag),
             )
         };
         let root = root

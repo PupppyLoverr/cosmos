@@ -4498,6 +4498,22 @@ impl Composer {
         cx.notify();
     }
 
+    /// A browser annotation capture: the PNG stages as an ordinary image
+    /// attachment and the note (element selector + page URL + the user's
+    /// comment) lands in the draft — the user reviews exactly what context
+    /// the agent receives before sending.
+    pub fn stage_browser_capture(&mut self, note: String, png: Vec<u8>, cx: &mut Context<Self>) {
+        let staged = attachments::stage_png_bytes("browser-annotation.png".into(), png);
+        self.add_staged(vec![staged], cx);
+        let existing = self.input.read(cx).text().to_string();
+        let text = if existing.trim().is_empty() {
+            note
+        } else {
+            format!("{}\n\n{}", existing.trim_end(), note)
+        };
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
+    }
+
     /// Stage image files (picker / drop / pasted paths). Non-images are
     /// skipped silently (matching the original's `image/*` filter); read
     /// failures and oversize files surface in the failure notice.
@@ -6288,6 +6304,13 @@ impl Composer {
         let restore_text = typed;
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
+        // Snapshot the loopback bridge endpoint — stamped onto the run
+        // request only when the chat's host is this device.
+        let browser_bridge = if host_is_remote {
+            None
+        } else {
+            self.state.read(cx).browser_bridge.clone()
+        };
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<Option<String>, String> = async {
                 // Attachments stage FIRST — before the chat row or anything
@@ -6581,13 +6604,24 @@ impl Composer {
                     return Ok(Some(queue_id.to_string()));
                 }
 
+                // Local runs get the embedded-browser bridge endpoint so the
+                // harness exposes the browser_* tools (the loopback URL is
+                // meaningless to a remote host — `browser_bridge` was already
+                // filtered to None for those).
+                let mut model_options = resolved.model_options.clone();
+                if let Some(info) = browser_bridge.as_ref() {
+                    model_options.insert(
+                        crate::browser::bridge::MODEL_OPTIONS_KEY.into(),
+                        serde_json::to_value(info).unwrap_or_default(),
+                    );
+                }
                 let command = SessionCommandPayload::Run {
                     request: RunRequest {
                         prompt: content.clone(),
                         harness: resolved.harness,
                         model: resolved.model.clone(),
                         reasoning: resolved.reasoning,
-                        model_options: resolved.model_options.clone(),
+                        model_options,
                         cwd,
                         sandbox: SandboxLevel::WorkspaceWrite,
                         auto_approve: false,

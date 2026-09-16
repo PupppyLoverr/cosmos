@@ -602,6 +602,7 @@ impl CodexHarness {
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
+        crate::browser_bridge_env(&mut cmd, &request);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -828,6 +829,16 @@ async fn run_session(session: Session) {
         }
         if let Some(tier) = &service_tier {
             p.insert("serviceTier".into(), Value::String(tier.clone()));
+        }
+        // The app stamps local runs with the loopback embedded-browser
+        // bridge; codex's config overrides MERGE with the user's file, so
+        // this adds one server without touching their configuration.
+        if let Some(url) = crate::browser_bridge_url(&request) {
+            p.entry("config")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .unwrap()
+                .insert("mcp_servers.zeron-browser.url".into(), url.into());
         }
         p
     };

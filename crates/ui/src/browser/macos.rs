@@ -146,7 +146,14 @@ pub(super) enum NativeEvent {
     Finished,
     NewTab(String),
     Key(gpui::Keystroke),
-    Favicon { page: String, url: String },
+    Favicon {
+        page: String,
+        url: String,
+    },
+    /// A script result for the surface's FIFO eval queue.
+    EvalResult(serde_json::Value),
+    /// PNG bytes (or the capture error) for the surface's FIFO shot queue.
+    Screenshot(Result<Vec<u8>, String>),
 }
 
 struct ObserverState {
@@ -493,6 +500,72 @@ impl NativePage {
             }
         }
     }
+    /// Runs `script` in the page; its string return value arrives as
+    /// `NativeEvent::EvalResult` in submission order (the caller's wrapper
+    /// JSON-encodes the real value into that string).
+    pub fn evaluate(&self, script: &str) {
+        let host = self.0.borrow();
+        let tx = host.tx.clone();
+        let completion = block2::RcBlock::new(move |value: *mut AnyObject, error: *mut NSError| {
+            let raw = if error.is_null() {
+                unsafe { value.as_ref() }
+                    .and_then(|value| value.downcast_ref::<NSString>())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            };
+            let value = raw
+                .map(|raw| super::decode_eval(&raw))
+                .unwrap_or_else(|| serde_json::json!({"ok":false,"e":"Script evaluation failed"}));
+            let _ = tx.try_send(NativeEvent::EvalResult(value));
+        });
+        unsafe {
+            host.view.evaluateJavaScript_completionHandler(
+                &NSString::from_str(script),
+                Some(&completion),
+            );
+        }
+    }
+
+    /// `takeSnapshotWithConfiguration` — the live page's rendered PNG,
+    /// including injected overlay DOM (the annotate highlight rides along).
+    pub fn screenshot(&self) {
+        let host = self.0.borrow();
+        let tx = host.tx.clone();
+        let completion = block2::RcBlock::new(
+            move |image: *mut objc2_app_kit::NSImage, error: *mut NSError| {
+                let result = if error.is_null() {
+                    unsafe { image.as_ref() }
+                        .ok_or_else(|| "The page capture returned no image".to_string())
+                        .and_then(|image| {
+                            let tiff = unsafe { image.TIFFRepresentation() }
+                                .ok_or_else(|| "The page capture is not readable".to_string())?;
+                            let rep = objc2_app_kit::NSBitmapImageRep::initWithData(
+                                objc2_app_kit::NSBitmapImageRep::alloc(),
+                                &tiff,
+                            )
+                            .ok_or_else(|| "The page capture is not readable".to_string())?;
+                            let png = unsafe {
+                                rep.representationUsingType_properties(
+                                    objc2_app_kit::NSBitmapImageFileType::PNG,
+                                    &objc2_foundation::NSDictionary::new(),
+                                )
+                            }
+                            .ok_or_else(|| "Could not encode the page capture".to_string())?;
+                            Ok(png.to_vec())
+                        })
+                } else {
+                    Err("Could not capture the page".to_string())
+                };
+                let _ = tx.try_send(NativeEvent::Screenshot(result));
+            },
+        );
+        unsafe {
+            host.view
+                .takeSnapshotWithConfiguration_completionHandler(None, &completion);
+        }
+    }
+
     pub fn discover_favicon(&self, page: String) {
         let host = self.0.borrow();
         let tx = host.tx.clone();

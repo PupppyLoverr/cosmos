@@ -522,8 +522,9 @@ fn accent_helper(accent: AccentSelection) -> String {
 fn surface_label(surface: SurfacePreference) -> &'static str {
     match surface {
         SurfacePreference::ThemeDefault => "Theme default",
-        SurfacePreference::Frosted => "Frosted",
-        SurfacePreference::Opaque => "Opaque",
+        SurfacePreference::Frosted => "Glass",
+        SurfacePreference::Acrylic => "Acrylic",
+        SurfacePreference::Opaque => "Normal",
     }
 }
 
@@ -532,11 +533,15 @@ fn surface_helper(surface: SurfacePreference, resolved: SurfaceTreatment) -> Str
         SurfacePreference::ThemeDefault => format!(
             "Uses this theme's {} default.",
             match resolved {
-                SurfaceTreatment::Frosted => "frosted",
-                SurfaceTreatment::Opaque => "opaque",
+                SurfaceTreatment::Frosted => "glass",
+                SurfaceTreatment::Acrylic => "acrylic",
+                SurfaceTreatment::Opaque => "solid",
             }
         ),
         SurfacePreference::Frosted => "Theme-colored glass where supported.".into(),
+        SurfacePreference::Acrylic => {
+            "Denser translucent surfaces — matte coverage over the backdrop.".into()
+        }
         SurfacePreference::Opaque => "Solid surfaces for every theme.".into(),
     }
 }
@@ -2604,10 +2609,14 @@ mod tests {
     #[test]
     fn surface_helper_explains_theme_default_and_global_overrides() {
         let default = surface_helper(SurfacePreference::ThemeDefault, SurfaceTreatment::Opaque);
-        assert!(default.contains("opaque default"));
+        assert!(default.contains("solid default"));
         assert!(
             surface_helper(SurfacePreference::Frosted, SurfaceTreatment::Opaque)
                 .contains("where supported")
+        );
+        assert!(
+            surface_helper(SurfacePreference::Acrylic, SurfaceTreatment::Opaque)
+                .contains("backdrop")
         );
         assert!(
             surface_helper(SurfacePreference::Opaque, SurfaceTreatment::Frosted)

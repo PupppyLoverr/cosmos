@@ -58,6 +58,10 @@ pub enum SurfaceTreatment {
     #[default]
     Opaque,
     Frosted,
+    /// Denser, more matte translucent surface — the same scene blur as
+    /// Frosted where the platform rasterizes it, but with heavier theme
+    /// tints (busy backdrops stay quiet under content).
+    Acrylic,
 }
 
 /// The device-local policy applied to a theme variant's recommended surface
@@ -68,16 +72,23 @@ pub enum SurfacePreference {
     #[default]
     ThemeDefault,
     Frosted,
+    Acrylic,
     Opaque,
 }
 
 impl SurfacePreference {
-    pub const ALL: [Self; 3] = [Self::ThemeDefault, Self::Frosted, Self::Opaque];
+    pub const ALL: [Self; 4] = [
+        Self::ThemeDefault,
+        Self::Frosted,
+        Self::Acrylic,
+        Self::Opaque,
+    ];
 
     pub fn resolve(self, recommended: SurfaceTreatment) -> SurfaceTreatment {
         match self {
             Self::ThemeDefault => recommended,
             Self::Frosted => SurfaceTreatment::Frosted,
+            Self::Acrylic => SurfaceTreatment::Acrylic,
             Self::Opaque => SurfaceTreatment::Opaque,
         }
     }

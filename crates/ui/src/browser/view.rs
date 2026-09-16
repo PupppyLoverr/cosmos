@@ -83,6 +83,22 @@ impl BrowserSurface {
         } else {
             mods.control
         };
+        // While the comment field owns focus, Enter captures and Escape
+        // cancels — the address field's own bindings stay untouched.
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        if self
+            .annotate
+            .as_ref()
+            .is_some_and(|annotate| annotate.input.focus_handle(cx).is_focused(window))
+        {
+            match key {
+                "enter" if !mods.shift => self.annotate_confirm(window, cx),
+                "escape" => self.annotate_cancel(cx),
+                _ => return,
+            }
+            cx.stop_propagation();
+            return;
+        }
         if address_focused && !primary && !mods.alt {
             match key {
                 "enter" if !mods.shift => self.submit(window, cx),
@@ -510,9 +526,29 @@ impl Render for BrowserSurface {
         .when(has_page, |el| {
             el.on_click(cx.listener(|this, _, _, cx| this.open_external(cx)))
         });
+        let annotating = self.annotate.is_some();
+        let annotate = button(
+            "browser-annotate",
+            "Annotate an element into the composer",
+            icons::PEN_NEW_SQUARE,
+            has_page
+                && !external
+                && cfg!(any(
+                    target_os = "macos",
+                    target_os = "linux",
+                    target_os = "windows"
+                )),
+            &theme,
+            cx,
+        );
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        let annotate = annotate
+            .when(annotating, |el| el.bg(crate::theme::wash(0.12)))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_annotate(window, cx)));
         let toolbar = surface_chrome::toolbar(&theme)
             .when(!external, |el| el.child(back).child(forward).child(reload))
             .child(address)
+            .child(annotate)
             .child(open);
 
         let body = div()
@@ -654,6 +690,60 @@ impl Render for BrowserSurface {
         #[cfg(target_os = "linux")]
         let body = body.when_some(self.linux_menu(&theme, cx), |el, menu| el.child(menu));
 
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        let annotate_bar = self.annotate.as_ref().map(|annotate| {
+            let mut bar = div()
+                .px(px(10.0))
+                .py(px(7.0))
+                .border_b_1()
+                .border_color(theme.border)
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_muted);
+            if let Some(picked) = &annotate.picked {
+                let selector = picked
+                    .get("selector")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("element")
+                    .to_string();
+                bar = bar
+                    .child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded(px(5.0))
+                            .border_1()
+                            .border_color(theme.border_strong)
+                            .bg(theme.surface_raised)
+                            .text_color(theme.text)
+                            .flex_none()
+                            .max_w(px(180.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(selector),
+                    )
+                    .child(div().flex_1().min_w_0().child(annotate.input.clone()))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.text_faint)
+                            .child("Enter to capture · Esc to cancel"),
+                    );
+            } else {
+                bar = bar
+                    .child(
+                        icons::icon(icons::PEN_NEW_SQUARE)
+                            .size(px(12.0))
+                            .flex_none()
+                            .text_color(theme.accent),
+                    )
+                    .child("Hover to highlight, click an element to annotate — Esc to cancel");
+            }
+            bar
+        });
+
         let remote_loopback = self.remote
             && self
                 .page
@@ -682,6 +772,16 @@ impl Render for BrowserSurface {
             .on_action(cx.listener(|this, _: &super::Forward, _, _| this.history(true)))
             .child(toolbar)
             .when_some(self.validation.clone(), |el, message| el.child(div().px(px(12.0)).py(px(8.0)).text_size(crate::typography::ui_rems(11.0)).text_color(theme.danger).child(message)))
+            .map(|el| {
+                #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+                {
+                    el.when_some(annotate_bar, |el, bar| el.child(bar))
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+                {
+                    el
+                }
+            })
             .when(remote_loopback, |el| el.child(div().px(px(12.0)).py(px(8.0)).border_b_1().border_color(theme.border)
                 .text_size(crate::typography::ui_rems(11.0)).text_color(theme.text_muted)
                 .child("Localhost opens on this device. Open a detected preview from a new tab to reach your other device.")))

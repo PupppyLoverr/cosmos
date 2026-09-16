@@ -32,6 +32,10 @@ pub enum NativeEvent {
     NewTab(String),
     /// A chord the page did not consume, replayed through GPUI's dispatcher.
     Key(gpui::Keystroke),
+    /// A script result for the surface's FIFO eval queue.
+    EvalResult(serde_json::Value),
+    /// PNG bytes (or the capture error) for the surface's FIFO shot queue.
+    Screenshot(Result<Vec<u8>, String>),
 }
 
 #[link(name = "user32")]
@@ -125,6 +129,9 @@ pub(super) struct Host {
     /// Kept alive for the controller's lifetime.
     _accelerator_handler: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2AcceleratorKeyPressedEventHandler,
     shortcuts: Rc<RefCell<Vec<String>>>,
+    /// Feeds `NativeEvent`s back to the surface — script results and page
+    /// captures complete on WebView2's own callbacks and re-enter here.
+    tx: Sender<NativeEvent>,
 }
 
 pub(super) struct NativePage {
@@ -272,6 +279,7 @@ impl NativePage {
                 _accelerator_token: accelerator_token,
                 _accelerator_handler: handler,
                 shortcuts,
+                tx,
             })),
         })
     }
@@ -340,9 +348,96 @@ impl NativePage {
         }
     }
 
-    #[cfg(feature = "browser-fixture")]
+    /// Runs `script` in the page; its return value — a JSON string produced
+    /// by the caller's own wrapper — is unwrapped and arrives as
+    /// `NativeEvent::EvalResult` in submission order.
     pub fn evaluate(&self, script: &str) {
-        let _ = self.host.borrow().webview.evaluate_script(script);
+        let host = self.host.borrow();
+        let tx = host.tx.clone();
+        let _ = host
+            .webview
+            .evaluate_script_with_callback(script, move |raw| {
+                // The callback runs on the UI thread — a blocking send on a
+                // full channel would freeze it, so a saturated queue drops
+                // instead (awaiters time out rather than hang).
+                let _ = tx.try_send(NativeEvent::EvalResult(super::decode_eval(&raw)));
+            });
+    }
+
+    /// `ICoreWebView2::CapturePreview` — the page's rendered PNG, including
+    /// injected overlay DOM (the annotate highlight rides along for free).
+    /// The stream must outlive the async capture, so it moves into the
+    /// completion handler.
+    pub fn screenshot(&self) {
+        use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG;
+        use windows::Win32::Foundation::HGLOBAL;
+        use windows::Win32::System::Com::StructuredStorage::CreateStreamOnHGlobal;
+        let host = self.host.borrow();
+        let stream = unsafe {
+            match CreateStreamOnHGlobal(HGLOBAL::default(), true) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = host.tx.try_send(NativeEvent::Screenshot(Err(format!(
+                        "Could not open the capture stream: {error}"
+                    ))));
+                    return;
+                }
+            }
+        };
+        let reader = stream.clone();
+        let tx = host.tx.clone();
+        let handler =
+            webview2_com::CapturePreviewCompletedHandler::create(Box::new(move |result| {
+                // The callback runs on the UI thread — try_send only, so a
+                // saturated queue drops instead of freezing it.
+                let _ = tx.try_send(NativeEvent::Screenshot(
+                    result
+                        .and_then(|()| read_stream(&reader))
+                        .map_err(|error| format!("Could not capture the page: {error}")),
+                ));
+                Ok(())
+            }));
+        unsafe {
+            if let Err(error) = host.webview.webview().CapturePreview(
+                COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
+                &stream,
+                &handler,
+            ) {
+                let _ = host.tx.try_send(NativeEvent::Screenshot(Err(format!(
+                    "Could not capture the page: {error}"
+                ))));
+            }
+        }
+    }
+}
+
+/// Drains an `IStream` written by `CapturePreview` back into bytes.
+#[cfg(target_os = "windows")]
+fn read_stream(stream: &windows::Win32::System::Com::IStream) -> windows_core::Result<Vec<u8>> {
+    use windows::Win32::System::Com::{STATFLAG_NONAME, STATSTG, STREAM_SEEK_SET};
+    unsafe {
+        let mut stat = STATSTG::default();
+        stream.Stat(&mut stat, STATFLAG_NONAME)?;
+        let size = stat.cbSize as usize;
+        stream.Seek(0, STREAM_SEEK_SET, None)?;
+        let mut data = vec![0u8; size];
+        let mut done = 0usize;
+        while done < size {
+            let mut count = 0u32;
+            stream
+                .Read(
+                    data[done..].as_mut_ptr() as *mut _,
+                    (size - done).min(u32::MAX as usize) as u32,
+                    Some(&mut count),
+                )
+                .ok()?;
+            if count == 0 {
+                break;
+            }
+            done += count as usize;
+        }
+        data.truncate(done);
+        Ok(data)
     }
 }
 

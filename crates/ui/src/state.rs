@@ -665,6 +665,11 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
+    /// Loopback endpoint agents on local chats use to drive the embedded
+    /// browser (stamped onto `RunRequest.model_options` by the composer;
+    /// `None` until the shell's bridge binds, and stays `None` when the
+    /// platform has no browser backend).
+    pub browser_bridge: Option<crate::browser::bridge::BridgeInfo>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
     pub update: Option<zeron_update::UpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
@@ -736,6 +741,7 @@ impl AppState {
             pending_sends: HashMap::new(),
             upload_progress: None,
             transfers: HashMap::new(),
+            browser_bridge: None,
             review_comments: HashMap::new(),
             review_comment_flushes: HashMap::new(),
             local_device_id: None,
@@ -1365,9 +1371,63 @@ impl AppState {
     pub fn pending_echoes(&self) -> &[SessionMessageEntry] {
         self.selected_chat
             .as_deref()
-            .and_then(|id| self.echoes.get(id))
+            .map(|id| self.echoes_for(id))
+            .unwrap_or(&[])
+    }
+
+    /// Unconfirmed echoes for an arbitrary chat id — a side-chat surface
+    /// renders its bound conversation's echoes the same way the primary
+    /// transcript renders the selection's.
+    pub fn echoes_for(&self, chat_id: &str) -> &[SessionMessageEntry] {
+        self.echoes
+            .get(chat_id)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Doc frames supersede side-chat echoes — the [`apply_transcript`]
+    /// dedupe for watched docs. A Run command persists the client-minted
+    /// message id (id match); a queued send's promoted entry arrives under a
+    /// server id but with identical user text (text match), which also
+    /// releases the pending-send overlay started for that echo.
+    fn adopt_sub_echoes(&mut self, doc_id: &str) {
+        if self
+            .echoes
+            .get(doc_id)
+            .is_none_or(|echoes| echoes.is_empty())
+        {
+            return;
+        }
+        let Some(rows) = self.sub_transcripts.get(doc_id) else {
+            return;
+        };
+        let mut landed_ids = HashSet::new();
+        let mut landed_user_texts = HashSet::new();
+        for entry in rows.iter() {
+            landed_ids.insert(entry.id.clone());
+            if entry.role == zeron_doc::MessageRole::User {
+                landed_user_texts.insert(entry_text(entry));
+            }
+        }
+        let pending_message_id = self.pending_sends.get(doc_id).map(|p| p.message_id.clone());
+        let echoes = self.echoes.get_mut(doc_id).expect("checked above");
+        let mut adopted_pending = false;
+        let before = echoes.len();
+        echoes.retain(|echo| {
+            let materialized = landed_ids.contains(&echo.id)
+                || (echo.role == zeron_doc::MessageRole::User
+                    && landed_user_texts.contains(&entry_text(echo)));
+            if materialized && pending_message_id.as_deref() == Some(echo.id.as_str()) {
+                adopted_pending = true;
+            }
+            !materialized
+        });
+        if adopted_pending {
+            self.pending_sends.remove(doc_id);
+        }
+        if echoes.len() != before {
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        }
     }
 
     // ---- queries ----
@@ -1563,7 +1623,13 @@ impl AppState {
 
     pub fn selected_chat_row(&self) -> Option<&Chat> {
         let id = self.selected_chat.as_deref()?;
-        self.chats.iter().find(|c| c.id == id)
+        self.chat_row(id)
+    }
+
+    /// Any chat row by id — a side-chat surface resolves its bound
+    /// conversation's config, cwd and host device through this.
+    pub fn chat_row(&self, chat_id: &str) -> Option<&Chat> {
+        self.chats.iter().find(|c| c.id == chat_id)
     }
 
     /// The chat the Archive session shortcut acts on: the selected one, unless
@@ -2369,6 +2435,21 @@ fn spawn_queue_watch(
     })
 }
 
+/// The joined text of a message's Text parts — how [`AppState::adopt_sub_echoes`]
+/// matches a queued send's promoted entry back to its optimistic echo (the
+/// queue keeps the client-minted id on its row, not on the message it
+/// eventually writes).
+fn entry_text(entry: &SessionMessageEntry) -> String {
+    entry
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            zeron_doc::MessagePart::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// [`spawn_transcript_watch`]'s shape, writing into `sub_transcripts[doc_id]`
 /// instead of the selected chat's transcript. The apply guard is per key so a
 /// subagent tab can outlive chat switches.
@@ -2422,6 +2503,13 @@ fn spawn_subagent_watch(
                         } else {
                             cx.notify();
                         }
+                    }
+                    if !desync {
+                        // Side-chat echoes/pending-sends adopt their
+                        // materialized entries here (the primary
+                        // transcript's `apply_transcript_frame` does it
+                        // for the selection).
+                        state.adopt_sub_echoes(&doc_id);
                     }
                 });
                 if alive.is_err() {

@@ -304,53 +304,68 @@ impl Shell {
             .gap(px(8.0))
             .pl(px(row_left))
             .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)))
-            // In panel takeover the header strip spans the whole band — the
-            // title would sit UNDER it (both flex_none, the row overflows and
-            // paint order stacks them), so it hides for the duration.
-            .when(!takeover, |el| {
-                el.child(
-                    div()
-                        .min_w_0()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .when_some(
-                            harness.map(crate::pickers::harness_brand_icon),
-                            |el, (path, tint)| {
-                                el.child(
-                                    icon(path)
-                                        .size(px(14.0))
-                                        .flex_none()
-                                        .text_color(tint.unwrap_or(theme.text_muted)),
-                                )
-                            },
-                        )
-                        .child(
+            // The title + the elastic gap behind it are the native drag zone:
+            // on Windows a `WindowControlArea::Drag` hitbox answers HTCAPTION
+            // for every point inside it — children included — so interactive
+            // controls (the surface tab strip, its ✕ and `+`) must live in a
+            // SIBLING region, never inside a Drag hitbox. The title itself is
+            // passive, so dragging by the label still works.
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .window_control_area(WindowControlArea::Drag)
+                    .flex()
+                    .items_center()
+                    // In panel takeover the header strip spans the whole band
+                    // — the title would sit UNDER it (both flex_none, the row
+                    // overflows and paint order stacks them), so it hides for
+                    // the duration; the zone stays as the drag surface.
+                    .when(!takeover, |el| {
+                        el.child(
                             div()
                                 .min_w_0()
-                                .truncate()
-                                .text_size(crate::typography::ui_rems(12.0))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(if on_canvas {
-                                    theme.text_muted.opacity(0.7)
-                                } else {
-                                    theme.text.opacity(0.85)
-                                })
-                                .child(title),
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .when_some(
+                                    harness.map(crate::pickers::harness_brand_icon),
+                                    |el, (path, tint)| {
+                                        el.child(
+                                            icon(path)
+                                                .size(px(14.0))
+                                                .flex_none()
+                                                .text_color(tint.unwrap_or(theme.text_muted)),
+                                        )
+                                    },
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(crate::typography::ui_rems(12.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(if on_canvas {
+                                            theme.text_muted.opacity(0.7)
+                                        } else {
+                                            theme.text.opacity(0.85)
+                                        })
+                                        .child(title),
+                                )
+                                .when_some(target, |el, target| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(crate::typography::ui_rems(12.0))
+                                            .text_color(theme.text_muted.opacity(0.5))
+                                            .child(target),
+                                    )
+                                }),
                         )
-                        .when_some(target, |el, target| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(crate::typography::ui_rems(12.0))
-                                    .text_color(theme.text_muted.opacity(0.5))
-                                    .child(target),
-                            )
-                        }),
-                )
-            })
-            .child(div().flex_1())
+                    }),
+            )
             .children(trailing);
 
         // The unified window titlebar: full-width on the glass shell, ABOVE

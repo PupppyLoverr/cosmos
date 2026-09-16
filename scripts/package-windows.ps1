@@ -65,6 +65,10 @@ DefaultDirName={localappdata}\Zeron
 DefaultGroupName=Zeron
 OutputDir=$OutDir
 OutputBaseFilename=Zeron-Setup-$Arch
+; Installer .exe icon; the embedded resource in zeron.exe covers shortcuts and
+; the Apps & Features entry (UninstallDisplayIcon just points back at it).
+SetupIconFile=$Root\dist\windows\zeron.ico
+UninstallDisplayIcon={app}\bin\zeron.exe
 Compression=lzma2
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible

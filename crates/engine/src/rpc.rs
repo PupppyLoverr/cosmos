@@ -902,6 +902,10 @@ fn forward_deadline(method: &str) -> std::time::Duration {
             Duration::from_secs(15 * 60)
         }
         methods::CREATE_WORKTREE => Duration::from_secs(120),
+        // Model/command discovery spawns the agent's CLI on the target —
+        // Hermes's plugin-heavy cold start alone takes ~18s before
+        // session/new answers, and the harness's own probe budget is 45s.
+        methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(60),
         _ => Duration::from_secs(30),
     }
 }
