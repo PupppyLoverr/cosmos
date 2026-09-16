@@ -19,6 +19,8 @@ serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+chrono.workspace = true
+rusqlite = { workspace = true, features = ["bundled"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

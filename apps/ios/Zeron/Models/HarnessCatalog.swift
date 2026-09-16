@@ -70,6 +70,8 @@ enum HarnessCatalog {
         "pi": "Pi",
         "cursor": "Cursor",
         "opencode": "OpenCode",
+        "antigravity": "Antigravity",
+        "amp": "Amp",
         "mock": "Mock",
     ]
 
@@ -82,6 +84,8 @@ enum HarnessCatalog {
     private static let codexUltraLadder = ["low", "medium", "high", "xhigh", "max", "ultra"]
     private static let codexMaxLadder = ["low", "medium", "high", "xhigh", "max"]
     private static let codexXhighLadder = ["low", "medium", "high", "xhigh"]
+    private static let ampEffortLadder = ["minimal", "low", "medium", "high", "xhigh", "max"]
+    private static let antigravityEffortLadder = ["low", "medium", "high"]
     private static let codexServiceTier = [
         ModelOptionInfo(id: "serviceTier", label: "Service Tier", choices: [
             ModelOptionChoiceInfo(id: "default", label: "Standard"),
@@ -118,6 +122,40 @@ enum HarnessCatalog {
                 ModelInfo(id: "default", label: "pi default",
                           description: "Runs the model configured in pi (`pi` settings)",
                           reasoningLevels: ["minimal", "low", "medium", "high", "xhigh", "max"]),
+            ]
+        case "amp":
+            // Amp's Dial modes — the public selection surface (`--mode`).
+            // Live `listModels` from a host replaces this when the device
+            // is reachable; the four names are stable even as routing
+            // behind them changes.
+            return [
+                ModelInfo(id: "low", label: "Low",
+                          description: "Fast, low-cost mode for small, well-defined tasks",
+                          reasoningLevels: ampEffortLadder),
+                ModelInfo(id: "medium", label: "Medium",
+                          description: "Balanced intelligence, speed, and cost — Amp's default",
+                          reasoningLevels: ampEffortLadder),
+                ModelInfo(id: "high", label: "High",
+                          description: "Deep reasoning for hard tasks",
+                          reasoningLevels: ampEffortLadder),
+                ModelInfo(id: "ultra", label: "Ultra",
+                          description: "The most capable mode for hard, open-ended tasks",
+                          reasoningLevels: ampEffortLadder),
+            ]
+        case "antigravity":
+            // Static fallback only — a reachable host answers `listModels`
+            // from `agy models`. Effort is a model-id suffix on Gemini
+            // rows; suffix-free ids (Claude through agy) have no ladder.
+            return [
+                ModelInfo(id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)",
+                          description: "Antigravity's default Gemini Flash",
+                          reasoningLevels: antigravityEffortLadder),
+                ModelInfo(id: "gemini-3.1-pro-high", label: "Gemini 3.1 Pro (High)",
+                          description: "Gemini Pro through Antigravity",
+                          reasoningLevels: ["low", "high"]),
+                ModelInfo(id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6",
+                          description: "Claude Sonnet through Antigravity",
+                          reasoningLevels: []),
             ]
         case "opencode":
             // Static fallback only — a reachable host answers `listModels`

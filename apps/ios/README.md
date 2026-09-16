@@ -1,10 +1,14 @@
-# Zeron for iOS
+# Cosmos for iOS
 
-A native SwiftUI viewport onto the zeron mesh. The phone is a **peer
+A native SwiftUI viewport onto the Cosmos mesh. The phone is a **peer
 device**: it joins the same Loro CRDT rooms as every other device (workspace
 doc + per-chat session docs over the edge's Durable Objects), renders the
 mirrors, and drives remote engines through the durable command queue. No
 engine runs on the phone.
+
+The home-screen name is **Cosmos**. Xcode still builds the `Zeron` target
+(`Zeron.xcodeproj`) so TestFlight, the bundle id `sh.zeron.ios`, and the
+`zeron://` auth callback stay compatible with the existing App Store listing.
 
 ## Build & run
 
@@ -34,9 +38,11 @@ The workflow uses the `AC_API_KEY_P8`, `AC_API_KEY_ID`, and
 
 ### Connecting
 
-- **WorkOS**: enter the edge URL, open the sign-in page on any device, paste
-  the code it shows (`/auth/exchange`), pick an org (`/auth/refresh` re-scopes
-  the token with the `org_id` claim).
+- **Woozlit**: tap Log in — the system browser opens
+  [woozlit.com/login](https://www.woozlit.com/login) (Google or Discord). After
+  you confirm, the app bounces back on `zeron://callback` with a Firebase
+  token. Desktop uses the same Woozlit account so the phone can drive that
+  machine.
 - **Dev**: against an `AUTH_MODE=dev` edge (e.g. `wrangler dev`), enter a user
   id + org id; the bearer is `userId@orgId`.
 - **Demo mode**: fully offline dataset with a scripted streaming reply —

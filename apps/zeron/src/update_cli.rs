@@ -54,14 +54,14 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
                 .unwrap_or_else(super::dirs_data_dir);
             let staged = zeron_update::stage_mac_app(edge_url, &manifest, &data_dir).await?;
             zeron_update::apply_mac_app(&staged, &bundle)?;
-            println!("updated {} — relaunch Zeron to finish.", bundle.display());
+            println!("updated {} — relaunch Cosmos to finish.", bundle.display());
             Ok(())
         }
         InstallKind::Unmanaged => {
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\
                  Linux: curl -fsSL https://zeron.sh/install.sh | sh\n\
-                 macOS: download the new Zeron.app dmg, or rebuild from source."
+                 macOS: download the new Cosmos dmg, or rebuild from source."
             )
         }
     }

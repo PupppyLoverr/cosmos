@@ -53,7 +53,7 @@ use zeron_proto::{
 
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
-use normalize::{map_update, parse_commands, preferred_allow_option};
+use normalize::{map_update, parse_commands, parse_session_list, preferred_allow_option};
 use subagent::SubagentTracker;
 use subagent_devin::DevinTracker;
 
@@ -853,6 +853,147 @@ impl AcpHarness {
         }
     }
 
+    /// One short-lived probe for the agent's resumable-session index:
+    /// initialize → `session/list`. Agents that don't implement the method
+    /// answer with an error we treat as "no sessions", never a failure.
+    async fn discover_sessions(&self) -> Result<Vec<zeron_proto::HarnessSession>, HarnessError> {
+        let (mut child, _stderr) = self.spawn_agent(None, false, &[]).await?;
+        let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
+            (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
+            _ => {
+                shutdown_child(&mut child, self.kill_grace).await;
+                return Err(HarnessError::Protocol("agent child has no stdio".into()));
+            }
+        };
+        let discovery = async {
+            client
+                .request("initialize", initialize_params(self.spec.id))
+                .await?;
+            let response = client
+                .request("session/list", json!({}))
+                .await
+                .unwrap_or(Value::Null);
+            // The list may stream an update after the response; give it a
+            // brief window, the way command discovery does.
+            let deadline = tokio::time::sleep(Duration::from_secs(1));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    inc = incoming.recv() => match inc {
+                        Some(Incoming::Request { id, .. }) => {
+                            client.respond_error(&id, -32601, "unsupported during discovery");
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                    _ = &mut deadline => break,
+                }
+            }
+            Ok::<Vec<zeron_proto::HarnessSession>, HarnessError>(
+                parse_session_list(&response),
+            )
+        };
+        let result = tokio::time::timeout(self.model_discovery_timeout, discovery).await;
+        shutdown_child(&mut child, self.kill_grace).await;
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(HarnessError::Protocol("session listing timed out".into())),
+        }
+    }
+
+    /// The `session/load` replay as flat transcript rows: initialize →
+    /// `session/load`, collecting `user_message_chunk`/`agent_message_chunk`
+    /// updates (coalesced per contiguous role run) until the response plus a
+    /// short straggler window. `None` when the agent can't load the session —
+    /// the picker row still resumes it, just without visible history.
+    async fn replay_transcript(
+        &self,
+        session_id: &str,
+        cwd: &str,
+    ) -> Option<Vec<zeron_proto::SessionTranscriptRow>> {
+        let (mut child, _stderr) = self.spawn_agent(None, false, &[]).await.ok()?;
+        let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
+            (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
+            _ => {
+                shutdown_child(&mut child, self.kill_grace).await;
+                return None;
+            }
+        };
+        let discovery = async {
+            client
+                .request("initialize", initialize_params(self.spec.id))
+                .await
+                .ok()?;
+            // Load from the session's OWN cwd — the store is cwd-keyed, so
+            // the discovery cwd would resolve nothing.
+            let probe_cwd = if cwd.is_empty() {
+                discovery_cwd()
+            } else {
+                cwd.to_string()
+            };
+            let load = client.request(
+                "session/load",
+                json!({
+                    "sessionId": session_id,
+                    "cwd": probe_cwd,
+                    "mcpServers": [],
+                }),
+            );
+            tokio::pin!(load);
+            let mut rows: Vec<zeron_proto::SessionTranscriptRow> = Vec::new();
+            // The replay streams ahead of the response; a short post-response
+            // window catches the tail frames still queued on the reader.
+            let mut loaded = false;
+            let deadline = tokio::time::sleep(Duration::from_secs(2));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    res = &mut load, if !loaded => {
+                        loaded = res.is_ok();
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+                    inc = incoming.recv() => match inc {
+                        Some(Incoming::Notification { method, params })
+                            if method == "session/update" =>
+                        {
+                            let update = &params["update"];
+                            let role = match update["sessionUpdate"].as_str() {
+                                Some("user_message_chunk") => "user",
+                                Some("agent_message_chunk") => "assistant",
+                                _ => continue,
+                            };
+                            let text = update["content"]["text"].as_str().unwrap_or_default();
+                            if text.is_empty() {
+                                continue;
+                            }
+                            match rows.last_mut() {
+                                Some(last) if last.role == role => last.text.push_str(text),
+                                _ => rows.push(zeron_proto::SessionTranscriptRow {
+                                    role: role.to_string(),
+                                    text: text.to_string(),
+                                    created_at: 0,
+                                }),
+                            }
+                        }
+                        Some(Incoming::Request { id, .. }) => {
+                            client.respond_error(&id, -32601, "unsupported during replay");
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                    _ = &mut deadline, if loaded => break,
+                }
+            }
+            Some(rows)
+        };
+        let result =
+            tokio::time::timeout(self.model_discovery_timeout, discovery).await;
+        shutdown_child(&mut child, self.kill_grace).await;
+        result.ok().flatten()
+    }
+
     /// One short-lived probe for the agent's real model list: initialize →
     /// `session/new`, then read the response's first-class `models`
     /// (SessionModelState) with the `model` config option as fallback. The
@@ -1256,6 +1397,54 @@ impl Harness for AcpHarness {
             .cloned()
     }
 
+    /// Agents that advertise `session/list` (Devin does) answer with their
+    /// stored session index; a method-not-found or dead store just means the
+    /// picker shows nothing for this harness. Grok's adapter predates the
+    /// method — its `~/.grok/sessions` summaries are the listing there.
+    async fn sessions(&self) -> Result<Vec<zeron_proto::HarnessSession>, HarnessError> {
+        self.resolve_launch()?;
+        let probed = self.discover_sessions().await.unwrap_or_default();
+        if !probed.is_empty() || self.spec.id != HarnessId::Grok {
+            return Ok(probed);
+        }
+        let Some(root) = crate::home_dir().map(|h| h.join(".grok").join("sessions")) else {
+            return Ok(probed);
+        };
+        Ok(tokio::task::spawn_blocking(move || crate::sessions::scan_grok(&root))
+            .await
+            .unwrap_or_default())
+    }
+
+    /// A `session/load` probe IS the transcript: the agent replays the stored
+    /// history as `session/update` notifications before the response. The
+    /// replay is collected into flat rows for the `/resume` doc import — the
+    /// same stream the live attach run would drain and drop.
+    async fn session_transcript(
+        &self,
+        session_id: &str,
+        cwd: &str,
+    ) -> Result<Option<Vec<zeron_proto::SessionTranscriptRow>>, HarnessError> {
+        self.resolve_launch()?;
+        // Grok's adapter predates session/load — its on-disk history file is
+        // the transcript (and cheaper than a replay probe besides).
+        if self.spec.id == HarnessId::Grok {
+            let root = crate::home_dir().map(|h| h.join(".grok").join("sessions"));
+            if let Some(root) = root {
+                let id = session_id.to_string();
+                let rows = tokio::task::spawn_blocking(move || {
+                    crate::sessions::find_grok_session(&root, &id)
+                        .map(|dir| crate::sessions::grok_transcript(&dir.join("chat_history.jsonl")))
+                })
+                .await
+                .unwrap_or_default();
+                if rows.is_some() {
+                    return Ok(rows);
+                }
+            }
+        }
+        Ok(self.replay_transcript(session_id, cwd).await)
+    }
+
     async fn run(
         &self,
         request: RunRequest,
@@ -1355,7 +1544,7 @@ pub(crate) fn initialize_params(harness: HarnessId) -> Value {
         "protocolVersion": 1,
         "clientInfo": {
             "name": "zeron",
-            "title": "Zeron",
+            "title": "Cosmos",
             "version": env!("CARGO_PKG_VERSION"),
         },
         // Declined: agents fall back to their own fs/terminal access, which
@@ -2045,14 +2234,45 @@ async fn run_session(session: Session) {
         let (session_id, mut session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
-            match request_draining(&client, &mut incoming, "session/load", load).await {
-                Ok(resp) => (resume.clone(), resp),
+            // The process this run replaces can still hold the session's
+            // lock while it dies (interrupt → respawn, engine restart, a
+            // second window) — Devin's `session_locked` is transient in
+            // that window, and a `session_not_found` can be a flush still
+            // landing. Retry a bounded while before the fresh-session
+            // fallback: an instant fallback silently forks the conversation
+            // and every later turn resumes the WRONG (empty) session.
+            let mut attempt = 0u32;
+            let loaded = loop {
+                match request_draining(&client, &mut incoming, "session/load", load.clone())
+                    .await
+                {
+                    Ok(resp) => break Some(resp),
+                    Err(e) => {
+                        attempt += 1;
+                        let msg = e.to_string();
+                        let locked =
+                            msg.contains("already open") || msg.contains("session_locked");
+                        let missing =
+                            msg.contains("not found") || msg.contains("session_not_found");
+                        // Locked frees when the old process exits — wait it
+                        // out (~15s). Missing gets a couple of cheap retries
+                        // for a late flush, then falls through to fresh.
+                        let give_up = attempt >= if locked { 30 } else { 3 };
+                        if give_up || (!locked && !missing) {
+                            tracing::debug!(
+                                target: "zeron_harness::acp",
+                                "session/load failed (starting fresh): {e}"
+                            );
+                            break None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            };
+            match loaded {
+                Some(resp) => (resume.clone(), resp),
                 // A missing/foreign session falls back to a fresh one.
-                Err(e) => {
-                    tracing::debug!(
-                        target: "zeron_harness::acp",
-                        "session/load failed (starting fresh): {e}"
-                    );
+                None => {
                     let new = request_draining(
                         &client,
                         &mut incoming,

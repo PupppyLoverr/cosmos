@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+default-run = "cosmos"
+
+[[bin]]
+name = "cosmos"
+path = "src/main.rs"
 
 [[bin]]
 name = "zeron"

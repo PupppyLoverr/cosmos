@@ -110,6 +110,46 @@ pub fn browser_bridge_url(request: &RunRequest) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
+/// `model_options` keys carrying zeron-internal run directives (underscore-
+/// prefixed, never harness config). RuntimeConfig comparisons ignore them —
+/// they mark ONE run's behavior, not the session's runtime shape.
+pub fn is_internal_option(key: &str) -> bool {
+    key.starts_with("_zeron")
+}
+
+/// One resumable harness session — a `/resume` picker row. `id` is the
+/// harness-native session/conversation id a run resumes via
+/// [`RunRequest::resume`]; `cwd` is the folder the session belongs to
+/// (harness session stores are cwd-keyed — resume only holds there).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessSession {
+    pub id: String,
+    pub title: String,
+    /// First-message excerpt, when the store surfaces one.
+    #[serde(default)]
+    pub preview: String,
+    /// The session's working directory — the resumed chat's cwd.
+    #[serde(default)]
+    pub cwd: String,
+    /// Last activity, epoch ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+}
+
+/// One replayed message row for a harness session whose transcript is
+/// readable off the wire — the `/resume` history import. Role strings map
+/// onto `MessageRole` ("user" | "assistant").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTranscriptRow {
+    pub role: String,
+    pub text: String,
+    /// Epoch ms.
+    #[serde(default)]
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRequest {

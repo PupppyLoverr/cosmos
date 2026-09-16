@@ -101,7 +101,7 @@ import dmgbuild
 app = os.environ["APP"]
 dmgbuild.build_dmg(
     filename=os.environ["DMG"],
-    volume_name="Zeron",
+    volume_name="Cosmos",
     settings={
         "format": "UDZO",
         "files": [app],

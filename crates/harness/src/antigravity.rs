@@ -22,8 +22,12 @@
 //!
 //! Model catalog: `agy models` emits `<id>\t<label>` TSV (plus a
 //! `Fetching available models…` preamble line that is filtered out). Effort
-//! is a model-id suffix (`…-low`/`-medium`/`-high`); `--effort` is still
-//! forwarded when the picker sets a reasoning level.
+//! is a model-id suffix (`…-low`/`-medium`/`-high`), NOT a combinable flag:
+//! agy rejects `--effort` whenever `--model` rides along (a suffixed model
+//! conflicts on mismatch; a suffix-free model isn't effort-capable at all),
+//! so a picked reasoning level rewrites the model's own suffix instead —
+//! `--effort` is only ever sent with no `--model`, where it sets the CLI
+//! default's effort.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -334,7 +338,12 @@ impl AntigravityHarness {
         })
     }
 
-    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+    fn build_command(
+        &self,
+        exe: &PathBuf,
+        request: &RunRequest,
+        catalog: Option<&[Model]>,
+    ) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_path(&mut cmd, exe);
         cmd.args([
@@ -343,11 +352,20 @@ impl AntigravityHarness {
             "--input-format",
             "stream-json",
         ]);
-        if let Some(model) = &request.model {
-            cmd.args(["--model", model]);
-        }
-        if let Some(effort) = to_effort(request.reasoning) {
-            cmd.args(["--effort", effort]);
+        let effort = to_effort(request.reasoning);
+        match &request.model {
+            // `--model` and `--effort` never combine — effort rides the
+            // model id's suffix instead.
+            Some(model) => {
+                let model = model_for_effort(model, effort, catalog);
+                cmd.args(["--model", &model]);
+            }
+            // `--effort` alone IS legal: it applies to the CLI's default model.
+            None => {
+                if let Some(effort) = effort {
+                    cmd.args(["--effort", effort]);
+                }
+            }
         }
         // Zeron sessions run unattended; auto_approve maps onto the CLI's own
         // skip flag (without it every tool call auto-denies — surfaced via
@@ -442,7 +460,7 @@ fn parse_models(text: &str) -> Vec<Model> {
         .collect()
 }
 
-/// `RunRequest::reasoning` → agy's `--effort` value; `None` when the picker
+/// `RunRequest::reasoning` → agy's effort spelling; `None` when the picker
 /// sent nothing (agy then applies the model's own default).
 fn to_effort(reasoning: Option<ReasoningLevel>) -> Option<&'static str> {
     match reasoning? {
@@ -451,6 +469,34 @@ fn to_effort(reasoning: Option<ReasoningLevel>) -> Option<&'static str> {
         ReasoningLevel::High | ReasoningLevel::XHigh | ReasoningLevel::Max => Some("high"),
         // No agy spelling for the Claude-shaped tiers; omit rather than guess.
         ReasoningLevel::Ultra | ReasoningLevel::Ultracode | ReasoningLevel::Ultrathink => None,
+    }
+}
+
+/// Split an agy model id into stem + effort suffix (`-low`/`-medium`/`-high`).
+fn split_effort_suffix(model: &str) -> Option<(&str, &str)> {
+    ["low", "medium", "high"]
+        .iter()
+        .find_map(|suffix| model.strip_suffix(format!("-{suffix}").as_str()).map(|stem| (stem, *suffix)))
+}
+
+/// The model id to run for a picked effort. agy has no combinable effort flag
+/// alongside `--model`, so the pick rewrites the id's own suffix — but only to
+/// a variant the discovered catalog actually advertises (`gpt-oss-120b` ships
+/// only `-medium`, `gemini-3.1-pro` skips `-medium`). Anything unverifiable —
+/// no suffix on the id, no catalog, target variant absent — keeps the picked
+/// id as-is: its baked-in tier still runs where a fabricated id would hard-fail.
+fn model_for_effort(model: &str, effort: Option<&str>, catalog: Option<&[Model]>) -> String {
+    let Some(effort) = effort else {
+        return model.to_owned();
+    };
+    let Some((stem, _)) = split_effort_suffix(model) else {
+        return model.to_owned();
+    };
+    let candidate = format!("{stem}-{effort}");
+    if catalog.is_some_and(|models| models.iter().any(|m| m.id == candidate)) {
+        candidate
+    } else {
+        model.to_owned()
     }
 }
 
@@ -493,19 +539,55 @@ impl Harness for AntigravityHarness {
             .cloned()
     }
 
+    /// `~/.gemini/antigravity-cli/conversation_summaries.db` — one sqlite row
+    /// per conversation; resumable through `agy --conversation <id>`.
+    async fn sessions(&self) -> Result<Vec<zeron_proto::HarnessSession>, HarnessError> {
+        self.resolve_executable()?;
+        let Some(db) = crate::home_dir().map(|h| {
+            h.join(".gemini")
+                .join("antigravity-cli")
+                .join("conversation_summaries.db")
+        }) else {
+            return Ok(Vec::new());
+        };
+        Ok(tokio::task::spawn_blocking(move || {
+            crate::sessions::scan_antigravity(&db)
+        })
+        .await
+        .unwrap_or_default())
+    }
+
     async fn run(
         &self,
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        let mut child = self.build_command(&exe, &request).spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
-            } else {
-                HarnessError::Io(e)
-            }
-        })?;
+        // The catalog validates effort→model-suffix rewrites — already warm
+        // whenever the picker supplied this model (same harness instance),
+        // and only worth a cold `agy models` spawn when the pick actually
+        // implies a suffix change. A failed discovery degrades to keeping
+        // the picked id, never to a failed run.
+        let needs_catalog = matches!(
+            (&request.model, to_effort(request.reasoning)),
+            (Some(model), Some(effort))
+                if split_effort_suffix(model).is_some_and(|(_, current)| current != effort)
+        );
+        let catalog = if needs_catalog {
+            self.models().await.ok()
+        } else {
+            None
+        };
+        let mut child = self
+            .build_command(&exe, &request, catalog.as_deref())
+            .spawn()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    HarnessError::NotInstalled(exe.display().to_string())
+                } else {
+                    HarnessError::Io(e)
+                }
+            })?;
 
         let stdin = child
             .stdin
@@ -1002,6 +1084,56 @@ mod tests {
     }
 
     #[test]
+    fn effort_rewrites_the_model_suffix_only_when_the_variant_is_real() {
+        let catalog = parse_models(
+            "gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n\
+             gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\n\
+             gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n\
+             gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n\
+             gemini-3.1-pro-low\tGemini 3.1 Pro (Low)\n\
+             gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n\
+             claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n",
+        );
+        let catalog = Some(catalog.as_slice());
+        // A real sibling variant: the effort pick wins over the id's suffix.
+        assert_eq!(
+            model_for_effort("gemini-3.8-flash-low", Some("medium"), catalog),
+            "gemini-3.8-flash-medium"
+        );
+        // Same tier: the id stands unchanged.
+        assert_eq!(
+            model_for_effort("gemini-3.8-flash-low", Some("low"), catalog),
+            "gemini-3.8-flash-low"
+        );
+        // The family ships no such variant — keep the picked id rather than
+        // fabricate `gpt-oss-120b-high` / `gemini-3.1-pro-medium` (agy
+        // hard-fails unknown ids).
+        assert_eq!(
+            model_for_effort("gpt-oss-120b-medium", Some("high"), catalog),
+            "gpt-oss-120b-medium"
+        );
+        assert_eq!(
+            model_for_effort("gemini-3.1-pro-high", Some("medium"), catalog),
+            "gemini-3.1-pro-high"
+        );
+        // Suffix-free ids aren't effort-capable at all (agy rejects --effort
+        // for them): the id passes through untouched.
+        assert_eq!(
+            model_for_effort("claude-sonnet-4-6", Some("medium"), catalog),
+            "claude-sonnet-4-6"
+        );
+        // No effort pick / no catalog: never guess.
+        assert_eq!(
+            model_for_effort("gemini-3.8-flash-low", None, catalog),
+            "gemini-3.8-flash-low"
+        );
+        assert_eq!(
+            model_for_effort("gemini-3.8-flash-low", Some("medium"), None),
+            "gemini-3.8-flash-low"
+        );
+    }
+
+    #[test]
     fn command_carries_model_effort_resume_and_permissions() {
         let exe = PathBuf::from(if cfg!(windows) { "agy.exe" } else { "agy" });
         let h = AntigravityHarness::new().with_executable(&exe);
@@ -1018,7 +1150,7 @@ mod tests {
             attachments: Vec::new(),
             worktree: None,
         };
-        let cmd = h.build_command(&exe, &request);
+        let cmd = h.build_command(&exe, &request, None);
         let args: Vec<String> = cmd
             .as_std()
             .get_args()
@@ -1026,13 +1158,29 @@ mod tests {
             .collect();
         let joined = args.join(" ");
         assert!(joined.contains("--model gemini-3.8-flash-high"), "{joined}");
-        assert!(joined.contains("--effort high"), "{joined}");
+        // `--effort` NEVER rides along with `--model` — agy rejects the pair.
+        assert!(!joined.contains("--effort"), "{joined}");
         assert!(joined.contains("--conversation conv-1"), "{joined}");
         assert!(
             joined.contains("--dangerously-skip-permissions"),
             "{joined}"
         );
         assert!(joined.contains("--output-format stream-json"), "{joined}");
+
+        // With NO model the effort flag is legal again (CLI default model).
+        let request = RunRequest {
+            model: None,
+            ..request
+        };
+        let joined = h
+            .build_command(&exe, &request, None)
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!joined.contains("--model"), "{joined}");
+        assert!(joined.contains("--effort high"), "{joined}");
 
         // Without auto_approve the skip flag is absent (denials then ride
         // `denied_actions`, not silence).
@@ -1041,7 +1189,7 @@ mod tests {
             resume: None,
             ..request
         };
-        let cmd = h.build_command(&exe, &request);
+        let cmd = h.build_command(&exe, &request, None);
         let joined = cmd
             .as_std()
             .get_args()

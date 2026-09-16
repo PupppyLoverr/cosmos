@@ -946,17 +946,15 @@ pub async fn serve_ipc(
     )))
 }
 
-/// Block until the WorkOS session is signed in AND org-scoped. On a TTY, print the
-/// headless (paste-code) sign-in URL, read the pasted `state.code` from stdin, and
-/// run workspace onboarding (create / auto-join / numbered picker). Off a TTY this
-/// errors immediately — a daemon under systemd/launchd must load the session that
-/// `zeron login` persisted, never wait on a prompt nobody can see.
+/// Block until the Woozlit session is signed in. On a TTY, print (and if
+/// possible open) the woozlit.com login URL; the engine's loopback callback
+/// finishes the session. Off a TTY this errors immediately — a daemon under
+/// systemd/launchd must load the session that `cosmos login` persisted.
 pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
     use std::io::IsTerminal;
     let interactive = std::io::stdin().is_terminal();
     let mut state_rx = auth.watch_state();
-    let mut stdin_reader: Option<tokio::task::JoinHandle<()>> = None;
-    let mut org_reader: Option<tokio::task::JoinHandle<()>> = None;
+    let mut opened = false;
     loop {
         let state = state_rx.borrow().clone();
         match state {
@@ -967,47 +965,25 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
             }
             AuthState::NeedsOrganization { user } => {
                 if !interactive {
-                    // No reader tasks have been spawned on this path (both spawns
-                    // are TTY-gated), so an early return leaks nothing.
                     return Err(EngineError::Other(format!(
-                        "signed in as {} but no workspace is selected — run `zeron login` on this machine to pick one",
+                        "signed in as {} but no workspace is selected — run `cosmos login` on this machine to pick one",
                         user.email
                     )));
                 }
-                if org_reader.is_none() {
-                    // Workspace onboarding on the TTY (old zeron's
-                    // `backend login` flow): create if none, auto-join a
-                    // single membership, numbered picker otherwise.
-                    println!("Signed in as {}.", user.email);
-                    org_reader = Some(tokio::spawn(run_org_onboarding(auth.clone())));
-                }
+                println!("Signed in as {} — finishing workspace setup…", user.email);
             }
             AuthState::SignedOut => {
                 if !interactive {
                     return Err(EngineError::Other(
-                        "not signed in — run `zeron login` on this machine first".into(),
+                        "not signed in — run `cosmos login` on this machine first".into(),
                     ));
                 }
-                if stdin_reader.is_none() {
-                    let url = auth.start_headless_sign_in();
-                    println!("Sign in to Zeron:\n\n  {url}\n");
-                    println!("Then paste the code shown in the browser here and press enter.");
-                    let auth = auth.clone();
-                    stdin_reader = Some(tokio::spawn(async move {
-                        loop {
-                            let Some(line) = read_stdin_line().await else {
-                                return;
-                            };
-                            let pasted = line.trim();
-                            if pasted.is_empty() {
-                                continue;
-                            }
-                            match auth.complete_sign_in(pasted).await {
-                                Ok(()) => return,
-                                Err(err) => println!("Sign-in failed: {err}"),
-                            }
-                        }
-                    }));
+                if !opened {
+                    let url = auth.start_sign_in().await?;
+                    println!("Sign in to Cosmos with your Woozlit account:\n\n  {url}\n");
+                    println!("A browser window should open. Log in on woozlit.com, then return here.");
+                    let _ = open_login_url(&url);
+                    opened = true;
                 }
             }
         }
@@ -1015,16 +991,32 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
             break;
         }
     }
-    if let Some(reader) = stdin_reader {
-        reader.abort();
-    }
-    if let Some(reader) = org_reader {
-        reader.abort();
-    }
     Ok(())
 }
 
+fn open_login_url(url: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn().is_ok()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .is_ok()
+    }
+}
+
 /// One line from stdin (blocking read off the runtime). `None` = stdin closed.
+#[allow(dead_code)]
 async fn read_stdin_line() -> Option<String> {
     tokio::task::spawn_blocking(|| {
         let mut line = String::new();
@@ -1042,12 +1034,13 @@ async fn read_stdin_line() -> Option<String> {
 /// `backend login` flow): no memberships → prompt a name and create; exactly
 /// one → auto-join; several → numbered picker. Success flips the auth state to
 /// `SignedIn`, which ends [`wait_for_sign_in`]'s wait (and aborts this task).
+#[allow(dead_code)]
 async fn run_org_onboarding(auth: Auth) {
     let orgs = match auth.list_orgs().await {
         Ok(orgs) => orgs,
         Err(err) => {
             println!(
-                "Could not list workspaces ({err}) — create or select one from the Zeron UI to continue."
+                "Could not list workspaces ({err}) — create or select one from the Cosmos UI to continue."
             );
             return;
         }

@@ -93,6 +93,25 @@ pub trait Harness: Send + Sync {
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         Ok(Vec::new())
     }
+    /// Sessions this harness's CLI can resume (`/resume` picker rows): id,
+    /// title, owning cwd, last activity. Sources differ per driver — an ACP
+    /// `session/list` probe where the agent advertises it, else the CLI's
+    /// on-disk session store. Empty for harnesses with no readable store.
+    async fn sessions(&self) -> Result<Vec<zeron_proto::HarnessSession>, HarnessError> {
+        Ok(Vec::new())
+    }
+    /// The session's transcript as flat role+text rows, when the store is
+    /// readable off the wire (claude/codex jsonl) or replayable through a
+    /// `session/load` probe (ACP). `cwd` is the session's own folder —
+    /// session stores are cwd-keyed, so the probe must load from there.
+    /// `None` when the store carries no readable history.
+    async fn session_transcript(
+        &self,
+        _session_id: &str,
+        _cwd: &str,
+    ) -> Result<Option<Vec<zeron_proto::SessionTranscriptRow>>, HarnessError> {
+        Ok(None)
+    }
     /// Run an isolated title request. Drivers must opt in with title-specific
     /// instructions and restrictions; never fall back to an ordinary coding run.
     async fn run_title(
@@ -123,6 +142,7 @@ pub mod cursor;
 pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod opencode;
+pub(crate) mod sessions;
 pub mod shell_env;
 
 /// The user's home directory on any platform: `HOME` first (msys/cygwin

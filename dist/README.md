@@ -2,10 +2,11 @@
 
 ## Icons
 
-All platform icons are generated from one square source PNG by:
+All platform icons are generated from one square source PNG
+(`dist/icon-source.png` — the Cosmos night-sky mark) by:
 
 ```sh
-node scripts/generate-icons.mjs <source.png>
+node scripts/generate-icons.mjs dist/icon-source.png
 ```
 
 (self-contained Node — no deps). It writes:
@@ -30,7 +31,7 @@ Produces `target/package/zeron-<version>-linux-<arch>.tar.gz` containing:
 
 - `zeron` — the binary (headed by default; `zeron headless` runs the engine alone)
 - `zeron.desktop` — XDG desktop entry
-- `zeron.png` — 1024×1024 Zeron app icon
+- `zeron.png` — 1024×1024 Cosmos app icon
 - `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`
 
 The release profile in the root `Cargo.toml` sets `lto = "thin"` and
@@ -39,7 +40,7 @@ The release profile in the root `Cargo.toml` sets `lto = "thin"` and
 ## Windows
 
 ```powershell
-scripts/package-windows.ps1            # → zip (+ Zeron-Setup-<arch>.exe when Inno is installed)
+scripts/package-windows.ps1            # → zip (+ Cosmos-Setup-<arch>.exe when Inno is installed)
 ```
 
 `apps/zeron/build.rs` embeds `dist/windows/zeron.ico` into `zeron.exe` via
@@ -57,7 +58,7 @@ scripts/package-macos.sh    # → target/package/zeron-<version>-macos-<arch>.dm
 Builds the release binary, assembles `Zeron.app` (Info.plist + icns), ad-hoc
 signs it (set `CODESIGN_IDENTITY` for a real Developer ID), and wraps it in a
 dmg. The auto-update tarball retains an internal `Zeron.app` path so older
-installed builds can update into Zeron. CI runs this on tags
+installed builds can update into Cosmos. CI runs this on tags
 (`.github/workflows/release.yml`). The manual steps it automates, for reference
 (run on a macOS host — gpui needs Metal; no cross-build from Linux):
 
@@ -90,4 +91,4 @@ installed builds can update into Zeron. CI runs this on tags
    xcrun notarytool submit Zeron.zip --keychain-profile … --wait
    xcrun stapler staple Zeron.app
    ```
-5. Ship as a `.dmg` (`hdiutil create -volname Zeron -srcfolder Zeron.app -ov -format UDZO Zeron.dmg`).
+5. Ship as a `.dmg` (`hdiutil create -volname Cosmos -srcfolder Zeron.app -ov -format UDZO Cosmos.dmg`).

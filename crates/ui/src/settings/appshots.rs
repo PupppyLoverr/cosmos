@@ -286,7 +286,7 @@ impl ShortcutsPage {
                 .child(widgets::page_subtitle(&theme, capabilities.setup_description()).line_height(px(20.0)))
                 .child(card).child(div().min_h(px(20.0)).mt(px(8.0)).text_size(px(12.0)).text_color(theme.text_muted).child(helper))
                 .child(div().mt(px(12.0)).flex().flex_wrap().items_center().gap(px(12.0))
-                    .child(div().flex_1().text_size(px(12.0)).text_color(theme.text_muted).child("Changed a permission? Check again after returning to Zeron."))
+                    .child(div().flex_1().text_size(px(12.0)).text_color(theme.text_muted).child("Changed a permission? Check again after returning to Cosmos."))
                     .child(refresh)))
             .into_any_element()
     }

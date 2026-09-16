@@ -383,6 +383,17 @@ impl Harness for CursorHarness {
     // listing (the cursor-agent TUI's slash commands are client-side only),
     // so the trait's empty default is the honest answer, not a gap.
 
+    /// `~/.cursor/acp-sessions/<uuid>/meta.json` — the agent's own ACP
+    /// session store; resumable via `session/load` with the dir name as id.
+    async fn sessions(&self) -> Result<Vec<zeron_proto::HarnessSession>, HarnessError> {
+        let Some(root) = crate::home_dir().map(|h| h.join(".cursor").join("acp-sessions")) else {
+            return Ok(Vec::new());
+        };
+        Ok(tokio::task::spawn_blocking(move || crate::sessions::scan_cursor(&root))
+            .await
+            .unwrap_or_default())
+    }
+
     async fn run(
         &self,
         request: RunRequest,

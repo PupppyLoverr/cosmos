@@ -28,4 +28,25 @@ final class HarnessCatalogTests: XCTestCase {
         XCTAssertEqual(HarnessCatalog.selectedChoice(for: option, selectedId: "fast").label, "Fast")
         XCTAssertEqual(HarnessCatalog.selectedChoice(for: option, selectedId: "stale").id, "default")
     }
+
+    func testAmpFallbackExposesDialModesAndEffortLadder() {
+        XCTAssertEqual(HarnessCatalog.label(for: "amp"), "Amp")
+        let models = HarnessCatalog.models(for: "amp")
+        XCTAssertEqual(models.map(\.id), ["low", "medium", "high", "ultra"])
+        XCTAssertEqual(models.first?.reasoningLevels,
+                       ["minimal", "low", "medium", "high", "xhigh", "max"])
+        XCTAssertEqual(BrandMark.forHarness("amp"), .amp)
+    }
+
+    func testAntigravityFallbackLabelsAndMark() {
+        XCTAssertEqual(HarnessCatalog.label(for: "antigravity"), "Antigravity")
+        let models = HarnessCatalog.models(for: "antigravity")
+        XCTAssertEqual(models.first?.id, "gemini-3.8-flash-high")
+        XCTAssertEqual(models.first?.reasoningLevels, ["low", "medium", "high"])
+        XCTAssertEqual(BrandMark.forHarness("antigravity"), .antigravity)
+    }
+
+    func testWorkingFlavourLeadsWithCosmosing() {
+        XCTAssertEqual(Motion.flavourWords.first, "Cosmosing")
+    }
 }

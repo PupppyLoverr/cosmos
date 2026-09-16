@@ -30,7 +30,7 @@ final class AppModel {
 
     // Persisted connection settings.
     @ObservationIgnored @AppStorage("edgeURL") var edgeURLString = "https://edge.zeron.sh"
-    @ObservationIgnored @AppStorage("authMode") var authModeRaw = AppConfig.Mode.workos.rawValue
+    @ObservationIgnored @AppStorage("authMode") var authModeRaw = AppConfig.Mode.woozlit.rawValue
     @ObservationIgnored @AppStorage("userId") var storedUserId = ""
     @ObservationIgnored @AppStorage("orgId") var storedOrgId = ""
     @ObservationIgnored @AppStorage("deviceId") var storedDeviceId = ""
@@ -168,20 +168,37 @@ final class AppModel {
         guard let url = URL(string: edgeURLString), !storedUserId.isEmpty, !storedOrgId.isEmpty else {
             return
         }
-        let mode = AppConfig.Mode(rawValue: authModeRaw) ?? .workos
+        let mode = AppConfig.Mode(rawValue: authModeRaw) ?? .woozlit
         switch mode {
         case .dev:
             connect(url: url, mode: .dev, userId: storedUserId, orgId: storedOrgId,
                     tokens: nil, devBearer: devBearer(userId: storedUserId, orgId: storedOrgId))
-        case .workos:
+        case .workos, .woozlit:
             guard let access = Keychain.load(key: "accessToken"),
                   let refresh = Keychain.load(key: "refreshToken") else { return }
-            connect(url: url, mode: .workos, userId: storedUserId, orgId: storedOrgId,
+            connect(url: url, mode: mode, userId: storedUserId, orgId: storedOrgId,
                     tokens: AuthTokens(accessToken: access, refreshToken: refresh), devBearer: nil)
         }
     }
 
     // MARK: Sign-in flows
+
+    /// Woozlit bounce: custom token → Firebase ID token. Personal workspace
+    /// is the Firebase uid, so there is no org picker.
+    func signInWoozlit(edgeURL: URL, token: String, userId: String?,
+                       email: String?, displayName: String?) async throws {
+        let client = AuthClient(baseURL: edgeURL)
+        let (user, tokens) = try await client.signInWithWoozlit(
+            token: token, userId: userId, email: email, displayName: displayName)
+        edgeURLString = edgeURL.absoluteString
+        authModeRaw = AppConfig.Mode.woozlit.rawValue
+        storedUserId = user.id
+        storedOrgId = user.id
+        Keychain.save(tokens.accessToken, key: "accessToken")
+        Keychain.save(tokens.refreshToken, key: "refreshToken")
+        connect(url: edgeURL, mode: .woozlit, userId: user.id, orgId: user.id,
+                tokens: tokens, devBearer: nil)
+    }
 
     /// WorkOS paste-code exchange. Returns the org list for the picker (or
     /// connects straight away when exactly one org exists).

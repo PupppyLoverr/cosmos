@@ -1,4 +1,4 @@
-// Zeron for iOS — a viewport onto the zeron mesh. The phone is a peer
+// Cosmos for iOS — a viewport onto the Cosmos mesh. The phone is a peer
 // device: it joins the workspace and session doc rooms and drives remote
 // engines through the durable command queue.
 

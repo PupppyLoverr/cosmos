@@ -26,8 +26,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use zeron_proto::{
-    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
-    UserInputQuestion, capabilities,
+    ChatConfig, FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand,
+    UserInputAnswer, UserInputQuestion, capabilities,
 };
 use zeron_rpc::{RpcError, methods};
 
@@ -103,6 +103,10 @@ const INPUT_FADE_BAND: f32 = 12.0;
 pub const AUTO_ADVANCE_MS: u64 = 220;
 /// Drag-selection autoscroll runs at the display-friendly 60fps cadence.
 pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
+
+/// The zeron-local `/resume` slash command — accepting it opens the
+/// agent→session picker instead of sending text to the agent.
+const RESUME_COMMAND: &str = "resume";
 
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
 /// only collapses when the text is comfortably narrower than the compact
@@ -868,6 +872,19 @@ const MENTION_SIDE_PAD: &str = "\u{00A0}";
 /// A private URI scheme keeps file mentions distinguishable from ordinary
 /// Markdown links pasted into the composer.
 const FILE_MENTION_SCHEME: &str = "zeron-file:";
+/// Same trick for `@chat` mentions: `[Title](zeron-chat:<chatId>)` — the
+/// target chat's transcript tail is folded into the outgoing prompt.
+const CHAT_MENTION_SCHEME: &str = "zeron-chat:";
+/// Total cap on injected `@chat` transcript digests across every mention in
+/// one prompt — keeps a multi-mention send from ballooning the request.
+const CHAT_CONTEXT_MAX: usize = 6000;
+
+/// What a mention chip points at — a workspace path or a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MentionLinkKind {
+    File,
+    Chat,
+}
 
 /// A restorable point in the input's history: text plus where the caret and
 /// selection sat when the edit landed.
@@ -885,8 +902,10 @@ struct EditSnapshot {
 struct FileMentionLink {
     range: Range<usize>,
     basename: String,
+    /// File path, or the chat id for `kind == Chat`.
     path: String,
     is_dir: bool,
+    kind: MentionLinkKind,
 }
 
 fn percent_encode_path(path: &str) -> String {
@@ -924,6 +943,43 @@ fn escape_mention_label(label: &str) -> String {
         .replace('\\', "\\\\")
         .replace('[', "\\[")
         .replace(']', "\\]")
+}
+
+/// Inverse of [`escape_mention_label`] — a chat link's label is free text
+/// (the conversation title), not a basename echo, so it unescapes back.
+fn unescape_mention_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut escaped = false;
+    for ch in label.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Chat ids are uuids — a permissive check keeps pasted junk from becoming
+/// a chip (control chars, whitespace and separators are all out).
+fn chat_mention_id_is_safe(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn local_chat_link(chat_id: &str, title: &str) -> String {
+    format!(
+        "[{}]({}{})",
+        escape_mention_label(title),
+        CHAT_MENTION_SCHEME,
+        percent_encode_path(chat_id)
+    )
 }
 
 fn local_file_link(path: &str, is_dir: bool) -> String {
@@ -1021,28 +1077,44 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
         };
         let end = target_start + relative_end + 1;
         let label = &text[start + 1..label_end];
-        let Some(encoded) = text[target_start..end - 1].strip_prefix(FILE_MENTION_SCHEME) else {
+        let target_str = &text[target_start..end - 1];
+        let (encoded, kind) = if let Some(e) = target_str.strip_prefix(FILE_MENTION_SCHEME) {
+            (e, MentionLinkKind::File)
+        } else if let Some(e) = target_str.strip_prefix(CHAT_MENTION_SCHEME) {
+            (e, MentionLinkKind::Chat)
+        } else {
             search = end;
             continue;
         };
-        let parsed = percent_decode_path(encoded).and_then(|target| {
-            let is_dir = target.ends_with('/');
-            let path = target.strip_suffix('/').unwrap_or(&target);
-            (local_path_is_safe(path)
-                && percent_encode_path(&target) == encoded
-                && path
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|basename| escape_mention_label(basename) == label))
-            .then(|| (path.to_string(), is_dir))
+        let parsed = percent_decode_path(encoded).and_then(|target| match kind {
+            MentionLinkKind::File => {
+                let is_dir = target.ends_with('/');
+                let path = target.strip_suffix('/').unwrap_or(&target);
+                (local_path_is_safe(path)
+                    && percent_encode_path(&target) == encoded
+                    && path
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|basename| escape_mention_label(basename) == label))
+                .then(|| {
+                    (
+                        path.to_string(),
+                        is_dir,
+                        path.rsplit('/').next().unwrap_or_default().to_string(),
+                    )
+                })
+            }
+            MentionLinkKind::Chat => (chat_mention_id_is_safe(&target)
+                && percent_encode_path(&target) == encoded)
+            .then(|| (target, false, unescape_mention_label(label))),
         });
-        if let Some((path, is_dir)) = parsed {
-            let basename = path.rsplit('/').next().unwrap_or_default().to_string();
+        if let Some((path, is_dir, basename)) = parsed {
             links.push(FileMentionLink {
                 range: start..end,
                 basename,
                 path,
                 is_dir,
+                kind,
             });
         }
         search = end;
@@ -1314,7 +1386,7 @@ pub struct SentMentionSpan {
 /// substring probe keeps ordinary prompts on the zero-allocation path, so this
 /// is safe to call for every user row.
 pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)> {
-    if !raw.contains(FILE_MENTION_SCHEME) {
+    if !raw.contains(FILE_MENTION_SCHEME) && !raw.contains(CHAT_MENTION_SCHEME) {
         return None;
     }
     let projection = TextProjection::new(raw);
@@ -1326,11 +1398,15 @@ pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)>
         .iter()
         .map(|(link, display)| SentMentionSpan {
             range: display.clone(),
-            path: SharedString::from(format!(
-                "{}{}",
-                link.path,
-                if link.is_dir { "/" } else { "" }
-            )),
+            path: SharedString::from(match link.kind {
+                MentionLinkKind::File => format!(
+                    "{}{}",
+                    link.path,
+                    if link.is_dir { "/" } else { "" }
+                ),
+                // The tooltip reads the conversation title, not its id.
+                MentionLinkKind::Chat => link.basename.clone(),
+            }),
             is_dir: link.is_dir,
         })
         .collect();
@@ -1896,6 +1972,42 @@ impl ComposerInput {
             path
         } else {
             format!("{path} ")
+        };
+        self.record_edit(&range, &inserted);
+        self.content =
+            self.content[..range.start].to_owned() + &inserted + &self.content[range.end..];
+        self.refresh_projection();
+        let cursor =
+            range.start + inserted.len() + existing_separator.map(char::len_utf8).unwrap_or(0);
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        self.follow_cursor = true;
+        self.reset_blink();
+        self.needs_measure = true;
+        cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
+    }
+
+    /// Replace the `@token` with a chat mention chip (`[Title](zeron-chat:id)`)
+    /// — same edit shape as [`Self::replace_mention`], different link target.
+    pub fn replace_chat_mention(
+        &mut self,
+        range: Range<usize>,
+        chat_id: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only {
+            return;
+        }
+        self.invalidate_mention_tooltip();
+        let link = local_chat_link(chat_id, title);
+        let next = self.content[range.end..].chars().next();
+        let existing_separator = next.filter(|ch| ch.is_whitespace() && *ch != '\n' && *ch != '\r');
+        let inserted = if existing_separator.is_some() {
+            link
+        } else {
+            format!("{link} ")
         };
         self.record_edit(&range, &inserted);
         self.content =
@@ -3941,10 +4053,41 @@ struct SlashState {
     dismissed: Option<(Range<usize>, String)>,
 }
 
+/// `/resume` flow: pick an agent, then one of its past sessions — the pick
+/// imports whatever transcript the session store exposes and binds the chat
+/// so the next send loads THAT native conversation. Two stages: `harness ==
+/// None` lists the offered agents; `Some` lists its sessions.
+#[derive(Debug, Clone, Default)]
+struct ResumeState {
+    open: bool,
+    harness: Option<HarnessId>,
+    sessions: Vec<zeron_proto::HarnessSession>,
+    active: Option<usize>,
+    request: u64,
+    loading: bool,
+    error: Option<SharedString>,
+    /// A session was picked; the ResumeSession call is in flight.
+    attaching: bool,
+}
+
+/// What the `@` popup is listing: the two top-level categories (bare `@`),
+/// workspace files (the existing search — also what a non-empty query shows
+/// straight from the category stage), or the app's conversations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum MentionMode {
+    #[default]
+    Categories,
+    Files,
+    Chats,
+}
+
 #[derive(Debug, Clone, Default)]
 struct FileMentionState {
     token: Option<MentionToken>,
+    mode: MentionMode,
     results: Vec<FileSearchMatch>,
+    /// `Chats` mode rows — `visible_chats` filtered by the token query.
+    chat_results: Vec<zeron_proto::Chat>,
     active: Option<usize>,
     request: u64,
     loading: bool,
@@ -3992,6 +4135,16 @@ fn slash_error_message(err: &RpcError) -> SharedString {
 pub struct Composer {
     pub(crate) state: Entity<AppState>,
     pub(crate) input: Entity<ComposerInput>,
+    /// When set, this composer is bound to that chat (the side-chat surface):
+    /// every "selected chat" read — send target, drafts key, queue edits,
+    /// indicators — resolves to it instead of the shell's selection, so the
+    /// surface is independent of main-pane navigation.
+    target_chat: Option<String>,
+    /// A context preamble prepended to the FIRST prompt this composer sends
+    /// (the side chat's seed digest — the source conversation's tail so the
+    /// fresh session starts with its context). Not rendered in the echo;
+    /// consumed once.
+    pending_context: Option<String>,
     /// Draft displaced while a queued message occupies the composer.
     pub(crate) queue_edit_draft: Option<(String, Vec<StagedAttachment>, Vec<CapturedAppshot>)>,
     /// Composer actions row plus the new-session floating target tab
@@ -4027,6 +4180,11 @@ pub struct Composer {
     /// Slash-popup row scroll — the stack overflows into a wheel/keyboard-
     /// scrollable list once it outgrows the card.
     slash_scroll: gpui::ScrollHandle,
+    /// The `/resume` agent→session picker (opens above the pill like the
+    /// slash popup).
+    resume: ResumeState,
+    resume_task: Option<Task<()>>,
+    resume_scroll: gpui::ScrollHandle,
     /// File-mention popup row scroll (same treatment).
     mention_scroll: gpui::ScrollHandle,
     /// Shared scrollbar hover/drag state for both popups' floating rails —
@@ -4215,29 +4373,42 @@ impl Composer {
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
             ComposerInputEvent::ModifiedSubmitted => this.on_modified_submit(cx),
-            ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
+            // A real text edit dismisses the /resume picker (it's a picker,
+            // not a completion); cursor moves and focus shifts leave it.
+            ComposerInputEvent::Edited => {
+                if this.resume.open {
+                    this.dismiss_resume(cx);
+                }
                 this.on_input_edited(cx)
             }
+            ComposerInputEvent::CursorMoved => this.on_input_edited(cx),
             ComposerInputEvent::ViewportChanged => cx.notify(),
-            // The slash popup and the mention popup share the input's
-            // completion key routing; they are mutually exclusive by token
-            // shape (`/` at offset 0 vs `@` at a token boundary).
+            // The resume picker, slash popup and mention popup share the
+            // input's completion key routing; they are mutually exclusive by
+            // token shape (`/` at offset 0 vs `@` at a token boundary — and
+            // the picker isn't token-driven at all).
             ComposerInputEvent::MentionNavigate(delta) => {
-                if this.slash.token.is_some() {
+                if this.resume.open {
+                    this.move_resume(*delta, cx)
+                } else if this.slash.token.is_some() {
                     this.move_slash(*delta, cx)
                 } else {
                     this.move_mention(*delta, cx)
                 }
             }
             ComposerInputEvent::MentionAccept => {
-                if this.slash.token.is_some() {
+                if this.resume.open {
+                    this.accept_resume(cx)
+                } else if this.slash.token.is_some() {
                     this.accept_slash(cx)
                 } else {
                     this.accept_mention(cx)
                 }
             }
             ComposerInputEvent::MentionDismiss => {
-                if this.slash.token.is_some() {
+                if this.resume.open {
+                    this.dismiss_resume(cx)
+                } else if this.slash.token.is_some() {
                     this.dismiss_slash(cx)
                 } else {
                     this.dismiss_mention(cx)
@@ -4253,9 +4424,123 @@ impl Composer {
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
+        Self::build(state, input, pickers, observe, pickers_observe, picker_focus, input_events, current_key, None, cx)
+    }
+
+    /// A composer bound to a specific chat (the side-chat surface) — same
+    /// entity, same machinery, but the send target and all chat-keyed state
+    /// resolve to `chat_id` instead of the shell's selection.
+    pub fn new_for_chat(
+        state: Entity<AppState>,
+        chat_id: String,
+        context_seed: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.on_release(|this, cx| this.release_queue_previews(cx))
+            .detach();
+        let input = cx.new(|cx| {
+            let mut input =
+                ComposerInput::with_context("Do anything…", MESSAGE_COMPOSER_CONTEXT, cx);
+            input.enable_mentions();
+            input
+        });
+        let pickers = cx.new(|cx| {
+            let mut pickers = Pickers::new(state.clone(), cx);
+            pickers.set_chat_override(chat_id.clone(), cx);
+            pickers
+        });
+        let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        let picker_focus = cx.subscribe(
+            &pickers,
+            |this: &mut Self, _, _: &crate::pickers::ReturnComposerFocus, cx| {
+                this.focus_pending = true;
+                cx.notify();
+            },
+        );
+        let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
+        let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
+            ComposerInputEvent::Submitted => this.on_submit(cx),
+            ComposerInputEvent::ModifiedSubmitted => this.on_modified_submit(cx),
+            // A real text edit dismisses the /resume picker (it's a picker,
+            // not a completion); cursor moves and focus shifts leave it.
+            ComposerInputEvent::Edited => {
+                if this.resume.open {
+                    this.dismiss_resume(cx);
+                }
+                this.on_input_edited(cx)
+            }
+            ComposerInputEvent::CursorMoved => this.on_input_edited(cx),
+            ComposerInputEvent::ViewportChanged => cx.notify(),
+            ComposerInputEvent::MentionNavigate(delta) => {
+                if this.resume.open {
+                    this.move_resume(*delta, cx)
+                } else if this.slash.token.is_some() {
+                    this.move_slash(*delta, cx)
+                } else {
+                    this.move_mention(*delta, cx)
+                }
+            }
+            ComposerInputEvent::MentionAccept => {
+                if this.resume.open {
+                    this.accept_resume(cx)
+                } else if this.slash.token.is_some() {
+                    this.accept_slash(cx)
+                } else {
+                    this.accept_mention(cx)
+                }
+            }
+            ComposerInputEvent::MentionDismiss => {
+                if this.resume.open {
+                    this.dismiss_resume(cx)
+                } else if this.slash.token.is_some() {
+                    this.dismiss_slash(cx)
+                } else {
+                    this.dismiss_mention(cx)
+                }
+            }
+            ComposerInputEvent::PastedImages(images) => {
+                let staged = images
+                    .iter()
+                    .map(|image| attachments::stage_clipboard_image(image.clone()))
+                    .collect();
+                this.add_staged(staged, cx);
+            }
+            ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
+        });
+        let mut composer = Self::build(
+            state,
+            input,
+            pickers,
+            observe,
+            pickers_observe,
+            picker_focus,
+            input_events,
+            chat_id.clone(),
+            Some(chat_id),
+            cx,
+        );
+        composer.pending_context = context_seed;
+        composer
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        state: Entity<AppState>,
+        input: Entity<ComposerInput>,
+        pickers: Entity<Pickers>,
+        observe: Subscription,
+        pickers_observe: Subscription,
+        picker_focus: Subscription,
+        input_events: Subscription,
+        current_key: String,
+        target_chat: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut composer = Self {
             state,
             input,
+            target_chat,
+            pending_context: None,
             queue_edit_draft: None,
             pickers,
             drafts: HashMap::new(),
@@ -4272,6 +4557,9 @@ impl Composer {
             slash: SlashState::default(),
             slash_cache: HashMap::new(),
             slash_scroll: gpui::ScrollHandle::new(),
+            resume: ResumeState::default(),
+            resume_task: None,
+            resume_scroll: gpui::ScrollHandle::new(),
             mention_scroll: gpui::ScrollHandle::new(),
             popup_bar: crate::popover::MenuScrollbarState::default(),
             current_key,
@@ -4369,6 +4657,22 @@ impl Composer {
     pub fn debug_open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pickers
             .update(cx, |pickers, cx| pickers.open_model_menu(window, cx));
+    }
+
+    /// The chat this composer drives: its bound side-chat target when set,
+    /// else the shell's selected conversation. EVERY chat-keyed read in the
+    /// send path goes through here so a bound composer is independent of
+    /// main-pane navigation.
+    fn target_chat_id(&self, state: &AppState) -> Option<String> {
+        self.target_chat.clone().or_else(|| state.selected_chat.clone())
+    }
+
+    /// The bound/selected chat's workspace row.
+    fn target_chat_row<'a>(&self, state: &'a AppState) -> Option<&'a zeron_proto::Chat> {
+        match self.target_chat.as_deref() {
+            Some(id) => state.chat_row(id),
+            None => state.selected_chat_row(),
+        }
     }
 
     pub fn is_sending(&self) -> bool {
@@ -4995,8 +5299,11 @@ impl Composer {
     }
 
     fn sync_mention_controls(&mut self, cx: &mut Context<Self>) {
-        let open = self.mention.token.is_some() || self.slash.token.is_some();
-        let has_selection = if self.slash.token.is_some() {
+        let open =
+            self.mention.token.is_some() || self.slash.token.is_some() || self.resume.open;
+        let has_selection = if self.resume.open {
+            self.resume.active.is_some()
+        } else if self.slash.token.is_some() {
             self.slash.active.is_some()
         } else {
             self.mention.active.is_some()
@@ -5035,7 +5342,15 @@ impl Composer {
             (input.text().to_string(), input.cursor_offset())
         };
         self.update_slash(&text, cursor, cx);
-        let token = mention_token(&text, cursor);
+        self.update_mention(&text, cursor, cx);
+    }
+
+    /// Track the `@` token: open/refresh the popup per edit. Mode decides the
+    /// source — `Chats` filters the workspace locally (no RPC), a bare `@`
+    /// opens on the two categories without walking the workspace, and
+    /// `Files`/a non-empty query run the debounced `SearchFiles` call.
+    fn update_mention(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
+        let token = mention_token(text, cursor);
         let still_dismissed = token.as_ref().is_some_and(|token| {
             self.mention
                 .dismissed
@@ -5066,6 +5381,9 @@ impl Composer {
         self.mention.token = token.clone();
         if !refining {
             self.mention.results.clear();
+            self.mention.chat_results.clear();
+            // A fresh `@` always opens on the category stage.
+            self.mention.mode = MentionMode::Categories;
             self.mention.active = None;
             // Fresh open: the row stack restarts at the top.
             reset_scroll_offset(&self.mention_scroll);
@@ -5075,6 +5393,37 @@ impl Composer {
         self.sync_mention_controls(cx);
         let Some(token) = token else {
             cx.notify();
+            return;
+        };
+        match self.mention.mode {
+            // Local filter — no fetch.
+            MentionMode::Chats => {
+                self.mention.loading = false;
+                self.refilter_mention_chats(cx);
+                self.sync_mention_controls(cx);
+                cx.notify();
+                return;
+            }
+            // Bare `@`: the two categories, no workspace walk yet. A query
+            // falls through to the file search — typing `@foo` keeps the
+            // straight-to-files behavior it always had.
+            MentionMode::Categories if token.query.is_empty() => {
+                self.mention.loading = false;
+                self.mention.active = Some(0);
+                self.sync_mention_controls(cx);
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
+        self.run_file_search(cx);
+    }
+
+    /// The debounced `SearchFiles` fetch behind `Files` mode (and the
+    /// `Categories`-with-query fast path). Reads the live token's query —
+    /// `self.mention.token` must already hold it.
+    fn run_file_search(&mut self, cx: &mut Context<Self>) {
+        let Some(token) = self.mention.token.clone() else {
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -5090,7 +5439,7 @@ impl Composer {
             let state = self.state.read(cx);
             let mut params = serde_json::Map::new();
             params.insert("query".into(), token.query.clone().into());
-            let target = if let Some(chat) = state.selected_chat_row() {
+            let target = if let Some(chat) = self.target_chat_row(&state) {
                 params.insert("chatId".into(), chat.id.clone().into());
                 Some(chat.device_id.clone())
             } else if let Some(space) = state.selected_space_row() {
@@ -5164,9 +5513,86 @@ impl Composer {
         cx.notify();
     }
 
+    /// Rows under the cursor in `Chats` mode: every visible conversation,
+    /// newest-first, fuzzy-filtered by the token query. Local — no fetch.
+    fn refilter_mention_chats(&mut self, cx: &mut Context<Self>) {
+        let query = self
+            .mention
+            .token
+            .as_ref()
+            .map(|t| t.query.clone())
+            .unwrap_or_default();
+        let mut chats: Vec<zeron_proto::Chat> =
+            self.state.read(cx).visible_chats().cloned().collect();
+        chats.sort_by(|a, b| {
+            (b.last_message_at.unwrap_or(b.created_at))
+                .cmp(&a.last_message_at.unwrap_or(a.created_at))
+        });
+        if !query.is_empty() {
+            let titles: Vec<&str> = chats
+                .iter()
+                .map(|c| c.title.as_deref().filter(|t| !t.trim().is_empty()).unwrap_or("Untitled"))
+                .collect();
+            let indices = crate::popover::filter_indices(&query, &titles);
+            chats = indices.into_iter().map(|ix| chats[ix].clone()).collect();
+        }
+        self.mention.active = (!chats.is_empty()).then_some(0);
+        self.mention.chat_results = chats;
+        reset_scroll_offset(&self.mention_scroll);
+    }
+
+    /// A category row picked from a bare `@`: `Files` kicks the workspace
+    /// search under the current query; `Chats` filters locally.
+    fn mention_pick_mode(&mut self, mode: MentionMode, cx: &mut Context<Self>) {
+        self.mention.mode = mode;
+        match mode {
+            MentionMode::Chats => {
+                self.mention.loading = false;
+                self.refilter_mention_chats(cx);
+            }
+            MentionMode::Files => {
+                // Categories never fetched on a bare `@` — run the search
+                // now (possibly an empty query = the cwd listing). Bump the
+                // request so a stale in-flight response can't land over it.
+                self.mention.request = self.mention.request.wrapping_add(1);
+                self.mention.loading = true;
+                self.mention.error = None;
+                self.mention.results.clear();
+                self.mention.active = None;
+                reset_scroll_offset(&self.mention_scroll);
+                self.run_file_search(cx);
+            }
+            MentionMode::Categories => {}
+        }
+        self.sync_mention_controls(cx);
+        cx.notify();
+    }
+
+    /// Rows the active popup lists right now — category rows on a bare `@`,
+    /// search results under `Files` (and under `Categories` once a query
+    /// exists), the filtered chat list under `Chats`.
+    fn mention_rows_len(&self) -> usize {
+        match self.mention.mode {
+            MentionMode::Chats => self.mention.chat_results.len(),
+            MentionMode::Files => self.mention.results.len(),
+            MentionMode::Categories => {
+                if self
+                    .mention
+                    .token
+                    .as_ref()
+                    .is_some_and(|t| t.query.is_empty())
+                {
+                    2
+                } else {
+                    self.mention.results.len()
+                }
+            }
+        }
+    }
+
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.mention.active =
-            crate::popover::menu_step(self.mention.active, self.mention.results.len(), delta);
+            crate::popover::menu_step(self.mention.active, self.mention_rows_len(), delta);
         if let Some(active) = self.mention.active {
             // Keep the keyboard cursor visible in the scrolled row stack.
             self.mention_scroll.scroll_to_item(active);
@@ -5191,19 +5617,52 @@ impl Composer {
         let Some(token) = self.mention.token.clone() else {
             return;
         };
-        let Some((path, is_dir)) = self
-            .mention
-            .active
-            .and_then(|active| self.mention.results.get(active))
-            .map(|result| (result.path.clone(), result.is_dir))
-        else {
-            return;
-        };
-        self.input.update(cx, |input, cx| {
-            input.replace_mention(token.range, &path, is_dir, cx)
-        });
-        self.reset_mention(None, cx);
-        cx.notify();
+        match self.mention.mode {
+            // Bare `@` category row — drill into the picked source.
+            MentionMode::Categories if token.query.is_empty() => {
+                let mode = match self.mention.active.unwrap_or(0) {
+                    1 => MentionMode::Chats,
+                    _ => MentionMode::Files,
+                };
+                self.mention_pick_mode(mode, cx);
+            }
+            MentionMode::Chats => {
+                let Some(chat) = self
+                    .mention
+                    .active
+                    .and_then(|active| self.mention.chat_results.get(active))
+                    .cloned()
+                else {
+                    return;
+                };
+                let title = chat
+                    .title
+                    .as_deref()
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or("Untitled")
+                    .to_string();
+                self.input.update(cx, |input, cx| {
+                    input.replace_chat_mention(token.range, &chat.id, &title, cx)
+                });
+                self.reset_mention(None, cx);
+                cx.notify();
+            }
+            _ => {
+                let Some((path, is_dir)) = self
+                    .mention
+                    .active
+                    .and_then(|active| self.mention.results.get(active))
+                    .map(|result| (result.path.clone(), result.is_dir))
+                else {
+                    return;
+                };
+                self.input.update(cx, |input, cx| {
+                    input.replace_mention(token.range, &path, is_dir, cx)
+                });
+                self.reset_mention(None, cx);
+                cx.notify();
+            }
+        }
     }
 
     fn render_file_mention_popup(
@@ -5212,6 +5671,8 @@ impl Composer {
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let token = self.mention.token.as_ref()?;
+        let categories_open =
+            self.mention.mode == MentionMode::Categories && token.query.is_empty();
         let mut card = crate::popover::popover_card(theme)
             .w_full()
             .max_h(px(320.0))
@@ -5228,7 +5689,137 @@ impl Composer {
             // dragged, including when the pointer has left the popup.
             .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
-        if self.mention.loading && self.mention.results.is_empty() {
+        if categories_open {
+            let categories = [
+                ("Files and folders", "Browse this folder's files", MentionMode::Files),
+                ("Chats", "Reference another conversation", MentionMode::Chats),
+            ];
+            let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(categories.len());
+            for (ix, (title, hint, mode)) in categories.iter().enumerate() {
+                let selected = self.mention.active == Some(ix);
+                let mode = *mode;
+                rows.push(
+                    crate::popover::menu_row(theme, selected, format!("mention-category-{ix}"))
+                        .id(("mention-category", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.mention.active = Some(ix);
+                            this.mention_pick_mode(mode, cx);
+                        }))
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(13.0))
+                                        .text_color(theme.text)
+                                        .child(*title),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .truncate()
+                                        .text_size(px(12.5))
+                                        .text_color(theme.text_muted)
+                                        .child(*hint),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+            }
+            card = card.child(div().id("mention-categories").flex().flex_col().children(rows));
+        } else if self.mention.mode == MentionMode::Chats {
+            if self.mention.chat_results.is_empty() {
+                card = card.child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(10.0))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted)
+                        .child("No matching chats"),
+                );
+            } else {
+                let mut rows: Vec<gpui::AnyElement> =
+                    Vec::with_capacity(self.mention.chat_results.len());
+                for (ix, chat) in self.mention.chat_results.iter().enumerate() {
+                    let selected = self.mention.active == Some(ix);
+                    let title = chat
+                        .title
+                        .as_deref()
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or("Untitled")
+                        .to_string();
+                    let cwd = chat.cwd.clone();
+                    rows.push(
+                        crate::popover::menu_row(theme, selected, format!("chat-mention-{ix}"))
+                            .id(("chat-mention", ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.mention.active = Some(ix);
+                                this.accept_mention(cx);
+                            }))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_none()
+                                            .overflow_hidden()
+                                            .truncate()
+                                            .text_size(px(13.0))
+                                            .text_color(theme.text)
+                                            .child(title),
+                                    )
+                                    .when_some(cwd.filter(|c| !c.is_empty()), |row, cwd| {
+                                        row.child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .truncate()
+                                                .text_size(px(12.5))
+                                                .text_color(theme.text_muted)
+                                                .child(cwd),
+                                        )
+                                    }),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                card = card.child(
+                    div()
+                        .id("mention-scroll-host")
+                        .relative()
+                        .on_hover(cx.listener(Self::on_popup_list_hover))
+                        .child(
+                            div()
+                                .id("mention-list")
+                                .max_h(px(312.0))
+                                .flex()
+                                .flex_col()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.mention_scroll)
+                                .children(rows),
+                        )
+                        .children(self.popup_scrollbar(
+                            "mention-scrollbar",
+                            &self.mention_scroll,
+                            theme,
+                            cx,
+                        )),
+                );
+            }
+        } else if self.mention.loading && self.mention.results.is_empty() {
             card = card.child(crate::popover::skeleton_rows(
                 "file-mention-loading",
                 theme,
@@ -5407,8 +5998,7 @@ impl Composer {
         };
         let target = {
             let state = self.state.read(cx);
-            state
-                .selected_chat_row()
+            self.target_chat_row(&state)
                 .map(|chat| chat.device_id.clone())
                 .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
         };
@@ -5443,6 +6033,25 @@ impl Composer {
         cx.notify();
     }
 
+    /// The effective slash list: zeron-local builtins first (currently just
+    /// `/resume`), then the harness's advertised commands. `filtered` and
+    /// the popup rows index into THIS merged list.
+    fn slash_commands(&self) -> Vec<SlashCommand> {
+        let mut commands = vec![SlashCommand {
+            name: RESUME_COMMAND.into(),
+            description: "Resume a past agent session in this chat".into(),
+            input_hint: None,
+        }];
+        if let Some(cached) = self
+            .slash
+            .harness
+            .and_then(|h| self.slash_cache.get(&h))
+        {
+            commands.extend(cached.iter().cloned());
+        }
+        commands
+    }
+
     /// Re-rank the cached list for the current query (pure local filter).
     fn refilter_slash(&mut self, cx: &mut Context<Self>) {
         let query = self
@@ -5451,12 +6060,7 @@ impl Composer {
             .as_ref()
             .map(|t| t.query.clone())
             .unwrap_or_default();
-        let commands = self
-            .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+        let commands = self.slash_commands();
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
         self.slash.filtered = crate::popover::filter_indices(&query, &names);
         self.slash.active = (!self.slash.filtered.is_empty()).then_some(0);
@@ -5497,16 +6101,20 @@ impl Composer {
             .slash
             .active
             .and_then(|active| self.slash.filtered.get(active))
-            .and_then(|&ix| {
-                self.slash
-                    .harness
-                    .and_then(|h| self.slash_cache.get(&h))
-                    .and_then(|c| c.get(ix))
-            })
-            .cloned()
+            .and_then(|&ix| self.slash_commands().into_iter().nth(ix))
         else {
             return;
         };
+        if command.name == RESUME_COMMAND {
+            // Zeron-local command: consume the token and open the session
+            // picker — nothing is sent to the agent.
+            self.input.update(cx, |input, cx| {
+                input.replace_plain_token(token.range, "", cx)
+            });
+            self.reset_slash(None, cx);
+            self.open_resume(cx);
+            return;
+        }
         self.input.update(cx, |input, cx| {
             input.replace_plain_token(token.range, &format!("/{}", command.name), cx)
         });
@@ -5527,6 +6135,270 @@ impl Composer {
         self.sync_mention_controls(cx);
     }
 
+    // ---- /resume ------------------------------------------------------------
+
+    /// Open the agent→session picker. The harness catalog rides the pickers'
+    /// fetch (kicked here in case the model picker never opened); sessions
+    /// land via `ListSessions` once an agent is picked.
+    fn open_resume(&mut self, cx: &mut Context<Self>) {
+        self.pickers
+            .update(cx, |pickers, cx| pickers.ensure_harness_list(cx));
+        self.resume = ResumeState {
+            open: true,
+            ..ResumeState::default()
+        };
+        self.sync_mention_controls(cx);
+        cx.notify();
+    }
+
+    /// Agent stage row picked: fetch that harness's session index.
+    fn resume_pick_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        self.resume.harness = Some(harness);
+        self.resume.sessions.clear();
+        self.resume.active = None;
+        self.resume.error = None;
+        self.resume.loading = true;
+        self.resume.request = self.resume.request.wrapping_add(1);
+        let request = self.resume.request;
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.resume.loading = false;
+            self.resume.error = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        self.resume_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::LIST_SESSIONS,
+                    serde_json::json!({ "harness": harness }),
+                )
+                .await;
+            this.update(cx, |composer, cx| {
+                if composer.resume.request != request {
+                    return;
+                }
+                composer.resume.loading = false;
+                match result {
+                    Ok(value) => {
+                        match serde_json::from_value::<Vec<zeron_proto::HarnessSession>>(value) {
+                            Ok(mut sessions) => {
+                                sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                                composer.resume.active =
+                                    (!sessions.is_empty()).then_some(0);
+                                composer.resume.sessions = sessions;
+                            }
+                            Err(err) => {
+                                tracing::warn!(%err, "session list decode failed");
+                                composer.resume.error = Some("Session list failed".into());
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        composer.resume.error = Some(match err {
+                            RpcError::UnknownMethod(_) => {
+                                "The session's device runs an older zeron — update it to list sessions".into()
+                            }
+                            _ => "Session list failed".into(),
+                        });
+                    }
+                }
+                reset_scroll_offset(&composer.resume_scroll);
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Back to the agent stage (sessions-stage header row / leftwards nav).
+    fn resume_back(&mut self, cx: &mut Context<Self>) {
+        if self.resume.harness.take().is_some() {
+            self.resume.sessions.clear();
+            self.resume.active = Some(0);
+            self.resume.error = None;
+            self.resume.request = self.resume.request.wrapping_add(1);
+            reset_scroll_offset(&self.resume_scroll);
+            cx.notify();
+        }
+    }
+
+    fn move_resume(&mut self, delta: isize, cx: &mut Context<Self>) {
+        // The sessions stage's row 0 is the back header — nav starts after it.
+        let rows = self.resume_rows_len(cx);
+        self.resume.active = crate::popover::menu_step(self.resume.active, rows, delta);
+        if let Some(active) = self.resume.active {
+            self.resume_scroll.scroll_to_item(active);
+        }
+        cx.notify();
+    }
+
+    /// Total rows in the current stage — harness stage lists the offered
+    /// agents, sessions stage carries a back-header row above the sessions.
+    fn resume_rows_len(&self, cx: &App) -> usize {
+        match self.resume.harness {
+            None => crate::pickers::offered_harnesses(
+                self.pickers.read(cx).harness_list().unwrap_or_default(),
+            )
+            .len(),
+            Some(_) => self.resume.sessions.len() + 1,
+        }
+    }
+
+    fn dismiss_resume(&mut self, cx: &mut Context<Self>) {
+        self.resume_task = None;
+        self.resume.request = self.resume.request.wrapping_add(1);
+        self.resume.open = false;
+        self.sync_mention_controls(cx);
+        cx.notify();
+    }
+
+    /// Enter/click on the highlighted resume row: harness stage picks the
+    /// agent; sessions stage's row 0 goes back, the rest attach the session.
+    fn accept_resume(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.resume.active else {
+            return;
+        };
+        if self.resume.harness.is_none() {
+            let harness = crate::pickers::offered_harnesses(
+                self.pickers.read(cx).harness_list().unwrap_or_default(),
+            )
+            .get(active)
+            .map(|d| d.id);
+            if let Some(harness) = harness {
+                self.resume_pick_harness(harness, cx);
+            }
+            return;
+        }
+        if active == 0 {
+            self.resume_back(cx);
+            return;
+        }
+        let Some(session) = self.resume.sessions.get(active - 1).cloned() else {
+            return;
+        };
+        let Some(harness) = self.resume.harness else {
+            return;
+        };
+        if self.resume.attaching {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.resume.error = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        self.resume.attaching = true;
+        cx.notify();
+
+        // Resolve the target chat: the bound/selected one, or MINT a fresh
+        // chat on the new-chat canvas — the resume lands there and the shell
+        // selects it.
+        let state = self.state.read(cx);
+        let existing = self.target_chat_id(state);
+        let chat_id = existing
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // The picked harness MUST own the chat config — resume only loads a
+        // session back under its own agent. A harness switch drops the model
+        // (model ids are per-harness); same-harness resumes keep everything.
+        let config = {
+            let current = self.target_chat_row(state).and_then(|c| c.config.clone());
+            match current {
+                Some(config) if config.harness == harness => config,
+                other => ChatConfig {
+                    harness,
+                    model: None,
+                    reasoning: None,
+                    model_options: Default::default(),
+                    sandbox: other.map(|c| c.sandbox).unwrap_or(SandboxLevel::WorkspaceWrite),
+                },
+            }
+        };
+        let space = state.selected_space_row().cloned();
+        let device_id = state.effective_device_id();
+        let session_cwd = session.cwd.clone();
+        let session_id = session.id.clone();
+        cx.spawn(async move |this, cx| {
+            let result: Result<(), String> = async {
+                if existing.is_none() {
+                    let mut fields = serde_json::json!({
+                        "op": "createChat",
+                        "chatId": chat_id,
+                        "config": config,
+                    });
+                    if let Some(space) = &space {
+                        fields["spaceId"] = serde_json::json!(space.id);
+                    } else if let Some(device) = &device_id {
+                        fields["deviceId"] = serde_json::json!(device);
+                    }
+                    if !session_cwd.is_empty() {
+                        fields["cwd"] = serde_json::json!(session_cwd);
+                    }
+                    attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::MUTATE,
+                        fields,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::MUTATE,
+                        serde_json::json!({
+                            "op": "setChatConfig",
+                            "chatId": chat_id,
+                            "config": config,
+                        }),
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+                attachments::call_with_timeout(
+                    &engine,
+                    cx.background_executor(),
+                    methods::RESUME_SESSION,
+                    serde_json::json!({
+                        "chatId": chat_id,
+                        "harness": harness,
+                        "sessionId": session_id,
+                        "cwd": session_cwd,
+                    }),
+                    std::time::Duration::from_secs(90),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            .await;
+            this.update(cx, |composer, cx| {
+                composer.resume.attaching = false;
+                match result {
+                    Ok(()) => {
+                        composer.resume.open = false;
+                        composer.sync_mention_controls(cx);
+                        if existing.is_none() {
+                            composer.state.update(cx, |s, cx| {
+                                s.select_chat(Some(chat_id.clone()), cx)
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        composer.resume.error = Some(err.into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn render_slash_popup(
         &self,
         theme: &Theme,
@@ -5534,12 +6406,12 @@ impl Composer {
     ) -> Option<gpui::AnyElement> {
         // Only while a slash token is active.
         self.slash.token.as_ref()?;
-        let commands = self
+        let commands = self.slash_commands();
+        let harness_commands_empty = self
             .slash
             .harness
             .and_then(|h| self.slash_cache.get(&h))
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+            .is_none_or(|c| c.is_empty());
         // Full pill width at the mention card's height budget — both composer
         // completions share the same surface shape.
         let mut card = crate::popover::popover_card(theme)
@@ -5556,7 +6428,7 @@ impl Composer {
             // dragged, including when the pointer has left the popup.
             .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_slash(cx)));
-        if self.slash.loading && commands.is_empty() {
+        if self.slash.loading && harness_commands_empty {
             card = card.child(crate::popover::skeleton_rows(
                 "slash-loading",
                 theme,
@@ -5580,11 +6452,9 @@ impl Composer {
                     .py(px(10.0))
                     .text_size(crate::typography::ui_rems(12.0))
                     .text_color(theme.text_muted)
-                    .child(if commands.is_empty() {
-                        "This agent has no slash commands"
-                    } else {
-                        "No matching commands"
-                    }),
+                    // The merged list always carries /resume — reaching here
+                    // means the query matched nothing.
+                    .child("No matching commands"),
             );
         } else {
             let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(self.slash.filtered.len());
@@ -5671,6 +6541,289 @@ impl Composer {
         // Full pill width above the composer, matching the file-mention popup.
         Some(crate::popover::full_width_menu_above(
             "slash-popup",
+            card.into_any_element(),
+            None,
+        ))
+    }
+
+    /// The `/resume` agent→session picker — same card shape as the slash
+    /// popup. Stage one lists the offered agents; stage two lists the picked
+    /// agent's past sessions behind a back-header row.
+    fn render_resume_popup(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.resume.open {
+            return None;
+        }
+        let mut card = crate::popover::popover_card(theme)
+            .w_full()
+            .max_h(px(320.0))
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.input.focus_handle(cx), cx);
+                }),
+            )
+            .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_resume(cx)));
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        match self.resume.harness {
+            None => {
+                let harnesses = crate::pickers::offered_harnesses(
+                    self.pickers.read(cx).harness_list().unwrap_or_default(),
+                );
+                if harnesses.is_empty() && self.pickers.read(cx).harness_list().is_none() {
+                    card = card.child(crate::popover::skeleton_rows(
+                        "resume-agents-loading",
+                        theme,
+                        3,
+                        cx.entity_id(),
+                        cx,
+                    ));
+                } else if harnesses.is_empty() {
+                    card = card.child(
+                        div()
+                            .px(px(12.0))
+                            .py(px(10.0))
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child("No agents available"),
+                    );
+                } else {
+                    for (row_ix, descriptor) in harnesses.iter().enumerate() {
+                        let selected = self.resume.active == Some(row_ix);
+                        let harness = descriptor.id;
+                        let (icon_path, tint) = crate::pickers::harness_brand_icon(harness);
+                        rows.push(
+                            crate::popover::menu_row(
+                                theme,
+                                selected,
+                                format!("resume-agent-{row_ix}"),
+                            )
+                            .id(("resume-agent", row_ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.resume.active = Some(row_ix);
+                                this.resume_pick_harness(harness, cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        crate::icons::icon(icon_path)
+                                            .size(px(14.0))
+                                            .text_color(tint.unwrap_or(theme.text_muted)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(crate::typography::ui_rems(12.5))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(theme.text)
+                                            .child(SharedString::from(descriptor.name.clone())),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .truncate()
+                                            .text_size(crate::typography::ui_rems(12.0))
+                                            .text_color(theme.text_muted)
+                                            .child("Past sessions"),
+                                    ),
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                }
+            }
+            Some(harness) => {
+                // Row 0: back to the agent list.
+                let (icon_path, tint) = crate::pickers::harness_brand_icon(harness);
+                let agent_name = self
+                    .pickers
+                    .read(cx)
+                    .harness_list()
+                    .and_then(|list| list.iter().find(|d| d.id == harness))
+                    .map(|d| d.name.clone())
+                    .unwrap_or_else(|| "agent".to_string());
+                rows.push(
+                    crate::popover::menu_row(theme, self.resume.active == Some(0), "resume-back")
+                        .id("resume-back")
+                        .on_click(cx.listener(|this, _, _, cx| this.resume_back(cx)))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    crate::icons::icon(crate::icons::ALT_ARROW_LEFT)
+                                        .size(px(12.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(
+                                    crate::icons::icon(icon_path)
+                                        .size(px(13.0))
+                                        .text_color(tint.unwrap_or(theme.text_muted)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(crate::typography::ui_rems(12.0))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme.text)
+                                        .child(SharedString::from(agent_name)),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+                if self.resume.attaching {
+                    card = card.child(
+                        div()
+                            .px(px(12.0))
+                            .py(px(10.0))
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child("Loading session…"),
+                    );
+                } else if self.resume.loading && self.resume.sessions.is_empty() {
+                    card = card.child(crate::popover::skeleton_rows(
+                        "resume-sessions-loading",
+                        theme,
+                        3,
+                        cx.entity_id(),
+                        cx,
+                    ));
+                } else if let Some(error) = self.resume.error.clone() {
+                    card = card.child(
+                        div()
+                            .px(px(12.0))
+                            .py(px(10.0))
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.danger_muted)
+                            .child(error),
+                    );
+                } else if self.resume.sessions.is_empty() {
+                    card = card.child(
+                        div()
+                            .px(px(12.0))
+                            .py(px(10.0))
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child("No past sessions found"),
+                    );
+                } else {
+                    let now = chrono::Utc::now();
+                    for (ix, session) in self.resume.sessions.iter().enumerate() {
+                        let row_ix = ix + 1; // row 0 is the back header
+                        let selected = self.resume.active == Some(row_ix);
+                        let title = if session.title.trim().is_empty() {
+                            session.id.clone()
+                        } else {
+                            session.title.clone()
+                        };
+                        let mut meta = session.cwd.clone();
+                        if let Some(updated) = session.updated_at {
+                            let ago = crate::state::format_time_ago(
+                                chrono::DateTime::from_timestamp_millis(updated)
+                                    .unwrap_or(now),
+                                now,
+                            );
+                            meta = if meta.is_empty() {
+                                ago
+                            } else {
+                                format!("{meta} · {ago}")
+                            };
+                        }
+                        if meta.is_empty() {
+                            meta = session.preview.clone();
+                        }
+                        rows.push(
+                            crate::popover::menu_row(
+                                theme,
+                                selected,
+                                format!("resume-session-{row_ix}"),
+                            )
+                            .id(("resume-session", row_ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.resume.active = Some(row_ix);
+                                this.accept_resume(cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
+                                            .size(px(13.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .overflow_hidden()
+                                                    .truncate()
+                                                    .text_size(crate::typography::ui_rems(12.5))
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(theme.text)
+                                                    .child(SharedString::from(title)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .overflow_hidden()
+                                                    .truncate()
+                                                    .text_size(crate::typography::ui_rems(11.0))
+                                                    .text_color(theme.text_muted)
+                                                    .child(SharedString::from(meta)),
+                                            ),
+                                    ),
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                }
+            }
+        }
+        if !rows.is_empty() {
+            card = card.child(
+                div()
+                    .id("resume-scroll-host")
+                    .relative()
+                    .on_hover(cx.listener(Self::on_popup_list_hover))
+                    .child(
+                        div()
+                            .id("resume-list")
+                            .max_h(px(312.0))
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.resume_scroll)
+                            .children(rows),
+                    )
+                    .children(self.popup_scrollbar(
+                        "resume-scrollbar",
+                        &self.resume_scroll,
+                        theme,
+                        cx,
+                    )),
+            );
+        }
+        Some(crate::popover::full_width_menu_above(
+            "resume-popup",
             card.into_any_element(),
             None,
         ))
@@ -5801,7 +6954,7 @@ impl Composer {
         let (key, pending, edited_row_exists) = {
             let s = self.state.read(cx);
             (
-                s.selected_chat.clone().unwrap_or_default(),
+                self.target_chat_id(&s).unwrap_or_default(),
                 pending_input_request(&s.transcript),
                 editing_id
                     .as_ref()
@@ -5947,11 +7100,11 @@ impl Composer {
 
     pub(crate) fn run_live(&self, cx: &App) -> bool {
         let s = self.state.read(cx);
-        let Some(chat_id) = s.selected_chat.as_deref() else {
+        let Some(chat_id) = self.target_chat_id(&s) else {
             return false;
         };
         matches!(
-            s.indicator_for(chat_id, chrono::Utc::now()),
+            s.indicator_for(&chat_id, chrono::Utc::now()),
             Indicator::Working | Indicator::AwaitingInput
         )
     }
@@ -5966,7 +7119,7 @@ impl Composer {
         if state.review_comment_flush_pending(&self.current_key) {
             return true;
         }
-        if state.selected_chat.is_some() {
+        if self.target_chat_id(&state).is_some() {
             return false;
         }
         // New-chat canvas: needs a runnable agent. The
@@ -6002,6 +7155,14 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).text().trim().to_string();
+        // A literal "/resume" (typed past the completion, or the row accepted
+        // with the popup already dismissed) opens the picker — the text must
+        // never reach the agent as an unknown command.
+        if text == format!("/{RESUME_COMMAND}") {
+            self.input.update(cx, |input, cx| input.set_text("", cx));
+            self.open_resume(cx);
+            return;
+        }
         let no_content = !composer_has_content(
             &text,
             self.staged().len() + self.staged_appshots().len(),
@@ -6049,7 +7210,9 @@ impl Composer {
         };
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
-        let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
+        // A bound composer (side chat) always targets its own chat — never
+        // the canvas.
+        let (chat_id, is_new) = match self.target_chat_id(&self.state.read(cx)) {
             Some(id) => (id, false),
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
@@ -6060,11 +7223,10 @@ impl Composer {
         // Fully-resolved model/reasoning/options — concrete values (chat config
         // or defaults), so the engine never has to guess a "default".
         let resolved = self.pickers.read(cx).resolved(cx);
-        let existing_cwd = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|c| c.cwd.clone());
+        let existing_cwd = {
+            let state = self.state.read(cx);
+            self.target_chat_row(&state).and_then(|c| c.cwd.clone())
+        };
         // The PROJECT fixes the new chat's device + base folder — sessions are
         // minted onto the project's device, not necessarily this one. With no
         // project ("Don't work in a project") the composer's device pick is
@@ -6077,9 +7239,8 @@ impl Composer {
                 .clone()
                 .unwrap_or_else(|| "local".to_string())
         } else {
-            self.state
-                .read(cx)
-                .selected_chat_row()
+            let state = self.state.read(cx);
+            self.target_chat_row(&state)
                 .map(|c| c.device_id.clone())
                 .or_else(|| local_device_id.clone())
                 .unwrap_or_else(|| "local".to_string())
@@ -6091,10 +7252,8 @@ impl Composer {
                 .clone()
                 .filter(|id| local_device_id.as_deref() != Some(id.as_str()))
         } else {
-            self.state
-                .read(cx)
-                .selected_chat_row()
-                .map(|c| c.device_id.clone())
+            let state = self.state.read(cx);
+            self.target_chat_row(&state).map(|c| c.device_id.clone())
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
@@ -6140,6 +7299,34 @@ impl Composer {
         });
         let typed = text.clone();
         let text = crate::comments::with_comments(&text, &comments);
+        // The side chat's context seed rides the FIRST prompt only — the
+        // fresh session opens with the source conversation's tail. Not in
+        // the echo (the user's own words stay clean) and not in queue rows.
+        let context_prefix = self.pending_context.take();
+        // `@chat` mentions each pull a bounded transcript tail of the
+        // referenced conversation into the run prompt. The mention link
+        // itself also stays in the text — the agent sees the reference
+        // inline AND the digest up front. Device-resolved NOW so the async
+        // block needs no state access.
+        let chat_mentions: Vec<(String, String, Option<String>)> = {
+            let state = self.state.read(cx);
+            let mut seen = std::collections::HashSet::new();
+            file_mention_links(&text)
+                .into_iter()
+                .filter(|link| link.kind == MentionLinkKind::Chat)
+                .filter(|link| seen.insert(link.path.clone()))
+                .filter_map(|link| {
+                    let row = state.chat_row(&link.path)?;
+                    let title = row
+                        .title
+                        .clone()
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| link.basename.clone());
+                    Some((link.path.clone(), title, Some(row.device_id.clone())))
+                })
+                .take(4)
+                .collect()
+        };
         self.preview = None;
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
@@ -6615,9 +7802,53 @@ impl Composer {
                         serde_json::to_value(info).unwrap_or_default(),
                     );
                 }
+                // Fold each `@chat` mention's transcript tail into the run
+                // prompt. Failures degrade to the inline link alone — the
+                // reference still names the conversation.
+                let mut context = context_prefix.unwrap_or_default();
+                for (mention_id, title, device) in &chat_mentions {
+                    let mut params =
+                        serde_json::json!({ "chatId": mention_id, "maxRows": 40 });
+                    if let Some(device) = device {
+                        params["targetDeviceId"] = serde_json::Value::String(device.clone());
+                    }
+                    let Ok(reply) = attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::CHAT_CONTEXT,
+                        params,
+                        std::time::Duration::from_secs(20),
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    let Ok(rows) =
+                        serde_json::from_value::<Vec<zeron_proto::SessionTranscriptRow>>(reply)
+                    else {
+                        continue;
+                    };
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    let mut block = format!("Context from the conversation \"{title}\":\n");
+                    for row in rows {
+                        let line = format!("{}: {}\n", row.role, row.text.trim());
+                        if context.len() + block.len() + line.len() > CHAT_CONTEXT_MAX {
+                            break;
+                        }
+                        block.push_str(&line);
+                    }
+                    context.push_str(&block);
+                }
+                let prompt = if !queue && !context.is_empty() {
+                    format!("{context}\n{content}")
+                } else {
+                    content.clone()
+                };
                 let command = SessionCommandPayload::Run {
                     request: RunRequest {
-                        prompt: content.clone(),
+                        prompt,
                         harness: resolved.harness,
                         model: resolved.model.clone(),
                         reasoning: resolved.reasoning,
@@ -6744,7 +7975,7 @@ impl Composer {
     }
 
     pub(crate) fn interrupt_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+        let Some(chat_id) = self.target_chat_id(&self.state.read(cx)) else {
             return;
         };
         self.interrupt_chat(chat_id, cx);
@@ -6852,7 +8083,7 @@ impl Composer {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+        let Some(chat_id) = self.target_chat_id(&self.state.read(cx)) else {
             return;
         };
         let request_id = wizard.request_id.clone();
@@ -7322,7 +8553,7 @@ impl Render for Composer {
         }
         // New chats render expanded regardless of `expanded_mode` (see below),
         // so a mode flip there changes nothing visible — never morph it.
-        let new_chat = self.state.read(cx).selected_chat.is_none();
+        let new_chat = self.target_chat_id(&self.state.read(cx)).is_none();
         // Morph clock in ms; dividing by the measurement knob stretches the
         // timeline exactly like shell.rs eval_tween's scaled duration.
         let now_ms = self.morph_clock.elapsed().as_secs_f32() * 1000.0 / motion::speed_scale();
@@ -7358,8 +8589,8 @@ impl Render for Composer {
         let queue_notice: Option<(SharedString, bool)> = {
             use zeron_proto::ConnectivityState as S;
             let state = self.state.read(cx);
-            let degraded = match state.selected_chat.as_deref() {
-                Some(id) => state.chat_delivery_degraded(id),
+            let degraded = match self.target_chat_id(&state) {
+                Some(id) => state.chat_delivery_degraded(&id),
                 None => {
                     // New-chat canvas: judge by the picked target device.
                     let remote_target = state
@@ -7927,10 +9158,12 @@ impl Render for Composer {
                 .absolute()
                 .inset_0()
             })
-            // Both completion popups span the full pill width above it —
-            // the file-mention and slash tokens are mutually exclusive.
+            // All three completion popups span the full pill width above
+            // it — the file-mention and slash tokens are mutually exclusive,
+            // and /resume's picker is token-free.
             .children(self.render_file_mention_popup(&theme, cx))
-            .children(self.render_slash_popup(&theme, cx));
+            .children(self.render_slash_popup(&theme, cx))
+            .children(self.render_resume_popup(&theme, cx));
         // Restore the original chip-only selector treatment: destination at
         // the top-right, no surrounding surface. Cancel the column gap as the
         // row collapses so the pill never jumps at the route boundary.
@@ -8664,12 +9897,14 @@ mod tests {
                 basename: "mod.rs".into(),
                 path: "foo/mod.rs".into(),
                 is_dir: false,
+                kind: MentionLinkKind::File,
             },
             FileMentionLink {
                 range: 0..0,
                 basename: "oomod.rs".into(),
                 path: "bar/oomod.rs".into(),
                 is_dir: false,
+                kind: MentionLinkKind::File,
             },
         ];
         assert_eq!(

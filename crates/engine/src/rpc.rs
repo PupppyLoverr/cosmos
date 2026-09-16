@@ -92,6 +92,26 @@ struct ListModelsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ResumeSessionParams {
+    chat_id: String,
+    harness: HarnessId,
+    session_id: String,
+    /// The session's own folder — resume only holds there, so the chat is
+    /// retargeted onto it (the picker's `HarnessSession.cwd`).
+    cwd: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatContextParams {
+    chat_id: String,
+    /// Rows to return (tail of the transcript); default 12.
+    #[serde(default)]
+    max_rows: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetHarnessEnabledParams {
     harness: HarnessId,
     enabled: bool,
@@ -390,6 +410,10 @@ enum MutateParams {
         /// Cwd override (isolated-worktree path); default = the space's folder.
         #[serde(default)]
         cwd: Option<String>,
+        /// Born hidden from the sidebar (side chats are temporary, chat-bound
+        /// surfaces — the row stays addressable by id but never lists).
+        #[serde(default)]
+        archived: bool,
     },
     /// Create a space (device + folder pair). Idempotent by id; a live
     /// duplicate `(deviceId, path)` no-ops. `gitDetected` is seeded from the
@@ -770,6 +794,7 @@ impl EngineRpc {
                 config,
                 branch,
                 cwd,
+                archived,
             } => {
                 self.workspace
                     .create_chat(
@@ -783,6 +808,11 @@ impl EngineRpc {
                 if let Some(branch) = branch.as_deref().filter(|b| !b.is_empty()) {
                     self.workspace
                         .set_chat_branch(&chat_id, branch)
+                        .map_err(failed)?;
+                }
+                if archived {
+                    self.workspace
+                        .set_chat_archived(&chat_id, true)
                         .map_err(failed)?;
                 }
                 Ok(())
@@ -902,10 +932,17 @@ fn forward_deadline(method: &str) -> std::time::Duration {
             Duration::from_secs(15 * 60)
         }
         methods::CREATE_WORKTREE => Duration::from_secs(120),
-        // Model/command discovery spawns the agent's CLI on the target —
-        // Hermes's plugin-heavy cold start alone takes ~18s before
+        // Model/command/session discovery spawns the agent's CLI on the
+        // target — Hermes's plugin-heavy cold start alone takes ~18s before
         // session/new answers, and the harness's own probe budget is 45s.
-        methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(60),
+        methods::LIST_MODELS | methods::LIST_COMMANDS | methods::LIST_SESSIONS => {
+            Duration::from_secs(60)
+        }
+        // ResumeSession probes the session store for its transcript (a
+        // `session/load` replay for ACP agents) — same probe budget class.
+        methods::RESUME_SESSION => Duration::from_secs(60),
+        // ChatContext is a local doc read — interactive, fails fast.
+        methods::CHAT_CONTEXT => Duration::from_secs(15),
         _ => Duration::from_secs(30),
     }
 }
@@ -922,6 +959,9 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_COMMANDS
+            | methods::LIST_SESSIONS
+            | methods::RESUME_SESSION
+            | methods::CHAT_CONTEXT
             | methods::QUEUE_COMMAND
             | methods::WATCH_DOC_MESSAGES
             // The queue lives on the chat doc, and only its host may send from
@@ -1236,6 +1276,130 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&commands)
+            }
+            methods::LIST_SESSIONS => {
+                // `/resume` picker rows: the harness's own session index —
+                // ACP `session/list`, claude/codex jsonl stores, cursor's
+                // acp-sessions dirs, antigravity's sqlite summaries.
+                let p: ListModelsParams = parse_params(params)?;
+                let harness = self
+                    .registry
+                    .resolve(p.harness)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let sessions = harness
+                    .sessions()
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&sessions)
+            }
+            methods::RESUME_SESSION => {
+                // `/resume` attach: import whatever transcript the session
+                // store exposes into the chat doc, retarget the chat onto the
+                // session's cwd (native session stores are cwd-keyed), then
+                // stamp the harness-session binding — the next send's
+                // engine-injected resume loads THIS conversation.
+                let p: ResumeSessionParams = parse_params(params)?;
+                let harness = self
+                    .registry
+                    .resolve(p.harness)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let transcript = harness
+                    .session_transcript(&p.session_id, &p.cwd)
+                    .await
+                    .unwrap_or_default()
+                    .unwrap_or_default();
+                let mut imported = 0usize;
+                if !transcript.is_empty()
+                    && let Ok(handle) = self.doc_host.open(&p.chat_id)
+                {
+                    let device_id = self.engine_info.device_id.clone();
+                    for row in &transcript {
+                        let role = match row.role.as_str() {
+                            "user" => zeron_doc::MessageRole::User,
+                            _ => zeron_doc::MessageRole::Assistant,
+                        };
+                        let entry = zeron_doc::SessionMessageEntry {
+                            id: format!("resume-{}-{}", p.session_id, imported),
+                            role,
+                            parts: vec![zeron_doc::MessagePart::Text {
+                                id: format!("resume-{}-{}-t", p.session_id, imported),
+                                text: row.text.clone(),
+                            }],
+                            created_at: if row.created_at > 0 {
+                                row.created_at
+                            } else {
+                                chrono::Utc::now().timestamp_millis()
+                            },
+                            device_id: device_id.clone(),
+                            status: Some(zeron_doc::MessageStatus::Complete),
+                            continuation_of: None,
+                        };
+                        if handle.doc().push_message(&entry).is_ok() {
+                            imported += 1;
+                        }
+                    }
+                }
+                if !p.cwd.is_empty() {
+                    let _ = self.workspace.set_chat_cwd(&p.chat_id, &p.cwd);
+                }
+                self.workspace
+                    .set_chat_harness_session(&p.chat_id, &p.session_id, &p.cwd);
+                RpcReply::value(&serde_json::json!({ "imported": imported }))
+            }
+            methods::CHAT_CONTEXT => {
+                // `@chat` mention payload: the tail of the chat's transcript
+                // as flat user/assistant text rows. A chat with no doc yet
+                // (or an unsalvageable one) reads as an empty list — the
+                // mention degrades to its label instead of erroring.
+                let p: ChatContextParams = parse_params(params)?;
+                let max_rows = p.max_rows.unwrap_or(12);
+                let rows: Vec<zeron_proto::SessionTranscriptRow> = self
+                    .doc_host
+                    .open(&p.chat_id)
+                    .and_then(|handle| {
+                        handle
+                            .doc()
+                            .read_entries()
+                            .map_err(crate::EngineError::from)
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|e| {
+                        matches!(
+                            e.role,
+                            zeron_doc::MessageRole::User | zeron_doc::MessageRole::Assistant
+                        )
+                    })
+                    .rev()
+                    .take(max_rows)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .filter_map(|e| {
+                        let text = e
+                            .parts
+                            .iter()
+                            .filter_map(|part| match part {
+                                zeron_doc::MessagePart::Text { text, .. } => {
+                                    Some(text.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let text = text.trim();
+                        (!text.is_empty()).then(|| zeron_proto::SessionTranscriptRow {
+                            role: match e.role {
+                                zeron_doc::MessageRole::User => "user",
+                                _ => "assistant",
+                            }
+                            .to_string(),
+                            text: text.to_string(),
+                            created_at: e.created_at,
+                        })
+                    })
+                    .collect();
+                RpcReply::value(&rows)
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;

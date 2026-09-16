@@ -6,8 +6,8 @@
 
 import SwiftUI
 
-enum BrandMark {
-    case claude, openai, cursor, devin, grok, hermes, pi, opencode
+enum BrandMark: Equatable {
+    case claude, openai, cursor, devin, grok, hermes, pi, opencode, antigravity, amp
 
     var viewBox: CGSize {
         switch self {
@@ -19,6 +19,7 @@ enum BrandMark {
         case .hermes: return CGSize(width: 24, height: 24)
         case .pi: return CGSize(width: 800, height: 800)
         case .opencode: return CGSize(width: 24, height: 30)
+        case .antigravity, .amp: return CGSize(width: 24, height: 24)
         }
     }
 
@@ -26,7 +27,7 @@ enum BrandMark {
     /// asset says so or the mark's holes fill in solid.
     var evenOddFill: Bool {
         switch self {
-        case .hermes, .pi, .opencode: return true
+        case .hermes, .pi, .opencode, .amp: return true
         default: return false
         }
     }
@@ -52,6 +53,10 @@ enum BrandMark {
             // 45%-opacity inner fill this single-path renderer skips — the
             // mark reads identically at glyph sizes).
             return "M24 0H0V30H24V0ZM18 6H6V24H18V6Z"
+        case .antigravity:
+            return "M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z"
+        case .amp:
+            return "M15.087 23.18 12.03 24l-2.097-7.823-5.738 5.738-2.251-2.251 5.718-5.719-7.769-2.082.82-3.057 11.294 3.08 3.08 11.295zM19.505 18.762l-3.057.82-2.564-9.573-9.572-2.564.819-3.057 11.295 3.079 3.08 11.295zM23.893 14.374l-3.057.82-2.565-9.572L8.7 3.057 9.52 0l11.295 3.08 3.079 11.294z"
         }
     }
 
@@ -64,6 +69,8 @@ enum BrandMark {
         case "hermes": return .hermes
         case "pi": return .pi
         case "opencode": return .opencode
+        case "antigravity": return .antigravity
+        case "amp": return .amp
         default: return .claude  // claude-code + mock share the mark, like the desktop
         }
     }

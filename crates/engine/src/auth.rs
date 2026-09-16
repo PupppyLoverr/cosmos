@@ -1,22 +1,21 @@
-//! Auth — the engine owns the WorkOS session for its device (feature-inventory §3.7,
-//! ARCHITECTURE §5). Port of zeron's `apps/backend/src/auth.ts`.
+//! Auth — the engine owns the cloud session for its device (feature-inventory §3.7,
+//! ARCHITECTURE §5).
 //!
-//! The engine is a public client: it builds the AuthKit authorize URL itself but
-//! delegates the secret-bearing **code exchange** and **refresh** to the edge Worker
-//! (`/auth/exchange`, `/auth/refresh` — the WorkOS API key lives only there).
+//! Production identity is **Woozlit** (Firebase on woozlit.com), the same login
+//! the Woozlit desktop app uses: open `/login?desktop=1&callback=…`, Google or
+//! Discord on the website, then a custom-token bounce back to this machine.
+//! The engine exchanges that custom token for a Firebase ID token + refresh
+//! token via Google's public Identity Toolkit (no Firebase SDK, no WorkOS).
+//! The edge verifies those ID tokens against Google's JWKS.
 //!
 //! Two modes:
-//! - **Dev** (no WorkOS client id configured, or the edge reports `auth: "dev"`): always
-//!   signed in; the bearer IS the configured user id (current M2/M3 behavior).
-//! - **WorkOS**: authorization-code flow. Headed devices use a loopback callback server
-//!   on an ephemeral port; headless devices use the paste-code flow (the redirect is the
-//!   edge's hosted `/auth/cli/callback` page, which shows `state.code` to paste back via
-//!   stdin or the `CompleteSignIn` RPC). The refresh token is persisted 0600 in the data
-//!   dir; access tokens are cached with dual-clock expiry (monotonic AND wall, whichever
-//!   aged more — see [`AccessEntry`]) and refreshed on demand plus by a background loop,
-//!   so the device-room relay and room clients always dial with a live `?token=`, even
-//!   on the first redial after a laptop wakes from sleep. Org onboarding: an org-less session is `NeedsOrganization`; `SelectOrg`
-//!   runs an org-scoped refresh and the state follows the returned token's `org_id`.
+//! - **Dev** (no cloud-auth client id configured, or the edge reports `auth: "dev"`):
+//!   always signed in; the bearer IS the configured user id.
+//! - **Woozlit**: headed devices bind a loopback callback and open woozlit.com;
+//!   the website returns `token` (Firebase custom token) + `userId`/`email`.
+//!   A personal workspace is implied (`org_id` = Firebase uid) so there is no
+//!   org picker. Refresh tokens are persisted 0600 in the data dir; access
+//!   tokens are cached with dual-clock expiry (see [`AccessEntry`]).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -33,6 +32,11 @@ const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
 /// Refresh when the cached token has less than this much life left.
 const TOKEN_SLACK: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Public Woozlit / Firebase client values (they ship in Woozlit's web bundle).
+pub const WOOZLIT_ORIGIN: &str = "https://www.woozlit.com";
+pub const FIREBASE_API_KEY: &str = "AIzaSyBbJtkBoJrKM2hjW2H3o9pgtcyiGge9yOo";
+pub const FIREBASE_PROJECT_ID: &str = "nexiloop-c0456";
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -128,10 +132,19 @@ pub struct AuthConfig {
     pub edge_url: String,
     /// Data dir for the persisted session (`session.json`, 0600).
     pub data_dir: PathBuf,
-    /// WorkOS client id; `None` = dev mode.
+    /// Cloud-auth enable flag; `None` = dev mode. Historically a WorkOS client
+    /// id; any non-empty value now turns on Woozlit login.
     pub workos_client_id: Option<String>,
-    /// WorkOS API base (authorize URL host).
+    /// WorkOS API base (unused for Woozlit; kept so existing env/tests compile).
     pub workos_api_base: String,
+    /// Woozlit origin that hosts `/login` (override for staging).
+    pub woozlit_origin: String,
+    /// Firebase web API key used for custom-token exchange + refresh.
+    pub firebase_api_key: String,
+    /// Override Identity Toolkit `signInWithCustomToken` URL (tests).
+    pub firebase_custom_token_url: String,
+    /// Override Secure Token refresh URL (tests).
+    pub firebase_refresh_url: String,
     /// Dev-mode bearer/user id (mirrors the old `ZERON_EDGE_TOKEN` behavior).
     pub dev_user_id: String,
     /// Loopback callback port; `None` = ephemeral.
@@ -145,9 +158,33 @@ impl AuthConfig {
             data_dir: data_dir.into(),
             workos_client_id: None,
             workos_api_base: "https://api.workos.com".into(),
+            woozlit_origin: WOOZLIT_ORIGIN.into(),
+            firebase_api_key: FIREBASE_API_KEY.into(),
+            firebase_custom_token_url: String::new(),
+            firebase_refresh_url: String::new(),
             dev_user_id: "dev-user".into(),
             callback_port: None,
         }
+    }
+
+    fn custom_token_url(&self) -> String {
+        if !self.firebase_custom_token_url.trim().is_empty() {
+            return self.firebase_custom_token_url.clone();
+        }
+        format!(
+            "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={}",
+            url_encode(&self.firebase_api_key)
+        )
+    }
+
+    fn refresh_url(&self) -> String {
+        if !self.firebase_refresh_url.trim().is_empty() {
+            return self.firebase_refresh_url.clone();
+        }
+        format!(
+            "https://securetoken.googleapis.com/v1/token?key={}",
+            url_encode(&self.firebase_api_key)
+        )
     }
 }
 
@@ -433,47 +470,47 @@ impl Auth {
 
     // -- sign-in flows ------------------------------------------------------
 
-    /// Begin a headed sign-in: returns the AuthKit authorize URL redirecting to our
-    /// loopback callback server (bound lazily on an ephemeral port).
+    /// Begin a headed sign-in: returns the Woozlit login URL whose `callback`
+    /// is our loopback server (bound lazily on an ephemeral port).
     pub async fn start_sign_in(&self) -> Result<String, EngineError> {
         if self.inner.workos.is_none() {
-            return Ok(String::new()); // dev mode: nothing to do (TS parity)
+            return Ok(String::new()); // dev mode: nothing to do
         }
         let port = self.ensure_loopback().await?;
-        Ok(self.begin_sign_in(&format!("http://127.0.0.1:{port}/callback")))
+        Ok(self.begin_woozlit_sign_in(&format!("http://127.0.0.1:{port}/callback")))
     }
 
-    /// Begin a headless sign-in: the redirect is the edge's hosted paste-code page —
-    /// nothing ever redirects to this machine, so the browser can be anywhere.
+    /// Same Woozlit login URL as headed sign-in. CLI uses the loopback callback
+    /// (open the URL on this machine); there is no paste-code page anymore.
     pub fn start_headless_sign_in(&self) -> String {
         if self.inner.workos.is_none() {
             return String::new();
         }
-        let edge = self.inner.config.edge_url.trim_end_matches('/');
-        self.begin_sign_in(&format!("{edge}/auth/cli/callback"))
+        // Headless without a bound loopback can't receive the bounce; callers
+        // that can open a browser should use `start_sign_in`. This helper is
+        // kept for tests that inject `state.token` via `complete_sign_in`.
+        self.begin_woozlit_sign_in("http://127.0.0.1/callback")
     }
 
-    /// Finish a headless sign-in with the pasted `state.code` string. The state half
-    /// must match a sign-in started HERE (same CSRF discipline as the loopback flow).
+    /// Finish a sign-in with `state.token` (Firebase custom token). The state
+    /// half must match a sign-in started HERE.
     pub async fn complete_sign_in(&self, pasted: &str) -> Result<(), EngineError> {
         if self.inner.workos.is_none() {
             return Ok(());
         }
         let trimmed = pasted.trim();
-        let (state, code) = trimmed.split_once('.').unwrap_or(("", ""));
-        if state.is_empty() || code.is_empty() {
+        let (state, token) = trimmed.split_once('.').unwrap_or(("", ""));
+        if state.is_empty() || token.is_empty() {
             return Err(EngineError::Other(
-                "invalid or expired sign-in code — start sign-in again and paste the full code"
-                    .into(),
+                "invalid or expired sign-in — start again from Cosmos".into(),
             ));
         }
         let Some(generation) = self.take_pending(state) else {
             return Err(EngineError::Other(
-                "invalid or expired sign-in code — start sign-in again and paste the full code"
-                    .into(),
+                "invalid or expired sign-in — start again from Cosmos".into(),
             ));
         };
-        let result = self.exchange_code(code).await?;
+        let result = self.exchange_woozlit_token(token, None, None, None).await?;
         self.finish_sign_in(result, generation)
     }
 
@@ -496,60 +533,38 @@ impl Auth {
         if self.inner.workos.is_none() {
             return Ok(Vec::new());
         }
-        #[derive(Deserialize)]
-        struct Orgs {
-            #[serde(default)]
-            orgs: Vec<OrgMembership>,
-        }
-        let body: Orgs = self
-            .authed_json(reqwest::Method::GET, "/auth/orgs", None)
-            .await?;
-        Ok(body.orgs)
+        // Woozlit accounts are personal: one workspace, id = Firebase uid.
+        Ok(self
+            .state()
+            .user()
+            .map(|user| {
+                vec![OrgMembership {
+                    id: user.id.clone(),
+                    organization_id: user.id.clone(),
+                    name: user
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| user.email.clone()),
+                }]
+            })
+            .unwrap_or_default())
     }
 
-    /// Create an org (the edge makes us its first admin member) and scope to it.
-    pub async fn create_org(&self, name: &str) -> Result<(), EngineError> {
-        if self.inner.workos.is_none() {
-            return Ok(());
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Created {
-            organization_id: String,
-        }
-        let created: Created = self
-            .authed_json(
-                reqwest::Method::POST,
-                "/auth/orgs",
-                Some(serde_json::json!({ "name": name })),
-            )
-            .await?;
-        self.select_org(&created.organization_id).await
+    /// Create an org — Woozlit has no org directory; the personal workspace
+    /// is created implicitly at sign-in.
+    pub async fn create_org(&self, _name: &str) -> Result<(), EngineError> {
+        Ok(())
     }
 
-    /// Scope the session to an org: one refresh with `organizationId`; the state follows
-    /// the returned token's `org_id` claim.
-    pub async fn select_org(&self, organization_id: &str) -> Result<(), EngineError> {
-        if self.inner.workos.is_none() {
-            return Ok(());
-        }
-        let token = self.refresh(Some(organization_id)).await?;
-        let scoped = token
-            .as_deref()
-            .and_then(jwt_claims)
-            .and_then(|c| c.org_id)
-            .is_some_and(|org| org == organization_id);
-        if !scoped {
-            return Err(EngineError::Other(
-                "could not switch to that workspace — you may no longer be a member".into(),
-            ));
-        }
+    /// Scope the session to an org. Woozlit personal workspaces are already
+    /// scoped to the Firebase uid; anything else is a no-op success.
+    pub async fn select_org(&self, _organization_id: &str) -> Result<(), EngineError> {
         Ok(())
     }
 
     // -- internals ----------------------------------------------------------
 
-    fn begin_sign_in(&self, redirect_uri: &str) -> String {
+    fn begin_woozlit_sign_in(&self, callback_base: &str) -> String {
         let state = uuid::Uuid::new_v4().to_string();
         {
             let mut sign_in = lock(&self.inner.sign_in);
@@ -559,13 +574,12 @@ impl Auth {
                 .retain(|_, at| cutoff.duration_since(*at) < SIGN_IN_TTL);
             sign_in.pending.insert(state.clone(), cutoff);
         }
-        let client_id = self.inner.workos.clone().unwrap_or_default();
+        let sep = if callback_base.contains('?') { '&' } else { '?' };
+        let callback = format!("{callback_base}{sep}state={state}");
         format!(
-            "{}/user_management/authorize?response_type=code&client_id={}&redirect_uri={}&provider=authkit&state={}",
-            self.inner.config.workos_api_base.trim_end_matches('/'),
-            url_encode(&client_id),
-            url_encode(redirect_uri),
-            state
+            "{}/login?desktop=1&callback={}",
+            self.inner.config.woozlit_origin.trim_end_matches('/'),
+            url_encode(&callback)
         )
     }
 
@@ -581,74 +595,100 @@ impl Auth {
         Some(sign_in.generation)
     }
 
-    async fn exchange_code(&self, code: &str) -> Result<SignInResult, EngineError> {
-        #[derive(Deserialize)]
+    async fn exchange_woozlit_token(
+        &self,
+        token: &str,
+        user_id: Option<&str>,
+        email: Option<&str>,
+        display_name: Option<&str>,
+    ) -> Result<SignInResult, EngineError> {
+        let (access_token, refresh_token, local_id) = if is_firebase_id_token(token) {
+            let sub = jwt_claims(token)
+                .and_then(|c| c.sub)
+                .unwrap_or_default();
+            (token.to_string(), String::new(), sub)
+        } else {
+            self.sign_in_with_custom_token(token).await?
+        };
+        let claims = jwt_claims(&access_token);
+        let id = user_id
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .or_else(|| claims.as_ref().and_then(|c| c.sub.clone()))
+            .or_else(|| (!local_id.is_empty()).then_some(local_id))
+            .unwrap_or_else(|| "woozlit-user".into());
+        let email = email
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .or_else(|| claims.as_ref().and_then(|c| c.email.clone()))
+            .unwrap_or_else(|| format!("{id}@woozlit.com"));
+        let name = display_name
+            .map(str::to_string)
+            .filter(|s| !s.is_empty());
+        Ok(SignInResult {
+            user: AuthUser { id, email, name },
+            access_token,
+            refresh_token,
+        })
+    }
+
+    async fn sign_in_with_custom_token(
+        &self,
+        custom_token: &str,
+    ) -> Result<(String, String, String), EngineError> {
+        #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
-        struct WireUser {
-            id: String,
-            email: String,
-            #[serde(default)]
-            first_name: Option<String>,
-            #[serde(default)]
-            last_name: Option<String>,
+        struct Body<'a> {
+            token: &'a str,
+            return_secure_token: bool,
         }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
-        struct Exchange {
-            user: WireUser,
-            access_token: String,
+        struct Reply {
+            id_token: String,
             refresh_token: String,
+            #[serde(default)]
+            local_id: String,
         }
-        let url = format!(
-            "{}/auth/exchange",
-            self.inner.config.edge_url.trim_end_matches('/')
-        );
+        let url = self.inner.config.custom_token_url();
         let res = self
             .inner
             .http
             .post(&url)
-            .json(&serde_json::json!({ "code": code }))
+            .json(&Body {
+                token: custom_token,
+                return_secure_token: true,
+            })
             .send()
             .await
-            .map_err(|e| EngineError::Other(format!("the edge is unreachable: {e}")))?;
+            .map_err(|e| EngineError::Other(format!("could not reach Woozlit auth: {e}")))?;
         if !res.status().is_success() {
             return Err(EngineError::Other(format!(
-                "sign-in failed during token exchange ({}) — the code may have expired; start again",
+                "Woozlit token exchange failed ({})",
                 res.status().as_u16()
             )));
         }
-        let body: Exchange = res
+        let body: Reply = res
             .json()
             .await
-            .map_err(|e| EngineError::Other(format!("malformed exchange response: {e}")))?;
-        let name = [body.user.first_name, body.user.last_name]
-            .into_iter()
-            .flatten()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        Ok(SignInResult {
-            user: AuthUser {
-                id: body.user.id,
-                email: body.user.email,
-                name: (!name.is_empty()).then_some(name),
-            },
-            access_token: body.access_token,
-            refresh_token: body.refresh_token,
-        })
+            .map_err(|e| EngineError::Other(format!("malformed Woozlit auth response: {e}")))?;
+        Ok((body.id_token, body.refresh_token, body.local_id))
     }
 
     fn finish_sign_in(&self, result: SignInResult, generation: u64) -> Result<(), EngineError> {
         // Serialize the final commit with sign-out. A callback can consume its
-        // OAuth state and spend time exchanging the code; if cancellation wins
+        // OAuth state and spend time exchanging the token; if cancellation wins
         // during that await, its old generation must never restore credentials.
         let sign_in = lock(&self.inner.sign_in);
         if sign_in.generation != generation {
             return Err(EngineError::Other(
-                "sign-in was canceled — start again from Zeron".into(),
+                "sign-in was canceled — start again from Cosmos".into(),
             ));
         }
-        let org_id = jwt_claims(&result.access_token).and_then(|c| c.org_id);
+        // Woozlit has no org directory: the Firebase uid IS the workspace.
+        let org_id = jwt_claims(&result.access_token)
+            .and_then(|c| c.org_id)
+            .or_else(|| Some(result.user.id.clone()));
         *lock(&self.inner.access) = Some(AccessEntry::fresh(result.access_token));
         let session = StoredSession {
             refresh_token: result.refresh_token,
@@ -683,28 +723,20 @@ impl Auth {
         let Some(refresh_token) = lock(&self.inner.stored)
             .as_ref()
             .map(|s| s.refresh_token.clone())
+            .filter(|s| !s.is_empty())
         else {
             return Ok(None);
         };
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct RefreshBody<'a> {
-            refresh_token: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            organization_id: Option<&'a str>,
-        }
-        let url = format!(
-            "{}/auth/refresh",
-            self.inner.config.edge_url.trim_end_matches('/')
-        );
+        let url = self.inner.config.refresh_url();
         let res = self
             .inner
             .http
             .post(&url)
-            .json(&RefreshBody {
-                refresh_token: &refresh_token,
-                organization_id,
-            })
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!(
+                "grant_type=refresh_token&refresh_token={}",
+                url_encode(&refresh_token)
+            ))
             .send()
             .await;
         let res = match res {
@@ -713,16 +745,13 @@ impl Auth {
                 // Network failure is transient: keep the session, but surface the
                 // error so the background loop applies its retry delay.
                 return Err(EngineError::Other(format!(
-                    "could not reach the edge during refresh: {err}"
+                    "could not reach Woozlit auth during refresh: {err}"
                 )));
             }
         };
         let status = res.status().as_u16();
         if (400..500).contains(&status) && organization_id.is_none() {
-            // A definitive 4xx means the refresh token itself is dead (revoked session,
-            // deleted user) — it can NEVER succeed again. Degrade to SignedOut so every
-            // downstream retry loop quiets down. (Org-switch refreshes are exempt: a 4xx
-            // there means "not a member", not a dead session.)
+            // A definitive 4xx means the refresh token itself is dead.
             tracing::warn!(
                 status,
                 "auth: refresh rejected — session revoked; signing out"
@@ -734,17 +763,27 @@ impl Auth {
             return Err(EngineError::Other(format!("refresh failed ({status})")));
         }
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
         struct Tokens {
-            access_token: String,
-            refresh_token: String,
+            #[serde(default, alias = "idToken", alias = "id_token")]
+            id_token: Option<String>,
+            #[serde(default, alias = "accessToken", alias = "access_token")]
+            access_token: Option<String>,
+            #[serde(default, alias = "refreshToken", alias = "refresh_token")]
+            refresh_token: Option<String>,
         }
         let tokens: Tokens = res
             .json()
             .await
             .map_err(|e| EngineError::Other(format!("malformed refresh response: {e}")))?;
-        let org_id = jwt_claims(&tokens.access_token).and_then(|c| c.org_id);
-        let entry = AccessEntry::fresh(tokens.access_token.clone());
+        let access_token = tokens
+            .id_token
+            .or(tokens.access_token)
+            .ok_or_else(|| EngineError::Other("refresh returned no access token".into()))?;
+        let new_refresh = tokens.refresh_token.unwrap_or(refresh_token);
+        let org_id = jwt_claims(&access_token)
+            .and_then(|c| c.org_id)
+            .or_else(|| lock(&self.inner.stored).as_ref().and_then(|s| s.org_id.clone()));
+        let entry = AccessEntry::fresh(access_token.clone());
         tracing::info!(ttl_s = entry.ttl.as_secs(), "auth: access token refreshed");
         *lock(&self.inner.access) = Some(entry);
         let (user, org_changed) = {
@@ -752,7 +791,7 @@ impl Auth {
             match stored.as_mut() {
                 Some(session) => {
                     let changed = session.org_id != org_id;
-                    session.refresh_token = tokens.refresh_token;
+                    session.refresh_token = new_refresh;
                     session.org_id = org_id.clone();
                     (session.user.clone(), changed)
                 }
@@ -766,7 +805,7 @@ impl Auth {
         self.inner
             .token_tx
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
-        Ok(Some(tokens.access_token))
+        Ok(Some(access_token))
     }
 
     fn session_file(&self) -> PathBuf {
@@ -791,6 +830,7 @@ impl Auth {
         }
     }
 
+    #[allow(dead_code)]
     async fn authed_json<T: serde::de::DeserializeOwned>(
         &self,
         method: reqwest::Method,
@@ -933,28 +973,34 @@ async fn handle_loopback_conn(
             .filter_map(|kv| kv.split_once('='))
             .map(|(k, v)| (k.to_string(), url_decode(v)))
             .collect();
-        let code = params.get("code");
+        let token = params.get("token").or_else(|| params.get("code"));
         let state = params.get("state");
+        let user_id = params.get("userId").map(String::as_str);
+        let email = params.get("email").map(String::as_str);
+        let display_name = params.get("displayName").map(String::as_str);
         let invalid_callback = || {
             (
                 "400 Bad Request",
-                page("Invalid or expired sign-in link. Start again from Zeron."),
+                page("Invalid or expired sign-in link. Start again from Cosmos."),
             )
         };
-        match (code, state) {
-            (Some(code), Some(state)) => match auth.take_pending(state) {
-                Some(generation) => match auth.exchange_code(code).await {
+        match (token, state) {
+            (Some(token), Some(state)) => match auth.take_pending(state) {
+                Some(generation) => match auth
+                    .exchange_woozlit_token(token, user_id, email, display_name)
+                    .await
+                {
                     Ok(result) => match auth.finish_sign_in(result, generation) {
                         Ok(()) => (
                             "200 OK",
-                            page("Signed in. You can close this tab and return to Zeron."),
+                            page("Signed in. You can close this tab and return to Cosmos."),
                         ),
                         Err(err) => {
                             tracing::info!(error = %err, "auth: discarded canceled callback exchange");
                             (
                                 "409 Conflict",
                                 page(
-                                    "This sign-in was canceled. Start again from Zeron if you still want to enable sync.",
+                                    "This sign-in was canceled. Start again from Cosmos if you still want to enable sync.",
                                 ),
                             )
                         }
@@ -963,7 +1009,7 @@ async fn handle_loopback_conn(
                         tracing::warn!(error = %err, "auth: loopback code exchange failed");
                         (
                             "502 Bad Gateway",
-                            page("Sign-in failed during token exchange — check the Zeron logs."),
+                            page("Sign-in failed during token exchange — check the Cosmos logs."),
                         )
                     }
                 },
@@ -996,6 +1042,18 @@ struct JwtClaims {
     iat: Option<i64>,
     #[serde(default)]
     org_id: Option<String>,
+    #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
+    iss: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+fn is_firebase_id_token(token: &str) -> bool {
+    jwt_claims(token)
+        .and_then(|c| c.iss)
+        .is_some_and(|iss| iss.contains("securetoken.google.com"))
 }
 
 /// Decode (without verifying — the edge verifies) the JWT payload claims. Total: a

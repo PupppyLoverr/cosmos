@@ -1,5 +1,5 @@
-//! zeron — headed by default; `zeron headless` runs the engine alone. Both start
-//! local-only without credentials. `zeron login` and `zeron logout` select the
+//! cosmos — headed by default; `cosmos headless` runs the engine alone. Both start
+//! local-only without credentials. `cosmos login` and `cosmos logout` select the
 //! profile used by the next engine start without mutating a live runtime.
 
 mod auth_cli;
@@ -9,11 +9,11 @@ mod update_cli;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "zeron", about = "Multi-device controller for coding agents")]
+#[command(name = "cosmos", about = "Cosmos — multi-device controller for coding agents")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Open a Zeron conversation URL.
+    /// Open a Cosmos conversation URL.
     #[arg(value_name = "URL")]
     open_url: Option<String>,
 }

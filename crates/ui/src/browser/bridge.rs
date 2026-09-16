@@ -235,7 +235,7 @@ async fn handle_message(message: Value, tx: &mpsc::Sender<BridgeRequest>) -> Opt
             "result": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "zeron-browser", "title": "Zeron Browser", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "zeron-browser", "title": "Cosmos Browser", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": "Drive the embedded browser tab the user is looking at. Prefer browser_state first; take a browser_screenshot when the user asks what they see."
             }
         })),

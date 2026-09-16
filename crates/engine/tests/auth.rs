@@ -1,6 +1,6 @@
-//! Auth service tests: dev mode, and the WorkOS flows (headless paste-code exchange,
-//! loopback callback, refresh rotation + revocation, org onboarding) against a stub
-//! edge HTTP server on a plain tokio TcpListener.
+//! Auth service tests: dev mode, and the Woozlit/Firebase flows (custom-token
+//! exchange, loopback callback, refresh rotation + revocation) against a stub
+//! Identity Toolkit / Secure Token HTTP server on a plain tokio TcpListener.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -157,15 +157,15 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
     let ttl = state.token_ttl.load(Ordering::SeqCst) as i64;
     match (method.as_str(), path) {
         ("GET", "/health") => {
-            respond(&mut stream, "200 OK", r#"{"ok":true,"auth":"workos"}"#).await;
+            respond(&mut stream, "200 OK", r#"{"ok":true,"auth":"woozlit"}"#).await;
         }
-        ("POST", "/auth/exchange") => {
+        ("POST", "/identitytoolkit/v1/accounts:signInWithCustomToken") => {
             let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-            if parsed.get("code").and_then(|v| v.as_str()).is_none() {
+            if parsed.get("token").and_then(|v| v.as_str()).is_none() {
                 respond(
                     &mut stream,
                     "400 Bad Request",
-                    r#"{"error":"missing code"}"#,
+                    r#"{"error":"missing token"}"#,
                 )
                 .await;
                 return;
@@ -178,24 +178,25 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
             let org = state.exchange_org.lock().expect("lock").clone();
             let token = fake_jwt(ttl, (!org.is_empty()).then_some(org.as_str()));
             let response = serde_json::json!({
-                "user": { "id": "user_1", "email": "w@example.com",
-                          "firstName": "Wing", "lastName": "Test" },
-                "accessToken": token,
+                "idToken": token,
                 "refreshToken": format!("refresh-{n}"),
+                "localId": "user_1",
+                "expiresIn": "3600",
             });
             respond(&mut stream, "200 OK", &response.to_string()).await;
         }
-        ("POST", "/auth/refresh") => {
-            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-            let refresh_token = parsed
-                .get("refreshToken")
-                .and_then(|v| v.as_str())
+        ("POST", "/securetoken/v1/token") => {
+            let refresh_token = body
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| *k == "refresh_token")
+                .map(|(_, v)| v.replace("%2D", "-"))
                 .unwrap_or_default();
             state
                 .refresh_tokens
                 .lock()
                 .expect("lock")
-                .push(refresh_token.to_string());
+                .push(refresh_token.clone());
             if state.drop_refresh.load(Ordering::SeqCst) {
                 state.refreshes.fetch_add(1, Ordering::SeqCst);
                 return;
@@ -205,10 +206,10 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
                 return;
             }
             let n = state.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
-            let org = parsed.get("organizationId").and_then(|v| v.as_str());
+            let org = state.exchange_org.lock().expect("lock").clone();
             let response = serde_json::json!({
-                "accessToken": fake_jwt(ttl, org),
-                "refreshToken": format!("rotated-{n}"),
+                "id_token": fake_jwt(ttl, (!org.is_empty()).then_some(org.as_str())),
+                "refresh_token": format!("rotated-{n}"),
             });
             respond(&mut stream, "200 OK", &response.to_string()).await;
         }
@@ -234,8 +235,32 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
 fn workos_config(edge_url: &str, data_dir: &std::path::Path) -> AuthConfig {
     let mut config = AuthConfig::new(edge_url, data_dir);
     config.workos_client_id = Some("client_test".into());
-    config.workos_api_base = "https://authkit.example".into();
+    config.firebase_custom_token_url =
+        format!("{edge_url}/identitytoolkit/v1/accounts:signInWithCustomToken");
+    config.firebase_refresh_url = format!("{edge_url}/securetoken/v1/token");
     config
+}
+
+fn decode_query_value(value: &str) -> String {
+    let mut out = String::new();
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                out.push(byte as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn login_callback(url: &str) -> String {
+    decode_query_value(&query_param(url, "callback").expect("callback"))
 }
 
 fn query_param(url: &str, key: &str) -> Option<String> {
@@ -295,33 +320,25 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     assert_eq!(auth.access_token().await, None, "signed out: no token");
 
     let url = auth.start_headless_sign_in();
-    assert!(url.starts_with("https://authkit.example/user_management/authorize?"));
-    assert_eq!(
-        query_param(&url, "client_id").as_deref(),
-        Some("client_test")
-    );
-    let redirect = query_param(&url, "redirect_uri").expect("redirect");
-    assert!(
-        redirect.contains("auth%2Fcli%2Fcallback"),
-        "hosted paste-code page: {redirect}"
-    );
-    let state = query_param(&url, "state").expect("state param");
+    assert!(url.contains("www.woozlit.com/login?desktop=1"));
+    let callback = login_callback(&url);
+    assert!(callback.contains("/callback"), "loopback callback: {callback}");
+    let state = query_param(&callback, "state").expect("state param");
 
-    // A code minted for someone else's flow (unknown state) is rejected — CSRF check.
-    assert!(auth.complete_sign_in("bogus-state.code123").await.is_err());
+    // A token minted for someone else's flow (unknown state) is rejected — CSRF check.
+    assert!(auth.complete_sign_in("bogus-state.token123").await.is_err());
 
-    // The real paste: `state.code`. The exchange-minted token carries no org claim, so
-    // the session lands in NeedsOrganization (the org gate).
-    auth.complete_sign_in(&format!("{state}.code123"))
+    // The real paste: `state.token`. Woozlit personal workspace = Firebase uid.
+    auth.complete_sign_in(&format!("{state}.token123"))
         .await
-        .expect("paste-code sign-in");
+        .expect("woozlit sign-in");
     assert!(
         !auth.loaded_workos_session(),
         "sign-in does not rewrite the startup fact"
     );
     assert_eq!(edge.state.exchanges.load(Ordering::SeqCst), 1);
     assert!(
-        matches!(auth.state(), AuthState::NeedsOrganization { user } if user.email == "w@example.com")
+        matches!(auth.state(), AuthState::SignedIn { user, org_id: Some(org) } if user.email.ends_with("@woozlit.com") && org == user.id)
     );
 
     // Session persisted 0600 with the exchange's refresh token.
@@ -338,37 +355,15 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
         assert_eq!(mode & 0o777, 0o600, "session file must be private");
     }
 
-    // Org onboarding: list, then select — an org-scoped refresh; state follows the
-    // returned token's org claim.
+    // Woozlit personal workspace: list_orgs is the Firebase uid; select is a no-op.
     let orgs = auth.list_orgs().await.expect("list orgs");
     assert_eq!(orgs.len(), 1);
-    assert_eq!(orgs[0].organization_id, "org_1");
-    let mut token_changes = auth.subscribe().expect("auth token signal");
-    auth.select_org("org_1").await.expect("select org");
-    token_changes
-        .changed()
-        .await
-        .expect("org-scoped token should wake transport supervisors");
+    assert_eq!(orgs[0].organization_id, "user_1");
+    auth.select_org("user_1").await.expect("select org");
     assert!(
-        matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), .. } if org == "org_1")
+        matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), .. } if org == "user_1")
     );
     assert!(auth.token().await.is_some());
-    assert_eq!(
-        edge.state
-            .refresh_tokens
-            .lock()
-            .expect("lock")
-            .first()
-            .map(String::as_str),
-        Some("refresh-1"),
-        "org refresh presents the stored refresh token"
-    );
-    // Rotation persisted.
-    let raw = std::fs::read_to_string(&session_file).expect("session persisted");
-    assert!(
-        raw.contains("rotated-1"),
-        "rotated refresh token stored: {raw}"
-    );
 
     // Sign-out clears state and removes the persisted session.
     auth.sign_out();
@@ -386,7 +381,8 @@ async fn short_lived_tokens_refresh_on_demand() {
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
 
     let url = auth.start_headless_sign_in();
-    let state = query_param(&url, "state").expect("state");
+    let callback = login_callback(&url);
+    let state = query_param(&callback, "state").expect("state");
     auth.complete_sign_in(&format!("{state}.codeX"))
         .await
         .expect("sign in");
@@ -471,24 +467,25 @@ async fn loopback_callback_completes_headed_sign_in() {
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
 
     let url = auth.start_sign_in().await.expect("authorize url");
-    let redirect = query_param(&url, "redirect_uri").expect("redirect");
+    assert!(url.contains("www.woozlit.com/login?desktop=1"));
+    let callback = login_callback(&url);
     assert!(
-        redirect.starts_with("http%3A%2F%2F127.0.0.1%3A"),
-        "loopback redirect: {redirect}"
+        callback.starts_with("http://127.0.0.1:"),
+        "loopback callback: {callback}"
     );
-    let state = query_param(&url, "state").expect("state");
-    let callback: String = redirect.replace("%3A", ":").replace("%2F", "/");
+    let _state = query_param(&callback, "state").expect("state");
+    let callback_base = callback.split('?').next().unwrap();
 
     // A wrong/expired state is rejected without touching the exchange endpoint.
-    let bad = reqwest::get(format!("{callback}?code=abc&state=wrong"))
+    let bad = reqwest::get(format!("{callback_base}?token=abc&state=wrong"))
         .await
         .expect("bad cb");
     assert_eq!(bad.status().as_u16(), 400);
     assert_eq!(edge.state.exchanges.load(Ordering::SeqCst), 0);
 
-    // The browser hits the loopback callback → the engine exchanges the code with the
-    // edge and the session lands org-scoped.
-    let ok = reqwest::get(format!("{callback}?code=abc&state={state}"))
+    // The browser hits the loopback callback → the engine exchanges the Woozlit
+    // custom token and the session lands in the personal workspace.
+    let ok = reqwest::get(format!("{callback}&token=abc&userId=user_1&email=w%40example.com&displayName=Wing%20Test"))
         .await
         .expect("cb");
     assert_eq!(ok.status().as_u16(), 200);
@@ -496,7 +493,7 @@ async fn loopback_callback_completes_headed_sign_in() {
     wait_for(&mut state_rx, |s| s.is_signed_in()).await;
     assert_eq!(edge.state.exchanges.load(Ordering::SeqCst), 1);
     assert!(
-        matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), user } if org == "org_1" && user.name.as_deref() == Some("Wing Test"))
+        matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), user } if org == "org_1" && user.name.as_deref() == Some("Wing Test") && user.email == "w@example.com")
     );
 }
 
@@ -508,13 +505,11 @@ async fn sign_out_invalidates_pending_and_in_flight_oauth_callbacks() {
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
 
     let first_url = auth.start_sign_in().await.expect("authorize url");
-    let callback = query_param(&first_url, "redirect_uri")
-        .expect("redirect")
-        .replace("%3A", ":")
-        .replace("%2F", "/");
-    let first_state = query_param(&first_url, "state").expect("state");
+    let first_callback = login_callback(&first_url);
+    let callback_base = first_callback.split('?').next().unwrap().to_string();
+    let first_state = query_param(&first_callback, "state").expect("state");
     auth.sign_out();
-    let canceled_pending = reqwest::get(format!("{callback}?code=old&state={first_state}"))
+    let canceled_pending = reqwest::get(format!("{callback_base}?token=old&state={first_state}"))
         .await
         .expect("pending callback response");
     assert_eq!(canceled_pending.status().as_u16(), 400);
@@ -522,9 +517,10 @@ async fn sign_out_invalidates_pending_and_in_flight_oauth_callbacks() {
 
     edge.state.block_exchange.store(true, Ordering::SeqCst);
     let second_url = auth.start_sign_in().await.expect("second authorize url");
-    let second_state = query_param(&second_url, "state").expect("second state");
+    let second_callback = login_callback(&second_url);
+    let second_state = query_param(&second_callback, "state").expect("second state");
     let callback_request = tokio::spawn(reqwest::get(format!(
-        "{callback}?code=in-flight&state={second_state}"
+        "{callback_base}?token=in-flight&state={second_state}"
     )));
     tokio::time::timeout(
         Duration::from_secs(5),

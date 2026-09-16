@@ -1,5 +1,5 @@
 #!/bin/sh
-# Zeron (native) headless installer.
+# Cosmos (native) headless installer.
 #
 #   curl -fsSL https://zeron.sh/install.sh | sh
 #
@@ -61,6 +61,11 @@ fi
 ln -sfn "$dest" "$app_root/current"
 mkdir -p "$HOME/.local/bin"
 ln -sf "$app_root/current/zeron" "$HOME/.local/bin/zeron"
+if [ -x "$app_root/current/cosmos" ]; then
+  ln -sf "$app_root/current/cosmos" "$HOME/.local/bin/cosmos"
+else
+  ln -sf "$app_root/current/zeron" "$HOME/.local/bin/cosmos"
+fi
 
 # --- service -----------------------------------------------------------------
 # The daemon is useful before auth: without a saved session it serves the local
@@ -71,7 +76,7 @@ if command -v systemctl >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
   mkdir -p "$HOME/.config/systemd/user"
   cat >"$HOME/.config/systemd/user/zeron.service" <<'UNIT'
 [Unit]
-Description=Zeron native headless engine
+Description=Cosmos native headless engine
 After=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
@@ -116,11 +121,11 @@ case "$service" in
     echo ""
     echo "optional sync (local sessions stay local):"
     echo "  systemctl --user stop zeron"
-    echo "  zeron login"
+    echo "  cosmos login"
     echo "  systemctl --user restart zeron"
     ;;
   manual)
     echo "next: run the local-only engine with \`zeron headless\`."
-    echo "optional sync: run \`zeron login\` before starting the engine."
+    echo "optional sync: run \`cosmos login\` before starting the engine."
     ;;
 esac

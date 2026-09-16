@@ -87,7 +87,7 @@ struct NewSessionView: View {
             ZStack {
                 Theme.bg
                 VStack(spacing: 24) {
-                    ZeronMark()
+                    CosmosMark()
                         .frame(width: 84, height: 84)
                         .opacity(0.22)
                     Text("What are we building?")

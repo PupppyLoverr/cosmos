@@ -16,6 +16,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{Bounds, Pixels, Window, px};
+use raw_window_handle::{
+    HandleError, HasWindowHandle, RawWindowHandle, WindowHandle, Win32WindowHandle,
+};
 use tokio::sync::mpsc::Sender;
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
@@ -68,16 +71,20 @@ fn chord_key(vk: u32) -> Option<&'static str> {
 /// user-data directory under %TEMP%, removed on drop once the runtime has
 /// released it. macOS uses a `nonPersistentDataStore` for the same semantic —
 /// a profile switch or app quit discards every cookie.
+///
+/// Only the directory is shared: on Windows a `WebContext` is read solely
+/// for this path, so each build wraps it in a fresh local `WebContext`
+/// rather than holding a shared `RefCell` borrow across `build_as_child`'s
+/// nested message pump — where a second build dispatched by that pump
+/// would panic on the borrow and abort across the FFI boundary.
 pub(super) struct BrowserData {
-    context: Rc<RefCell<wry::WebContext>>,
-    dir: std::path::PathBuf,
+    dir: Rc<std::path::PathBuf>,
 }
 
 impl Clone for BrowserData {
     /// Clones share the profile: a `BrowserContext` is one ephemeral session.
     fn clone(&self) -> Self {
         Self {
-            context: self.context.clone(),
             dir: self.dir.clone(),
         }
     }
@@ -91,10 +98,7 @@ impl Default for BrowserData {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        Self {
-            context: Rc::new(RefCell::new(wry::WebContext::new(Some(dir.clone())))),
-            dir,
-        }
+        Self { dir: Rc::new(dir) }
     }
 }
 
@@ -102,8 +106,8 @@ impl Drop for BrowserData {
     fn drop(&mut self) {
         // Best effort: the runtime still holds the directory while any of its
         // webviews live; stale dirs are reclaimed by the OS temp cleaner.
-        if Rc::strong_count(&self.context) == 1 {
-            let _ = std::fs::remove_dir_all(&self.dir);
+        if Rc::strong_count(&self.dir) == 1 {
+            let _ = std::fs::remove_dir_all(self.dir.as_path());
         }
     }
 }
@@ -120,6 +124,8 @@ pub(super) struct Host {
     webview: wry::WebView,
     page: Rc<RefCell<HostPage>>,
     presented: Presentation,
+    /// Last sync inputs, for the fixture's `host_info` diagnostics.
+    last_sync: Option<String>,
     /// Whether Win32 focus currently sits inside the child HWND. Edge-guarded
     /// so paint-time sync never spams `MoveFocus`.
     focus_pushed: bool,
@@ -134,13 +140,48 @@ pub(super) struct Host {
     tx: Sender<NativeEvent>,
 }
 
+/// An owned snapshot of the GPUI window's HWND for `build_as_child`.
+///
+/// WebView2 environment + controller creation pumps the Win32 message
+/// loop (`webview2_com::wait_with_pump`). If that pump runs while gpui's
+/// `App` cell is borrowed — inside any event or update callback — a
+/// queued gpui task it dispatches panics on the second `borrow_mut`,
+/// which then aborts across the `CallWindowProcW` FFI boundary. The
+/// surface therefore captures the handle up front and calls
+/// [`NativePage::new`] from a foreground task, which gpui only polls
+/// with the cell unborrowed.
+pub(super) struct ParentWindow(Win32WindowHandle);
+
+impl ParentWindow {
+    pub fn of(window: &Window) -> Result<Self, String> {
+        // `Window` has an inherent `window_handle` returning gpui's own
+        // `AnyWindowHandle` — call the trait method explicitly.
+        let handle = HasWindowHandle::window_handle(window)
+            .map_err(|error| format!("Window handle unavailable: {error}"))?;
+        match handle.as_raw() {
+            RawWindowHandle::Win32(handle) => Ok(Self(handle)),
+            _ => Err("Window does not expose a Win32 handle".into()),
+        }
+    }
+}
+
+impl HasWindowHandle for ParentWindow {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Win32(self.0)) })
+    }
+}
+
 pub(super) struct NativePage {
     host: Rc<RefCell<Host>>,
 }
 
 impl NativePage {
+    /// `parent` must come from [`ParentWindow::of`]. Creation pumps the
+    /// Win32 message loop, so call it only where no `App` borrow is held
+    /// (a foreground task body) — never inside an event or update
+    /// callback.
     pub fn new(
-        window: &Window,
+        parent: &ParentWindow,
         data: &BrowserData,
         tx: Sender<NativeEvent>,
     ) -> Result<Self, String> {
@@ -156,8 +197,9 @@ impl NativePage {
         let title_tx = tx.clone();
         let title_page = page.clone();
         let new_tab = tx.clone();
-        let mut context = data.context.borrow_mut();
-        let webview = wry::WebViewBuilder::new_with_web_context(&mut *context)
+        // A local context over the shared profile dir — see `BrowserData`.
+        let mut context = wry::WebContext::new(Some((*data.dir).clone()));
+        let webview = wry::WebViewBuilder::new_with_web_context(&mut context)
             .with_visible(false)
             .with_focused(false)
             .with_navigation_handler(move |url| {
@@ -199,7 +241,7 @@ impl NativePage {
                 wry::NewWindowResponse::Deny
             })
             .with_download_started_handler(|_, _| false)
-            .build_as_child(window)
+            .build_as_child(parent)
             .map_err(|error| error.to_string())?;
 
         // While the page holds Win32 focus, GPUI never sees keystrokes.
@@ -275,6 +317,7 @@ impl NativePage {
                 webview,
                 page,
                 presented: Presentation::Hidden,
+                last_sync: None,
                 focus_pushed: false,
                 _accelerator_token: accelerator_token,
                 _accelerator_handler: handler,
@@ -364,6 +407,41 @@ impl NativePage {
             });
     }
 
+    /// Diagnostic snapshot of the container HWND's placement, for the
+    /// browser fixture: parent hwnd, screen rect, visibility, and the
+    /// WebView2 controller's own bounds.
+    pub fn host_info(&self) -> String {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetParent, GetWindowRect, IsWindowVisible,
+        };
+        let host = self.host.borrow();
+        let hwnd = host.webview.hwnd();
+        let parent = unsafe { GetParent(hwnd) };
+        let mut rect = RECT::default();
+        let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+        let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+        let mut cbounds = RECT::default();
+        let bounds_result = unsafe { host.webview.controller().Bounds(&mut cbounds) };
+        format!(
+            "container={:?} parent={:?} visible={} rect={},{},{}-{} controller={},{},{}-{} ctrl_err={:?} presented={:?} last_sync={:?}",
+            hwnd,
+            parent,
+            visible,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            cbounds.left,
+            cbounds.top,
+            cbounds.right,
+            cbounds.bottom,
+            bounds_result.err(),
+            host.presented,
+            host.last_sync,
+        )
+    }
+
     /// `ICoreWebView2::CapturePreview` — the page's rendered PNG, including
     /// injected overlay DOM (the annotate highlight rides along for free).
     /// The stream must outlive the async capture, so it moves into the
@@ -449,6 +527,9 @@ impl Host {
     pub fn sync(&mut self, bounds: Bounds<Pixels>, mask: Bounds<Pixels>) {
         let clipped = bounds.intersect(&mask);
         let visible = clipped.size.width > px(0.0) && clipped.size.height > px(0.0);
+        self.last_sync = Some(format!(
+            "bounds={bounds:?} mask={mask:?} clipped={clipped:?} visible={visible}"
+        ));
         self.apply_visibility(Some(visible));
         if visible && self.presented != Presentation::Hidden {
             let _ = self.webview.set_bounds(wry::Rect {

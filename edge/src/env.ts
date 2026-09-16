@@ -18,6 +18,8 @@ export interface Env {
   /** Optional overrides for the WorkOS trust anchor. */
   WORKOS_ISSUER?: string;
   WORKOS_JWKS_URL?: string;
+  /** Woozlit Firebase project id (ID-token `aud` / `iss`). */
+  FIREBASE_PROJECT_ID?: string;
   /** WorkOS secret API key (wrangler secret) — powers the absorbed /auth/*
    * routes (code exchange, refresh, orgs). Unset ⇒ those routes answer 501,
    * matching the old apps/server dev-mode behavior. */

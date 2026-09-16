@@ -35,7 +35,14 @@ fn capture(directory: &std::path::Path, name: &str) -> anyhow::Result<()> {
             .arg(&path)
             .status()?
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    let status = {
+        let _ = (directory, name);
+        // External window capture is not wired on Windows; page pixels are
+        // verified through the WebView2 CapturePreview path instead.
+        std::process::Command::new("cmd").args(["/c", "exit 0"]).status()?
+    };
+    #[cfg(target_os = "linux")]
     let status = {
         let capture_window = std::env::var("ZERON_BROWSER_CAPTURE_WINDOW").ok();
         let windows = std::process::Command::new("xdotool")
@@ -163,6 +170,12 @@ fn main() -> anyhow::Result<()> {
     });
     let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
     let result = failure.clone();
+    // Same as `run_app`: gpui's topmost DirectComposition visual covers the
+    // WebView2 child HWND — drop to the classic swapchain before platform init.
+    #[cfg(target_os = "windows")]
+    if std::env::var_os("GPUI_DISABLE_DIRECT_COMPOSITION").is_none() {
+        unsafe { std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1") };
+    }
     gpui_platform::application().with_assets(icons::Assets).run(move |cx| {
         gpui_tokio::init(cx); gpui_base::init(cx);
         let settings = settings::UiSettings::default();
@@ -237,6 +250,24 @@ fn main() -> anyhow::Result<()> {
                     while !first.read_with(cx, |b, _| b.page.title == "Updated title" && b.page.url.as_deref().is_some_and(|u| u.ends_with("/same-document"))) {
                         anyhow::ensure!(std::time::Instant::now() < deadline, "same-document state did not update"); pause(cx, 50).await;
                     }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    window.update(cx, |_, w, cx| first.update(cx, |b, cx| b.navigate(&_origin, w, cx)))?;
+                    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+                    while !first.read_with(cx, |b, _| b.page.title == "Fieldnotes" && !b.page.loading && b.fixture_native_visible()) {
+                        anyhow::ensure!(std::time::Instant::now() < deadline, "first page did not load: {:?}", first.read_with(cx, |b, _| b.page.clone()));
+                        pause(cx, 50).await;
+                    }
+                    pause(cx, 800).await;
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    first.update(cx, |b, _| b.screenshot(tx));
+                    let png = rx.await?.map_err(|e| anyhow::anyhow!("page capture failed: {e}"))?;
+                    std::fs::write(output.join("browser-preview-windows.png"), &png)?;
+                    eprintln!("Browser fixture: page captured ({} bytes), pid={}", png.len(), std::process::id());
+                    eprintln!("Browser fixture: {}", first.read_with(cx, |b, _| b.fixture_host_info()));
+                    pause(cx, 25000).await;
+                    eprintln!("Browser fixture: {}", first.read_with(cx, |b, _| b.fixture_host_info()));
                 }
                 let (second_id, second) = window.update(cx, |shell, w, cx| shell.fixture_open_browser(None, w, cx))?;
                 pause(cx, 250).await;

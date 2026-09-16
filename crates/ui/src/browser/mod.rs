@@ -110,6 +110,13 @@ pub struct BrowserSurface {
     composer: Option<gpui::WeakEntity<crate::composer::Composer>>,
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     native: Option<native::NativePage>,
+    /// A WebView2 build in flight. `build_as_child` pumps the Win32
+    /// message loop, so creation runs on a foreground task — gpui only
+    /// polls those while the `App` cell is unborrowed, letting the nested
+    /// loop dispatch queued work safely. The latest navigation, and any
+    /// shortcuts pushed mid-build, replay when the page lands.
+    #[cfg(target_os = "windows")]
+    pending_native: Option<PendingNative>,
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     native_tx: tokio::sync::mpsc::Sender<native::NativeEvent>,
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -192,6 +199,8 @@ impl BrowserSurface {
             composer: None,
             #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             native: None,
+            #[cfg(target_os = "windows")]
+            pending_native: None,
             #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             native_tx,
             #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -211,14 +220,20 @@ impl BrowserSurface {
     }
     pub fn set_shortcuts(&mut self, keymap: &crate::settings::KeymapConfig) {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if let Some(native) = &self.native {
-            native.set_shortcuts(
-                crate::settings::ShortcutId::ALL
-                    .iter()
-                    .filter(|id| **id != crate::settings::ShortcutId::SaveFile)
-                    .map(|id| crate::settings::platform_combo(keymap.get(*id)))
-                    .collect(),
-            );
+        {
+            let shortcuts: Vec<String> = crate::settings::ShortcutId::ALL
+                .iter()
+                .filter(|id| **id != crate::settings::ShortcutId::SaveFile)
+                .map(|id| crate::settings::platform_combo(keymap.get(*id)))
+                .collect();
+            // An in-flight WebView2 build applies them when the page lands.
+            #[cfg(target_os = "windows")]
+            if let Some(pending) = &mut self.pending_native {
+                pending.shortcuts = Some(shortcuts.clone());
+            }
+            if let Some(native) = &self.native {
+                native.set_shortcuts(shortcuts);
+            }
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = keymap;
@@ -349,12 +364,7 @@ impl BrowserSurface {
             let result = if let Some(native) = &self.native {
                 native.load(&url)
             } else {
-                native::NativePage::new(window, &self.context.data, self.native_tx.clone())
-                    .map(|mut native| {
-                        native.present(self.presentation);
-                        self.native = Some(native);
-                    })
-                    .and_then(|_| self.native.as_ref().unwrap().load(&url))
+                self.create_native(&url, window, cx)
             };
             self.page.loading = result.is_ok();
             if let Err(error) = result {
@@ -374,6 +384,90 @@ impl BrowserSurface {
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let url = self.address.read(cx).text().to_owned();
         self.navigate(&url, window, cx);
+    }
+
+    /// Attach the native page and start `url` — synchronous here: neither
+    /// platform pumps the window's message loop while building, so running
+    /// inside the current `App` borrow is safe.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn create_native(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        native::NativePage::new(window, &self.context.data, self.native_tx.clone())
+            .map(|mut native| {
+                native.present(self.presentation);
+                self.native = Some(native);
+            })
+            .and_then(|_| self.native.as_ref().unwrap().load(url))
+    }
+
+    /// WebView2's `build_as_child` pumps the Win32 message loop while the
+    /// environment and controller come up. Run under the `App` borrow an
+    /// event or update callback holds, that pump dispatches queued gpui
+    /// tasks — which then panic on the second `AppCell` borrow and abort
+    /// across the `CallWindowProcW` boundary. The build therefore runs on
+    /// a foreground task, which gpui only polls with the cell unborrowed;
+    /// the page lands back in context and replays the pending target.
+    #[cfg(target_os = "windows")]
+    fn create_native(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if let Some(pending) = &mut self.pending_native {
+            pending.url = url.to_owned();
+            return Ok(());
+        }
+        let parent = native::ParentWindow::of(window)?;
+        let data = self.context.data.clone();
+        let tx = self.native_tx.clone();
+        self.pending_native = Some(PendingNative {
+            url: url.to_owned(),
+            shortcuts: None,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            // The task body runs with no `App` borrow held, so the message
+            // pump inside `NativePage::new` is free to dispatch queued gpui
+            // work — including this entity's own event handlers — without
+            // re-entering a borrowed `AppCell`.
+            let created = native::NativePage::new(&parent, &data, tx);
+            let _ = this.update_in(cx, |this, _, cx| {
+                if let Some(pending) = this.pending_native.take() {
+                    match created {
+                        Ok(mut native) => {
+                            native.present(this.presentation);
+                            if let Some(shortcuts) = pending.shortcuts {
+                                native.set_shortcuts(shortcuts);
+                            }
+                            let result = native.load(&pending.url);
+                            this.page.loading = result.is_ok();
+                            if let Err(error) = result {
+                                this.page.error =
+                                    Some(format!("Could not open this page: {error}"));
+                            }
+                            this.native = Some(native);
+                        }
+                        Err(error) => {
+                            this.page.loading = false;
+                            this.page.error =
+                                Some(format!("Could not open this page: {error}"));
+                        }
+                    }
+                } else {
+                    // `close` ran while the host was building — the page
+                    // drops rather than attaching to a closed surface.
+                    this.page.loading = false;
+                }
+                cx.emit(BrowserEvent::Changed);
+                cx.notify();
+            });
+        })
+        .detach();
+        Ok(())
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
@@ -709,6 +803,12 @@ impl BrowserSurface {
                 cx.defer(move |cx| gpui::ImageSource::Render(image).evict(None, cx));
             }
             self.native = None;
+            // Cancels an in-flight WebView2 build: it drops on landing
+            // instead of attaching to a closed surface.
+            #[cfg(target_os = "windows")]
+            {
+                self.pending_native = None;
+            }
             #[cfg(target_os = "macos")]
             {
                 self.favicon_task = None;
@@ -909,6 +1009,16 @@ struct Annotate {
     _poll: gpui::Task<()>,
 }
 
+/// State for an in-flight WebView2 build; see the `pending_native` field
+/// for why creation is deferred to a foreground task.
+#[cfg(target_os = "windows")]
+struct PendingNative {
+    /// Latest navigation target — re-navigating mid-build just retargets.
+    url: String,
+    /// App chords pushed while the build was in flight.
+    shortcuts: Option<Vec<String>>,
+}
+
 /// Every platform returns the evaluated script's *string* result — the
 /// caller-side wrapper JSON-encodes the real value into that string, so the
 /// native boundary only ever ferries text. Windows and Linux then JSON-wrap
@@ -1050,6 +1160,13 @@ impl BrowserSurface {
     #[cfg(target_os = "macos")]
     pub fn fixture_geometry(&self) -> (f32, f32, f32) {
         self.native.as_ref().unwrap().fixture_geometry()
+    }
+    #[cfg(target_os = "windows")]
+    pub fn fixture_host_info(&self) -> String {
+        self.native
+            .as_ref()
+            .map(|native| native.host_info())
+            .unwrap_or_else(|| "no native page".into())
     }
     pub fn fixture_eval(&self, script: &str) {
         #[cfg(target_os = "macos")]

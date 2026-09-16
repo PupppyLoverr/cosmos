@@ -404,6 +404,38 @@ impl Harness for ClaudeHarness {
             .cloned()
     }
 
+    /// `~/.claude/projects/<cwd-slug>/<sessionId>.jsonl` — one file per
+    /// session. Resumable through `claude --resume <id>` keyed by cwd.
+    async fn sessions(&self) -> Result<Vec<zeron_proto::HarnessSession>, HarnessError> {
+        self.resolve_executable()?;
+        let Some(root) = crate::home_dir().map(|h| h.join(".claude").join("projects")) else {
+            return Ok(Vec::new());
+        };
+        let root2 = root.clone();
+        Ok(tokio::task::spawn_blocking(move || crate::sessions::scan_claude(&root2))
+            .await
+            .unwrap_or_default())
+    }
+
+    /// The session's own jsonl file is the transcript — user/assistant text
+    /// rows, skipping command echoes and sidechains.
+    async fn session_transcript(
+        &self,
+        session_id: &str,
+        _cwd: &str,
+    ) -> Result<Option<Vec<zeron_proto::SessionTranscriptRow>>, HarnessError> {
+        let Some(root) = crate::home_dir().map(|h| h.join(".claude").join("projects")) else {
+            return Ok(None);
+        };
+        let id = session_id.to_string();
+        Ok(tokio::task::spawn_blocking(move || {
+            crate::sessions::find_session_file(&root, &id, 1)
+                .map(|p| crate::sessions::claude_transcript(&p))
+        })
+        .await
+        .unwrap_or_default())
+    }
+
     async fn run(
         &self,
         request: RunRequest,

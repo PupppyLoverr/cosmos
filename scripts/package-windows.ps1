@@ -1,6 +1,6 @@
 # Windows packaging: build the release binary and produce
 #   target/package/zeron-<version>-windows-<arch>.zip
-#   target/package/Zeron-Setup-<arch>.exe   (when Inno Setup is installed)
+#   target/package/Cosmos-Setup-<arch>.exe   (when Inno Setup is installed)
 #
 # The zip is the portable package AND the self-update payload — crates/update
 # resolves it via headless_artifact() and unpacks it with System32 bsdtar.
@@ -26,25 +26,29 @@ try {
     if ($Profile -eq 'release') { cargo build --release -p zeron }
     else                        { cargo build -p zeron }
     $Bin = "$Root\target\$Profile\zeron.exe"
+    $CosmosBin = "$Root\target\$Profile\cosmos.exe"
     if (-not (Test-Path $Bin)) { throw "build did not produce $Bin" }
+    if (-not (Test-Path $CosmosBin)) { throw "build did not produce $CosmosBin" }
 
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Stage, $Zip
     New-Item -ItemType Directory -Force $Stage | Out-Null
     Copy-Item $Bin "$Stage\zeron.exe"
+    Copy-Item $CosmosBin "$Stage\cosmos.exe"
     New-Item -ItemType Directory -Force "$Stage\licenses\fonts" | Out-Null
     Copy-Item "$Root\crates\ui\assets\fonts\licenses\*" "$Stage\licenses\fonts\"
 
-    # Per-user installer: drops zeron.exe under %LOCALAPPDATA%\Zeron\bin and
+    # Per-user installer: drops zeron.exe under %LOCALAPPDATA%\Cosmos\bin and
     # prepends it to the user's PATH. No admin, no shell restart needed for
     # `zeron` in new terminals (PATH change applies to new processes).
     @'
 @echo off
 setlocal
-set "DEST=%LOCALAPPDATA%\Zeron\bin"
+set "DEST=%LOCALAPPDATA%\Cosmos\bin"
 if not exist "%DEST%" mkdir "%DEST%"
 copy /y "%~dp0zeron.exe" "%DEST%\zeron.exe" >nul
-powershell -NoProfile -Command "$p=[Environment]::GetEnvironmentVariable('Path','User'); if ($p -notlike '*Zeron\bin*') { [Environment]::SetEnvironmentVariable('Path', $p + ';%DEST%', 'User') }"
-echo Installed zeron to %DEST% (added to your user PATH - new terminals see it).
+copy /y "%~dp0cosmos.exe" "%DEST%\cosmos.exe" >nul
+powershell -NoProfile -Command "$p=[Environment]::GetEnvironmentVariable('Path','User'); if ($p -notlike '*Cosmos\bin*') { [Environment]::SetEnvironmentVariable('Path', $p + ';%DEST%', 'User') }"
+echo Installed Cosmos to %DEST% (added to your user PATH - new terminals see it).
 '@ | Set-Content -Encoding ASCII "$Stage\install.cmd"
 
     Compress-Archive -Path "$Stage\*" -DestinationPath $Zip -Force
@@ -58,28 +62,29 @@ echo Installed zeron to %DEST% (added to your user PATH - new terminals see it).
         @"
 #define Version "$Version"
 [Setup]
-AppName=Zeron
+AppName=Cosmos
 AppVersion={#Version}
-AppPublisher=Zeron
-DefaultDirName={localappdata}\Zeron
-DefaultGroupName=Zeron
+AppPublisher=Cosmos
+DefaultDirName={localappdata}\Cosmos
+DefaultGroupName=Cosmos
 OutputDir=$OutDir
-OutputBaseFilename=Zeron-Setup-$Arch
+OutputBaseFilename=Cosmos-Setup-$Arch
 ; Installer .exe icon; the embedded resource in zeron.exe covers shortcuts and
 ; the Apps & Features entry (UninstallDisplayIcon just points back at it).
 SetupIconFile=$Root\dist\windows\zeron.ico
-UninstallDisplayIcon={app}\bin\zeron.exe
+UninstallDisplayIcon={app}\bin\cosmos.exe
 Compression=lzma2
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Files]
-Source: "$Bin"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "$Bin"; DestDir: "{app}\bin"; DestName: "zeron.exe"; Flags: ignoreversion
+Source: "$CosmosBin"; DestDir: "{app}\bin"; DestName: "cosmos.exe"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Zeron"; Filename: "{app}\bin\zeron.exe"
-Name: "{autodesktop}\Zeron"; Filename: "{app}\bin\zeron.exe"
+Name: "{group}\Cosmos"; Filename: "{app}\bin\cosmos.exe"
+Name: "{autodesktop}\Cosmos"; Filename: "{app}\bin\cosmos.exe"
 
 [Registry]
 ; Per-user PATH entry so `zeron` resolves in new terminals.
@@ -91,12 +96,12 @@ function NeedsAddPath(): Boolean;
 var P: String;
 begin
   RegQueryStringValue(HKCU, 'Environment', 'Path', P);
-  Result := Pos('Zeron\bin', P) = 0;
+  Result := Pos('Cosmos\bin', P) = 0;
 end;
 "@ | Set-Content -Encoding ASCII $iss
         & $iscc.Source $iss | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "iscc failed ($LASTEXITCODE)" }
-        Write-Host "wrote $OutDir\Zeron-Setup-$Arch.exe"
+        Write-Host "wrote $OutDir\Cosmos-Setup-$Arch.exe"
     } else {
         Write-Host "Inno Setup not found (or SKIP_INSTALLER=1) - zip only"
     }

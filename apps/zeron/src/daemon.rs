@@ -7,7 +7,7 @@
 //! `ZERON_EDGE_URL=… zeron daemon install` bakes that override in.
 //!
 //! Auth is decoupled: without a saved session the service remains up on the
-//! local-only profile. `zeron login` and a service restart opt into sync.
+//! local-only profile. `cosmos login` and a service restart opt into sync.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -310,7 +310,7 @@ fn captured_env() -> Vec<(String, String)> {
 
 fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
     let mut unit = String::from(
-        "[Unit]\nDescription=Zeron headless engine\nAfter=network-online.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
+        "[Unit]\nDescription=Cosmos headless engine\nAfter=network-online.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
     );
     for (key, value) in env {
         // systemd unquotes the value; escape the characters it treats specially.

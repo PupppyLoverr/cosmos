@@ -483,6 +483,32 @@ pub(crate) fn parse_commands(value: Option<&Value>) -> Vec<SlashCommand> {
         .collect()
 }
 
+/// Decode a `session/list` response — `{sessions: [{sessionId, title, cwd,
+/// updatedAt}]}`. Agents that don't implement the method answer Null/{} and
+/// decode to empty.
+pub(crate) fn parse_session_list(value: &Value) -> Vec<zeron_proto::HarnessSession> {
+    value
+        .get("sessions")
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| {
+            let id = str_field(s, "sessionId");
+            (!id.is_empty()).then(|| zeron_proto::HarnessSession {
+                id,
+                title: str_field(s, "title"),
+                preview: str_field(s, "preview"),
+                cwd: str_field(s, "cwd"),
+                updated_at: s
+                    .get("updatedAt")
+                    .and_then(Value::as_str)
+                    .and_then(crate::sessions::iso_to_epoch_ms),
+            })
+        })
+        .collect()
+}
+
 /// `session/request_permission` options (`{optionId, name, kind}`) → the
 /// preferred auto-approve choice: `allow_always` > `allow_once` > first.
 pub(crate) fn preferred_allow_option(options: &[Value]) -> Option<String> {

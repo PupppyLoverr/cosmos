@@ -182,7 +182,7 @@ impl CodexHarness {
                     json!({
                         "clientInfo": {
                             "name": "zeron-native",
-                            "title": "Zeron",
+                            "title": "Cosmos",
                             "version": env!("CARGO_PKG_VERSION"),
                         },
                         "capabilities": { "experimentalApi": true },
@@ -233,7 +233,7 @@ impl CodexHarness {
                     json!({
                         "clientInfo": {
                             "name": "zeron-native",
-                            "title": "Zeron",
+                            "title": "Cosmos",
                             "version": env!("CARGO_PKG_VERSION"),
                         },
                         "capabilities": { "experimentalApi": true },
@@ -557,6 +557,36 @@ impl Harness for CodexHarness {
             .cloned()
     }
 
+    /// `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` — resumable through
+    /// codex's `thread/resume` keyed by the `session_meta` id.
+    async fn sessions(&self) -> Result<Vec<zeron_proto::HarnessSession>, HarnessError> {
+        self.resolve_executable()?;
+        let Some(root) = crate::home_dir().map(|h| h.join(".codex").join("sessions")) else {
+            return Ok(Vec::new());
+        };
+        Ok(tokio::task::spawn_blocking(move || crate::sessions::scan_codex(&root))
+            .await
+            .unwrap_or_default())
+    }
+
+    /// The rollout file is the transcript — user/assistant message rows.
+    async fn session_transcript(
+        &self,
+        session_id: &str,
+        _cwd: &str,
+    ) -> Result<Option<Vec<zeron_proto::SessionTranscriptRow>>, HarnessError> {
+        let Some(root) = crate::home_dir().map(|h| h.join(".codex").join("sessions")) else {
+            return Ok(None);
+        };
+        let id = session_id.to_string();
+        Ok(tokio::task::spawn_blocking(move || {
+            crate::sessions::find_session_file(&root, &id, 4)
+                .map(|p| crate::sessions::codex_transcript(&p))
+        })
+        .await
+        .unwrap_or_default())
+    }
+
     async fn run(
         &self,
         request: RunRequest,
@@ -851,7 +881,7 @@ async fn run_session(session: Session) {
                 json!({
                     "clientInfo": {
                         "name": "zeron-native",
-                        "title": "Zeron",
+                        "title": "Cosmos",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                     "capabilities": { "experimentalApi": true },

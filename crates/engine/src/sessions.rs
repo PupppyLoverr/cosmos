@@ -85,11 +85,21 @@ struct RuntimeConfig {
 
 impl RuntimeConfig {
     fn from_request(harness_id: HarnessId, request: &RunRequest) -> Self {
+        // `_zeron_*` keys mark ONE run's behavior (an attach's replay flag),
+        // never the session's runtime shape — a stamped attach followed by an
+        // unstamped send must still route into the parked session, so
+        // internal directives are filtered out of the routing comparison.
+        let model_options: serde_json::Map<String, serde_json::Value> = request
+            .model_options
+            .iter()
+            .filter(|(k, _)| !zeron_proto::is_internal_option(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         Self {
             harness_id,
             model: request.model.clone(),
             reasoning: request.reasoning,
-            model_options: request.model_options.clone(),
+            model_options,
             cwd: request.cwd.clone(),
             sandbox: request.sandbox,
             auto_approve: request.auto_approve,

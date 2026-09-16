@@ -579,7 +579,8 @@ pub fn default_registry() -> HarnessRegistry {
     // Google Antigravity (`agy`) over its own stream-json protocol, same lazy
     // pattern: the static descriptor mirrors AntigravityHarness exactly.
     // Turn-boundary steering — each `user` stdin line runs one full turn —
-    // and the low/medium/high effort ladder rides `--effort`.
+    // and the low/medium/high effort ladder rides the model id's suffix
+    // (agy rejects `--effort` alongside `--model`).
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Antigravity,

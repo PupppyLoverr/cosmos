@@ -42,6 +42,18 @@ pub mod methods {
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_COMMANDS: &str = "ListCommands";
+    /// The harness's resumable session index (`/resume` picker):
+    /// `{harness}` → `HarnessSession[]`.
+    pub const LIST_SESSIONS: &str = "ListSessions";
+    /// Attach a chat to a harness-native session: imports whatever transcript
+    /// the store exposes into the doc, then stamps the chat's
+    /// `harnessSessionId`/`harnessSessionCwd` so the next send resumes it.
+    /// `{chatId, harness, sessionId, cwd}` → `{imported}`.
+    pub const RESUME_SESSION: &str = "ResumeSession";
+    /// A chat transcript's tail as flat rows — the `@chat` mention payload
+    /// the composer folds into the outgoing prompt.
+    /// `{chatId, maxRows?}` → `SessionTranscriptRow[]`.
+    pub const CHAT_CONTEXT: &str = "ChatContext";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     /// Peer-to-peer delivery fallback: the SENDER's engine forwards a queued
     /// command entry (client-minted id and all) straight over the device-room

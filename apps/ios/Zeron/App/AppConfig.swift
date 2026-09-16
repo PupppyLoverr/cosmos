@@ -7,6 +7,7 @@ import Foundation
 final class AppConfig: @unchecked Sendable {
     enum Mode: String {
         case workos
+        case woozlit
         case dev
     }
 
@@ -53,7 +54,7 @@ final class AppConfig: @unchecked Sendable {
         switch mode {
         case .dev:
             return lock.withLock { devBearer }
-        case .workos:
+        case .workos, .woozlit:
             let current = lock.withLock { tokens }
             guard let current else { return nil }
             if !Self.isExpired(jwt: current.accessToken) {
@@ -72,10 +73,15 @@ final class AppConfig: @unchecked Sendable {
                 return existing
             }
 
-            let task = Task<String?, Never> { [edgeURL, orgId] in
+            let task = Task<String?, Never> { [edgeURL, orgId, mode] in
                 let client = AuthClient(baseURL: edgeURL)
-                let refreshed = try? await client.refresh(refreshToken: current.refreshToken,
+                let refreshed: AuthTokens?
+                if mode == .woozlit {
+                    refreshed = try? await client.refreshWoozlit(refreshToken: current.refreshToken)
+                } else {
+                    refreshed = try? await client.refresh(refreshToken: current.refreshToken,
                                                           organizationId: orgId)
+                }
                 if let refreshed {
                     self.updateTokens(refreshed)
                     Keychain.save(refreshed.accessToken, key: "accessToken")

@@ -179,7 +179,7 @@ impl Terminals {
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", "Zeron");
+        cmd.env("TERM_PROGRAM", "Cosmos");
         let mut child = pair
             .slave
             .spawn_command(cmd)

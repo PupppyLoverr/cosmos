@@ -1,6 +1,6 @@
 // Sign-in — the OAuth authorization-code flow against WorkOS AuthKit, with
 // the secret-bearing exchange delegated to the edge (`POST /auth/exchange`).
-// The zeron mark on black, one white button — the old mobile app's Gate.
+// The Cosmos mark on black, one white button — the old mobile app's Gate.
 //
 // Endpoints are fixed to production (the old app's rule: mobile always talks
 // to prod; a stale override once broke sign-in in the worst ghost way).
@@ -8,21 +8,16 @@
 import AuthenticationServices
 import SwiftUI
 
-/// Production cloud endpoints — mirrors edge/wrangler.jsonc.
+/// Production cloud endpoints — Woozlit login, same bounce the desktop uses.
 enum Endpoints {
     static let edgeURL = URL(string: "https://edge.zeron.sh")!
-    static let workosClientId = "client_01KWD0EAKZKD50YCQJNYSRE4BY"
-    static let workosAPIBase = "https://api.workos.com"
     static let callbackScheme = "zeron"
 
-    static func authorizeURL(state: String) -> URL {
-        var components = URLComponents(string: "\(workosAPIBase)/user_management/authorize")!
+    static func loginURL() -> URL {
+        var components = URLComponents(string: "https://www.woozlit.com/login")!
         components.queryItems = [
-            URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "client_id", value: workosClientId),
-            URLQueryItem(name: "redirect_uri", value: "\(callbackScheme)://callback"),
-            URLQueryItem(name: "provider", value: "authkit"),
-            URLQueryItem(name: "state", value: state),
+            URLQueryItem(name: "desktop", value: "1"),
+            URLQueryItem(name: "callback", value: "\(callbackScheme)://callback"),
         ]
         return components.url!
     }
@@ -42,14 +37,14 @@ struct SignInView: View {
                 Spacer()
 
                 VStack(spacing: 24) {
-                    ZeronMark()
+                    CosmosMark()
                         .frame(width: 72, height: 72)
                     VStack(spacing: 6) {
-                        Text("Zeron")
+                        Text("Cosmos")
                             .font(Theme.sans(28, weight: .semibold))
                             .kerning(-0.5)
                             .foregroundStyle(Theme.text)
-                        Text("Your coding agents, from anywhere")
+                        Text("Sign in with your Woozlit account")
                             .font(Theme.sans(15))
                             .foregroundStyle(Theme.textMuted)
                     }
@@ -64,7 +59,7 @@ struct SignInView: View {
                                 ProgressView()
                                     .tint(Theme.bg)
                             } else {
-                                Text("Log in to Zeron")
+                                Text("Continue with Woozlit")
                                     .font(Theme.sans(15, weight: .semibold))
                                     .foregroundStyle(Theme.bg)
                             }
@@ -92,13 +87,12 @@ struct SignInView: View {
         }
     }
 
-    /// The AuthKit code flow: system browser session → zeron://callback with
-    /// code + state → exchange on the edge.
+    /// Woozlit login: system browser → woozlit.com (Google / Discord) →
+    /// zeron://callback?token=… then Firebase custom-token exchange.
     private func signIn() {
         busy = true
         error = nil
-        let state = UUID().uuidString
-        authSession.start(url: Endpoints.authorizeURL(state: state),
+        authSession.start(url: Endpoints.loginURL(),
                           callbackScheme: Endpoints.callbackScheme) { result in
             Task { @MainActor in
                 switch result {
@@ -110,15 +104,19 @@ struct SignInView: View {
                 case .success(let callbackURL):
                     let params = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
                         .queryItems ?? []
-                    let code = params.first { $0.name == "code" }?.value
-                    let cbState = params.first { $0.name == "state" }?.value
-                    guard let code, cbState == state else {
+                    let token = params.first { $0.name == "token" }?.value
+                    guard let token, !token.isEmpty else {
                         busy = false
-                        error = "Callback missing code or state mismatch"
+                        error = "Woozlit login did not return a token"
                         return
                     }
+                    let userId = params.first { $0.name == "userId" }?.value
+                    let email = params.first { $0.name == "email" }?.value
+                    let displayName = params.first { $0.name == "displayName" }?.value
                     do {
-                        try await model.signIn(edgeURL: Endpoints.edgeURL, code: code)
+                        try await model.signInWoozlit(edgeURL: Endpoints.edgeURL, token: token,
+                                                      userId: userId, email: email,
+                                                      displayName: displayName)
                     } catch {
                         self.error = error.localizedDescription
                     }
@@ -235,10 +233,10 @@ struct OrgPickerView: View {
     }
 }
 
-/// The actual zeron mark — the desktop's 34-cell logo
+/// The actual Cosmos mark — the desktop's 34-cell logo
 /// (crates/ui/assets/icons/zeron-logo.svg), cells scaled from its 820×940
 /// viewbox and tinted by `color`.
-struct ZeronMark: View {
+struct CosmosMark: View {
     var color: Color = Theme.text
 
     /// (x, y) of each 100×100 rx16 cell in the 820×940 viewbox.
@@ -252,19 +250,19 @@ struct ZeronMark: View {
     ]
 
     var body: some View {
-        ZeronMarkShape()
+        CosmosMarkShape()
             .fill(color)
             .aspectRatio(820 / 940, contentMode: .fit)
     }
 }
 
-struct ZeronMarkShape: Shape {
+struct CosmosMarkShape: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
         let scale = min(rect.width / 820, rect.height / 940)
         let dx = rect.minX + (rect.width - 820 * scale) / 2
         let dy = rect.minY + (rect.height - 940 * scale) / 2
-        for (x, y) in ZeronMark.cells {
+        for (x, y) in CosmosMark.cells {
             let cell = CGRect(x: dx + x * scale, y: dy + y * scale,
                               width: 100 * scale, height: 100 * scale)
             path.addRoundedRect(in: cell, cornerSize: CGSize(width: 16 * scale, height: 16 * scale))
