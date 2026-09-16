@@ -1,6 +1,8 @@
 //! Actual CodexHarness JSON-RPC decoding through the engine's document writer.
 //! Fixtures run offline; no installed agent or model account is involved.
 
+#![cfg(unix)]
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;

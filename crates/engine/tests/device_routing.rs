@@ -808,7 +808,13 @@ async fn terminal_stream_proxies_over_the_relay() {
             methods::WRITE_TERMINAL,
             serde_json::json!({
                 "terminalId": terminal_id,
-                "data": BASE64.encode("echo r3lay-$((20+2))\n"),
+                // POSIX `$((…))` arithmetic in the marker doubles as a shell
+                // probe; cmd/PowerShell get a plain echo (same assertion).
+                "data": BASE64.encode(if cfg!(windows) {
+                    "echo r3lay-22\r\n"
+                } else {
+                    "echo r3lay-$((20+2))\n"
+                }),
                 "targetDeviceId": "device-b",
             }),
         )

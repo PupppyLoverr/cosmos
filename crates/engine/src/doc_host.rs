@@ -4405,12 +4405,18 @@ impl DocHost {
         chat_id: &str,
         spec: &zeron_proto::WorktreeSpec,
     ) -> Result<(String, Option<zeron_proto::Worktree>), EngineError> {
+        // canonicalize() hands us `\\?\` verbatim paths on Windows, and git
+        // records `gitdir:` links with forward slashes — compare as normalized
+        // paths, not strings.
+        let spec_repo = crate::repos::unverbatim(std::path::Path::new(&spec.repo_path));
         if let Some(ws) = self.workspace()
             && let Ok(Some(chat)) = ws.chat(chat_id)
             && let Some(cwd) = chat.cwd
-            && cwd != spec.repo_path
-            && crate::workspace_host::linked_worktree_root(std::path::Path::new(&cwd)).as_deref()
-                == Some(spec.repo_path.as_str())
+            && std::path::Path::new(&cwd) != spec_repo.as_path()
+            && crate::workspace_host::linked_worktree_root(std::path::Path::new(&cwd))
+                .map(std::path::PathBuf::from)
+                .as_deref()
+                == Some(spec_repo.as_path())
         {
             tracing::info!(chat = %chat_id, cwd = %cwd, "worktree spec: reusing the chat's existing worktree");
             return Ok((cwd, None));

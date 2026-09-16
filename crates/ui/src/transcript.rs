@@ -64,6 +64,45 @@ pub const OVERDRAW_PX: f32 = 320.0;
 /// Show the scroll-to-bottom button beyond this distance from the end.
 pub const SCROLL_BUTTON_THRESHOLD_PX: f32 = 320.0;
 
+/// The thumb occupies only the unobscured part of the transcript. Keep the
+/// list's full scroll range, even though chrome shortens the scrollbar track.
+#[derive(Clone)]
+struct TranscriptScrollbar {
+    list: ListState,
+    top: f32,
+    bottom: f32,
+}
+
+impl gpui_base::ScrollbarHandle for TranscriptScrollbar {
+    fn viewport_bounds(&self) -> Bounds<Pixels> {
+        let mut bounds = self.list.viewport_bounds();
+        let top = px(self.top).min(bounds.size.height);
+        bounds.origin.y += top;
+        bounds.size.height = (bounds.size.height - top - px(self.bottom)).max(px(0.0));
+        bounds
+    }
+
+    fn offset(&self) -> Point<Pixels> {
+        self.list.scroll_px_offset_for_scrollbar()
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>) {
+        self.list.set_offset_from_scrollbar(offset);
+    }
+
+    fn content_size(&self) -> gpui::Size<Pixels> {
+        self.viewport_bounds().size + self.list.max_offset_for_scrollbar().into()
+    }
+
+    fn start_drag(&self) {
+        self.list.scrollbar_drag_started();
+    }
+
+    fn end_drag(&self) {
+        self.list.scrollbar_drag_ended();
+    }
+}
+
 fn jump_visibility(was_shown: bool, distance: f32) -> bool {
     // Once offered, keep the control until close to the end. A single 320px
     // threshold made it disappear halfway through a downward scroll gesture.
@@ -2686,6 +2725,7 @@ pub struct Transcript {
     /// One `on_next_frame` callback in flight at most.
     spring_scheduled: bool,
     scroll_anim: Option<Task<()>>,
+    scrollbar_pressed: bool,
     /// Last pointer sample while markdown selection owns a left-button drag.
     selection_drag_position: Option<Point<Pixels>>,
     /// One-shot timer rescheduled only while the pointer remains in an edge
@@ -2910,6 +2950,7 @@ impl Transcript {
             scroll_anim: None,
             selection_drag_position: None,
             selection_scroll_task: None,
+            scrollbar_pressed: false,
             rail_enabled,
             bottom_clearance: 0.0,
             rail_hover: None,
@@ -3263,6 +3304,17 @@ impl Transcript {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.scrollbar_pressed {
+            self.scrollbar_pressed = false;
+            self.last_scroll_distance = self.distance_from_bottom();
+            self.pinned = self.last_scroll_distance <= AT_BOTTOM_PX;
+            if self.pinned {
+                self.wake_spring();
+            }
+            self.show_jump_button =
+                jump_visibility(self.show_jump_button, self.last_scroll_distance) && !self.pinned;
+            cx.notify();
+        }
         let was_selecting = self.selection_drag_position.is_some();
         self.stop_selection_scroll();
         if let Some(_text) = crate::markdown::selection::end_active_drag() {
@@ -4003,6 +4055,7 @@ impl Transcript {
             self.copied_message = None;
             self.copied_message_clear = None;
             self.list.reset(0);
+            self.scrollbar_pressed = false;
             self.pending_viewport = None;
             self.viewport_generation = self.viewport_generation.wrapping_add(1);
             self.viewport_finalize_pending = false;
@@ -6001,6 +6054,28 @@ impl Transcript {
                 (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(default_open)
             })
             .collect();
+        // Auto-fetch the full diff for an open edit chip whose doc only
+        // carries stats: expanding an edit is exactly "show me the lines it
+        // changed", so the sidecar fetch shouldn't need a second click on the
+        // affordance. Only the still-showing-Stats case fetches — an already-
+        // Ready Diff needs nothing, and a fetched Output the user picked over
+        // it stays put. Unfetched only: spawn_blob_fetch re-bumps the order of
+        // a Ready ref, which would steal the shown slot back every paint.
+        for (ix, tool) in tools.iter().enumerate() {
+            if !detail_opens[ix] {
+                continue;
+            }
+            let is_stats = matches!(details[ix].as_deref(), Some(ToolDetail::Stats { .. }));
+            let Some(diff_ref) = tool.diff_ref.as_ref() else {
+                continue;
+            };
+            if is_stats && self.blob_details.get(diff_ref).is_none() {
+                self.spawn_blob_fetch(diff_ref.clone(), cx);
+                // Repaint now so the affordance reads "Loading full diff…"
+                // for the fetch's duration, not just "Show full diff" → diff.
+                cx.notify();
+            }
+        }
         let detail_highlights: Vec<Option<Arc<crate::changes::DiffHighlights>>> = details
             .iter()
             .enumerate()
@@ -6873,6 +6948,34 @@ enum ChipTrail {
     OpenArrow,
 }
 
+/// Extract `(+additions, −deletions)` from a file-editing tool's precomputed
+/// detail, for the chip header's inline stat. Returns None for non-file tools,
+/// details without counts, or no-op edits (both zero) — so a collapsed chip
+/// already reads "Edit foo.rs +5 −6" without expanding, matching the per-file
+/// stat rows the thin doc keeps. The full diff (when fetched via the sidecar)
+/// carries the same counts, so the header stat stays correct after the
+/// upgrade.
+fn tool_diff_counts(tool: &ToolItem) -> Option<(u64, u64)> {
+    let is_file_edit = matches!(
+        &tool.call,
+        ToolCall::EditFile { .. } | ToolCall::WriteFile { .. } | ToolCall::ApplyPatch { .. }
+    );
+    if !is_file_edit {
+        return None;
+    }
+    let detail = tool.detail.as_deref()?;
+    let (additions, deletions) = match detail {
+        ToolDetail::Diff { file, .. } => (file.additions as u64, file.deletions as u64),
+        ToolDetail::Stats { stats } => {
+            let a: u64 = stats.iter().map(|s| s.additions).sum();
+            let d: u64 = stats.iter().map(|s| s.deletions).sum();
+            (a, d)
+        }
+        _ => return None,
+    };
+    (additions > 0 || deletions > 0).then_some((additions, deletions))
+}
+
 /// The chip's content row: icon tile + label + detail line (+ trailing tile
 /// when the chip expands or links out). Shared between the plain chip, the
 /// header of an expandable chip card, and the spawn link chip.
@@ -6907,6 +7010,11 @@ fn chip_header_row(
     let failed = tool.is_error
         || (tool.subagent_ref.is_some()
             && matches!(tool.subagent_status, Some(SubagentStatus::Failed)));
+    // Inline `+N −N` stat for file-editing tools — visible in the collapsed
+    // chip without expanding, sourced from the precomputed detail (Stats or
+    // Diff). Suppressed on failure so a red header doesn't carry green/red
+    // counts for an edit that didn't land.
+    let diff_counts = (!failed).then(|| tool_diff_counts(tool)).flatten();
     // Text resolves its color during layout, so group-hover text needs stable
     // child IDs under the keyed, expandable header to retain hover state.
     let hover_text = activity && trail.is_some() && !failed;
@@ -6978,7 +7086,7 @@ fn chip_header_row(
         )
         .child(
             div()
-                .when(!activity, |detail| detail.flex_1())
+                .when(!activity || diff_counts.is_some(), |detail| detail.flex_1())
                 .min_w_0()
                 .h(px(if file_path.is_some() {
                     22.0
@@ -7067,6 +7175,33 @@ fn chip_header_row(
                     }
                 }),
         )
+        .when_some(diff_counts, |row, (additions, deletions)| {
+            // Inline `+N −N` stat trailing the file badge — the same green/red
+            // pair the expanded Stats rows use, so the collapsed header reads
+            // "Edit foo.rs +5 −6" at a glance. flex_none so it never truncates
+            // away; the detail div flex_1 (set above) absorbs the squeeze.
+            row.child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(TOOL_LABEL_SIZE))
+                    .line_height(px(TOOL_LABEL_LINE_HEIGHT))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.success)
+                            .child(SharedString::from(format!("+{additions}"))),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.danger)
+                            .child(SharedString::from(format!("−{deletions}"))),
+                    ),
+            )
+        })
         .when_some(tool.call.subagent_model(), |row, model| {
             // Which model the child runs on, when the spawn named one.
             //
@@ -7643,6 +7778,41 @@ impl Render for Transcript {
             });
         }
         let rail = self.render_rail(cx);
+        if self.scrollbar_pressed {
+            self.last_scroll_distance = self.distance_from_bottom();
+            self.show_jump_button =
+                jump_visibility(self.show_jump_button, self.last_scroll_distance);
+        }
+        let scrollbar = TranscriptScrollbar {
+            list: self.list.clone(),
+            top: if self.doc_override.is_some() {
+                0.0
+            } else {
+                Theme::TITLEBAR_HEIGHT + Theme::TRANSCRIPT_FADE_BAND
+            },
+            bottom: self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND,
+        };
+        let scrollbar_el = div()
+            .id("transcript-scrollbar")
+            .absolute()
+            .right_0()
+            .top(px(scrollbar.top))
+            .bottom(px(scrollbar.bottom))
+            .w(px(16.0))
+            .capture_any_mouse_down(cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                if event.button == MouseButton::Left
+                    && this.list.max_offset_for_scrollbar().y > px(0.0)
+                {
+                    this.begin_scroll_navigation();
+                    this.scrollbar_pressed = true;
+                    cx.notify();
+                }
+            }))
+            .child(
+                gpui_base::Scrollbar::vertical(&scrollbar)
+                    .id("transcript-scrollbar-thumb")
+                    .mode(gpui_base::ScrollbarMode::Always),
+            );
         // The scroll-to-bottom pill is rendered by the SHELL (conversation
         // region overlay): it must float just above the composer and paint
         // OVER the bottom fade gradient, which is a later sibling of this
@@ -7689,7 +7859,8 @@ impl Render for Transcript {
             // (document paint order = selection order; see markdown/render.rs).
             .child(crate::markdown::render::selection_frame_reset())
             .child(content)
-            .child(rail);
+            .child(rail)
+            .child(scrollbar_el);
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
         if let Some(preview) = self.attachment_preview.clone() {
@@ -9164,6 +9335,7 @@ mod tests {
             + 'static,
         ) {
             gpui_platform::headless().run(move |cx| {
+                gpui_base::init(cx);
                 cx.set_global(Theme::dark());
                 let state = cx.new(|_| AppState::new());
                 let window = cx
@@ -9328,6 +9500,97 @@ mod tests {
                 );
             })
             .unwrap();
+        }
+
+        #[test]
+        fn scrollbar_browses_history_and_returns_to_following() {
+            use gpui_base::ScrollbarHandle as _;
+
+            with_window(|transcript, window, cx| {
+                let text = (0..80)
+                    .map(|i| format!("Paragraph {i} in the conversation.\n\n"))
+                    .collect::<String>();
+                transcript.update(cx, |this, cx| {
+                    feed(
+                        this,
+                        vec![assistant(
+                            "reply",
+                            MessageStatus::Streaming,
+                            vec![text_part("text", &text)],
+                        )],
+                        cx,
+                    );
+                    this.set_bottom_clearance(180.0, cx);
+                });
+                draw(window, cx);
+                let handle = TranscriptScrollbar {
+                    list: transcript.read(cx).list.clone(),
+                    top: Theme::TITLEBAR_HEIGHT + Theme::TRANSCRIPT_FADE_BAND,
+                    bottom: 180.0 + Theme::TRANSCRIPT_FADE_BAND,
+                };
+                let bounds = handle.viewport_bounds();
+                assert_eq!(bounds.bottom(), px(596.0));
+                assert_eq!(
+                    handle.content_size().height - bounds.size.height,
+                    handle.list.max_offset_for_scrollbar().y,
+                    "chrome must not change the reachable scroll range"
+                );
+                let click = |position, cx: &mut gpui::App| {
+                    cx.update_window(window.into(), |_, window, cx| {
+                        window.dispatch_event(
+                            gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                                position,
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                                button: MouseButton::Left,
+                                position,
+                                click_count: 1,
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                                button: MouseButton::Left,
+                                position,
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                    })
+                    .unwrap();
+                    draw(window, cx);
+                };
+
+                click(point(bounds.right() - px(8.0), bounds.top() + px(2.0)), cx);
+                assert!(!transcript.read(cx).pinned);
+                assert!(transcript.read(cx).distance_from_bottom() > 320.0);
+                assert!(transcript.read(cx).show_jump_button);
+                let offset = handle.offset();
+                tick(&transcript, window, cx);
+                assert_eq!(
+                    handle.offset(),
+                    offset,
+                    "following must not undo navigation"
+                );
+
+                click(
+                    point(bounds.right() - px(8.0), bounds.bottom() - px(2.0)),
+                    cx,
+                );
+                assert!(transcript.read(cx).pinned);
+                assert!(!transcript.read(cx).show_jump_button);
+                wheel(window, 240.0, cx);
+                draw(window, cx);
+                assert!(
+                    !transcript.read(cx).pinned,
+                    "wheel input must still reach the list"
+                );
+            });
         }
 
         #[test]
@@ -10712,6 +10975,94 @@ mod tests {
         // Nothing → no affordance.
         assert!(tool_detail(None, None, None).is_none());
         assert!(tool_detail(Some("\n\n"), None, None).is_none());
+    }
+
+    #[test]
+    fn tool_diff_counts_extracts_add_del() {
+        let base = ToolItem {
+            call: ToolCall::EditFile {
+                path: "a.rs".into(),
+                old_string: None,
+                new_string: None,
+            },
+            is_error: false,
+            resolved: true,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+            is_thought: false,
+        };
+        // Stats detail → counts.
+        let mut item = base.clone();
+        item.detail = Some(Arc::new(ToolDetail::Stats {
+            stats: Arc::new(vec![zeron_doc::ToolDiffStat {
+                path: "a.rs".into(),
+                additions: 5,
+                deletions: 6,
+            }]),
+        }));
+        assert_eq!(tool_diff_counts(&item), Some((5, 6)));
+        // Multi-file stats sum.
+        item.detail = Some(Arc::new(ToolDetail::Stats {
+            stats: Arc::new(vec![
+                zeron_doc::ToolDiffStat {
+                    path: "a.rs".into(),
+                    additions: 5,
+                    deletions: 6,
+                },
+                zeron_doc::ToolDiffStat {
+                    path: "b.rs".into(),
+                    additions: 2,
+                    deletions: 1,
+                },
+            ]),
+        }));
+        assert_eq!(tool_diff_counts(&item), Some((7, 7)));
+        // Diff detail → its file's counts.
+        let diff = zeron_proto::ToolDiff {
+            path: "a.rs".into(),
+            old_text: Some("old\n".into()),
+            new_text: "new\n".into(),
+        };
+        item.detail = tool_detail(None, Some(&diff), None).map(Arc::new);
+        assert_eq!(tool_diff_counts(&item), Some((1, 1)));
+        // No-op edit (both zero) → None, so the header stays clean.
+        item.detail = Some(Arc::new(ToolDetail::Stats {
+            stats: Arc::new(vec![zeron_doc::ToolDiffStat {
+                path: "a.rs".into(),
+                additions: 0,
+                deletions: 0,
+            }]),
+        }));
+        assert_eq!(tool_diff_counts(&item), None);
+        // No detail → None.
+        item.detail = None;
+        assert_eq!(tool_diff_counts(&item), None);
+        // Non-file tool → None even with stats present.
+        let mut exec = base.clone();
+        exec.call = ToolCall::Exec {
+            command: "x".into(),
+        };
+        exec.detail = Some(Arc::new(ToolDetail::Stats {
+            stats: Arc::new(vec![zeron_doc::ToolDiffStat {
+                path: "a.rs".into(),
+                additions: 5,
+                deletions: 6,
+            }]),
+        }));
+        assert_eq!(tool_diff_counts(&exec), None);
+        // Output detail → None.
+        let mut out = base.clone();
+        out.detail = Some(Arc::new(ToolDetail::Output {
+            lines: vec!["x".into()],
+            truncated_by: 0,
+        }));
+        assert_eq!(tool_diff_counts(&out), None);
     }
 
     #[test]

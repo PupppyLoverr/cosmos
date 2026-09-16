@@ -22,10 +22,12 @@
 //!
 //! Set `ZERON_NO_LOGIN_SHELL=1` to disable the snapshot entirely.
 
-use std::ffi::{OsStr, OsString};
-use std::sync::OnceLock;
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::ffi::OsString;
 
-static CACHE: OnceLock<Option<OsString>> = OnceLock::new();
+#[cfg(unix)]
+static CACHE: std::sync::OnceLock<Option<OsString>> = std::sync::OnceLock::new();
 
 /// The PATH the user's login shell reports, captured once and cached for the
 /// life of the process. `None` when disabled, non-unix, no usable shell, or

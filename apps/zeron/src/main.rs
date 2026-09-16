@@ -34,7 +34,7 @@ enum Command {
     #[cfg(target_os = "linux")]
     /// Trigger an Appshot in the running headed instance (desktop shortcut fallback).
     Appshot,
-    /// Manage `zeron headless` as a background service (launchd / systemd --user).
+    /// Manage `zeron headless` as a background service (launchd / systemd --user / Task Scheduler).
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -266,12 +266,22 @@ fn harness_from_env() -> zeron_engine::HarnessId {
         Ok("grok") => zeron_engine::HarnessId::Grok,
         Ok("hermes") => zeron_engine::HarnessId::Hermes,
         Ok("pi") => zeron_engine::HarnessId::Pi,
+        Ok("opencode") => zeron_engine::HarnessId::Opencode,
+        Ok("antigravity" | "agy") => zeron_engine::HarnessId::Antigravity,
+        Ok("amp") => zeron_engine::HarnessId::Amp,
         _ => zeron_engine::HarnessId::ClaudeCode,
     }
 }
 
 fn dirs_data_dir() -> std::path::PathBuf {
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME not set"));
+    // HOME first (msys/git-bash set it on Windows too), then USERPROFILE —
+    // a service/Task-Scheduler launch can have neither, in which case the
+    // OS-level fallback keeps a panic off the boot path.
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     let dir = home.join(".zeron");
     // One-shot 0.2.0 migration: adopt the pre-rename data dir (sign-in,
     // device identity, prefs) instead of starting fresh.

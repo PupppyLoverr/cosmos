@@ -32,6 +32,8 @@ const MAX_INPUT_BYTES: usize = 64 * 1024;
 const MAX_REPLAY_BYTES: usize = 1024 * 1024;
 const EXITED_TTL: Duration = Duration::from_secs(30 * 60);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
+/// Grace period to flush buffered PTY output after the child reports its exit.
+const EXIT_DRAIN_MS: Duration = Duration::from_millis(250);
 
 struct LiveTerminal {
     master: Box<dyn portable_pty::MasterPty + Send>,
@@ -364,7 +366,47 @@ async fn pump_output(
         });
         true
     };
-    'outer: while let Some(first) = raw_rx.recv().await {
+    fn status_code(
+        status: Result<Result<portable_pty::ExitStatus, std::io::Error>, tokio::task::JoinError>,
+    ) -> i32 {
+        match status {
+            Ok(Ok(status)) => status.exit_code() as i32,
+            Ok(Err(err)) => {
+                tracing::debug!(error = %err, "terminal wait failed");
+                -1
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "terminal wait task failed");
+                -1
+            }
+        }
+    }
+    let mut wait = wait;
+    let mut exit_code: Option<i32> = None;
+    // On Windows the ConPTY output pipe stays open until the master handle
+    // drops, so reader EOF never arrives for a dead child. Once `wait` reports
+    // the exit, keep draining buffered output for a beat instead of blocking
+    // on a close that isn't coming.
+    let mut drain_deadline: Option<tokio::time::Instant> = None;
+    'outer: loop {
+        let first = match drain_deadline {
+            None => {
+                tokio::select! {
+                    chunk = raw_rx.recv() => chunk,
+                    status = &mut wait => {
+                        exit_code = Some(status_code(status));
+                        drain_deadline =
+                            Some(tokio::time::Instant::now() + EXIT_DRAIN_MS);
+                        continue;
+                    }
+                }
+            }
+            Some(deadline) => match tokio::time::timeout_at(deadline, raw_rx.recv()).await {
+                Ok(chunk) => chunk,
+                Err(_) => break 'outer,
+            },
+        };
+        let Some(first) = first else { break 'outer };
         let mut buffer = first;
         let deadline = tokio::time::Instant::now() + batch;
         loop {
@@ -382,16 +424,9 @@ async fn pump_output(
             return; // terminal closed underneath us
         }
     }
-    let exit_code = match wait.await {
-        Ok(Ok(status)) => status.exit_code() as i32,
-        Ok(Err(err)) => {
-            tracing::debug!(error = %err, "terminal wait failed");
-            -1
-        }
-        Err(err) => {
-            tracing::debug!(error = %err, "terminal wait task failed");
-            -1
-        }
+    let exit_code = match exit_code {
+        Some(code) => code,
+        None => status_code(wait.await),
     };
     if let Some(session) = session.upgrade() {
         let mut session = lock(&session);

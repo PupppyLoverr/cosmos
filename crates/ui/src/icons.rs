@@ -197,6 +197,10 @@ icon_assets![
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
     (OPENCODE_MARK, "opencode-mark"),
+    // Antigravity's arch mark (the lobe-icons silhouette), monochrome.
+    (ANTIGRAVITY_MARK, "antigravity-mark"),
+    // Amp's three-bar mark (lobe-icons amp.svg), monochrome.
+    (AMP_MARK, "amp-mark"),
 ];
 
 /// Serves both the compact control-icon set and the complete file-identity

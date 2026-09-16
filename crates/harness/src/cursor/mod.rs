@@ -61,9 +61,15 @@ const SHIM_SOURCE: &str = include_str!("shim.mjs");
 
 fn cursor_cli_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::home_dir() {
         dirs.push(home.join(".local").join("bin").join("cursor-agent"));
         dirs.push(home.join(".cursor").join("bin").join("cursor-agent"));
+        // Scoop shims and the Windows installer's user-local dir.
+        dirs.push(home.join("scoop").join("shims").join("cursor-agent"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        dirs.push(local.join("cursor-agent").join("cursor-agent"));
+        dirs.push(local.join("Programs").join("cursor").join("cursor-agent"));
     }
     dirs.push(PathBuf::from("/opt/homebrew/bin/cursor-agent"));
     dirs.push(PathBuf::from("/usr/local/bin/cursor-agent"));
@@ -946,10 +952,9 @@ mod tests {
 
     #[test]
     fn nested_frames_arrive_tagged() {
-        let frame: Value = serde_json::from_str(
-            r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#,
-        )
-        .unwrap();
+        let frame: Value =
+            serde_json::from_str(r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#)
+                .unwrap();
         assert_eq!(
             map_shim_frame(&frame, false),
             vec![AgentEvent::Subagent {

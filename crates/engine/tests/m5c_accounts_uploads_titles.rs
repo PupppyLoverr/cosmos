@@ -18,10 +18,9 @@ use zeron_engine::{
     worktree_branch_from_title,
 };
 use zeron_harness::mock::MockHarness;
-use zeron_proto::{
-    AgentAccountsSnapshot, AgentEvent, AgentLoginMode, AgentLoginStatus, DoneStatus, HarnessId,
-    SandboxLevel,
-};
+use zeron_proto::{AgentAccountsSnapshot, AgentEvent, DoneStatus, HarnessId, SandboxLevel};
+#[cfg(unix)]
+use zeron_proto::{AgentLoginMode, AgentLoginStatus};
 use zeron_rpc::methods;
 
 // ---------------------------------------------------------------------------
@@ -1036,6 +1035,9 @@ async fn cursor_slot_swap_round_trip() {
     );
 }
 
+// The shim fixture is a POSIX shell script spawned directly; `Command` cannot
+// exec it on Windows.
+#[cfg(unix)]
 #[tokio::test]
 async fn cursor_login_flow_spawns_shim_and_auto_activates() {
     let dir = tempfile::tempdir().expect("tmp");

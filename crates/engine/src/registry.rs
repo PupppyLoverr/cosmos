@@ -576,6 +576,52 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::OpencodeHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::OpencodeHarness::new()) as Arc<dyn Harness>)),
     );
+    // Google Antigravity (`agy`) over its own stream-json protocol, same lazy
+    // pattern: the static descriptor mirrors AntigravityHarness exactly.
+    // Turn-boundary steering — each `user` stdin line runs one full turn —
+    // and the low/medium/high effort ladder rides `--effort`.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Antigravity,
+            name: "Antigravity".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+            ],
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AntigravityHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AntigravityHarness::new()) as Arc<dyn Harness>)),
+    );
+    // Amp (`amp`) over its Claude-compatible stream-json execute mode, same
+    // lazy pattern: the static descriptor mirrors AmpHarness exactly.
+    // Step-boundary steering via `steer: true` input; the catalog is the
+    // Dial modes (low/medium/high/ultra) — Amp's public selection
+    // abstraction — and reasoning maps onto `--effort`.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Amp,
+            name: "Amp".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AmpHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AmpHarness::new()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -655,7 +701,9 @@ mod tests {
                 HarnessId::Grok,
                 HarnessId::Hermes,
                 HarnessId::Pi,
-                HarnessId::Opencode
+                HarnessId::Opencode,
+                HarnessId::Antigravity,
+                HarnessId::Amp
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -714,6 +762,35 @@ mod tests {
         assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
         assert_eq!(
             pi.reasoning_levels(),
+            &[
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max
+            ]
+        );
+        // Antigravity and Amp mirror their drivers the same way (descriptor-
+        // stability rule): names, steering modes, effort ladders.
+        let agy = registry.resolve(HarnessId::Antigravity).unwrap();
+        assert_eq!(agy.id(), HarnessId::Antigravity);
+        assert_eq!(agy.display_name(), "Antigravity");
+        assert_eq!(agy.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(
+            agy.reasoning_levels(),
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High
+            ]
+        );
+        let amp = registry.resolve(HarnessId::Amp).unwrap();
+        assert_eq!(amp.id(), HarnessId::Amp);
+        assert_eq!(amp.display_name(), "Amp");
+        assert_eq!(amp.steering_mode(), SteeringMode::StepBoundary);
+        assert_eq!(
+            amp.reasoning_levels(),
             &[
                 ReasoningLevel::Minimal,
                 ReasoningLevel::Low,

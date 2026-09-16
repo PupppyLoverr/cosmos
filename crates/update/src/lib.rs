@@ -64,10 +64,12 @@ pub struct FileMeta {
 }
 
 /// Artifact-name platform pair — `uname`-style strings matching the packaging
-/// scripts: `linux-x86_64`, `linux-aarch64`, `macos-arm64`.
+/// scripts: `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `windows-x86_64`.
 pub fn platform_key() -> (&'static str, &'static str) {
     let os = if cfg!(target_os = "macos") {
         "macos"
+    } else if cfg!(windows) {
+        "windows"
     } else {
         "linux"
     };
@@ -78,10 +80,15 @@ pub fn platform_key() -> (&'static str, &'static str) {
     (os, arch)
 }
 
-/// `zeron-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball (Linux CI builds).
+/// `zeron-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball on unix; the
+/// Windows package is a `.zip` (no tar dependency beyond bsdtar-in-System32).
 pub fn headless_artifact(version: &str) -> String {
     let (os, arch) = platform_key();
-    format!("zeron-{version}-{os}-{arch}.tar.gz")
+    if os == "windows" {
+        format!("zeron-{version}-{os}-{arch}.zip")
+    } else {
+        format!("zeron-{version}-{os}-{arch}.tar.gz")
+    }
 }
 
 /// `zeron-<ver>-macos-<arch>-app.tar.gz` — the macOS app update payload.
@@ -177,7 +184,12 @@ pub fn detect_install() -> InstallKind {
     let Ok(exe) = std::env::current_exe() else {
         return InstallKind::Unmanaged;
     };
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // Same HOME→USERPROFILE fallback as the app data dir — a Task-Scheduler
+    // launch has no HOME on Windows.
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+        .map(PathBuf::from);
     detect_install_from(&exe, home.as_deref())
 }
 
@@ -284,7 +296,8 @@ pub async fn stage_headless(
 ) -> anyhow::Result<PathBuf> {
     let version = &manifest.version;
     let dest = app_root.join(version);
-    if dest.join("zeron").exists() {
+    let binary = if cfg!(windows) { "zeron.exe" } else { "zeron" };
+    if dest.join(binary).exists() {
         return Ok(dest);
     }
     let file = headless_artifact(version);
@@ -296,25 +309,27 @@ pub async fn stage_headless(
         download_release_file(edge_url, manifest, &file, &tarball).await?;
         let unpacked = stage.join("unpacked");
         std::fs::create_dir_all(&unpacked)?;
-        // Tarball root is the versioned stage dir (see scripts/package-linux.sh);
-        // strip it exactly as install.sh does.
+        // Package root is the versioned stage dir (see scripts/package-*);
+        // strip it exactly as install.sh does. `-xf` (not `-xzf`): Windows
+        // System32 tar is bsdtar, which sniffs zip from the magic bytes.
         run(
             "tar",
             &[
-                "-xzf",
+                "-xf",
                 &tarball.to_string_lossy(),
                 "-C",
                 &unpacked.to_string_lossy(),
                 "--strip-components=1",
             ],
         )?;
-        if !unpacked.join("zeron").is_file() {
-            bail!("tarball {file} did not contain a zeron binary");
+        let binary = if cfg!(windows) { "zeron.exe" } else { "zeron" };
+        if !unpacked.join(binary).is_file() {
+            bail!("package {file} did not contain a {binary} binary");
         }
         match std::fs::rename(&unpacked, &dest) {
             Ok(()) => {}
             // Lost a race with another stager — the staged copy is equivalent.
-            Err(_) if dest.join("zeron").exists() => {}
+            Err(_) if dest.join(binary).exists() => {}
             Err(err) => {
                 return Err(err).with_context(|| format!("moving {} into place", dest.display()));
             }
@@ -327,7 +342,11 @@ pub async fn stage_headless(
 }
 
 /// Atomically repoint `app_root/current` at `app_root/<ver>` (symlink to a temp
-/// name, then rename over — never a window with no `current`).
+/// name, then rename over — never a window with no `current`). On Windows
+/// `current` is a directory junction (`mklink /J` needs no admin, and unlike a
+/// symlink creation it isn't privilege-gated). Parent-dir renames are legal
+/// while the old exe is still mapped, so the swap succeeds under a running
+/// daemon — the new image is picked up by the service restart that follows.
 pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -341,10 +360,34 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
         std::fs::rename(&tmp, app_root.join("current")).context("swapping current symlink")?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let target = app_root.join(version);
+        if !target.join("zeron.exe").exists() {
+            bail!("{} is not a staged install", target.display());
+        }
+        let current = app_root.join("current");
+        // `rmdir` on a junction removes the link only — never the target dir.
+        if current.exists() {
+            run("cmd", &["/c", "rmdir", &current.to_string_lossy()])
+                .context("removing the current junction")?;
+        }
+        run(
+            "cmd",
+            &[
+                "/c",
+                "mklink",
+                "/J",
+                &current.to_string_lossy(),
+                &target.to_string_lossy(),
+            ],
+        )
+        .context("creating the current junction")
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (app_root, version);
-        bail!("managed installs are unix-only");
+        bail!("managed installs are unix/windows-only");
     }
 }
 
@@ -359,6 +402,11 @@ pub fn restart_service() -> anyhow::Result<()> {
             "launchctl",
             &["kickstart", "-k", &format!("gui/{uid}/sh.zeron.app")],
         )
+    } else if cfg!(windows) {
+        // End the running task instance, then run it again — schtasks has no
+        // single restart verb.
+        let _ = run("schtasks", &["/end", "/tn", "ZeronHeadless"]);
+        run("schtasks", &["/run", "/tn", "ZeronHeadless"])
     } else {
         run("systemctl", &["--user", "restart", "zeron.service"])
     }
@@ -756,9 +804,11 @@ mod tests {
     fn artifact_names_match_packaging() {
         let (os, arch) = platform_key();
         assert!(headless_artifact("0.2.0").starts_with("zeron-0.2.0-"));
+        // Windows packaging is a zip; unix ships tarballs.
+        let ext = if os == "windows" { "zip" } else { "tar.gz" };
         assert_eq!(
             headless_artifact("0.2.0"),
-            format!("zeron-0.2.0-{os}-{arch}.tar.gz")
+            format!("zeron-0.2.0-{os}-{arch}.{ext}")
         );
         assert!(mac_app_artifact("0.2.0").ends_with("-app.tar.gz"));
     }
@@ -800,6 +850,29 @@ mod tests {
             std::fs::read_link(app_root.join("current")).unwrap(),
             app_root.join("0.1.1")
         );
+        // Unstaged version refuses.
+        assert!(apply_headless(&app_root, "0.2.0").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn headless_junction_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("app");
+        for ver in ["0.1.0", "0.1.1"] {
+            std::fs::create_dir_all(app_root.join(ver)).unwrap();
+            std::fs::write(app_root.join(ver).join("zeron.exe"), ver).unwrap();
+        }
+        let resolved = |app_root: &Path| {
+            // Junctions aren't symlinks to read_link — canonicalize the
+            // marker file through `current` to see which version answers.
+            std::fs::read_to_string(app_root.join("current").join("zeron.exe")).unwrap()
+        };
+        apply_headless(&app_root, "0.1.0").unwrap();
+        assert_eq!(resolved(&app_root), "0.1.0");
+        // Swap over an existing junction.
+        apply_headless(&app_root, "0.1.1").unwrap();
+        assert_eq!(resolved(&app_root), "0.1.1");
         // Unstaged version refuses.
         assert!(apply_headless(&app_root, "0.2.0").is_err());
     }

@@ -1340,8 +1340,14 @@ impl DeviceIdentityLock {
             let file = loop {
                 match options.open(&path) {
                     Ok(file) => break file,
+                    // Exclusive-share opens fail with ERROR_SHARING_VIOLATION
+                    // (32) or ERROR_LOCK_VIOLATION (33) while a peer holds the
+                    // lock — neither maps to PermissionDenied, so match the raw
+                    // codes. Anything else is a real failure.
                     Err(err)
-                        if err.kind() == std::io::ErrorKind::PermissionDenied && retries > 0 =>
+                        if retries > 0
+                            && (matches!(err.raw_os_error(), Some(32 | 33))
+                                || err.kind() == std::io::ErrorKind::PermissionDenied) =>
                     {
                         retries -= 1;
                         std::thread::sleep(std::time::Duration::from_millis(5));

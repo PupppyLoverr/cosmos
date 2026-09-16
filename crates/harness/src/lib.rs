@@ -14,6 +14,8 @@
 //! first uncorrelated idle), manufacturing done-status bugs the native
 //! wires don't have (decision record: docs/research/acp.md).
 
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tokio::sync::{mpsc, oneshot};
@@ -113,6 +115,8 @@ pub trait Harness: Send + Sync {
 
 pub mod acp;
 pub(crate) mod adapter_install;
+pub mod amp;
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
@@ -121,14 +125,124 @@ pub mod mock;
 pub mod opencode;
 pub mod shell_env;
 
+/// The user's home directory on any platform: `HOME` first (msys/cygwin
+/// environments set it on Windows too), then `USERPROFILE`.
+pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+        .map(std::path::PathBuf::from)
+}
+
+/// The file names a bare command `name` resolves to on this platform.
+/// Windows walks PATHEXT-style suffixes — CLIs installed through npm/pnpm/
+/// bun ship `.cmd` shims (and `.ps1` wrappers) next to, or instead of, a
+/// `.exe`; probing only the bare name misses all of them. Unix probes the
+/// bare name only.
+pub(crate) fn exe_names(name: &str) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    if cfg!(windows) {
+        if std::path::Path::new(name).extension().is_some() {
+            // Already extensioned (`agy.exe`): probe it verbatim.
+            return vec![OsString::from(name)];
+        }
+        ["exe", "cmd", "bat"]
+            .iter()
+            .map(|ext| OsString::from(format!("{name}.{ext}")))
+            .chain(std::iter::once(OsString::from(name)))
+            .collect()
+    } else {
+        vec![OsString::from(name)]
+    }
+}
+
+/// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
+/// On Windows each directory is probed for every [`exe_names`] spelling
+/// (`.exe`/`.cmd`/`.bat`), so npm-shim and native installs both resolve.
+pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
+    let names = exe_names(exe);
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .filter(|d| !d.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(shell_path) = crate::shell_env::login_shell_path() {
+        dirs.extend(std::env::split_paths(shell_path).filter(|d| !d.as_os_str().is_empty()));
+    }
+    // GUI/service launches never see the version-manager dirs a shell init
+    // puts on PATH — probe the known homes directly.
+    dirs.extend(node_version_manager_bins());
+    // `extra` entries are complete candidate paths (dir already joined), while
+    // PATH/manager entries are bare directories needing the exe names joined.
+    let (extra_dirs, extra_files): (Vec<PathBuf>, Vec<PathBuf>) = extra
+        .into_iter()
+        .partition(|p| p.file_name().is_none() || p.is_dir());
+    dirs.extend(extra_dirs);
+    let mut candidates: Vec<PathBuf> = dirs
+        .iter()
+        .flat_map(|d| names.iter().map(|n| d.join(n)))
+        .collect();
+    // File candidates carry the exe name already (callers join it
+    // themselves); extensionless ones get the PATHEXT spellings too so a
+    // `…/bin/opencode` candidate still finds `opencode.exe` on Windows.
+    for path in extra_files {
+        if path.extension().is_some() || !cfg!(windows) {
+            candidates.push(path);
+        } else {
+            for name in exe_names(&path.file_name().unwrap_or_default().to_string_lossy()) {
+                candidates.push(path.with_file_name(name));
+            }
+        }
+    }
+    candidates.into_iter().find(|p| p.exists())
+}
+
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell
 /// init (fnm's per-shell multishells, nvm's shell function), which a
 /// Dock/Finder-launched app never runs.
 pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = home_dir();
     let mut dirs: Vec<PathBuf> = Vec::new();
+    if cfg!(windows) {
+        // Windows package-manager / version-manager homes:
+        //   npm i -g   → %APPDATA%\npm
+        //   pnpm i -g  → %LOCALAPPDATA%\pnpm
+        //   bun        → ~/.bun/bin (real exe shims)
+        //   nvm4w      → %NVM_SYMLINK% (the shim symlink dir, default
+        //                C:\Program Files\nodejs, usually already on PATH)
+        //   volta      → %LOCALAPPDATA%\Volta\bin
+        //   fnm        → %LOCALAPPDATA%\fnm_multishells\<shell>\ (per-shell;
+        //                also %FNM_DIR%\aliases\default)
+        if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+            dirs.push(appdata.join("npm"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            dirs.push(local.join("pnpm"));
+            dirs.push(local.join("Volta").join("bin"));
+            dirs.push(local.join("Programs").join("Volta").join("bin"));
+            // fnm's per-shell multishell dirs are ephemeral but real while a
+            // terminal set them up; include whatever exists.
+            if let Ok(entries) = std::fs::read_dir(local.join("fnm_multishells")) {
+                dirs.extend(entries.flatten().map(|e| e.path()));
+            }
+        }
+        if let Some(home) = &home {
+            dirs.push(home.join(".bun").join("bin"));
+            dirs.push(home.join(".volta").join("bin"));
+            dirs.push(home.join("AppData").join("Local").join("pnpm"));
+        }
+        if let Some(link) = std::env::var_os("NVM_SYMLINK").map(PathBuf::from) {
+            dirs.push(link);
+        }
+        if let Some(fnm) = std::env::var_os("FNM_DIR").map(PathBuf::from) {
+            dirs.push(fnm.join("aliases").join("default"));
+        }
+        return dirs;
+    }
     // fnm: `aliases/default` is a stable symlink to the active default
     // installation (the multishell PATH entries are ephemeral, per-shell).
     let mut fnm_roots: Vec<PathBuf> = std::env::var_os("FNM_DIR")
@@ -273,6 +387,8 @@ pub(crate) fn crash_message(
 }
 
 pub use acp::AcpHarness;
+pub use amp::AmpHarness;
+pub use antigravity::AntigravityHarness;
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
 pub use cursor::CursorHarness;
@@ -333,4 +449,147 @@ pub fn supports_titles(id: HarnessId) -> bool {
         id,
         HarnessId::Codex | HarnessId::ClaudeCode | HarnessId::Mock
     )
+}
+
+// ---------------------------------------------------------------------------
+// Test seam: script fixtures
+// ---------------------------------------------------------------------------
+
+/// A `Command`-spawnable path for a script `fixture` (`with_executable` spawns
+/// the path it is given directly). On unix the fixture itself; on Windows a
+/// generated `.cmd` trampoline — `Command` runs `.cmd` via cmd.exe — that
+/// invokes the script's interpreter: Git Bash for `.sh`, Python for `.py`.
+/// Trampolines land in the temp dir so fixture dirs stay clean. Extensions
+/// `Command` already runs natively (`.cmd`, `.bat`, `.exe`, …) and unknown
+/// extensions pass through unchanged.
+///
+/// Caveat: the trampoline makes the interpreter a *grandchild* — killing the
+/// spawned cmd.exe orphans it. Tests that rely on signal-escalation semantics
+/// against a wedged child should stay `#[cfg(unix)]` (the fixtures write
+/// `sleep`/`kill` scripts anyway).
+#[doc(hidden)]
+pub fn spawnable_fixture(script: &std::path::Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        script.to_path_buf()
+    }
+    #[cfg(windows)]
+    {
+        use std::io::Write as _;
+        let ext = script
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let (interp, arg) = match ext.as_str() {
+            "sh" => (
+                windows_script_interp::git_bash()
+                    .expect("Git Bash not found — harness .sh fixtures need it on Windows"),
+                windows_script_interp::msys_path(script),
+            ),
+            "py" => (
+                windows_script_interp::python()
+                    .expect("Python not found — .py fixtures need it on Windows"),
+                script.to_string_lossy().into_owned(),
+            ),
+            _ => return script.to_path_buf(),
+        };
+        let dir = std::env::temp_dir().join("zeron-test-fixtures");
+        std::fs::create_dir_all(&dir).expect("creating fixture trampoline dir");
+        let name = format!(
+            "{}-{:x}.cmd",
+            script
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("fixture"),
+            // Path-stable name so parallel tests share one trampoline.
+            fxhash(script)
+        );
+        let trampoline = dir.join(name);
+        // `%*` forwards the harness's own args (e.g. `agent stdio`).
+        let body = format!(
+            "@echo off\r\n\"{}\" \"{arg}\" %*\r\nexit /b %errorlevel%\r\n",
+            interp.display()
+        );
+        if std::fs::read_to_string(&trampoline).ok().as_deref() != Some(body.as_str()) {
+            let mut f = std::fs::File::create(&trampoline).expect("writing fixture trampoline");
+            f.write_all(body.as_bytes()).unwrap();
+        }
+        trampoline
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        script.to_path_buf()
+    }
+}
+
+#[cfg(windows)]
+fn fxhash(p: &std::path::Path) -> u64 {
+    // FNV-1a over the canonical string — plenty for a trampoline name.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in p.to_string_lossy().as_bytes() {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[cfg(windows)]
+mod windows_script_interp {
+    use std::path::{Path, PathBuf};
+
+    /// `C:\Users\x\y.sh` → `/c/Users/x/y.sh` — the msys spelling Git Bash
+    /// resolves without relying on argv path translation.
+    pub fn msys_path(p: &Path) -> String {
+        let s = p.to_string_lossy().replace('\\', "/");
+        let b = s.as_bytes();
+        if b.len() > 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+            format!("/{}/{}", (b[0] as char).to_ascii_lowercase(), &s[3..])
+        } else {
+            s
+        }
+    }
+
+    fn which(name: &str) -> Option<PathBuf> {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(name))
+                .find(|p| p.is_file())
+        })
+    }
+
+    /// Git for Windows' bash — NOT `System32\bash.exe`, which is the WSL
+    /// launcher and would interpret the script path inside a Linux distro.
+    pub fn git_bash() -> Option<PathBuf> {
+        for fixed in [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        ] {
+            let p = PathBuf::from(fixed);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        // git.exe on PATH usually sits in <Git>\cmd — bash is ../bin over.
+        if let Some(git) = which("git.exe")
+            && let Some(bin) = git
+                .parent()
+                .and_then(|cmd| cmd.parent())
+                .map(|root| root.join("bin").join("bash.exe"))
+            && bin.is_file()
+        {
+            return Some(bin);
+        }
+        // Last resort: bash on PATH outside the Windows system dirs.
+        which("bash.exe").filter(|p| {
+            !p.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains(r"\windows\")
+        })
+    }
+
+    pub fn python() -> Option<PathBuf> {
+        which("python.exe")
+            .or_else(|| which("python3.exe"))
+            .or_else(|| which("py.exe"))
+    }
 }

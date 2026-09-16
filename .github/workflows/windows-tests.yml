@@ -1,0 +1,66 @@
+name: Windows tests
+
+# Windows coverage for the native app: format, workspace check, clippy, the
+# pure-logic test crates, and a real `zeron.exe` compile. GPU/windowed tests
+# stay in ui-tests.yml — this job only proves the MSVC target builds and the
+# harness/engine logic passes on Windows.
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'apps/**'
+      - 'scripts/package-windows.ps1'
+      - '.github/workflows/windows-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'apps/**'
+      - 'scripts/package-windows.ps1'
+      - '.github/workflows/windows-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup show active-toolchain; if ($LASTEXITCODE -ne 0) { rustup toolchain install }
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: workspace check (x86_64-pc-windows-msvc)
+        run: cargo check --locked --workspace
+
+      - name: clippy
+        # Informational for now — the workspace predates Windows CI and carries
+        # platform-conditional warnings to burn down before -D warnings gates.
+        run: cargo clippy --locked --workspace
+
+      - name: harness + proto + engine logic tests
+        run: |
+          cargo test --locked -p zeron-proto
+          cargo test --locked -p zeron-harness
+          cargo test --locked -p zeron-engine --lib
+          cargo test --locked -p zeron-update
+
+      - name: release binary compiles
+        run: cargo build --locked --release -p zeron

@@ -145,8 +145,22 @@ fn git(cwd: &std::path::Path, args: &[&str]) {
 async fn run_with_worktree_spec_materializes_on_host_and_reuses() {
     let tmp = tempfile::tempdir().unwrap();
     // Canonicalize: git records canonical paths in worktree gitdir links, and
-    // macOS tempdirs live behind the /var → /private/var symlink.
-    let tmp_path = tmp.path().canonicalize().unwrap();
+    // macOS tempdirs live behind the /var → /private/var symlink. On Windows
+    // canonicalize returns `\\?\` verbatim paths, which git can't consume —
+    // strip the prefix back off.
+    let tmp_path = {
+        let canonical = tmp.path().canonicalize().unwrap();
+        #[cfg(windows)]
+        {
+            canonical
+                .to_str()
+                .and_then(|s| s.strip_prefix(r"\\?\"))
+                .map(PathBuf::from)
+                .unwrap_or(canonical)
+        }
+        #[cfg(not(windows))]
+        canonical
+    };
     let worktrees_root = tmp_path.join("worktrees");
     unsafe { std::env::set_var("ZERON_WORKTREES_DIR", &worktrees_root) };
 

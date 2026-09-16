@@ -68,6 +68,21 @@ pub struct CheckoutIdentity {
     pub git_dir: PathBuf,
 }
 
+/// Strip the `\\?\` verbatim prefix `canonicalize` produces on Windows — git
+/// rewrites it to `//?/` and then fails to create the path. UNC verbatim
+/// paths (`\\?\UNC\…`) keep their prefix.
+pub(crate) fn unverbatim(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(stripped) = path
+        .to_str()
+        .and_then(|s| s.strip_prefix(r"\\?\"))
+        .filter(|s| !s.starts_with(r"UNC\"))
+    {
+        return PathBuf::from(stripped);
+    }
+    path.to_path_buf()
+}
+
 /// Best-effort home directory (the `ListFolders` default and worktree root base).
 pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -183,7 +198,7 @@ impl Repos {
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(args);
         if let Some(cwd) = cwd {
-            cmd.current_dir(cwd);
+            cmd.current_dir(unverbatim(cwd));
         }
         cmd.stdin(std::process::Stdio::null());
         let output = cmd
@@ -1050,11 +1065,12 @@ impl Repos {
         repo_path: &Path,
         branch: &str,
     ) -> Result<Worktree, EngineError> {
+        let repo_path = &unverbatim(repo_path);
         let repo_name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
-        let base = self.inner.worktrees_root.join(&repo_name);
+        let base = unverbatim(&self.inner.worktrees_root).join(&repo_name);
         std::fs::create_dir_all(&base)?;
         // Auto-generate a name colliding with neither an existing dir nor branch.
         let existing: HashSet<String> = self

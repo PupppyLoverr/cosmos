@@ -852,6 +852,7 @@ async fn read_capped(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
@@ -890,10 +891,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct ExecutableGhRunner {
         executable: PathBuf,
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl ProcessRunner for ExecutableGhRunner {
         async fn run(&self, mut request: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
@@ -1022,6 +1025,8 @@ mod tests {
         assert_eq!(requests[0].output_limit, GITHUB_OUTPUT_LIMIT);
     }
 
+    // The fake `gh` is a POSIX shell script chmod'd executable.
+    #[cfg(unix)]
     #[tokio::test]
     async fn real_git_checkout_resolves_through_host_fake_gh() {
         let temp = tempfile::tempdir().expect("fixture tempdir");

@@ -49,6 +49,28 @@ jobs:
           path: target/package/*.tar.gz
           if-no-files-found: error
 
+  # Windows: portable zip (also the self-update payload — see crates/update
+  # headless_artifact) plus an Inno Setup per-user installer when available.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain; if ($LASTEXITCODE -ne 0) { rustup toolchain install }
+      - uses: Swatinem/rust-cache@v2
+      - name: Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: package
+        shell: pwsh
+        run: scripts/package-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ runner.arch }}
+          path: |
+            target/package/*.zip
+            target/package/*.exe
+          if-no-files-found: error
+
   # All desktop artifacts must build before publishing the release and updater
   # manifest. A macOS failure must not publish a Linux-only version as latest.
   #
@@ -113,7 +135,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, macos]
+    needs: [linux, macos, windows]
     runs-on: ubuntu-latest
     env:
       # `secrets` is not a valid context in step `if:` expressions — surface

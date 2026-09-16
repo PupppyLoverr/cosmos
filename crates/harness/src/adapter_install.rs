@@ -64,9 +64,7 @@ fn adapters_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("ZERON_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
     }
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join(".zeron").join("adapters"))
+    crate::home_dir().map(|h| h.join(".zeron").join("adapters"))
 }
 
 fn install_dir(pin: &NpmPin) -> Option<PathBuf> {
@@ -115,7 +113,9 @@ pub(crate) fn launch_for_entry(entry: &Path) -> Result<(PathBuf, Vec<String>), H
         .unwrap_or_default();
     let native = head.starts_with(b"\x7fELF")
         || head.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
-        || head.starts_with(&[0xca, 0xfe, 0xba, 0xbe]);
+        || head.starts_with(&[0xca, 0xfe, 0xba, 0xbe])
+        // PE executables (Windows .exe) start with `MZ`.
+        || head.starts_with(b"MZ");
     if native {
         return Ok((entry.to_path_buf(), Vec::new()));
     }
@@ -429,8 +429,18 @@ mod tests {
 
     #[test]
     fn npm_errno_exits_are_decoded() {
-        use std::os::unix::process::ExitStatusExt;
-        let status = |code: i32| Some(std::process::ExitStatus::from_raw(code << 8));
+        // Unix wait-status encodes the exit code in the high byte; the Windows
+        // raw representation is the code itself.
+        #[cfg(unix)]
+        let status = |code: i32| {
+            use std::os::unix::process::ExitStatusExt;
+            Some(std::process::ExitStatus::from_raw(code << 8))
+        };
+        #[cfg(windows)]
+        let status = |code: i32| {
+            use std::os::windows::process::ExitStatusExt;
+            Some(std::process::ExitStatus::from_raw(code as u32))
+        };
         assert!(describe_npm_exit(status(254)).contains("ENOENT"));
         assert!(describe_npm_exit(status(243)).contains("EACCES"));
         assert!(describe_npm_exit(status(226)).contains("EROFS"));

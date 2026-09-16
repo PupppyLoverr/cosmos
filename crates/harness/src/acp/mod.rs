@@ -124,30 +124,9 @@ fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String 
 }
 
 /// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
-pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
-    }
-    candidates.extend(extra);
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
-}
+/// Shared implementation lives at [`crate::find_on_paths`]; kept re-exported
+/// here so existing callers stay put.
+pub(crate) use crate::find_on_paths;
 
 /// Generic effort ladder for agents without their own clamping rules.
 fn default_effort_values(
@@ -182,9 +161,13 @@ fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
 
 fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::home_dir() {
         dirs.push(home.join(".local").join("bin").join(exe));
         dirs.push(home.join(".npm-global").join("bin").join(exe));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        // Windows `npm i -g` shims (`<exe>.cmd`) land here.
+        dirs.push(appdata.join("npm").join(exe));
     }
     dirs.push(PathBuf::from("/opt/homebrew/bin").join(exe));
     dirs.push(PathBuf::from("/usr/local/bin").join(exe));
@@ -193,7 +176,7 @@ fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
 
 fn grok_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::home_dir() {
         dirs.push(home.join(".local").join("bin").join("grok"));
         dirs.push(home.join(".grok").join("bin").join("grok"));
         dirs.push(home.join(".npm-global").join("bin").join("grok"));
@@ -263,10 +246,32 @@ fn grok_spec() -> AcpAgentSpec {
 
 fn devin_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::home_dir() {
         // The official installer's launcher symlink (the binary lives below
         // ~/.local/share/devin/cli/_versions).
         dirs.push(home.join(".local").join("bin").join("devin"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        // The Devin desktop bundle ships the CLI here on Windows.
+        dirs.push(
+            local
+                .join("Programs")
+                .join("Devin")
+                .join("resources")
+                .join("app")
+                .join("extensions")
+                .join("windsurf")
+                .join("devin")
+                .join("bin")
+                .join("devin.exe"),
+        );
+        dirs.push(
+            local
+                .join("Programs")
+                .join("Devin")
+                .join("bin")
+                .join("devin.cmd"),
+        );
     }
     dirs.push(PathBuf::from("/opt/homebrew/bin/devin"));
     dirs.push(PathBuf::from("/usr/local/bin/devin"));
@@ -334,9 +339,12 @@ fn devin_spec() -> AcpAgentSpec {
 
 fn hermes_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::home_dir() {
         dirs.push(home.join(".local").join("bin").join("hermes"));
         dirs.push(home.join(".hermes").join("bin").join("hermes"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        dirs.push(local.join("hermes").join("bin").join("hermes"));
     }
     dirs.push(PathBuf::from("/opt/homebrew/bin/hermes"));
     dirs.push(PathBuf::from("/usr/local/bin/hermes"));
@@ -2198,7 +2206,8 @@ async fn run_session(session: Session) {
     // settled ids are remembered so a STALE `prompt_complete` (a late replay
     // of an already-settled prompt) can never settle a newer turn.
     let mut prompt_seq: u64 = 0;
-    let mut current_prompt_id: Option<String> = None;
+    // Assigned inside the `turn` initializer below before any read.
+    let mut current_prompt_id: Option<String>;
     let mut completed_prompts: VecDeque<String> = VecDeque::new();
     // `ZERON_ACP_PROMPT_STALL_MS` overrides the spec's bound; 0 disables.
     let prompt_stall: Option<Duration> = match std::env::var("ZERON_ACP_PROMPT_STALL_MS")
@@ -2959,7 +2968,6 @@ async fn run_session(session: Session) {
             _ = tokio::time::sleep_until(
                 prompt_stall_deadline.unwrap_or_else(tokio::time::Instant::now),
             ), if prompt_stall_deadline.is_some() && turn.is_some() && !interrupted => {
-                prompt_stall_deadline = None;
                 let _ = send(
                     &event_tx,
                     AgentEvent::Error {

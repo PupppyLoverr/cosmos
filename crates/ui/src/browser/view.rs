@@ -135,7 +135,10 @@ impl BrowserSurface {
             };
             content = content.child(
                 div()
-                    .id(gpui::SharedString::from(format!("preview-row-{}", service.id)))
+                    .id(gpui::SharedString::from(format!(
+                        "preview-row-{}",
+                        service.id
+                    )))
                     .w_full()
                     .h(px(56.0))
                     .px(px(14.0))
@@ -281,7 +284,11 @@ impl BrowserSurface {
         if self.page.url.is_none() && self.previews_task.is_some() {
             return self.preview_body(theme, cx);
         }
-        let external = !cfg!(any(target_os = "macos", target_os = "linux"));
+        let external = !cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        ));
         let has_error = self.page.error.is_some();
         let title = if has_error {
             "Couldn’t load this page"
@@ -293,7 +300,7 @@ impl BrowserSurface {
         let description = if let Some(error) = &self.page.error {
             error.clone()
         } else if external {
-            "Open a website or local app in your default browser. Embedded browsing is available on macOS and Linux.".into()
+            "Open a website or local app in your default browser. Embedded browsing is available on macOS, Linux, and Windows.".into()
         } else {
             "Preview your local app or keep a website beside your conversation.".into()
         };
@@ -400,7 +407,11 @@ impl Render for BrowserSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let focused = self.address.focus_handle(cx).is_focused(window);
-        let external = !cfg!(any(target_os = "macos", target_os = "linux"));
+        let external = !cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        ));
         let has_page = self.page.url.is_some();
         let back = button(
             "browser-back",
@@ -443,11 +454,11 @@ impl Render for BrowserSurface {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| {
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     if let Some(native) = &this.native {
                         native.focus_chrome();
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                     let _ = this;
                 }),
             )
@@ -605,7 +616,39 @@ impl Render for BrowserSurface {
         } else {
             body.child(self.empty_body(&theme, cx))
         };
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        let body = if let Some(native) = &self.native {
+            if self.page.error.is_some() {
+                body.child(self.empty_body(&theme, cx))
+            } else {
+                let native = native.handle();
+                let focus = self.focus.clone();
+                body.child(
+                    gpui::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _cx| {
+                            let native = std::rc::Rc::downgrade(&native);
+                            let mask = window.content_mask().bounds;
+                            // GPUI focus is decided at paint time; the HWND
+                            // push happens after the frame commits.
+                            let focused = focus.is_focused(window);
+                            window.on_present(move || {
+                                if let Some(native) = native.upgrade() {
+                                    let mut host = native.borrow_mut();
+                                    host.sync(bounds, mask);
+                                    host.sync_focus(focused);
+                                }
+                            });
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            }
+        } else {
+            body.child(self.empty_body(&theme, cx))
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         let body = body.child(self.empty_body(&theme, cx));
 
         #[cfg(target_os = "linux")]

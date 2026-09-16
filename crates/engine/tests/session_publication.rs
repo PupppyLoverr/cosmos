@@ -1,5 +1,7 @@
 //! Real Codex adapter + engine persistence + ChatClient over a loopback relay.
 //! Faults are injected only in temporary profiles and the test relay.
+#![cfg(unix)]
+
 use futures::{SinkExt, StreamExt, future::BoxFuture};
 use loro::{ExportMode, LoroDoc};
 use std::collections::HashMap;

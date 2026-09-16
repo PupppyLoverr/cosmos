@@ -49,6 +49,14 @@ pub(crate) struct SystemFrame {
     /// absent on subagent-owned background shell tasks.
     #[serde(default)]
     pub subagent_type: Option<String>,
+    /// `system` error frames (Amp `error_during_execution`/`error_max_turns`
+    /// arrive as `{"type":"system","subtype":"error_*","error":…}`).
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Amp reports the selected Dial mode on init (`agent_mode`) instead of
+    /// a `model` field — SessionStarted falls back to it.
+    #[serde(default)]
+    pub agent_mode: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -117,6 +125,9 @@ pub(crate) struct ContentBlock {
     pub kind: String,
     #[serde(default)]
     pub text: String,
+    /// Amp `--stream-json-thinking` blocks carry `{type:"thinking",thinking}`.
+    #[serde(default)]
+    pub thinking: String,
     #[serde(default)]
     pub id: String,
     #[serde(default)]
@@ -151,8 +162,17 @@ pub(crate) struct ResultFrame {
     pub subtype: String,
     #[serde(default)]
     pub result: Option<String>,
+    /// Amp's error results carry a single `error` string (its schema has no
+    /// `errors` array); claude's carry `errors`.
+    #[serde(default)]
+    pub error: Option<String>,
     #[serde(default)]
     pub errors: Vec<Value>,
+    /// Tool calls the CLI declined (Amp `permission_denials`, agy
+    /// `denied_actions`): surfaced verbatim so a denied run never reads as a
+    /// silent success.
+    #[serde(default)]
+    pub permission_denials: Vec<Value>,
     #[serde(default)]
     pub usage: UsageBody,
     #[serde(default)]
@@ -212,6 +232,37 @@ pub(crate) fn user_message_line(text: &str) -> String {
         "parent_tool_use_id": null,
     })
     .to_string()
+}
+
+/// Amp's stdin turn: same `type:"user"` envelope but `content` must be a
+/// BLOCK ARRAY (Amp rejects the string shorthand Claude accepts) and steering
+/// rides a top-level `steer: true` flag rather than a convention.
+/// `images` are Anthropic-shaped base64 blocks — the same payload Amp's
+/// documented input schema takes (`source.type: "base64"`).
+pub(crate) fn amp_user_line(text: &str, steer: bool, images: &[ImageBlock]) -> String {
+    let mut blocks: Vec<Value> = images
+        .iter()
+        .map(|img| {
+            json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.media_type,
+                    "data": img.data,
+                },
+            })
+        })
+        .collect();
+    blocks.push(json!({ "type": "text", "text": text }));
+    let mut line = json!({
+        "type": "user",
+        "message": { "role": "user", "content": blocks },
+        "parent_tool_use_id": null,
+    });
+    if steer {
+        line["steer"] = Value::Bool(true);
+    }
+    line.to_string()
 }
 
 /// One inline image for a stdin user turn (Anthropic base64 image source).

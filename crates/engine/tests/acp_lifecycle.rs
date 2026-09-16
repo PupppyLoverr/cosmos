@@ -1,5 +1,7 @@
 //! #296 through the engine: completed tools must not park a pending ACP turn.
 //! Separate binary because the diagnostic watchdog setting is process-wide.
+#![cfg(unix)]
+
 use std::{sync::Arc, time::Duration};
 use zeron_doc::{
     MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,

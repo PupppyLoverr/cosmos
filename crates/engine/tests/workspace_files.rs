@@ -32,6 +32,10 @@ async fn git(cwd: &Path, args: &[&str]) {
 async fn init_repo(path: &Path) {
     std::fs::create_dir_all(path.join("src/nested")).expect("repo tree");
     git(path, &["init", "-b", "main"]).await;
+    // Hash assertions compare checkout bytes — pin LF so a host with
+    // core.autocrlf=true can't rewrite worktree checkouts to CRLF.
+    git(path, &["config", "core.autocrlf", "false"]).await;
+    git(path, &["config", "core.eol", "lf"]).await;
     std::fs::write(path.join("README.md"), "hello\n").expect("readme");
     std::fs::write(path.join("src/lib.rs"), "pub fn answer() -> u8 { 42 }\n").expect("source");
     std::fs::write(path.join("src/nested/mod.rs"), "pub mod child;\n").expect("nested source");

@@ -89,20 +89,35 @@ fn decoded(events: &[TerminalEvent]) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-/// Drain a terminal subscription until `predicate` matches the decoded transcript
-/// (or the deadline hits).
-async fn drain_until(
+/// ConPTY can drop input written before the shell finishes initializing —
+/// resend `cmd` (must be idempotent) until `predicate` matches the transcript.
+async fn write_until(
+    terminals: &Terminals,
+    id: &str,
+    cmd: &str,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalEvent>,
     events: &mut Vec<TerminalEvent>,
     predicate: impl Fn(&[TerminalEvent]) -> bool,
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut last_send = None;
     while !predicate(events) {
-        let event = tokio::time::timeout_at(deadline, rx.recv())
-            .await
-            .expect("terminal event before timeout")
-            .expect("terminal stream alive");
-        events.push(event);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "terminal output never matched"
+        );
+        if last_send.is_none_or(|t: tokio::time::Instant| t.elapsed() > Duration::from_millis(500))
+        {
+            // The shell may have already exited (e.g. a resent `exit`) — the
+            // pending Exit event satisfies the predicate on the next iteration.
+            let _ = terminals.write(id, &BASE64.encode(cmd));
+            last_send = Some(tokio::time::Instant::now());
+        }
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(event)) => events.push(event),
+            Ok(None) => panic!("terminal stream ended before predicate matched"),
+            Err(_) => {}
+        }
     }
 }
 
@@ -1019,20 +1034,35 @@ async fn checkout_file_diff_text_rpc_reads_pinned_commit_sources() {
 async fn terminal_e2e_replay_live_resize_exit() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let terminals = Terminals::new();
+    // POSIX `$((expr))` keeps the produced output distinct from the echoed
+    // input; cmd.exe has no inline arithmetic, so the literal markers exercise
+    // the same replay/resize/exit plumbing through ConPTY.
+    let (shell, marker, after, shell_name) = if cfg!(windows) {
+        (
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()),
+            "echo m4rk3r-42\r\n",
+            "echo aft3r-11\r\n",
+            "cmd.exe",
+        )
+    } else {
+        (
+            "/bin/sh".to_string(),
+            "echo m4rk3r-$((40+2))\n",
+            "echo aft3r-$((10+1))\n",
+            "sh",
+        )
+    };
     let session = terminals
-        .open_with_shell(&tmp.path().to_string_lossy(), 80, 24, Some("/bin/sh"))
-        .expect("open sh");
-    assert_eq!(session.shell, "sh");
+        .open_with_shell(&tmp.path().to_string_lossy(), 80, 24, Some(&shell))
+        .expect("open shell");
+    assert_eq!(session.shell, shell_name);
     assert_eq!(session.cwd, tmp.path().to_string_lossy());
 
     // Live subscribe, then run a command whose OUTPUT differs from the echoed input.
     let mut rx = terminals.subscribe(&session.id, None).expect("subscribe");
     let mut events = Vec::new();
-    terminals
-        .write(&session.id, &BASE64.encode("echo m4rk3r-$((40+2))\n"))
-        .expect("write echo");
-    drain_until(&mut rx, &mut events, |events| {
-        decoded(events).contains("m4rk3r-42")
+    write_until(&terminals, &session.id, marker, &mut rx, &mut events, |e| {
+        decoded(e).contains("m4rk3r-42")
     })
     .await;
 
@@ -1044,17 +1074,21 @@ async fn terminal_e2e_replay_live_resize_exit() {
 
     // Detach (drop the stream) — the shell survives and keeps producing output.
     drop(rx);
-    terminals
-        .write(&session.id, &BASE64.encode("echo aft3r-$((10+1))\n"))
-        .expect("write");
     let mut rx2 = terminals
         .subscribe(&session.id, None)
         .expect("re-subscribe");
     let mut events2 = Vec::new();
-    drain_until(&mut rx2, &mut events2, |events| {
-        let text = decoded(events);
-        text.contains("m4rk3r-42") && text.contains("aft3r-11")
-    })
+    write_until(
+        &terminals,
+        &session.id,
+        after,
+        &mut rx2,
+        &mut events2,
+        |e| {
+            let text = decoded(e);
+            text.contains("m4rk3r-42") && text.contains("aft3r-11")
+        },
+    )
     .await;
     // The replay was re-delivered from seq 0 — first event seq is 1.
     let first_seq = match events2.first().expect("replayed events") {
@@ -1071,15 +1105,20 @@ async fn terminal_e2e_replay_live_resize_exit() {
         .expect("resume");
 
     // Exit: shell terminates, Exit event lands on every live stream, streams end.
-    terminals
-        .write(&session.id, &BASE64.encode("exit 3\n"))
-        .expect("write exit");
+    let exit_cmd = if cfg!(windows) {
+        "exit 3\r\n"
+    } else {
+        "exit 3\n"
+    };
     let mut events3 = Vec::new();
-    drain_until(&mut rx3, &mut events3, |events| {
-        events
-            .iter()
-            .any(|e| matches!(e, TerminalEvent::Exit { .. }))
-    })
+    write_until(
+        &terminals,
+        &session.id,
+        exit_cmd,
+        &mut rx3,
+        &mut events3,
+        |e| e.iter().any(|e| matches!(e, TerminalEvent::Exit { .. })),
+    )
     .await;
     match events3.last().expect("exit event") {
         TerminalEvent::Exit { exit_code, .. } => assert_eq!(*exit_code, 3),
@@ -1118,15 +1157,20 @@ async fn terminal_e2e_replay_live_resize_exit() {
 async fn terminal_guards_input_size_and_cwd() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let terminals = Terminals::new();
+    let shell = if cfg!(windows) {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
+    } else {
+        "/bin/sh".to_string()
+    };
     assert!(
         terminals
-            .open_with_shell("/definitely/not/a/dir", 80, 24, Some("/bin/sh"))
+            .open_with_shell("/definitely/not/a/dir", 80, 24, Some(&shell))
             .is_err(),
         "bad cwd rejected"
     );
     let session = terminals
-        .open_with_shell(&tmp.path().to_string_lossy(), 80, 24, Some("/bin/sh"))
-        .expect("open sh");
+        .open_with_shell(&tmp.path().to_string_lossy(), 80, 24, Some(&shell))
+        .expect("open shell");
     let huge = BASE64.encode(vec![b'x'; 65 * 1024]);
     assert!(
         terminals.write(&session.id, &huge).is_err(),
@@ -1345,7 +1389,11 @@ async fn rpc_dispatch_for_m5_methods() {
             methods::WRITE_TERMINAL,
             serde_json::json!({
                 "terminalId": terminal_id,
-                "data": BASE64.encode("echo rpc-t3st-$((5+4))\n"),
+                "data": BASE64.encode(if cfg!(windows) {
+                    "echo rpc-t3st-9\r\n"
+                } else {
+                    "echo rpc-t3st-$((5+4))\n"
+                }),
             }),
         )
         .await

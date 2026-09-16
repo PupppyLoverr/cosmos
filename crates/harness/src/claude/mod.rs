@@ -32,8 +32,10 @@
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
 
 pub mod catalog;
-mod normalize;
-mod wire;
+// Shared with the Amp driver (`crate::amp`): its stream-json wire is the
+// Claude-compatible schema these frames normalize.
+pub(crate) mod normalize;
+pub(crate) mod wire;
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -69,38 +71,16 @@ fn resolve_claude_executable() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(p));
     }
-    let exe = if cfg!(windows) {
-        "claude.exe"
-    } else {
-        "claude"
-    };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
+    let mut extra: Vec<PathBuf> = Vec::new();
+    if let Some(home) = crate::home_dir() {
+        extra.push(home.join(".claude").join("local").join("claude"));
+        extra.push(home.join(".local").join("bin").join("claude"));
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".claude").join("local").join("claude"));
-        candidates.push(home.join(".local").join("bin").join("claude"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
-    candidates.push(PathBuf::from("/usr/local/bin/claude"));
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    extra.push(PathBuf::from("/opt/homebrew/bin/claude"));
+    extra.push(PathBuf::from("/usr/local/bin/claude"));
+    // find_on_paths covers PATH, the login-shell snapshot, the node-version-
+    // manager bins, and Windows PATHEXT spellings (claude.exe/.cmd/…).
+    crate::find_on_paths("claude", extra)
 }
 
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
@@ -570,8 +550,9 @@ fn image_media_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str
 
 /// Load `RunRequest::attachments` into inline image blocks, best-effort: an
 /// unreadable, oversized, or unsupported file is skipped — its path ref still
-/// rides the prompt text — never fatal to the run.
-async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
+/// rides the prompt text — never fatal to the run. Shared with the Amp
+/// driver (same Anthropic-shaped image block schema).
+pub(crate) async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
     use base64::Engine as _;
     let mut blocks = Vec::new();
     for path in paths {
@@ -658,7 +639,7 @@ async fn run_session(session: Session) {
     } = controls;
     let request_input = Arc::new(request_input);
 
-    let mut norm = Normalizer::new();
+    let mut norm = Normalizer::new(HarnessId::ClaudeCode);
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;

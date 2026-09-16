@@ -113,10 +113,13 @@ fn stall_bound() -> Option<Duration> {
 
 fn opencode_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::home_dir() {
         dirs.push(home.join(".opencode").join("bin").join("opencode"));
         dirs.push(home.join(".local").join("bin").join("opencode"));
         dirs.push(home.join(".npm-global").join("bin").join("opencode"));
+        // Scoop / bun shims on Windows.
+        dirs.push(home.join("scoop").join("shims").join("opencode"));
+        dirs.push(home.join(".bun").join("bin").join("opencode"));
     }
     dirs.push(PathBuf::from("/opt/homebrew/bin/opencode"));
     dirs.push(PathBuf::from("/usr/local/bin/opencode"));

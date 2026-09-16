@@ -1,7 +1,9 @@
 //! `zeron daemon …` — install/manage `zeron headless` as a background service:
 //! a systemd **user** unit on Linux (the VPS deployment target), a launchd
-//! LaunchAgent on macOS. The unit runs the current executable with the
-//! `ZERON_*` environment captured at install time, so
+//! LaunchAgent on macOS, and a per-user Task Scheduler task on Windows (a
+//! `cmd` wrapper carries the captured env — schtasks itself can't set it).
+//! No admin required on any platform. The unit runs the current executable
+//! with the `ZERON_*` environment captured at install time, so
 //! `ZERON_EDGE_URL=… zeron daemon install` bakes that override in.
 //!
 //! Auth is decoupled: without a saved session the service remains up on the
@@ -16,6 +18,8 @@ const LAUNCHD_LABEL: &str = "sh.zeron.app";
 /// Same unit name the curl|sh installer (`edge/src/install.sh`) writes, so
 /// `zeron daemon …` manages that installation rather than a competing copy.
 const SYSTEMD_UNIT: &str = "zeron.service";
+/// The Task Scheduler task name on Windows (per-user, at-logon trigger).
+const WIN_TASK: &str = "ZeronHeadless";
 
 /// Environment captured into the unit file. `PATH` is always included (the
 /// engine spawns harness CLIs like `claude`, which service managers' minimal
@@ -66,15 +70,45 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
         println!(
             "For start-at-boot without an active login session (VPS): loginctl enable-linger $USER"
         );
+    } else if cfg!(windows) {
+        // Per-user Task Scheduler entry — no admin needed for the current
+        // user's own tasks. schtasks has no env-var surface, so the captured
+        // environment is baked into a `daemon.cmd` wrapper in the data dir.
+        std::fs::create_dir_all(data_dir)?;
+        let wrapper = data_dir.join("daemon.cmd");
+        std::fs::write(
+            &wrapper,
+            render_cmd_wrapper(&exe, &env, &data_dir.join("daemon.log")),
+        )?;
+        run("schtasks", &["/delete", "/tn", WIN_TASK, "/f"]).ok();
+        run(
+            "schtasks",
+            &[
+                "/create",
+                "/tn",
+                WIN_TASK,
+                "/sc",
+                "onlogon",
+                "/rl",
+                "limited",
+                "/f",
+                "/tr",
+                &format!("cmd.exe /c \"{}\"", wrapper.display()),
+            ],
+        )?;
+        run("schtasks", &["/run", "/tn", WIN_TASK])?;
+        println!("Installed and started {WIN_TASK} ({}).", wrapper.display());
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!(
+            "zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Task Scheduler)"
+        );
     }
     println!(
         "Without a saved account the engine stays local-only; sign-in and restart are optional for sync."
     );
     println!(
         "Logs: {}",
-        if cfg!(target_os = "macos") {
+        if cfg!(target_os = "macos") || cfg!(windows) {
             format!("{}", data_dir.join("daemon.log").display())
         } else {
             format!("journalctl --user -u {SYSTEMD_UNIT}")
@@ -107,8 +141,16 @@ pub fn uninstall() -> anyhow::Result<()> {
             }
             Err(err) => return Err(err.into()),
         }
+    } else if cfg!(windows) {
+        let _ = run_quiet("schtasks", &["/end", "/tn", WIN_TASK]);
+        match run("schtasks", &["/delete", "/tn", WIN_TASK, "/f"]) {
+            Ok(()) => println!("Removed task {WIN_TASK}."),
+            Err(_) => println!("Not installed."),
+        }
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!(
+            "zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Task Scheduler)"
+        );
     }
     Ok(())
 }
@@ -128,8 +170,13 @@ pub fn start() -> anyhow::Result<()> {
         run("launchctl", &["kickstart", &launchd_service_target()?])?;
     } else if cfg!(target_os = "linux") {
         run("systemctl", &["--user", "start", SYSTEMD_UNIT])?;
+    } else if cfg!(windows) {
+        run("schtasks", &["/run", "/tn", WIN_TASK])
+            .context("task not installed — run `zeron daemon install` first")?;
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!(
+            "zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Task Scheduler)"
+        );
     }
     println!("Started.");
     Ok(())
@@ -141,8 +188,14 @@ pub fn stop() -> anyhow::Result<()> {
         run("launchctl", &["bootout", &launchd_service_target()?])?;
     } else if cfg!(target_os = "linux") {
         run("systemctl", &["--user", "stop", SYSTEMD_UNIT])?;
+    } else if cfg!(windows) {
+        // `/end` stops the task's running instance; the task itself stays
+        // registered (parity with launchd bootout leaving the plist).
+        run("schtasks", &["/end", "/tn", WIN_TASK]).context("task not installed or not running")?;
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!(
+            "zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Task Scheduler)"
+        );
     }
     println!("Stopped.");
     Ok(())
@@ -165,8 +218,15 @@ pub fn restart() -> anyhow::Result<()> {
         run("systemctl", &["--user", "restart", SYSTEMD_UNIT])?;
         println!("Restarted.");
         Ok(())
+    } else if cfg!(windows) {
+        let _ = run_quiet("schtasks", &["/end", "/tn", WIN_TASK]);
+        run("schtasks", &["/run", "/tn", WIN_TASK])?;
+        println!("Restarted.");
+        Ok(())
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!(
+            "zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Task Scheduler)"
+        );
     }
 }
 
@@ -208,8 +268,32 @@ pub fn status() -> anyhow::Result<()> {
             .status()
             .context("running systemctl")?;
         Ok(())
+    } else if cfg!(windows) {
+        let output = Command::new("schtasks")
+            .args(["/query", "/tn", WIN_TASK, "/v", "/fo", "list"])
+            .output()
+            .context("running schtasks")?;
+        if !output.status.success() {
+            println!("{WIN_TASK}: not installed — `zeron daemon install`");
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        // `/v /fo list` is verbose; surface just the liveness lines.
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Status:")
+                || trimmed.starts_with("Last Run Time:")
+                || trimmed.starts_with("Last Result:")
+                || trimmed.starts_with("Next Run Time:")
+            {
+                println!("  {trimmed}");
+            }
+        }
+        Ok(())
     } else {
-        bail!("zeron daemon is only supported on macOS (launchd) and Linux (systemd)");
+        bail!(
+            "zeron daemon is only supported on macOS (launchd), Linux (systemd), and Windows (Task Scheduler)"
+        );
     }
 }
 
@@ -298,6 +382,36 @@ fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path) -> Str
         env_dict = env_dict,
         log = xml_escape(&log.to_string_lossy()),
     )
+}
+
+/// The `daemon.cmd` a Windows logon task runs. schtasks can't carry
+/// environment variables, so the captured `ZERON_*`/`PATH` set is baked in
+/// here — same contract as the launchd `EnvironmentVariables` dict.
+fn render_cmd_wrapper(exe: &Path, env: &[(String, String)], log: &Path) -> String {
+    let mut script = String::from("@echo off\r\n");
+    for (key, value) in env {
+        script.push_str(&format!("set \"{key}={}\"\r\n", cmd_escape(value)));
+    }
+    // `>log 2>&1` truncates each start — Task Scheduler has no append-capped
+    // log surface like journald; the engine's own rotation bounds this file.
+    script.push_str(&format!(
+        "\"{}\" headless >> \"{}\" 2>&1\r\n",
+        exe.display(),
+        log.display()
+    ));
+    script
+}
+
+/// Escape a value for `set "K=V"`: `%` → `%%` (the batch-file expansion char)
+/// and strip newlines so a hostile env value can't inject commands.
+fn cmd_escape(input: &str) -> String {
+    input
+        .replace(['\r', '\n'], "")
+        .replace('%', "%%")
+        .replace('&', "^&")
+        .replace('>', "^>")
+        .replace('<', "^<")
+        .replace('|', "^|")
 }
 
 fn xml_escape(input: &str) -> String {
@@ -448,5 +562,30 @@ mod tests {
         assert!(
             plist.contains("<key>StandardOutPath</key><string>/Users/x/.zeron/daemon.log</string>")
         );
+    }
+
+    #[test]
+    fn cmd_wrapper_shape() {
+        let script = render_cmd_wrapper(
+            Path::new("C:\\Users\\x\\zeron.exe"),
+            &[
+                ("PATH".into(), "C:\\bin;%PATH%".into()),
+                ("ZERON_EDGE_URL".into(), "https://e?a=1&b=2".into()),
+            ],
+            Path::new("C:\\Users\\x\\.zeron\\daemon.log"),
+        );
+        // `%` doubled for batch expansion; `&` escaped so it can't split commands.
+        assert!(script.contains("set \"PATH=C:\\bin;%%PATH%%\"\r\n"));
+        assert!(script.contains("set \"ZERON_EDGE_URL=https://e?a=1^&b=2\"\r\n"));
+        assert!(script.contains(
+            "\"C:\\Users\\x\\zeron.exe\" headless >> \"C:\\Users\\x\\.zeron\\daemon.log\" 2>&1"
+        ));
+        // A newline in an env value can't inject a second command.
+        let injected = render_cmd_wrapper(
+            Path::new("x.exe"),
+            &[("K".into(), "v\r\nevil.exe".into())],
+            Path::new("l.log"),
+        );
+        assert!(!injected.contains("evil.exe"));
     }
 }

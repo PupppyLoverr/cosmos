@@ -473,12 +473,31 @@ mod tests {
         assert!(racing.exists(), "fresh empty staging dir was reclaimed");
 
         let stale = std::time::SystemTime::now() - (STAGING_TTL + Duration::from_secs(60));
+        // Backdating a directory's mtime needs a write handle — on Windows
+        // that means FILE_FLAG_BACKUP_SEMANTICS (a plain File::open gives a
+        // read handle, and dir opens without the flag are refused outright).
+        #[cfg(unix)]
         std::fs::File::open(&racing)
             .unwrap()
             .set_modified(stale)
             .unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&racing)
+                .unwrap()
+                .set_modified(stale)
+                .unwrap();
+        }
         uploads.append("upload-other", "aGk=", Some(0)).unwrap();
-        assert!(!racing.exists(), "abandoned empty staging dir must be swept");
+        assert!(
+            !racing.exists(),
+            "abandoned empty staging dir must be swept"
+        );
     }
 
     #[test]

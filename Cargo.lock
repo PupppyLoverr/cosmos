@@ -11979,6 +11979,8 @@ dependencies = [
  "url",
  "usvg",
  "uuid",
+ "webview2-com",
+ "windows-core 0.61.2",
  "wry",
  "x11rb 0.14.0",
  "zeron-doc",

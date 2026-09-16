@@ -689,12 +689,18 @@ const SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP: f32 = 10.0;
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
 const SIDEBAR_GLASS_FADE_BAND: f32 = 24.0;
 
-/// New-thread controls float over the tail of a top-anchored image hero. The
-/// hero reaches below the composer, giving its lower mask room to dissolve
-/// gradually into the otherwise empty lower canvas.
+/// The backdrop artwork fills the whole conversation column — on the
+/// new-thread canvas and beneath an open thread alike. The composer clears a
+/// feathered cutout around itself so the control reads over any image.
 const NEW_THREAD_BACKGROUND_FROSTED_OPACITY: f32 = 0.84;
-const NEW_THREAD_BACKGROUND_VIEWPORT_RATIO: f32 = 0.72;
-const NEW_THREAD_BACKGROUND_MAX_HEIGHT: f32 = 760.0;
+
+/// While a thread is open the artwork drops behind a theme-colored scrim so
+/// every transcript row keeps its normal contrast over any image. The artwork
+/// still reads through the weave — strongest inside the composer cutout and
+/// along the column's vertical edges — and the scrim rides the dock's
+/// transcript schedule, arriving and leaving with the conversation.
+const CHAT_BACKDROP_SCRIM_DARK: f32 = 0.82;
+const CHAT_BACKDROP_SCRIM_LIGHT: f32 = 0.88;
 
 /// Drag marker for the sidebar resize handle.
 struct SidebarResize;
@@ -848,8 +854,17 @@ fn new_thread_background_opacity(is_frost: bool) -> f32 {
 }
 
 fn new_thread_background_height(viewport_height: f32) -> f32 {
-    (viewport_height.max(0.0) * NEW_THREAD_BACKGROUND_VIEWPORT_RATIO)
-        .min(NEW_THREAD_BACKGROUND_MAX_HEIGHT)
+    // The artwork layer is the full conversation column. The bottom fade is
+    // measured from its painted bounds, so the image always dissolves into
+    // the shell floor at the window's bottom edge — canvas and chat alike.
+    viewport_height.max(0.0)
+}
+
+fn chat_backdrop_scrim(theme: &Theme) -> f32 {
+    match theme.appearance {
+        crate::theme::Appearance::Dark => CHAT_BACKDROP_SCRIM_DARK,
+        crate::theme::Appearance::Light => CHAT_BACKDROP_SCRIM_LIGHT,
+    }
 }
 
 fn new_thread_background(
@@ -2640,7 +2655,11 @@ impl Shell {
                 LinkAction::External
             };
         }
-        let outcome = resolved.web_outcome(cfg!(any(target_os = "macos", target_os = "linux")));
+        let outcome = resolved.web_outcome(cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        )));
         if outcome == LinkOutcome::Internal {
             if !self.right_pane_open(cx) {
                 self.toggle_right_pane(cx);
@@ -7197,16 +7216,25 @@ impl Shell {
             composer.set_available_width(composer_width, cx)
         });
         let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
-        let new_thread_background_layer = (!has_selection || dock_frame.active).then(|| {
+        // The artwork stays mounted while a thread is open: it persists under
+        // the chat scrim instead of dissolving away on the canvas→chat handoff.
+        // The dissolve schedule still applies on the return to the canvas and
+        // during right-pane geometry handoffs.
+        let artwork_dissolve = if has_selection {
+            0.0
+        } else {
+            dock_frame.dissolve()
+        };
+        let new_thread_background_layer = (artwork.is_some() || dock_frame.active).then(|| {
             if artwork.is_some() && artwork_opacity < 1.0 {
                 window.request_animation_frame();
             }
             new_thread_background(
-                artwork,
+                artwork.clone(),
                 self.viewport_height,
                 (self.viewport_width - self.sidebar_now()).max(0.0),
                 self.composer.read(cx).surface_bounds(),
-                dock_frame.dissolve(),
+                artwork_dissolve,
                 artwork_opacity * new_thread_background_opacity(theme.is_frost()),
             )
         });
@@ -7338,6 +7366,21 @@ impl Shell {
             // it must paint under the overlaid titlebar instead of becoming
             // fully transparent across the titlebar's inset band.
             .children(new_thread_background_layer)
+            // While a conversation is on screen the artwork drops behind a
+            // theme-colored scrim so transcript text, tool output, and chrome
+            // keep their normal contrast; the image still reads through the
+            // weave and inside the composer cutout. Rides the dock's
+            // transcript schedule — it arrives and leaves exactly with the
+            // conversation. It spans the whole column (including behind the
+            // terminal dock) so the treatment is uniform; surfaces above it
+            // keep their own fills.
+            .when(artwork.is_some(), |el| {
+                el.child(
+                    div().absolute().inset_0().bg(theme
+                        .bg
+                        .opacity(chat_backdrop_scrim(theme) * dock_frame.transcript())),
+                )
+            })
             .child(
                 // Full-height underlay: the transcript viewport spans the
                 // whole column, scrolling UNDER the titlebar above and the
@@ -9985,11 +10028,12 @@ mod tests {
             new_thread_background_opacity(true),
             NEW_THREAD_BACKGROUND_FROSTED_OPACITY
         );
-        assert_eq!(new_thread_background_height(400.0), 288.0);
-        assert!((new_thread_background_height(600.0) - 432.0).abs() < 0.001);
-        assert_eq!(new_thread_background_height(1_000.0), 720.0);
-        assert_eq!(new_thread_background_height(1_200.0), 760.0);
-        assert!(new_thread_background_height(848.0) > 848.0 / 2.0);
+        // The backdrop fills the entire conversation column at any window
+        // size — the bottom fade is measured from the painted bounds, so a
+        // taller image always dissolves into the shell floor.
+        assert_eq!(new_thread_background_height(400.0), 400.0);
+        assert_eq!(new_thread_background_height(1_000.0), 1_000.0);
+        assert_eq!(new_thread_background_height(1_200.0), 1_200.0);
     }
 
     #[test]

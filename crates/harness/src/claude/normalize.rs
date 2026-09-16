@@ -63,6 +63,21 @@ fn str_field(input: &Value, key: &str) -> String {
     input.get(key).and_then(Value::as_str).unwrap_or("").into()
 }
 
+/// First string field among several spellings — Amp names its tool inputs
+/// `path`/`file` where Claude uses `file_path`.
+fn first_str_field(input: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|k| input.get(*k).and_then(Value::as_str))
+        .unwrap_or("")
+        .into()
+}
+
+fn first_opt_str_field(input: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| input.get(*k).and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
 fn opt_str_field(input: &Value, key: &str) -> Option<String> {
     input.get(key).and_then(Value::as_str).map(str::to_owned)
 }
@@ -70,36 +85,36 @@ fn opt_str_field(input: &Value, key: &str) -> Option<String> {
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
 pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
     match name {
-        "Bash" => ToolCall::Exec {
-            command: str_field(input, "command"),
+        "Bash" | "bash" | "run_command" => ToolCall::Exec {
+            command: first_str_field(input, &["command", "cmd", "command_line"]),
         },
-        "Read" => ToolCall::ReadFile {
-            path: str_field(input, "file_path"),
+        "Read" | "read" | "read_file" | "read_mcp_resource" => ToolCall::ReadFile {
+            path: first_str_field(input, &["file_path", "path", "file", "uri"]),
         },
-        "Write" => ToolCall::WriteFile {
-            path: str_field(input, "file_path"),
-            content: opt_str_field(input, "content"),
+        "Write" | "create_file" | "write_file" => ToolCall::WriteFile {
+            path: first_str_field(input, &["file_path", "path", "file"]),
+            content: first_opt_str_field(input, &["content", "contents"]),
         },
-        "Edit" => ToolCall::EditFile {
-            path: str_field(input, "file_path"),
-            old_string: opt_str_field(input, "old_string"),
-            new_string: opt_str_field(input, "new_string"),
+        "Edit" | "edit_file" | "undo_edit" => ToolCall::EditFile {
+            path: first_str_field(input, &["file_path", "path", "file"]),
+            old_string: first_opt_str_field(input, &["old_string", "old_str", "old"]),
+            new_string: first_opt_str_field(input, &["new_string", "new_str", "new"]),
         },
-        "Grep" => ToolCall::Search {
-            pattern: str_field(input, "pattern"),
-            path: opt_str_field(input, "path"),
+        "Grep" | "grep" | "search" => ToolCall::Search {
+            pattern: first_str_field(input, &["pattern", "query", "regex"]),
+            path: first_opt_str_field(input, &["path", "dir", "root"]),
         },
-        "Glob" => ToolCall::Glob {
-            pattern: str_field(input, "pattern"),
+        "Glob" | "glob" | "finder" | "find" => ToolCall::Glob {
+            pattern: first_str_field(input, &["pattern", "glob", "query"]),
         },
-        "WebFetch" => ToolCall::WebFetch {
+        "WebFetch" | "read_web_page" | "fetch" => ToolCall::WebFetch {
             url: str_field(input, "url"),
             prompt: opt_str_field(input, "prompt"),
         },
-        "WebSearch" => ToolCall::WebSearch {
+        "WebSearch" | "web_search" => ToolCall::WebSearch {
             query: str_field(input, "query"),
         },
-        "TodoWrite" => ToolCall::Todo {
+        "TodoWrite" | "todo_write" => ToolCall::Todo {
             items: input
                 .get("todos")
                 .and_then(Value::as_array)
@@ -184,6 +199,13 @@ fn is_synthetic_user_text(text: &str) -> bool {
 /// the wake turn's own frames flow through and the engine's parked-session
 /// resume turns them into the done→Working→done wake.
 pub(crate) struct Normalizer {
+    /// Harness stamped onto `SessionStarted` (Amp reuses this wire).
+    harness: HarnessId,
+    /// Amp's stream has no `stream_event` partials — the assistant frame IS
+    /// the text carrier (whole content blocks arrive settled), so this mode
+    /// folds text/thinking blocks off the untagged assistant frame where
+    /// Claude's mode leaves them to the delta stream.
+    emit_assistant_blocks: bool,
     saw_init: bool,
     last_model: Option<String>,
     /// Background-agent ids (`task_started.task_id`) → the spawning Agent
@@ -207,8 +229,10 @@ pub(crate) struct Normalizer {
 }
 
 impl Normalizer {
-    pub fn new() -> Self {
+    pub fn new(harness: HarnessId) -> Self {
         Self {
+            harness,
+            emit_assistant_blocks: false,
             saw_init: false,
             last_model: None,
             agent_tasks: std::collections::HashMap::new(),
@@ -216,6 +240,15 @@ impl Normalizer {
             assistant_message_id: new_message_id(),
             session_id: None,
         }
+    }
+
+    /// Amp mode: the same wire schema, but assistant text/thinking arrive as
+    /// settled content blocks on the `assistant` frame (no `stream_event`
+    /// partial stream), so they fold from there.
+    pub fn for_amp() -> Self {
+        let mut norm = Self::new(HarnessId::Amp);
+        norm.emit_assistant_blocks = true;
+        norm
     }
 
     /// Rotate the assistant message id for a steer boundary; returns
@@ -251,9 +284,7 @@ impl Normalizer {
                         return Vec::new();
                     }
                     let status = match f.status.as_deref().unwrap_or("") {
-                        "completed" | "complete" | "succeeded" | "success" => {
-                            DoneStatus::Completed
-                        }
+                        "completed" | "complete" | "succeeded" | "success" => DoneStatus::Completed,
                         "failed" | "errored" | "error" => DoneStatus::Errored,
                         "killed" | "cancelled" | "canceled" | "stopped" | "interrupted" => {
                             DoneStatus::Interrupted
@@ -285,14 +316,31 @@ impl Normalizer {
                     self.agent_spawn_tools.insert(tool.to_owned());
                     return Vec::new();
                 }
+                // Amp's `system` error frames (`error_during_execution`,
+                // `error_max_turns`) carry a user-visible `error` string —
+                // surface it; an unsurfaced error reads as a silent turn.
+                if f.subtype.starts_with("error") {
+                    return vec![AgentEvent::Error {
+                        message: f
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| result_error_text(&f.subtype).to_owned()),
+                    }];
+                }
                 if f.subtype != "init" || self.saw_init {
                     return Vec::new();
                 }
                 self.saw_init = true;
                 self.session_id = Some(f.session_id.clone());
+                // Amp's init names the Dial mode (`agent_mode`), not a model.
+                let model = if f.model.is_empty() {
+                    f.agent_mode.unwrap_or_default()
+                } else {
+                    f.model
+                };
                 vec![AgentEvent::SessionStarted {
-                    harness: HarnessId::ClaudeCode,
-                    model: f.model,
+                    harness: self.harness,
+                    model,
                     tools: f.tools,
                     cwd: f.cwd,
                     session_id: f.session_id,
@@ -394,57 +442,78 @@ impl Normalizer {
                         self.agent_spawn_tools.insert(b.id.clone());
                     }
                 }
-                let mut out: Vec<AgentEvent> = f
-                    .message
-                    .blocks()
-                    .filter(|b: &ContentBlock| b.kind == "tool_use")
-                    .flat_map(|b| {
-                        let call = AgentEvent::ToolCall {
-                            id: b.id.clone(),
-                            call: decode_tool_use(&b.name, &b.input),
-                        };
-                        // A spawn's `prompt` is the subagent's opening user
-                        // message — the wire never echoes it on the child
-                        // feed (child user frames carry tool results and
-                        // steers only), so seed it here and the subagent
-                        // transcript starts the way every chat does.
-                        let opening = matches!(b.name.as_str(), "Agent" | "Task")
-                            .then(|| b.input.get("prompt"))
-                            .flatten()
-                            .and_then(Value::as_str)
-                            .filter(|p| !p.trim().is_empty())
-                            .map(|prompt| tag(
-                                &b.id,
-                                AgentEvent::UserMessage {
-                                    text: prompt.to_owned(),
-                                },
-                            ));
-                        // A SendMessage steer never echoes on the child feed
-                        // (live-verified) — surface it from the parent's own
-                        // call, re-keyed onto the spawn it addresses.
-                        let steer = (b.name == "SendMessage")
-                            .then(|| {
-                                let to = ["to", "recipient"]
-                                    .iter()
-                                    .find_map(|k| b.input.get(*k))
-                                    .and_then(Value::as_str)?;
-                                let spawn = self.agent_tasks.get(to)?;
-                                let text = ["message", "content"]
-                                    .iter()
-                                    .find_map(|k| b.input.get(*k))
-                                    .and_then(Value::as_str)
-                                    .filter(|m| !m.trim().is_empty())?;
-                                Some(tag(
-                                    spawn,
-                                    AgentEvent::UserMessage {
-                                        text: text.to_owned(),
-                                    },
-                                ))
-                            })
-                            .flatten();
-                        std::iter::once(call).chain(opening).chain(steer)
-                    })
-                    .collect();
+                let mut out: Vec<AgentEvent> = Vec::new();
+                if self.emit_assistant_blocks {
+                    // Amp: no delta stream — text and thinking settle ON the
+                    // assistant frame. `redacted_thinking` carries no text and
+                    // is dropped (same policy as signature deltas).
+                    out.extend(f.message.blocks().filter_map(
+                        |b: ContentBlock| match b.kind.as_str() {
+                            "text" if !b.text.is_empty() => Some(AgentEvent::TextDelta {
+                                text: format!("{}\n\n", b.text.trim_end()),
+                            }),
+                            "thinking" if !b.thinking.is_empty() => {
+                                Some(AgentEvent::ReasoningDelta {
+                                    text: format!("{}\n\n", b.thinking.trim_end()),
+                                })
+                            }
+                            _ => None,
+                        },
+                    ));
+                }
+                out.extend(
+                    f.message
+                        .blocks()
+                        .filter(|b: &ContentBlock| b.kind == "tool_use")
+                        .flat_map(|b| {
+                            let call = AgentEvent::ToolCall {
+                                id: b.id.clone(),
+                                call: decode_tool_use(&b.name, &b.input),
+                            };
+                            // A spawn's `prompt` is the subagent's opening user
+                            // message — the wire never echoes it on the child
+                            // feed (child user frames carry tool results and
+                            // steers only), so seed it here and the subagent
+                            // transcript starts the way every chat does.
+                            let opening = matches!(b.name.as_str(), "Agent" | "Task")
+                                .then(|| b.input.get("prompt"))
+                                .flatten()
+                                .and_then(Value::as_str)
+                                .filter(|p| !p.trim().is_empty())
+                                .map(|prompt| {
+                                    tag(
+                                        &b.id,
+                                        AgentEvent::UserMessage {
+                                            text: prompt.to_owned(),
+                                        },
+                                    )
+                                });
+                            // A SendMessage steer never echoes on the child feed
+                            // (live-verified) — surface it from the parent's own
+                            // call, re-keyed onto the spawn it addresses.
+                            let steer = (b.name == "SendMessage")
+                                .then(|| {
+                                    let to = ["to", "recipient"]
+                                        .iter()
+                                        .find_map(|k| b.input.get(*k))
+                                        .and_then(Value::as_str)?;
+                                    let spawn = self.agent_tasks.get(to)?;
+                                    let text = ["message", "content"]
+                                        .iter()
+                                        .find_map(|k| b.input.get(*k))
+                                        .and_then(Value::as_str)
+                                        .filter(|m| !m.trim().is_empty())?;
+                                    Some(tag(
+                                        spawn,
+                                        AgentEvent::UserMessage {
+                                            text: text.to_owned(),
+                                        },
+                                    ))
+                                })
+                                .flatten();
+                            std::iter::once(call).chain(opening).chain(steer)
+                        }),
+                );
                 self.last_model = f.message.model.clone().or(self.last_model.take());
                 if let Some(usage) = &f.message.usage {
                     let fields = [
@@ -590,7 +659,7 @@ impl Normalizer {
                     // Split the CLI's internal `[ede_diagnostic]` breadcrumbs
                     // off the real errors: diagnostics are debug-logged, never
                     // surfaced as transcript error parts.
-                    let (diagnostics, errors): (Vec<String>, Vec<String>) = f
+                    let (diagnostics, mut errors): (Vec<String>, Vec<String>) = f
                         .errors
                         .iter()
                         .map(|e| match e {
@@ -598,6 +667,10 @@ impl Normalizer {
                             other => other.to_string(),
                         })
                         .partition(|m| is_internal_diagnostic(m));
+                    // Amp's error shape is a single `error` string.
+                    if let Some(err) = &f.error {
+                        errors.push(err.clone());
+                    }
                     for diagnostic in &diagnostics {
                         tracing::debug!(
                             target: "zeron_harness::claude",
@@ -641,6 +714,27 @@ impl Normalizer {
                     out.push(AgentEvent::ContextUsage {
                         tokens: None,
                         window: Some(window),
+                    });
+                }
+                // Denied tool calls (Amp `permission_denials`, agy
+                // `denied_actions`) still end the turn "successfully" — the
+                // user must see WHAT was refused, not a clean result.
+                if !f.permission_denials.is_empty() {
+                    let denied: Vec<String> = f
+                        .permission_denials
+                        .iter()
+                        .map(|d| match d {
+                            Value::String(s) => s.clone(),
+                            other => other
+                                .get("tool_name")
+                                .or_else(|| other.get("name"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| other.to_string()),
+                        })
+                        .collect();
+                    out.push(AgentEvent::Error {
+                        message: format!("Permission denied: {}", denied.join(", ")),
                     });
                 }
                 out.extend([usage, done]);
@@ -705,7 +799,7 @@ mod tests {
 
     fn normalize_one(raw: &str) -> Vec<AgentEvent> {
         let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
-        Normalizer::new().normalize(frame, false)
+        Normalizer::new(HarnessId::ClaudeCode).normalize(frame, false)
     }
 
     fn result_done(raw: &str) -> AgentEvent {
@@ -775,7 +869,7 @@ mod tests {
 
     #[test]
     fn subagent_tool_calls_and_results_arrive_tagged_without_boundary_rotation() {
-        let mut norm = Normalizer::new();
+        let mut norm = Normalizer::new(HarnessId::ClaudeCode);
         let before = norm.assistant_message_id.clone();
         let frame = crate::claude::wire::parse_frame(
             r#"{"type":"assistant","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
@@ -841,8 +935,7 @@ mod tests {
         ] {
             let ev = normalize_one(frame);
             assert!(
-                !ev.iter()
-                    .any(|e| matches!(e, AgentEvent::Subagent { .. })),
+                !ev.iter().any(|e| matches!(e, AgentEvent::Subagent { .. })),
                 "{frame}: {ev:?}"
             );
         }
@@ -888,7 +981,7 @@ mod tests {
         // Live 2.1.228: the steer NEVER echoes on the child feed; the only
         // wire evidence is the parent's SendMessage call addressed to the
         // agent id that task_started paired with the spawn tool id.
-        let mut norm = Normalizer::new();
+        let mut norm = Normalizer::new(HarnessId::ClaudeCode);
         let started = crate::claude::wire::parse_frame(
             r#"{"type":"system","subtype":"task_started","task_id":"a20b2336","tool_use_id":"toolu_spawn","subagent_type":"general-purpose","prompt":"p","description":"d"}"#,
         )
@@ -910,7 +1003,7 @@ mod tests {
         );
         // Unknown recipient (no task_started seen) or a subagent-owned shell
         // task's task_started: no steer synthesized.
-        let mut norm = Normalizer::new();
+        let mut norm = Normalizer::new(HarnessId::ClaudeCode);
         let shell_task = crate::claude::wire::parse_frame(
             r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#,
         )
@@ -987,7 +1080,7 @@ mod tests {
             let frame = crate::claude::wire::parse_frame(raw).expect("parses");
             norm.normalize(frame, false)
         };
-        let mut norm = Normalizer::new();
+        let mut norm = Normalizer::new(HarnessId::ClaudeCode);
         spawn(&mut norm);
         let ev = notify(
             &mut norm,
@@ -999,7 +1092,7 @@ mod tests {
                 if parent_tool_use_id == "toolu_agent"
                     && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })
         ));
-        let mut norm = Normalizer::new();
+        let mut norm = Normalizer::new(HarnessId::ClaudeCode);
         spawn(&mut norm);
         let ev = notify(
             &mut norm,
@@ -1011,17 +1104,19 @@ mod tests {
                 if matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Errored, .. })
         ));
         // Non-terminal or id-less notifications close nothing.
-        let mut norm = Normalizer::new();
+        let mut norm = Normalizer::new(HarnessId::ClaudeCode);
         spawn(&mut norm);
         assert!(notify(
             &mut norm,
             r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_agent","status":"running"}"#,
         )
         .is_empty());
-        assert!(normalize_one(
-            r#"{"type":"system","subtype":"task_notification","status":"completed"}"#,
-        )
-        .is_empty());
+        assert!(
+            normalize_one(
+                r#"{"type":"system","subtype":"task_notification","status":"completed"}"#,
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1031,7 +1126,7 @@ mod tests {
         // Tagging that Done bound a subagent ref onto an ordinary Run chip,
         // which then rendered as a spawn chip opening an empty, never-created
         // subagent doc (user report 2026-08-20).
-        let mut norm = Normalizer::new();
+        let mut norm = Normalizer::new(HarnessId::ClaudeCode);
         for raw in [
             // The shell task's start is already unmapped (no subagent_type)…
             r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#,
@@ -1073,7 +1168,7 @@ mod tests {
     fn wake_turn_init_is_deduped_but_second_result_still_emits_done() {
         // Live-verified 2.1.228 shape: background subagent → eager result,
         // then a second init (same session id) + second result on completion.
-        let mut norm = Normalizer::new();
+        let mut norm = Normalizer::new(HarnessId::ClaudeCode);
         let init = r#"{"type":"system","subtype":"init","model":"m","cwd":"/x","session_id":"s1"}"#;
         let frame = crate::claude::wire::parse_frame(init).unwrap();
         assert_eq!(norm.normalize(frame, false).len(), 1, "first init");
@@ -1160,7 +1255,7 @@ mod context_tests {
     use super::*;
     #[test]
     fn context_counts_cached_prompt_and_matches_primary_model() {
-        let mut normalizer = Normalizer::new();
+        let mut normalizer = Normalizer::new(HarnessId::ClaudeCode);
         let events = normalizer.normalize(super::super::wire::parse_frame(r#"{"type":"assistant","message":{"model":"primary","content":[],"usage":{"input_tokens":200,"cache_read_input_tokens":40000,"cache_creation_input_tokens":1800,"output_tokens":100}}}"#).unwrap(), false);
         assert!(events.contains(&AgentEvent::ContextUsage {
             tokens: Some(42000),
