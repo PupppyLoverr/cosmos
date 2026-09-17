@@ -29,7 +29,7 @@ class CosmosClient(private val connection: Connection) {
         .build()
 
     // Local replica: kind -> id -> row, plus the sync cursor.
-    private val rows = HashMap<String, HashMap<String, RegistryRow>>()
+    private val rows: MutableMap<String, MutableMap<String, RegistryRow>> = HashMap()
     private var cursor: Long = 0
     private var presence: Map<String, Long> = emptyMap()
 
@@ -61,11 +61,7 @@ class CosmosClient(private val connection: Connection) {
             val body = r.body?.string().orEmpty()
             if (!r.isSuccessful) throw CosmosException("rows ${r.code}: $body")
             val resp = json.decodeFromString(RowsResponse.serializer(), body)
-            if (resp.full) rows.clear()
-            for (row in resp.rows) {
-                val table = rows.getOrPut(row.kind) { HashMap() }
-                if (row.deleted) table.remove(row.id) else table[row.id] = row
-            }
+            Registry.applyDelta(rows, resp)
             cursor = resp.seq
             presence = resp.presence
         }
@@ -73,55 +69,12 @@ class CosmosClient(private val connection: Connection) {
 
     fun currentPresence(): Map<String, Long> = presence
 
-    private fun table(kind: String): Collection<RegistryRow> = rows[kind]?.values ?: emptyList()
+    fun spaces(): List<SpaceInfo> = Registry.spaces(rows)
 
-    fun spaces(): List<SpaceInfo> = table(RowKind.SPACES).mapNotNull { row ->
-        val f = row.fields
-        val id = f.str("id") ?: row.id
-        val path = f.str("path") ?: return@mapNotNull null
-        SpaceInfo(id, path, f.str("name"), f.str("deviceId") ?: "")
-    }
-
-    fun devices(): List<DeviceInfo> = table(RowKind.DEVICES).mapNotNull { row ->
-        val f = row.fields
-        DeviceInfo(f.str("id") ?: row.id, f.str("name") ?: "device", f.str("platform") ?: "", f.long("lastSeenAt"))
-    }
+    fun devices(): List<DeviceInfo> = Registry.devices(rows)
 
     /** Join chat rows with their live session-status rows into display sessions. */
-    fun sessions(): List<SessionSummary> {
-        val statuses = table(RowKind.SESSIONS).associateBy({ it.fields.str("chatId") ?: it.id }, { it })
-        return table(RowKind.CHATS).mapNotNull { row ->
-            val f = row.fields
-            val chatId = f.str("id") ?: row.id
-            val config = f.obj("config")
-            val statusRow = statuses[chatId]?.fields
-            val status = when (statusRow?.str("status")) {
-                "working" -> SessionStatus.working
-                "awaitingInput" -> SessionStatus.awaitingInput
-                "errored" -> SessionStatus.errored
-                "idle" -> SessionStatus.idle
-                else -> SessionStatus.idle
-            }
-            SessionSummary(
-                chatId = chatId,
-                title = f.str("title")?.takeIf { it.isNotEmpty() } ?: "New session",
-                harness = config?.str("harness"),
-                model = config?.str("model"),
-                reasoning = config?.str("reasoning"),
-                branch = f.str("branch"),
-                cwd = f.str("cwd"),
-                spaceId = f.str("spaceId"),
-                deviceId = f.str("deviceId"),
-                archived = f.bool("archived"),
-                lastMessagePreview = f.str("lastMessagePreview"),
-                lastMessageAt = f.long("lastMessageAt"),
-                createdAt = f.long("createdAt") ?: 0,
-                lastSeenAt = f.long("lastSeenAt"),
-                status = status,
-                statusUpdatedAt = statusRow?.long("updatedAt"),
-            )
-        }
-    }
+    fun sessions(): List<SessionSummary> = Registry.sessions(rows)
 
     private fun nextHlc(): String {
         val now = System.currentTimeMillis()
