@@ -40,7 +40,9 @@ fn capture(directory: &std::path::Path, name: &str) -> anyhow::Result<()> {
         let _ = (directory, name);
         // External window capture is not wired on Windows; page pixels are
         // verified through the WebView2 CapturePreview path instead.
-        std::process::Command::new("cmd").args(["/c", "exit 0"]).status()?
+        std::process::Command::new("cmd")
+            .args(["/c", "exit 0"])
+            .status()?
     };
     #[cfg(target_os = "linux")]
     let status = {

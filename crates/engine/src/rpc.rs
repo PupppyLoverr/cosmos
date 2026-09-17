@@ -1390,9 +1390,7 @@ impl RpcService for EngineRpc {
                             .parts
                             .iter()
                             .filter_map(|part| match part {
-                                zeron_doc::MessagePart::Text { text, .. } => {
-                                    Some(text.as_str())
-                                }
+                                zeron_doc::MessagePart::Text { text, .. } => Some(text.as_str()),
                                 _ => None,
                             })
                             .collect::<Vec<_>>()

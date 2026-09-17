@@ -453,8 +453,7 @@ impl BrowserSurface {
                         }
                         Err(error) => {
                             this.page.loading = false;
-                            this.page.error =
-                                Some(format!("Could not open this page: {error}"));
+                            this.page.error = Some(format!("Could not open this page: {error}"));
                         }
                     }
                 } else {

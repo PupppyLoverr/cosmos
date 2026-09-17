@@ -787,7 +787,9 @@ impl Pickers {
 
     /// The chat this picker serves: the bound override, else the selection.
     fn chat_id(&self, state: &AppState) -> Option<String> {
-        self.chat_override.clone().or_else(|| state.selected_chat.clone())
+        self.chat_override
+            .clone()
+            .or_else(|| state.selected_chat.clone())
     }
 
     /// That chat's workspace row.

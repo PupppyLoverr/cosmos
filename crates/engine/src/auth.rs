@@ -541,10 +541,7 @@ impl Auth {
                 vec![OrgMembership {
                     id: user.id.clone(),
                     organization_id: user.id.clone(),
-                    name: user
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| user.email.clone()),
+                    name: user.name.clone().unwrap_or_else(|| user.email.clone()),
                 }]
             })
             .unwrap_or_default())
@@ -574,7 +571,11 @@ impl Auth {
                 .retain(|_, at| cutoff.duration_since(*at) < SIGN_IN_TTL);
             sign_in.pending.insert(state.clone(), cutoff);
         }
-        let sep = if callback_base.contains('?') { '&' } else { '?' };
+        let sep = if callback_base.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
         let callback = format!("{callback_base}{sep}state={state}");
         format!(
             "{}/login?desktop=1&callback={}",
@@ -603,9 +604,7 @@ impl Auth {
         display_name: Option<&str>,
     ) -> Result<SignInResult, EngineError> {
         let (access_token, refresh_token, local_id) = if is_firebase_id_token(token) {
-            let sub = jwt_claims(token)
-                .and_then(|c| c.sub)
-                .unwrap_or_default();
+            let sub = jwt_claims(token).and_then(|c| c.sub).unwrap_or_default();
             (token.to_string(), String::new(), sub)
         } else {
             self.sign_in_with_custom_token(token).await?
@@ -622,9 +621,7 @@ impl Auth {
             .filter(|s| !s.is_empty())
             .or_else(|| claims.as_ref().and_then(|c| c.email.clone()))
             .unwrap_or_else(|| format!("{id}@woozlit.com"));
-        let name = display_name
-            .map(str::to_string)
-            .filter(|s| !s.is_empty());
+        let name = display_name.map(str::to_string).filter(|s| !s.is_empty());
         Ok(SignInResult {
             user: AuthUser { id, email, name },
             access_token,
@@ -782,7 +779,11 @@ impl Auth {
         let new_refresh = tokens.refresh_token.unwrap_or(refresh_token);
         let org_id = jwt_claims(&access_token)
             .and_then(|c| c.org_id)
-            .or_else(|| lock(&self.inner.stored).as_ref().and_then(|s| s.org_id.clone()));
+            .or_else(|| {
+                lock(&self.inner.stored)
+                    .as_ref()
+                    .and_then(|s| s.org_id.clone())
+            });
         let entry = AccessEntry::fresh(access_token.clone());
         tracing::info!(ttl_s = entry.ttl.as_secs(), "auth: access token refreshed");
         *lock(&self.inner.access) = Some(entry);

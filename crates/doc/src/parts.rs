@@ -616,12 +616,7 @@ fn plan_badge(call: &ToolCall) -> Option<serde_json::Value> {
     if name != PLAN_TOOL_NAME {
         return None;
     }
-    let plan = input
-        .as_ref()?
-        .get("plan")?
-        .as_str()?
-        .trim()
-        .to_owned();
+    let plan = input.as_ref()?.get("plan")?.as_str()?.trim().to_owned();
     (!plan.is_empty()).then(|| serde_json::json!({ "plan": plan }))
 }
 

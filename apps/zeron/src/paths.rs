@@ -112,7 +112,11 @@ fn profile_store_bytes(root: &Path) -> u64 {
             };
             if meta.is_dir() {
                 pending.push(entry.path());
-            } else if entry.file_name().to_string_lossy().starts_with("docs.sqlite3") {
+            } else if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("docs.sqlite3")
+            {
                 total += meta.len();
             }
         }
@@ -273,13 +277,10 @@ mod tests {
         assert_eq!(dir, local.join("Zeron"));
         assert!(home.join(".zeron").exists(), "legacy left untouched");
         assert!(
-            std::fs::read_dir(&local)
-                .unwrap()
-                .flatten()
-                .all(|e| !e
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("Zeron.pre-migration-")),
+            std::fs::read_dir(&local).unwrap().flatten().all(|e| !e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("Zeron.pre-migration-")),
             "no park dir created"
         );
         std::fs::remove_dir_all(&tmp).ok();

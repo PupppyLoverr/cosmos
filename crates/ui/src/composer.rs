@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt as _;
 use gpui::{
     AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
@@ -22,7 +23,6 @@ use gpui::{
     TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
     prelude::*, px, quad, relative, size,
 };
-use futures::StreamExt as _;
 use unicode_segmentation::UnicodeSegmentation;
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
@@ -1125,7 +1125,7 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
             }
             MentionLinkKind::Chat => (chat_mention_id_is_safe(&target)
                 && percent_encode_path(&target) == encoded)
-            .then(|| (target, false, unescape_mention_label(label))),
+                .then(|| (target, false, unescape_mention_label(label))),
         });
         if let Some((path, is_dir, basename)) = parsed {
             links.push(FileMentionLink {
@@ -1418,11 +1418,9 @@ pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)>
         .map(|(link, display)| SentMentionSpan {
             range: display.clone(),
             path: SharedString::from(match link.kind {
-                MentionLinkKind::File => format!(
-                    "{}{}",
-                    link.path,
-                    if link.is_dir { "/" } else { "" }
-                ),
+                MentionLinkKind::File => {
+                    format!("{}{}", link.path, if link.is_dir { "/" } else { "" })
+                }
                 // The tooltip reads the conversation title, not its id.
                 MentionLinkKind::Chat => link.basename.clone(),
             }),
@@ -4625,7 +4623,18 @@ impl Composer {
             ComposerInputEvent::DictationApplied => this.on_input_edited(cx),
         });
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
-        Self::build(state, input, pickers, observe, pickers_observe, picker_focus, input_events, current_key, None, cx)
+        Self::build(
+            state,
+            input,
+            pickers,
+            observe,
+            pickers_observe,
+            picker_focus,
+            input_events,
+            current_key,
+            None,
+            cx,
+        )
     }
 
     /// A composer bound to a specific chat (the side-chat surface) — same
@@ -4886,7 +4895,9 @@ impl Composer {
     /// send path goes through here so a bound composer is independent of
     /// main-pane navigation.
     fn target_chat_id(&self, state: &AppState) -> Option<String> {
-        self.target_chat.clone().or_else(|| state.selected_chat.clone())
+        self.target_chat
+            .clone()
+            .or_else(|| state.selected_chat.clone())
     }
 
     /// The bound/selected chat's workspace row.
@@ -5521,8 +5532,7 @@ impl Composer {
     }
 
     fn sync_mention_controls(&mut self, cx: &mut Context<Self>) {
-        let open =
-            self.mention.token.is_some() || self.slash.token.is_some() || self.resume.open;
+        let open = self.mention.token.is_some() || self.slash.token.is_some() || self.resume.open;
         let has_selection = if self.resume.open {
             self.resume.active.is_some()
         } else if self.slash.token.is_some() {
@@ -5756,7 +5766,12 @@ impl Composer {
         if !query.is_empty() {
             let titles: Vec<&str> = chats
                 .iter()
-                .map(|c| c.title.as_deref().filter(|t| !t.trim().is_empty()).unwrap_or("Untitled"))
+                .map(|c| {
+                    c.title
+                        .as_deref()
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or("Untitled")
+                })
                 .collect();
             let indices = crate::popover::filter_indices(&query, &titles);
             chats = indices.into_iter().map(|ix| chats[ix].clone()).collect();
@@ -5914,8 +5929,16 @@ impl Composer {
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         if categories_open {
             let categories = [
-                ("Files and folders", "Browse this folder's files", MentionMode::Files),
-                ("Chats", "Reference another conversation", MentionMode::Chats),
+                (
+                    "Files and folders",
+                    "Browse this folder's files",
+                    MentionMode::Files,
+                ),
+                (
+                    "Chats",
+                    "Reference another conversation",
+                    MentionMode::Chats,
+                ),
             ];
             let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(categories.len());
             for (ix, (title, hint, mode)) in categories.iter().enumerate() {
@@ -5956,7 +5979,13 @@ impl Composer {
                         .into_any_element(),
                 );
             }
-            card = card.child(div().id("mention-categories").flex().flex_col().children(rows));
+            card = card.child(
+                div()
+                    .id("mention-categories")
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            );
         } else if self.mention.mode == MentionMode::Chats {
             if self.mention.chat_results.is_empty() {
                 card = card.child(
@@ -6261,11 +6290,7 @@ impl Composer {
             description: "Resume a past agent session in this chat".into(),
             input_hint: None,
         }];
-        if let Some(cached) = self
-            .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
-        {
+        if let Some(cached) = self.slash.harness.and_then(|h| self.slash_cache.get(&h)) {
             commands.extend(cached.iter().cloned());
         }
         commands
@@ -6530,7 +6555,9 @@ impl Composer {
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
-                    sandbox: other.map(|c| c.sandbox).unwrap_or(SandboxLevel::WorkspaceWrite),
+                    sandbox: other
+                        .map(|c| c.sandbox)
+                        .unwrap_or(SandboxLevel::WorkspaceWrite),
                 },
             }
         };
@@ -6602,9 +6629,9 @@ impl Composer {
                         composer.resume.open = false;
                         composer.sync_mention_controls(cx);
                         if existing.is_none() {
-                            composer.state.update(cx, |s, cx| {
-                                s.select_chat(Some(chat_id.clone()), cx)
-                            });
+                            composer
+                                .state
+                                .update(cx, |s, cx| s.select_chat(Some(chat_id.clone()), cx));
                         }
                     }
                     Err(err) => {
@@ -6945,8 +6972,7 @@ impl Composer {
                         let mut meta = session.cwd.clone();
                         if let Some(updated) = session.updated_at {
                             let ago = crate::state::format_time_ago(
-                                chrono::DateTime::from_timestamp_millis(updated)
-                                    .unwrap_or(now),
+                                chrono::DateTime::from_timestamp_millis(updated).unwrap_or(now),
                                 now,
                             );
                             meta = if meta.is_empty() {
@@ -9365,12 +9391,8 @@ impl Render for Composer {
                 })
                 .role(gpui::Role::Button)
                 .aria_label(label)
-                .tooltip(move |_, cx| {
-                    cx.new(|_| AppshotActionTooltip(label.into())).into()
-                })
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.toggle_dictation(window, cx)
-                }))
+                .tooltip(move |_, cx| cx.new(|_| AppshotActionTooltip(label.into())).into())
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_dictation(window, cx)))
                 .child(if dictating {
                     div()
                         .flex()

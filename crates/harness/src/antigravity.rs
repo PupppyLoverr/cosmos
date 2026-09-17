@@ -33,13 +33,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use crate::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -473,9 +473,11 @@ fn to_effort(reasoning: Option<ReasoningLevel>) -> Option<&'static str> {
 
 /// Split an agy model id into stem + effort suffix (`-low`/`-medium`/`-high`).
 fn split_effort_suffix(model: &str) -> Option<(&str, &str)> {
-    ["low", "medium", "high"]
-        .iter()
-        .find_map(|suffix| model.strip_suffix(format!("-{suffix}").as_str()).map(|stem| (stem, *suffix)))
+    ["low", "medium", "high"].iter().find_map(|suffix| {
+        model
+            .strip_suffix(format!("-{suffix}").as_str())
+            .map(|stem| (stem, *suffix))
+    })
 }
 
 /// The model id to run for a picked effort. agy has no combinable effort flag
@@ -549,11 +551,11 @@ impl Harness for AntigravityHarness {
         }) else {
             return Ok(Vec::new());
         };
-        Ok(tokio::task::spawn_blocking(move || {
-            crate::sessions::scan_antigravity(&db)
-        })
-        .await
-        .unwrap_or_default())
+        Ok(
+            tokio::task::spawn_blocking(move || crate::sessions::scan_antigravity(&db))
+                .await
+                .unwrap_or_default(),
+        )
     }
 
     async fn run(

@@ -322,7 +322,10 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     let url = auth.start_headless_sign_in();
     assert!(url.contains("www.woozlit.com/login?desktop=1"));
     let callback = login_callback(&url);
-    assert!(callback.contains("/callback"), "loopback callback: {callback}");
+    assert!(
+        callback.contains("/callback"),
+        "loopback callback: {callback}"
+    );
     let state = query_param(&callback, "state").expect("state param");
 
     // A token minted for someone else's flow (unknown state) is rejected — CSRF check.
@@ -485,9 +488,11 @@ async fn loopback_callback_completes_headed_sign_in() {
 
     // The browser hits the loopback callback → the engine exchanges the Woozlit
     // custom token and the session lands in the personal workspace.
-    let ok = reqwest::get(format!("{callback}&token=abc&userId=user_1&email=w%40example.com&displayName=Wing%20Test"))
-        .await
-        .expect("cb");
+    let ok = reqwest::get(format!(
+        "{callback}&token=abc&userId=user_1&email=w%40example.com&displayName=Wing%20Test"
+    ))
+    .await
+    .expect("cb");
     assert_eq!(ok.status().as_u16(), 200);
     let mut state_rx = auth.watch_state();
     wait_for(&mut state_rx, |s| s.is_signed_in()).await;

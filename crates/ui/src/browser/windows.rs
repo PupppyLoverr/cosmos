@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{Bounds, Pixels, Window, px};
 use raw_window_handle::{
-    HandleError, HasWindowHandle, RawWindowHandle, WindowHandle, Win32WindowHandle,
+    HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle,
 };
 use tokio::sync::mpsc::Sender;
 use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -412,9 +412,7 @@ impl NativePage {
     /// WebView2 controller's own bounds.
     pub fn host_info(&self) -> String {
         use windows::Win32::Foundation::RECT;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetParent, GetWindowRect, IsWindowVisible,
-        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetParent, GetWindowRect, IsWindowVisible};
         let host = self.host.borrow();
         let hwnd = host.webview.hwnd();
         let parent = unsafe { GetParent(hwnd) };
