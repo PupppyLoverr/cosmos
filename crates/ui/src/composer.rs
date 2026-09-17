@@ -2179,6 +2179,16 @@ impl ComposerInput {
         self.last_edit = None;
     }
 
+    /// Whether dictated text landing at `start` would fuse with the typed
+    /// character before it — the cue to inject a separating space.
+    fn dictation_needs_space(&self, start: usize) -> bool {
+        start > 0
+            && self.content[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| !ch.is_whitespace())
+    }
+
     /// Replace the live hypothesis — or seed one at the selection — without
     /// recording undo (`dictation_snapshot_once` owns the session's step).
     /// The span keeps an IME-style underline until it commits or the session
@@ -2188,12 +2198,20 @@ impl ComposerInput {
             return;
         }
         self.dictation_snapshot_once();
-        let range = self
+        let seeding = self.dictation_hypothesis.is_none();
+        let mut range = self
             .dictation_hypothesis
             .clone()
             .unwrap_or_else(|| self.selected_range.clone());
-        let range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        range = range.start.min(self.content.len())..range.end.min(self.content.len());
         self.invalidate_mention_tooltip();
+        // A fresh hypothesis abutting typed text needs a separating space;
+        // it lives outside the span so later updates and the commit keep it.
+        if seeding && self.dictation_needs_space(range.start) {
+            self.content.insert(range.start, ' ');
+            range.start += 1;
+            range.end += 1;
+        }
         self.content = self.content[..range.start].to_owned() + text + &self.content[range.end..];
         self.refresh_projection();
         let end = range.start + text.len();
@@ -2216,11 +2234,20 @@ impl ComposerInput {
             return;
         }
         self.dictation_snapshot_once();
-        let range = self
+        let seeding = self.dictation_hypothesis.is_none();
+        let mut range = self
             .dictation_hypothesis
             .take()
             .unwrap_or_else(|| self.selected_range.clone());
-        let range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        self.invalidate_mention_tooltip();
+        // Same fuse guard as the hypothesis path — a `Committed` event can
+        // arrive without a preceding hypothesis.
+        if seeding && self.dictation_needs_space(range.start) {
+            self.content.insert(range.start, ' ');
+            range.start += 1;
+            range.end += 1;
+        }
         let trimmed = text.trim();
         let next = self.content[range.end..].chars().next();
         let separated = next.is_some_and(|ch| ch.is_whitespace() && ch != '\n' && ch != '\r');
@@ -2229,7 +2256,6 @@ impl ComposerInput {
         } else {
             format!("{trimmed} ")
         };
-        self.invalidate_mention_tooltip();
         self.content =
             self.content[..range.start].to_owned() + &inserted + &self.content[range.end..];
         self.refresh_projection();
@@ -7403,6 +7429,10 @@ impl Composer {
             self.stop_dictation(cx);
             return;
         }
+        // A read-only input (queue-edit save in flight) can't take dictation.
+        if self.input.read(cx).read_only {
+            return;
+        }
         let (dictation, mut events) = match crate::dictation::Dictation::start() {
             Ok(started) => started,
             Err(reason) => {
@@ -9290,7 +9320,13 @@ impl Render for Composer {
         let mic = crate::dictation::Dictation::supported().then(|| {
             let dictating = self.dictation.is_some();
             let bars = self.dictation_bars;
-            let label: &'static str = if dictating { "Stop dictation" } else { "Dictate" };
+            let label: &'static str = if !dictating {
+                "Dictate"
+            } else if self.dictation_ready {
+                "Stop dictation"
+            } else {
+                "Starting microphone…"
+            };
             div()
                 .id("composer-dictation")
                 .size(px(28.0))
@@ -11444,6 +11480,64 @@ mod appshot_rebase_tests {
             assert!(composer.editing_queued.is_none());
             assert_eq!(composer.staged_appshots().len(), 2);
             assert_eq!(composer.input.read(cx).text(), "original\n\nedited");
+        });
+    }
+}
+
+#[cfg(test)]
+mod dictation_tests {
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+
+    /// Speech lands after typed text: a separating space must live outside
+    /// the hypothesis span, and stopping keeps the in-flight hypothesis as
+    /// ordinary text.
+    #[gpui::test]
+    fn hypothesis_separates_from_typed_text_and_stays_on_stop(cx: &mut TestAppContext) {
+        let input = cx.new(|cx| ComposerInput::new("Draft", cx));
+        input.update(cx, |input, cx| {
+            input.set_text("fix the bug", cx);
+            input.dictation_hypothesis_update("then", cx);
+            input.dictation_hypothesis_update("then refactor it", cx);
+            assert_eq!(input.text(), "fix the bug then refactor it");
+            assert!(input.dictating());
+            // Stopping mid-hypothesis keeps what was already spoken.
+            input.dictation_end(cx);
+            assert_eq!(input.text(), "fix the bug then refactor it");
+            assert!(!input.dictating());
+        });
+    }
+
+    /// Hypotheses replace in place; commits append with a separator; the
+    /// whole session is exactly one undo step.
+    #[gpui::test]
+    fn session_collapses_to_a_single_undo_step(cx: &mut TestAppContext) {
+        let input = cx.new(|cx| ComposerInput::new("Draft", cx));
+        input.update(cx, |input, cx| {
+            input.set_text("fix the bug", cx);
+            input.dictation_hypothesis_update("then", cx);
+            input.dictation_hypothesis_update("then refactor", cx);
+            input.dictation_commit("then refactor", cx);
+            input.dictation_hypothesis_update("and ship", cx);
+            input.dictation_commit("and ship it", cx);
+            input.dictation_end(cx);
+            assert_eq!(input.text(), "fix the bug then refactor and ship it ");
+            assert_eq!(input.undo_stack.len(), 1);
+            let snapshot = input.undo_stack.pop().unwrap();
+            input.restore(snapshot, cx);
+            assert_eq!(input.text(), "fix the bug");
+        });
+    }
+
+    /// A `Committed` event with no preceding hypothesis inserts at the
+    /// caret with the same separator rules.
+    #[gpui::test]
+    fn commit_without_hypothesis_inserts_at_caret(cx: &mut TestAppContext) {
+        let input = cx.new(|cx| ComposerInput::new("Draft", cx));
+        input.update(cx, |input, cx| {
+            input.dictation_commit("hello world", cx);
+            input.dictation_end(cx);
+            assert_eq!(input.text(), "hello world ");
         });
     }
 }
