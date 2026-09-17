@@ -112,6 +112,7 @@ windows = { version = "0.61", features = [
     "Media_SpeechRecognition",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    "Win32_System_WinRT",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -30,8 +30,10 @@ pub enum DictationEvent {
     Level(f32),
     /// The recognizer ended on its own (auto-stop timeout, device lost).
     Ended,
-    /// Startup or runtime failure with a short user-facing reason.
-    Failed(&'static str),
+    /// Startup or runtime failure with the underlying OS error text — the
+    /// raw message is what distinguishes a privacy toggle from a missing
+    /// speech pack or a dead mic.
+    Failed(String),
 }
 
 /// A live dictation session. [`Dictation::stop`] — or just dropping it —
@@ -51,14 +53,14 @@ impl Dictation {
     }
 
     /// Start a dictation session; events arrive on the returned receiver.
-    pub fn start() -> Result<(Self, UnboundedReceiver<DictationEvent>), &'static str> {
+    pub fn start() -> Result<(Self, UnboundedReceiver<DictationEvent>), String> {
         #[cfg(windows)]
         {
             windows_impl::start()
         }
         #[cfg(not(windows))]
         {
-            Err("Dictation isn't available on this platform yet")
+            Err("Dictation isn't available on this platform yet".to_string())
         }
     }
 
@@ -93,13 +95,25 @@ mod windows_impl {
     };
     use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
     use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eConsole};
-    use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
-    };
+    use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+    use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
     use windows::core::h;
 
     /// Visualizer sample cadence — 25fps of levels is plenty for bars.
     const LEVEL_POLL_MS: u64 = 40;
+
+    /// The recognizer runs on a dedicated thread — the failure event carries
+    /// the OS error text, so keep the HRESULT alongside the message: that
+    /// pair is what separates a privacy toggle from a missing speech pack.
+    fn err_text(e: &windows::core::Error) -> String {
+        let code = e.code().0 as u32;
+        let message = e.message();
+        if code == 0 {
+            message
+        } else {
+            format!("{message} (0x{code:08X})")
+        }
+    }
 
     fn seconds(secs: u64) -> TimeSpan {
         TimeSpan {
@@ -113,13 +127,13 @@ mod windows_impl {
         }
     }
 
-    pub fn start() -> Result<(Dictation, UnboundedReceiver<DictationEvent>), &'static str> {
+    pub fn start() -> Result<(Dictation, UnboundedReceiver<DictationEvent>), String> {
         let (events_tx, events_rx) = futures::channel::mpsc::unbounded();
         let (stop_tx, stop_rx) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("zeron-dictation".into())
             .spawn(move || run(stop_rx, events_tx))
-            .map_err(|_| "Could not start dictation")?;
+            .map_err(|e| format!("Could not start dictation ({e})"))?;
         Ok((
             Dictation {
                 stop: stop_tx,
@@ -137,8 +151,11 @@ mod windows_impl {
 
     fn run(stop_rx: mpsc::Receiver<()>, events: UnboundedSender<DictationEvent>) {
         // The recognizer and its handlers live on this thread's apartment.
+        // RoInitialize (not just CoInitializeEx) — WinRT classes want the
+        // full runtime initialized, and a bare CoInit can surface as a
+        // StartAsync failure on some builds.
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let _ = RoInitialize(RO_INIT_MULTITHREADED);
         }
         match start_session(&events) {
             Ok(Running {
@@ -184,36 +201,42 @@ mod windows_impl {
         let _ = events.unbounded_send(DictationEvent::Ended);
     }
 
-    fn start_session(events: &UnboundedSender<DictationEvent>) -> Result<Running, &'static str> {
-        let recognizer = SpeechRecognizer::new()
-            .map_err(|_| "Speech recognition isn't available on this device")?;
+    fn start_session(events: &UnboundedSender<DictationEvent>) -> Result<Running, String> {
+        let recognizer = SpeechRecognizer::new().map_err(|e| {
+            format!("Speech recognition isn't available on this device ({})", err_text(&e))
+        })?;
 
         // Free dictation, not a grammar list.
         let topic = SpeechRecognitionTopicConstraint::Create(
             SpeechRecognitionScenario::Dictation,
             h!("dictation"),
         )
-        .map_err(|_| "Speech recognition isn't available on this device")?;
+        .map_err(|e| {
+            format!(
+                "Speech recognition isn't available on this device ({})",
+                err_text(&e)
+            )
+        })?;
         recognizer
             .Constraints()
             .and_then(|constraints| constraints.Append(&topic))
-            .map_err(|_| "Speech recognition isn't available on this device")?;
+            .map_err(|e| format!("Couldn't apply the dictation grammar ({})", err_text(&e)))?;
         let compiled = recognizer
             .CompileConstraintsAsync()
             .and_then(|pending| pending.get())
-            .map_err(|_| "Speech recognition couldn't start")?;
+            .map_err(|e| format!("Speech recognition couldn't start ({})", err_text(&e)))?;
         let status = compiled
             .Status()
-            .map_err(|_| "Speech recognition couldn't start")?;
+            .map_err(|e| format!("Speech recognition couldn't start ({})", err_text(&e)))?;
         if status != SpeechRecognitionResultStatus::Success {
             return Err(match status {
                 SpeechRecognitionResultStatus::TopicLanguageNotSupported => {
-                    "Speech recognition isn't installed for your language"
+                    "Speech recognition isn't installed for your language".to_string()
                 }
                 SpeechRecognitionResultStatus::MicrophoneUnavailable => {
-                    "No microphone is available"
+                    "No microphone is available".to_string()
                 }
-                _ => "Speech recognition couldn't start",
+                _ => format!("Speech recognition couldn't start ({status:?})"),
             });
         }
 
@@ -242,11 +265,11 @@ mod windows_impl {
                 }
                 Ok(())
             }))
-            .map_err(|_| "Speech recognition couldn't start")?;
+            .map_err(|e| format!("Speech recognition couldn't start ({})", err_text(&e)))?;
 
         let session = recognizer
             .ContinuousRecognitionSession()
-            .map_err(|_| "Speech recognition couldn't start")?;
+            .map_err(|e| format!("Speech recognition couldn't start ({})", err_text(&e)))?;
         // Silence shouldn't end a dictation session — the mic button does.
         let _ = session.SetAutoStopSilenceTimeout(seconds(600));
 
@@ -268,18 +291,39 @@ mod windows_impl {
                 }
                 Ok(())
             }))
-            .map_err(|_| "Speech recognition couldn't start")?;
+            .map_err(|e| format!("Speech recognition couldn't start ({})", err_text(&e)))?;
 
         let ended_tx = events.clone();
         session
             .Completed(&TypedEventHandler::<
                 SpeechContinuousRecognitionSession,
                 SpeechContinuousRecognitionCompletedEventArgs,
-            >::new(move |_sender, _args| {
+            >::new(move |_sender, args| {
+                // A completed session isn't always a clean stop — a lost mic
+                // or a speech-service timeout ends it too, and the status is
+                // the only way to tell them apart.
+                if let Ok(args) = args.ok()
+                    && let Ok(status) = args.Status()
+                    && status != SpeechRecognitionResultStatus::Success
+                    && status != SpeechRecognitionResultStatus::UserCanceled
+                {
+                    let _ = ended_tx.unbounded_send(DictationEvent::Failed(match status {
+                        SpeechRecognitionResultStatus::MicrophoneUnavailable => {
+                            "Microphone became unavailable".to_string()
+                        }
+                        SpeechRecognitionResultStatus::TimeoutExceeded => {
+                            "Dictation timed out".to_string()
+                        }
+                        SpeechRecognitionResultStatus::PauseLimitExceeded => {
+                            "Dictation paused too long".to_string()
+                        }
+                        _ => format!("Dictation stopped ({status:?})"),
+                    }));
+                }
                 let _ = ended_tx.unbounded_send(DictationEvent::Ended);
                 Ok(())
             }))
-            .map_err(|_| "Speech recognition couldn't start")?;
+            .map_err(|e| format!("Speech recognition couldn't start ({})", err_text(&e)))?;
 
         // Non-fatal: without the endpoint meter the bars idle-sway instead.
         let meter = endpoint_meter();
@@ -287,7 +331,17 @@ mod windows_impl {
         session
             .StartAsync()
             .and_then(|pending| pending.get())
-            .map_err(|_| "Could not start dictation — check microphone access")?;
+            .map_err(|e| {
+                // Capture refuses most often on consent: Windows mic privacy
+                // or the online-speech-recognition toggle. Name the toggles
+                // alongside the raw error so the fix is one Settings visit.
+                let hint = if e.code().0 as u32 == 0x80070005 {
+                    "check Settings → Privacy & security → Microphone and Speech"
+                } else {
+                    "check microphone access and Windows speech settings"
+                };
+                format!("Could not start dictation — {} — {hint}", err_text(&e))
+            })?;
 
         Ok(Running {
             recognizer,

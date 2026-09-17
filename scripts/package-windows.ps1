@@ -1,30 +1,27 @@
-# Windows packaging: build the release binaries and produce
-#   target/package/zeron-<version>-windows-x86_64.zip   (portable + update payload)
-#   target/package/zeron-<version>-windows-x86_64.exe   (raw exe update payload)
+# Windows packaging: build the Cosmos release binary and produce
+#   target/package/Cosmos-Setup-x86_64.exe              (per-user Inno installer)
+#   target/package/cosmos-<version>-windows-x86_64.zip  (portable + update payload)
 #   target/package/manifest.json                        (release/updater manifest)
-#   target/package/Cosmos-Setup-x86_64.exe              (when Inno Setup is installed)
 #
-# The zip carries both entry points (zeron.exe, cosmos.exe — same binary, two
-# brandings), zeron-update.json pointing at -ReleasesUrl, licenses, and a
-# per-user install.cmd that puts the bin dir on PATH.
+# The installer and zip ship cosmos.exe only.
 #
-# Usage: scripts/package-windows.ps1 -ReleasesUrl <https-feed>
+# Usage: scripts/package-windows.ps1 [-ReleasesUrl <https-feed>]
 # Env:   SKIP_INSTALLER=1 to skip the Inno Setup step even when iscc is present.
 
 param(
-    [Parameter(Mandatory)][string]$ReleasesUrl
+    [string]$ReleasesUrl = 'https://github.com/PupppyLoverr/cosmos/releases/latest/download'
 )
 $ErrorActionPreference = 'Stop'
 if (-not $ReleasesUrl.StartsWith('https://')) { throw 'Release feed must use HTTPS' }
 $root = Split-Path $PSScriptRoot -Parent
 Push-Location $root
 try {
-    cargo build --release --locked -p zeron
+    cargo build --release --locked -p zeron --bin cosmos
     if ($LASTEXITCODE -ne 0) { throw 'Windows build failed' }
     # Explicit pipes also work for the GUI-subsystem executable in CI. A
     # PowerShell collection match does not populate the scalar $Matches map.
     $probe = [Diagnostics.ProcessStartInfo]::new()
-    $probe.FileName = (Resolve-Path -LiteralPath './target/release/zeron.exe').Path
+    $probe.FileName = (Resolve-Path -LiteralPath './target/release/cosmos.exe').Path
     $probe.Arguments = '--version'
     $probe.UseShellExecute = $false
     $probe.CreateNoWindow = $true
@@ -45,22 +42,22 @@ try {
         $version = $versionMatch.Groups[1].Value
     } finally { $process.Dispose() }
     $out = Join-Path $root 'target/package'
-    $stage = Join-Path $out "zeron-$version-windows-x86_64"
+    $stage = Join-Path $out "cosmos-$version-windows-x86_64"
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
-    Copy-Item -LiteralPath './target/release/zeron.exe' -Destination (Join-Path $stage 'zeron.exe')
     Copy-Item -LiteralPath './target/release/cosmos.exe' -Destination (Join-Path $stage 'cosmos.exe')
-    @{ releases_url = $ReleasesUrl } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM -LiteralPath (Join-Path $stage 'zeron-update.json')
+    # BOM-free UTF-8: serde_json rejects a BOM, and -Encoding utf8NoBOM only
+    # exists on pwsh 7 — on Windows PowerShell 5.1 it isn't even a valid enum.
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [IO.File]::WriteAllText((Join-Path $stage 'zeron-update.json'), (@{ releases_url = $ReleasesUrl } | ConvertTo-Json) + "`n", $utf8NoBom)
     Copy-Item -LiteralPath 'LICENSE','THIRD_PARTY_NOTICES.md' -Destination $stage
 
-    # Per-user installer: drops both binaries under %LOCALAPPDATA%\Cosmos\bin
-    # and prepends it to the user's PATH. No admin, no shell restart needed for
-    # `cosmos`/`zeron` in new terminals.
+    # Per-user installer: drops cosmos.exe under %LOCALAPPDATA%\Cosmos\bin
+    # and prepends it to the user's PATH.
     @'
 @echo off
 setlocal
 set "DEST=%LOCALAPPDATA%\Cosmos\bin"
 if not exist "%DEST%" mkdir "%DEST%"
-copy /y "%~dp0zeron.exe" "%DEST%\zeron.exe" >nul
 copy /y "%~dp0cosmos.exe" "%DEST%\cosmos.exe" >nul
 powershell -NoProfile -Command "$p=[Environment]::GetEnvironmentVariable('Path','User'); if ($p -notlike '*Cosmos\bin*') { [Environment]::SetEnvironmentVariable('Path', $p + ';%DEST%', 'User') }"
 echo Installed Cosmos to %DEST% (added to your user PATH - new terminals see it).
@@ -70,19 +67,22 @@ echo Installed Cosmos to %DEST% (added to your user PATH - new terminals see it)
     New-Item -ItemType Directory -Force -Path $licenses | Out-Null
     Copy-Item -Path 'crates/ui/assets/fonts/licenses/*' -Destination $licenses
     Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip" -Force
-    Copy-Item -LiteralPath './target/release/zeron.exe' -Destination "$stage.exe"
-    $file = Split-Path "$stage.exe" -Leaf
-    $hash = (Get-FileHash -LiteralPath "$stage.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
-    @{ version = $version; files = @{ $file = @{ sha256 = $hash } } } |
-        ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM -LiteralPath (Join-Path $out 'manifest.json')
+    $file = Split-Path "$stage.zip" -Leaf
+    $hash = (Get-FileHash -LiteralPath "$stage.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+    [IO.File]::WriteAllText((Join-Path $out 'manifest.json'), (@{ version = $version; files = @{ $file = @{ sha256 = $hash } } } | ConvertTo-Json -Depth 4) + "`n", $utf8NoBom)
     Write-Host "Packaged $stage.zip"
 
     # Optional Inno Setup installer — only when iscc is on PATH (CI installs it
     # via choco). SKIP_INSTALLER=1 forces zip-only packaging.
-    $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+    $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+    if (-not $iscc -and (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')) {
+        $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+    }
+    if (-not $iscc -and (Test-Path 'C:\Program Files\Inno Setup 6\ISCC.exe')) {
+        $iscc = 'C:\Program Files\Inno Setup 6\ISCC.exe'
+    }
     if ($iscc -and $env:SKIP_INSTALLER -ne '1') {
         $iss = Join-Path $out 'cosmos.iss'
-        $bin = Join-Path $root 'target/release/zeron.exe'
         $cosmosBin = Join-Path $root 'target/release/cosmos.exe'
         @"
 #define Version "$version"
@@ -94,8 +94,6 @@ DefaultDirName={localappdata}\Cosmos
 DefaultGroupName=Cosmos
 OutputDir=$out
 OutputBaseFilename=Cosmos-Setup-x86_64
-; Installer .exe icon; the embedded resource in zeron.exe covers shortcuts and
-; the Apps & Features entry (UninstallDisplayIcon just points back at it).
 SetupIconFile=$root\dist\windows\zeron.ico
 UninstallDisplayIcon={app}\bin\cosmos.exe
 Compression=lzma2
@@ -104,15 +102,20 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Files]
-Source: "$bin"; DestDir: "{app}\bin"; DestName: "zeron.exe"; Flags: ignoreversion
 Source: "$cosmosBin"; DestDir: "{app}\bin"; DestName: "cosmos.exe"; Flags: ignoreversion
+Source: "$stage\zeron-update.json"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "$root\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "$root\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Cosmos"; Filename: "{app}\bin\cosmos.exe"
 Name: "{autodesktop}\Cosmos"; Filename: "{app}\bin\cosmos.exe"
 
+[Run]
+Filename: "{app}\bin\cosmos.exe"; Description: "Launch Cosmos"; Flags: nowait postinstall skipifsilent
+
 [Registry]
-; Per-user PATH entry so `cosmos` resolves in new terminals.
+; Per-user PATH entry so ``cosmos`` resolves in new terminals.
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
     ValueData: "{olddata};{app}\bin"; Check: NeedsAddPath
 
@@ -124,7 +127,7 @@ begin
   Result := Pos('Cosmos\bin', P) = 0;
 end;
 "@ | Set-Content -Encoding ASCII $iss
-        & $iscc.Source $iss | Out-Host
+        & $iscc $iss | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "iscc failed ($LASTEXITCODE)" }
         Write-Host "wrote $out\Cosmos-Setup-x86_64.exe"
     } else {
