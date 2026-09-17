@@ -314,12 +314,12 @@ impl NativePage {
             .as_bytes(0)
             .ok_or_else(|| "The page frame is not readable".to_string())?;
         let mut png = Vec::new();
-        let mut encoder = image::codecs::png::PngEncoder::new(&mut png);
+        let encoder = image::codecs::png::PngEncoder::new(&mut png);
         image::ImageEncoder::write_image(
-            &mut encoder,
+            encoder,
             bytes,
-            width,
-            height,
+            width as u32,
+            height as u32,
             image::ExtendedColorType::Rgba8,
         )
         .map_err(|e| format!("Could not encode the page capture: {e}"))?;
