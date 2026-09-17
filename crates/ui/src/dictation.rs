@@ -354,6 +354,28 @@ mod windows_impl {
         })
     }
 
+    #[cfg(test)]
+    mod tests {
+        /// Manual OS-level probe: `cargo test -p zeron-ui probe -- --ignored
+        /// --nocapture`. Starts the real session outside the app process —
+        /// if it fails here too, the cause is Windows, not our wiring.
+        #[test]
+        #[ignore = "needs a live mic and speech service"]
+        fn probe_start_session() {
+            let (tx, _rx) = futures::channel::mpsc::unbounded();
+            unsafe {
+                let _ = super::RoInitialize(super::RO_INIT_MULTITHREADED);
+            }
+            match super::start_session(&tx) {
+                Ok(running) => {
+                    println!("session started, metered={}", running.meter.is_some());
+                    let _ = running.session.StopAsync().and_then(|p| p.get());
+                }
+                Err(reason) => panic!("{reason}"),
+            }
+        }
+    }
+
     /// The two consent gates WinRT dictation sits behind — read only on a
     /// startup failure so the error names the exact Settings toggle instead
     /// of guessing.

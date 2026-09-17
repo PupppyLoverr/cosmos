@@ -430,10 +430,25 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
         // Subagent spawns decode as Unknown named "Agent[: <description>]"
         // (every native driver's convention): label them "Agent" with the
         // description as the detail — "Tool · Agent: scan repo" read as two
-        // labels fighting.
-        ToolCall::Unknown { name, .. } => match name.strip_prefix("Agent: ") {
+        // labels fighting. A PLAN_TOOL_NAME call is the plan document
+        // itself: label it "Plan", detail its first heading/line.
+        ToolCall::Unknown { name, input } => match name.strip_prefix("Agent: ") {
             Some(description) => ("Agent", description.to_owned()),
             None if name == "Agent" => ("Agent", String::new()),
+            None if name == crate::PLAN_TOOL_NAME => (
+                "Plan",
+                input
+                    .as_ref()
+                    .and_then(|i| i.get("plan"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|plan| {
+                        plan.lines()
+                            .map(str::trim)
+                            .find(|line| !line.is_empty())
+                            .map(|line| line.trim_start_matches('#').trim().to_owned())
+                    })
+                    .unwrap_or_default(),
+            ),
             None => ("Tool", name.clone()),
         },
     }

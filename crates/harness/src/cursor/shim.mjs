@@ -55,7 +55,9 @@ try {
 } catch (e) {
   fatal(`@cursor/sdk failed to load: ${e?.message ?? e}`);
 }
-const { Agent, Cursor, FileCredentialStore, JsonlLocalAgentStore } = sdk;
+const { Agent, AgentBusyError, Cursor, FileCredentialStore, JsonlLocalAgentStore } = sdk;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- per-run agent store --------------------------------------------------
 // The SDK's default local store is SQLite keyed by WORKSPACE
@@ -150,6 +152,16 @@ if (process.argv[2] === "login") {
 let agent = null;
 let run = null;
 let interrupted = false;
+// Where this shim's agent record lives — the drain-on-busy path polls the
+// same store for the run still holding the agent's active-run lease.
+let agentStore = null;
+let agentCwd = null;
+
+// Tools whose args are worth re-emitting as they stream: a plan document is
+// useful while it's still being written, and a todo list is legible at
+// every size. Other tools' partial args (a half-written command) only make
+// chips flap, so they still emit once at start/completion.
+const STREAMED_ARG_TOOLS = new Set(["createPlan", "updateTodos"]);
 
 // One InteractionUpdate → zero or one frame. `parent` attributes nested
 // subagent traffic (tool-call-delta carries the child's updates tagged by
@@ -196,6 +208,24 @@ function mapUpdate(u, parent) {
       // Nested subagent update, tagged by the spawning task call.
       if (u.taskUpdate) mapUpdate(u.taskUpdate, u.callId);
       break;
+    case "partial-tool-call":
+      // Args arrive as a growing snapshot; re-emitting them as start frames
+      // lets the plan surface stream the document as it's written.
+      if (
+        STREAMED_ARG_TOOLS.has(u.toolCall?.type) &&
+        u.toolCall?.args &&
+        typeof u.toolCall.args === "object"
+      ) {
+        out({
+          ev: "tool",
+          phase: "start",
+          id: u.callId,
+          name: u.toolCall.type,
+          args: u.toolCall.args,
+          ...tag,
+        });
+      }
+      break;
     case "turn-ended":
       if (u.usage) {
         out({
@@ -227,10 +257,69 @@ function withAuthHint(message) {
   return text;
 }
 
+// `agent.send` throws AgentBusyError while the store still shows an active
+// run for this agent — the just-finished turn's lease can lag run.wait()'s
+// resolution, and a sibling shim resumed onto the same session can hold a
+// genuinely live one. Poll the agent's own store until no run is active,
+// then retry the send; the error only surfaces if a real run outlasts the
+// drain window.
+const BUSY_DRAIN_MS = 10 * 60 * 1000;
+
+const isBusyError = (e) =>
+  e instanceof AgentBusyError ||
+  e?.status === 409 ||
+  /active run/i.test(String(e?.message ?? e));
+
+async function activeRunPresent() {
+  try {
+    const opts = { cwd: agentCwd };
+    if (agentStore) opts.store = agentStore;
+    const record = await Agent.get(agent.agentId, opts);
+    if (record && typeof record === "object" && "activeRunId" in record) {
+      return record.activeRunId != null;
+    }
+  } catch {
+    // getAgent is best-effort; fall through to the run list.
+  }
+  try {
+    const opts = { runtime: "local", cwd: agentCwd };
+    if (agentStore) opts.store = agentStore;
+    const list = await Agent.listRuns(agent.agentId, opts);
+    return (list?.items ?? []).some(
+      (r) => String(r?.status).toUpperCase() === "RUNNING",
+    );
+  } catch {
+    // Store introspection failed — let the send retry decide.
+    return false;
+  }
+}
+
+async function sendWhenIdle(prompt, options) {
+  const deadline = Date.now() + BUSY_DRAIN_MS;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await agent.send(prompt, options);
+    } catch (e) {
+      if (!isBusyError(e) || interrupted || Date.now() >= deadline || attempt >= 20)
+        throw e;
+      // A visible run drains in place — one send attempt per lease. When no
+      // run is visible (lease flag lagging wait(), or an uninspectable
+      // store) back off instead of hammering sends for the whole window.
+      let sawRun = false;
+      while (!interrupted && Date.now() < deadline && (await activeRunPresent())) {
+        sawRun = true;
+        await sleep(750);
+      }
+      if (interrupted) throw e;
+      await sleep(sawRun ? 400 : Math.min(400 * (attempt + 1), 4000));
+    }
+  }
+}
+
 async function runTurn(prompt) {
   interrupted = false;
   try {
-    run = await agent.send(prompt, {
+    run = await sendWhenIdle(prompt, {
       onDelta: ({ update }) => {
         try {
           mapUpdate(update);
@@ -315,6 +404,8 @@ async function start(msg) {
     local.store = fresh.store;
     runDir = fresh.dir;
   }
+  agentStore = local.store ?? null;
+  agentCwd = local.cwd;
   const options = {
     model,
     // askQuestion has no public answer channel in this SDK (SDKRequestMessage

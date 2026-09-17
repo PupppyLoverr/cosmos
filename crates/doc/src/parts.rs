@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use zeron_proto::{AgentEvent, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputQuestion};
+use zeron_proto::{
+    AgentEvent, PLAN_TOOL_NAME, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputQuestion,
+};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -568,7 +570,7 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
         },
         ToolCall::Unknown { name, .. } => ToolCall::Unknown {
             name: name.clone(),
-            input: spawn_badge(call),
+            input: spawn_badge(call).or_else(|| plan_badge(call)),
         },
         other => other.clone(),
     }
@@ -599,6 +601,28 @@ fn spawn_badge(call: &ToolCall) -> Option<serde_json::Value> {
         })
         .collect();
     (!kept.is_empty()).then(|| serde_json::Value::Object(kept))
+}
+
+/// The plan document itself is the payload a [`PLAN_TOOL_NAME`] call exists
+/// to deliver — the docked plan surface reads `input["plan"]` back, so the
+/// render-parts policy keeps exactly that key (adapters normalize every
+/// plan-doc call to `{"plan": "<markdown>"}` before it reaches the doc).
+/// `None` for any other `Unknown`, keeping this a whitelist like
+/// [`spawn_badge`].
+fn plan_badge(call: &ToolCall) -> Option<serde_json::Value> {
+    let ToolCall::Unknown { name, input } = call else {
+        return None;
+    };
+    if name != PLAN_TOOL_NAME {
+        return None;
+    }
+    let plan = input
+        .as_ref()?
+        .get("plan")?
+        .as_str()?
+        .trim()
+        .to_owned();
+    (!plan.is_empty()).then(|| serde_json::json!({ "plan": plan }))
 }
 
 /// Deterministic continuation id: `"{root}#c{n}"`.

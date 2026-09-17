@@ -45,8 +45,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SteeringMode, TodoItem, ToolCall,
+    AgentEvent, DoneStatus, HarnessId, LIVE_PLAN_TOOL_ID, Model, ModelOption, ModelOptionChoice,
+    PLAN_TOOL_NAME, ReasoningLevel, RunRequest, SteeringMode, TodoItem, ToolCall,
 };
 
 use crate::process::{Child, ChildStdin, Command, Stdio};
@@ -970,6 +970,14 @@ fn decode_tool(name: &str, args: &Value) -> ToolCall {
             url: s(&["url"]),
             prompt: None,
         },
+        // The plan document: cursor's plan-mode tool carries ONE freeform
+        // markdown blob (`{plan: string}`), not a todo list — decode it to
+        // the shared PLAN_TOOL_NAME shape so the doc keeps the payload and
+        // the plan surface can read it back.
+        "createPlan" => ToolCall::Unknown {
+            name: PLAN_TOOL_NAME.into(),
+            input: Some(json!({ "plan": s(&["plan"]) })),
+        },
         "updateTodos" => ToolCall::Todo {
             items: args
                 .get("todos")
@@ -1041,12 +1049,21 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
         "text" => vec![tag(AgentEvent::TextDelta { text: text() })],
         "thinking" => vec![tag(AgentEvent::ReasoningDelta { text: text() })],
         "tool" => {
-            let id = frame
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
             let name = frame.get("name").and_then(Value::as_str).unwrap_or("tool");
+            // Plan-shaped tools ride the session-scoped live-plan id, the
+            // same convention ACP plan updates use: streaming partials,
+            // repeat calls, and re-emits across a steer/park boundary all
+            // refresh ONE chip in place — and the engine's stale-echo and
+            // quiesce exemptions are keyed on exactly this id.
+            let id = if name == "createPlan" || name == "updateTodos" {
+                LIVE_PLAN_TOOL_ID.to_owned()
+            } else {
+                frame
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
             let args = frame.get("args").cloned().unwrap_or(Value::Null);
             match frame.get("phase").and_then(Value::as_str) {
                 Some("start") => {

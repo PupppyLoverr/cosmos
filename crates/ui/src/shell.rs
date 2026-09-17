@@ -479,6 +479,10 @@ pub enum RightSurface {
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
+    /// The chat's live plan, read-only: the latest plan-shaped tool part
+    /// (todo list or `Plan` document) read back out of the transcript — one
+    /// tab per chat, auto-opened when a harness's plan resolves.
+    Plan,
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -488,6 +492,34 @@ fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface
         tabs.push(surface);
         true
     }
+}
+
+/// The latest plan-shaped tool part in a transcript — a todo list or a
+/// `Plan` document call, whichever is newest (every adapter feeds the same
+/// dock: ACP `plan`, cursor `createPlan`/`updateTodos`, claude
+/// `ExitPlanMode`, codex `update_plan`). Returns the owning ENTRY id —
+/// each turn's plan lands in its own entry, so the id distinguishes "the
+/// plan I already dismissed" from "a new plan" — plus the part's resolved
+/// flag (a plan is "ready" once its tool result lands).
+fn latest_plan_part(
+    entries: &[zeron_doc::SessionMessageEntry],
+) -> Option<(String, bool)> {
+    entries.iter().rev().find_map(|entry| {
+        entry
+            .parts
+            .iter()
+            .rev()
+            .find(|part| {
+                matches!(part, zeron_doc::MessagePart::Tool { call, .. } if call.is_plan())
+            })
+            .map(|part| {
+                let resolved = matches!(
+                    part,
+                    zeron_doc::MessagePart::Tool { resolved: true, .. }
+                );
+                (entry.id.clone(), resolved)
+            })
+    })
 }
 
 fn workspace_file_title(path: &str) -> SharedString {
@@ -1398,6 +1430,13 @@ pub struct Shell {
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
+    /// Per panel key, the entry id of the plan the dock already surfaced or
+    /// the user dismissed — auto-open fires once per plan (each turn's plan
+    /// lands in its own transcript entry), not once per plan update.
+    plan_acted: std::collections::HashMap<String, String>,
+    /// The transcript revision the plan scan last ran against — the scan
+    /// skips notifies that didn't touch the transcript.
+    plan_scan_revision: u64,
     /// In-flight surface-tab drag (slide animation state).
     right_tab_drag: Option<RightTabDragState>,
     /// Surface-tab strip scroll (the strip overflows horizontally, t3
@@ -1803,6 +1842,8 @@ impl Shell {
             _browser_bridge: browser_bridge,
             _browser_bridge_drain,
             right_tabs: std::collections::HashMap::new(),
+            plan_acted: std::collections::HashMap::new(),
+            plan_scan_revision: 0,
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
             route,
@@ -2245,6 +2286,31 @@ impl Shell {
                 changes.update(cx, |changes, cx| changes.ensure_content(cx));
             }
         }
+        // The plan dock: a RESOLVED plan-shaped part claims the Plan surface
+        // once per (chat, entry) — "ready" is the tool result landing, and
+        // the entry id distinguishes a fresh plan from the one the user
+        // already dismissed (closing the tab snoozes only that plan). The
+        // tab then tracks every later update itself; the scan rides the
+        // transcript revision so other notifies skip it.
+        {
+            let key = self.panel_key(cx);
+            let revision = state.read(cx).transcript_revision;
+            if revision != self.plan_scan_revision {
+                self.plan_scan_revision = revision;
+                if let Some((entry_id, resolved)) =
+                    latest_plan_part(&state.read(cx).transcript)
+                    && resolved
+                    && self.plan_acted.get(&key).map(String::as_str) != Some(entry_id.as_str())
+                    && !self
+                        .right_tabs
+                        .get(&key)
+                        .is_some_and(|tabs| tabs.contains(&RightSurface::Plan))
+                {
+                    self.plan_acted.insert(key, entry_id);
+                    self.add_plan_surface(cx);
+                }
+            }
+        }
         match state.read(cx).connection {
             ConnectionStatus::Ready => {
                 if self.splash == SplashPhase::Visible {
@@ -2461,6 +2527,10 @@ impl Shell {
                         browser.page.url.clone().map(Into::into),
                     )
                 }),
+                // The plan surface carries no entity of its own — the tab's
+                // presence in `right_tabs` is the whole state; its content
+                // derives from the transcript at render time.
+                RightSurface::Plan => Some((*surface, "Plan".into(), false, None)),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -2482,7 +2552,8 @@ impl Shell {
             | RightSurface::Terminal(_)
             | RightSurface::Subagent(_)
             | RightSurface::SideChat(_)
-            | RightSurface::Browser(_) => {
+            | RightSurface::Browser(_)
+            | RightSurface::Plan => {
                 return None;
             }
         };
@@ -2585,7 +2656,7 @@ impl Shell {
             // The tab's feed (watch or snapshot) runs from open to close —
             // activation needs no revalidation.
             RightSurface::Subagent(_) | RightSurface::Browser(_) => {}
-            RightSurface::SideChat(_) | RightSurface::Picker => {}
+            RightSurface::SideChat(_) | RightSurface::Picker | RightSurface::Plan => {}
         }
         cx.notify();
     }
@@ -3076,6 +3147,102 @@ impl Shell {
         self.focus_right_file_editor(RightSurface::Files, window, cx);
     }
 
+    /// The "+" menu's Plan row — and the auto-open when a harness's plan
+    /// resolves (every adapter feeds it: ACP `plan`, cursor `createPlan`/
+    /// `updateTodos`, claude `ExitPlanMode`, codex `update_plan`). One tab
+    /// per chat; the surface reads the plan back out of the transcript.
+    fn add_plan_surface(&mut self, cx: &mut Context<Self>) {
+        if self.active_chat.is_empty() {
+            return;
+        }
+        if !self.right_pane_open(cx) {
+            self.toggle_right_pane(cx);
+        }
+        let key = self.panel_key(cx);
+        let tabs = self.right_tabs.entry(key).or_default();
+        push_unique_right_surface(tabs, RightSurface::Plan);
+        self.set_right_active(RightSurface::Plan, cx);
+    }
+
+    /// The docked plan: the latest plan-shaped tool part in THIS chat's
+    /// transcript rendered as markdown — a `Plan` document verbatim, a todo
+    /// list as its task list. Read-only: the plan is the agent's document.
+    /// Deriving from the transcript keeps the surface free of its own feed —
+    /// a resolved plan's content is already durable, and a streaming one
+    /// re-renders on each transcript notify.
+    fn render_plan_surface(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let latest = {
+            let state = self.state.read(cx);
+            state.transcript.iter().rev().find_map(|entry| {
+                entry.parts.iter().rev().find_map(|part| match part {
+                    zeron_doc::MessagePart::Tool {
+                        call, resolved, ..
+                    } => call.plan_markdown().map(|markdown| (markdown, *resolved)),
+                    _ => None,
+                })
+            })
+        };
+        let Some((markdown, resolved)) = latest else {
+            // Reachable only by racing a manual open — the surface's own
+            // state never depends on the plan still being there.
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(crate::typography::ui_rems(13.0))
+                .text_color(theme.text_muted)
+                .child("No plan yet")
+                .into_any_element();
+        };
+        let workspace_root = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat_row()
+                .and_then(|chat| chat.cwd.as_deref())
+                .map(SharedString::from)
+        };
+        let tree = crate::markdown::parser::parse_full(&markdown);
+        let opts = crate::markdown::render::RenderOptions {
+            tasks: None,
+            media: None,
+            row_key: "plan-surface".into(),
+            veil: None,
+            cache: None,
+            now: std::time::Instant::now(),
+            copy: None,
+            link: Some(Self::session_links(Some(self.active_chat.clone()), cx)),
+            workspace_root,
+            code: None,
+        };
+        let body = crate::markdown::render::render_tree(&tree, &opts, &theme, window, &|_| None);
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p(px(Theme::SPACE_LG))
+                    .child(body),
+            )
+            .when(!resolved, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .px(px(Theme::SPACE_LG))
+                        .pb(px(Theme::SPACE_MD))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_muted)
+                        .child("Plan is still being written…"),
+                )
+            })
+            .into_any_element()
+    }
+
     /// The picker's Side Chat card / the `+` menu's Side Chat row: a fresh
     /// side-chat tab each click (several conversations can sit docked at
     /// once). The tab binds the panel's own chat by default — the header
@@ -3511,6 +3678,16 @@ impl Shell {
                     if let Some(doc) = doc {
                         self.maybe_unwatch_doc(&doc, cx);
                     }
+                }
+            }
+            RightSurface::Plan => {
+                // Snooze THIS plan only: `plan_acted` keys on the owning
+                // transcript entry, so the next turn's plan still docks
+                // while this one stays closed.
+                if let Some((entry_id, _)) =
+                    latest_plan_part(&self.state.read(cx).transcript)
+                {
+                    self.plan_acted.insert(key.clone(), entry_id);
                 }
             }
             RightSurface::Picker => {}
@@ -8502,6 +8679,7 @@ impl Shell {
                         .children(pill)
                         .into_any_element()
                 }
+                RightSurface::Plan => self.render_plan_surface(window, cx),
                 _ => self.render_surface_picker(cx),
             }
         } else {
@@ -8628,6 +8806,21 @@ impl Shell {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.add_side_chat_surface(window, cx);
                         })),
+                    )
+                    // The plan card only while a plan exists to reopen.
+                    .when(
+                        self.state.read(cx).transcript.iter().rev().any(|entry| {
+                            entry.parts.iter().any(|part| {
+                                matches!(part, zeron_doc::MessagePart::Tool { call, .. } if call.is_plan())
+                            })
+                        }),
+                        |el| {
+                            el.child(
+                                row("surface-card-plan", icons::CHECKLIST, "Plan").on_click(
+                                    cx.listener(|this, _, _, cx| this.add_plan_surface(cx)),
+                                ),
+                            )
+                        },
                     )
                     // Git surfaces only where there IS git — the pane itself
                     // no longer gates on it (terminals work anywhere).
@@ -8837,6 +9030,7 @@ impl Shell {
                 RightSurface::SideChat(_) => icons::CHAT_ROUND_LINE,
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
+                RightSurface::Plan => icons::CHECKLIST,
                 RightSurface::Picker => icons::PLUS,
             };
             // A live subagent tab swaps its icon for the mini working
@@ -9186,6 +9380,32 @@ impl Shell {
                                         .text_color(theme.text_muted),
                                 )
                                 .child(SharedString::from("Side Chat")),
+                        )
+                        // The plan row appears only while a plan exists to
+                        // reopen — the surface reads it from the transcript,
+                        // so before the first plan there's nothing to show.
+                        .when(
+                            self.state.read(cx).transcript.iter().rev().any(|entry| {
+                                entry.parts.iter().any(|part| {
+                                    matches!(part, zeron_doc::MessagePart::Tool { call, .. } if call.is_plan())
+                                })
+                            }),
+                            |menu| {
+                                menu.child(
+                                    popover::menu_row(&theme, false, "right-plus-plan")
+                                        .id("right-plus-plan-row")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.add_plan_surface(cx);
+                                            this.close_right_plus(cx);
+                                        }))
+                                        .child(
+                                            icon(icons::CHECKLIST)
+                                                .size(px(13.0))
+                                                .text_color(theme.text_muted),
+                                        )
+                                        .child(SharedString::from("Plan")),
+                                )
+                            },
                         )
                         .when(self.space_git_detected(cx), |menu| {
                             menu.child(

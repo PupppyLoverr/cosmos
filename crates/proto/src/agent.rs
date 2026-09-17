@@ -212,6 +212,19 @@ pub struct WorktreeSpec {
 /// life of a run.
 pub const LIVE_PLAN_TOOL_ID: &str = "acp-plan";
 
+/// The [`ToolCall::Unknown`] name a whole-plan document decodes under — a
+/// harness that hands the model a "write the plan" tool (cursor `createPlan`,
+/// claude `ExitPlanMode`) carries a freeform markdown blob, not a todo list,
+/// so the shared plan surface reads it back off `input["plan"]`. Adapters
+/// normalize every plan-doc call to exactly `{"plan": "<markdown>"}` — the
+/// render-parts policy keeps that one key the way it keeps a spawn's badge.
+///
+/// An `Unknown` name rather than a new `ToolCall` variant because the doc is
+/// a cross-version format: `kind:"unknown"` deserializes on every shipped
+/// build (a new kind tag would make older apps drop the whole part), and the
+/// `Agent[: <desc>]` convention already gives `Unknown` semantic names.
+pub const PLAN_TOOL_NAME: &str = "Plan";
+
 /// A decoded tool invocation, reduced to the fields each kind renders.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -314,6 +327,41 @@ impl ToolCall {
             .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
             .map(str::trim)
             .filter(|model| !model.is_empty())
+    }
+
+    /// A plan-shaped call: the plan surfaces (chip + right-dock plan tab)
+    /// key on shape, not harness — a todo list IS the live plan for most
+    /// adapters, and [`PLAN_TOOL_NAME`] calls carry a whole markdown plan.
+    pub fn is_plan(&self) -> bool {
+        match self {
+            ToolCall::Todo { .. } => true,
+            ToolCall::Unknown { name, .. } => name == PLAN_TOOL_NAME,
+            _ => false,
+        }
+    }
+
+    /// The plan body as markdown, when this call carries one. Todos render
+    /// as a task list (the markdown surface draws real checkboxes); a
+    /// [`PLAN_TOOL_NAME`] call reads its canonical `input["plan"]` blob back.
+    /// `None` for non-plan calls and for a plan call whose payload was never
+    /// written into the doc (older builds stripped `Unknown` inputs).
+    pub fn plan_markdown(&self) -> Option<String> {
+        match self {
+            ToolCall::Todo { items } if !items.is_empty() => Some(
+                items
+                    .iter()
+                    .map(|i| format!("- [{}] {}", if i.done { "x" } else { " " }, i.text))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            ToolCall::Unknown { name, input } if name == PLAN_TOOL_NAME => input
+                .as_ref()?
+                .get("plan")?
+                .as_str()
+                .filter(|plan| !plan.trim().is_empty())
+                .map(str::to_owned),
+            _ => None,
+        }
     }
 }
 

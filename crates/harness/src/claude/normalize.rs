@@ -2,7 +2,7 @@
 //! decoding, error-code mapping).
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
+use zeron_proto::{AgentEvent, DoneStatus, HarnessId, PLAN_TOOL_NAME, TodoItem, ToolCall};
 
 use super::wire::{ContentBlock, Frame};
 
@@ -126,6 +126,17 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
                     done: t.get("status").and_then(Value::as_str) == Some("completed"),
                 })
                 .collect(),
+        },
+        // The plan document: ExitPlanMode carries the whole proposed plan as
+        // one `plan` markdown blob — decode it to the shared PLAN_TOOL_NAME
+        // shape so the doc keeps the payload (a bare Unknown would have its
+        // input stripped by the render-parts policy) and the plan surface
+        // can read it back.
+        "ExitPlanMode" | "exit_plan_mode" => ToolCall::Unknown {
+            name: PLAN_TOOL_NAME.into(),
+            input: Some(serde_json::json!({
+                "plan": str_field(input, "plan")
+            })),
         },
         // The subagent spawn: name the chip — and the tab it opens — after
         // the TASK, not the bare tool ("Agent" alone says nothing in a tab
