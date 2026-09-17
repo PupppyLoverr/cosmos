@@ -355,7 +355,14 @@ fn open_main_window(
                 // (cosmos.desktop's StartupWMClass). Other platforms keep "zeron"
                 // so the Windows AppUserModelID (taskbar pins) and the macOS
                 // bundle identity stay exactly as before.
-                app_id: Some(if cfg!(target_os = "linux") { "cosmos" } else { "zeron" }.into()),
+                app_id: Some(
+                    if cfg!(target_os = "linux") {
+                        "cosmos"
+                    } else {
+                        "zeron"
+                    }
+                    .into(),
+                ),
                 ..Default::default()
             },
             move |window, cx| {
