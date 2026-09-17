@@ -25,7 +25,22 @@ fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>) -> PathBuf {
                     .map(|home| PathBuf::from(home).join("AppData").join("Local"))
             })
             .expect("LOCALAPPDATA and USERPROFILE not set; set ZERON_DATA_DIR");
-        local.join("Zeron")
+        let dir = local.join("Zeron");
+        // One-shot migration: adopt the pre-native-Windows data dir
+        // (sign-in, device identity, sessions, prefs) on first launch.
+        if !dir.exists() {
+            for var in ["HOME", "USERPROFILE"] {
+                let Some(home) = env(var).filter(|v| !v.is_empty()) else {
+                    continue;
+                };
+                let old = PathBuf::from(home).join(".zeron");
+                if old.exists() && std::fs::rename(&old, &dir).is_ok() {
+                    eprintln!("migrated data dir {} -> {}", old.display(), dir.display());
+                    break;
+                }
+            }
+        }
+        dir
     }
     #[cfg(not(windows))]
     {
@@ -87,5 +102,43 @@ mod tests {
             resolve(&[("HOME", r"D:\msys-home"), ("LOCALAPPDATA", r"C:\Local")]),
             PathBuf::from(r"C:\Local\Zeron"),
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_migrates_home_dot_zeron_once() {
+        let tmp = std::env::temp_dir().join(format!("zeron-paths-migrate-{}", std::process::id()));
+        let home = tmp.join("home");
+        let local = tmp.join("local");
+        std::fs::create_dir_all(home.join(".zeron")).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        let vars = [
+            ("HOME", home.to_str().unwrap()),
+            ("USERPROFILE", home.to_str().unwrap()),
+            ("LOCALAPPDATA", local.to_str().unwrap()),
+        ];
+        let dir = resolve(&vars);
+        assert_eq!(dir, local.join("Zeron"));
+        assert!(dir.exists());
+        assert!(!home.join(".zeron").exists());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_existing_native_dir_wins_over_dot_zeron() {
+        let tmp = std::env::temp_dir().join(format!("zeron-paths-nowin-{}", std::process::id()));
+        let home = tmp.join("home");
+        let local = tmp.join("local");
+        std::fs::create_dir_all(home.join(".zeron")).unwrap();
+        std::fs::create_dir_all(local.join("Zeron")).unwrap();
+        let vars = [
+            ("USERPROFILE", home.to_str().unwrap()),
+            ("LOCALAPPDATA", local.to_str().unwrap()),
+        ];
+        let dir = resolve(&vars);
+        assert_eq!(dir, local.join("Zeron"));
+        assert!(home.join(".zeron").exists());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
