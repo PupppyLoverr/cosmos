@@ -350,7 +350,12 @@ fn open_main_window(
                 // — if these two ever disagree, vibrancy dies on the first theme
                 // change and never comes back.
                 window_background: theme::Theme::of(cx).window_background_appearance(),
-                app_id: Some("zeron".into()),
+                // User-facing Linux identity is Cosmos: the Wayland app_id / X11
+                // WM_CLASS drives dock grouping and .desktop/icon matching
+                // (cosmos.desktop's StartupWMClass). Other platforms keep "zeron"
+                // so the Windows AppUserModelID (taskbar pins) and the macOS
+                // bundle identity stay exactly as before.
+                app_id: Some(if cfg!(target_os = "linux") { "cosmos" } else { "zeron" }.into()),
                 ..Default::default()
             },
             move |window, cx| {
