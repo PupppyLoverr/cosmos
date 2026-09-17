@@ -3223,6 +3223,7 @@ impl Shell {
             .flex_col()
             .child(
                 div()
+                    .id("plan-surface-scroll")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -10796,6 +10797,78 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_entry(
+        id: &str,
+        call: zeron_proto::ToolCall,
+        resolved: bool,
+    ) -> zeron_doc::SessionMessageEntry {
+        zeron_doc::SessionMessageEntry {
+            id: id.into(),
+            role: zeron_doc::MessageRole::Assistant,
+            parts: vec![zeron_doc::MessagePart::Tool {
+                id: "p0".into(),
+                call,
+                is_error: false,
+                resolved,
+                output: None,
+                diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
+            }],
+            created_at: 0,
+            device_id: "local".into(),
+            status: None,
+            continuation_of: None,
+        }
+    }
+
+    /// The dock keys on the LATEST plan-shaped part, and "ready" is the
+    /// part's own resolved flag — a still-streaming plan reports its entry
+    /// but doesn't claim the surface.
+    #[test]
+    fn latest_plan_part_picks_the_newest_plan_and_its_resolved_state() {
+        let doc_plan = |markdown: &str| zeron_proto::ToolCall::Unknown {
+            name: zeron_proto::PLAN_TOOL_NAME.into(),
+            input: Some(serde_json::json!({ "plan": markdown })),
+        };
+        let todo_plan = zeron_proto::ToolCall::Todo {
+            items: vec![zeron_proto::TodoItem {
+                text: "one".into(),
+                done: false,
+            }],
+        };
+        assert_eq!(latest_plan_part(&[]), None);
+        assert_eq!(
+            latest_plan_part(&[plan_entry("e1", doc_plan("# a"), true)]),
+            Some(("e1".to_owned(), true))
+        );
+        // Newest plan-bearing entry wins even when an older plan resolved.
+        let entries = vec![
+            plan_entry("e1", doc_plan("# a"), true),
+            plan_entry("e2", todo_plan, false),
+        ];
+        assert_eq!(
+            latest_plan_part(&entries),
+            Some(("e2".to_owned(), false))
+        );
+        // Non-plan entries after the plan don't hide it — the scan keeps
+        // walking back until a plan part turns up.
+        let mut tail = entries.clone();
+        tail.push(zeron_doc::SessionMessageEntry {
+            parts: vec![zeron_doc::MessagePart::Text {
+                id: "t0".into(),
+                text: "working…".into(),
+            }],
+            ..plan_entry("e3", doc_plan("# hidden"), true)
+        });
+        assert_eq!(latest_plan_part(&tail), Some(("e2".to_owned(), false)));
+    }
 
     #[test]
     fn sidebar_drag_nudges_each_edge_once_until_rearmed() {
