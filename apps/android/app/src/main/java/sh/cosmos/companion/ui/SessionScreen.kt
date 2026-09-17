@@ -1,7 +1,10 @@
 package sh.cosmos.companion.ui
 
+import androidx.compose.animation.core.withInfiniteAnimationFrameMillis
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,44 +15,52 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowUpward
-import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import sh.cosmos.companion.net.ChatBridge
+import sh.cosmos.companion.net.ChatIndicator
 import sh.cosmos.companion.net.CosmosClient
 import sh.cosmos.companion.net.SendOutcome
-import sh.cosmos.companion.net.SessionStatus
 import sh.cosmos.companion.net.SessionSummary
 import sh.cosmos.companion.net.TranscriptItem
 import sh.cosmos.companion.theme.CosmosColors
 import sh.cosmos.companion.theme.Geist
-import sh.cosmos.companion.theme.GeistMono
+import sh.cosmos.companion.theme.HarnessMark
+import sh.cosmos.companion.theme.Motion
+import sh.cosmos.companion.theme.WorkingSpinner
 
 @Composable
 fun SessionScreen(
@@ -66,7 +77,7 @@ fun SessionScreen(
     val items = remember(session.chatId) {
         mutableStateListOf<TranscriptItem>().apply {
             if (!session.lastMessagePreview.isNullOrBlank()) {
-                add(TranscriptItem("preview", "assistant", session.lastMessagePreview, session.lastMessageAt ?: now))
+                add(TranscriptItem("preview", "assistant", session.lastMessagePreview!!, session.lastMessageAt ?: now))
             }
         }
     }
@@ -79,58 +90,65 @@ fun SessionScreen(
     Column(Modifier.fillMaxSize().background(CosmosColors.bg).imePadding()) {
         // Header
         Row(
-            Modifier.fillMaxWidth().padding(start = 4.dp, end = 16.dp, top = 12.dp, bottom = 10.dp),
+            Modifier.fillMaxWidth().padding(start = 2.dp, end = 16.dp, top = 10.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = CosmosColors.textMuted)
-            }
+            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = CosmosColors.textMuted) }
             Column(Modifier.weight(1f)) {
-                Text(session.title, color = CosmosColors.text, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, maxLines = 1)
+                Text(session.title, color = CosmosColors.text, fontFamily = Geist, fontWeight = FontWeight.SemiBold,
+                    fontSize = 16.sp, maxLines = 1)
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    StatusDot(indicator)
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        buildString {
-                            append(indicator.label())
-                            session.branch?.let { append("  ·  $it") }
-                        },
-                        color = CosmosColors.textFaint, fontSize = 12.sp, maxLines = 1,
-                    )
+                    StatusCorner(indicator)
+                    session.branch?.takeIf { it.isNotBlank() }?.let {
+                        Text("  ·  $it", color = CosmosColors.textFaint, fontFamily = Geist, fontSize = 12.sp, maxLines = 1)
+                    }
                 }
             }
         }
-        MetaBar(session)
         Box(Modifier.fillMaxWidth().height(1.dp).background(CosmosColors.border))
 
         // Transcript
         LazyColumn(
             state = scrollState,
             modifier = Modifier.weight(1f).fillMaxWidth(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
             if (items.isEmpty()) {
                 item {
                     Text(
-                        "No messages mirrored yet. The latest message preview and live status " +
-                            "sync from the registry; the full transcript streams over chat2 with the native bridge.",
-                        color = CosmosColors.textFaint, fontSize = 13.sp,
+                        "Live status and the latest message sync from the registry. The full " +
+                            "transcript streams over chat2 with the native bridge.",
+                        color = CosmosColors.textFaint, fontFamily = Geist, fontSize = 13.sp,
                     )
                 }
             }
-            items(items, key = { it.id }) { MessageBubble(it) }
+            items(items, key = { it.id }) { MessageBlock(it) }
+            if (indicator == ChatIndicator.working) {
+                item { WorkingRow(session.chatId, session.statusUpdatedAt ?: now) }
+            }
         }
 
         note?.let {
-            Text(it, color = CosmosColors.textFaint, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+            Text(it, color = CosmosColors.textFaint, fontFamily = Geist, fontSize = 11.sp,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 2.dp))
         }
 
-        // Composer
+        // Meta chips
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            session.model?.let { ModelChip(session.harness, it) }
+            session.reasoning?.let { Pill(it, color = CosmosColors.textFaint) }
+        }
+
         Composer(
             draft = draft,
             onDraft = { draft = it },
-            working = indicator == sh.cosmos.companion.net.ChatIndicator.working,
+            working = indicator == ChatIndicator.working,
             onSend = {
                 val text = draft.trim()
                 if (text.isEmpty()) return@Composer
@@ -160,32 +178,50 @@ fun SessionScreen(
 }
 
 @Composable
-private fun MetaBar(s: SessionSummary) {
-    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-        s.harness?.let { Pill(harnessLabel(it)); Spacer(Modifier.width(6.dp)) }
-        s.model?.let { Pill(it, color = CosmosColors.textFaint); Spacer(Modifier.width(6.dp)) }
-        s.reasoning?.let { Pill(it, color = CosmosColors.textFaint) }
+private fun ModelChip(harness: String?, model: String) {
+    Row(
+        Modifier.clip(RoundedCornerShape(50)).background(CosmosColors.elementHover)
+            .border(1.dp, CosmosColors.border, RoundedCornerShape(50))
+            .padding(horizontal = 9.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        harness?.let { HarnessMark(it, size = 12.dp, neutral = CosmosColors.textMuted); Spacer(Modifier.width(6.dp)) }
+        Text(model, color = CosmosColors.textMuted, fontFamily = Geist, fontWeight = FontWeight.Medium, fontSize = 12.sp)
     }
 }
 
 @Composable
-private fun MessageBubble(item: TranscriptItem) {
-    val isUser = item.role == "user"
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start) {
-        Box(
-            Modifier
-                .clip(RoundedCornerShape(if (isUser) 18.dp else 10.dp))
-                .background(if (isUser) CosmosColors.elementActive else CosmosColors.surface)
-                .border(1.dp, CosmosColors.border, RoundedCornerShape(if (isUser) 18.dp else 10.dp))
-                .padding(horizontal = 14.dp, vertical = 10.dp),
-        ) {
-            Text(
-                item.text,
-                color = if (isUser) CosmosColors.text else CosmosColors.textMuted,
-                fontSize = 15.sp,
-                fontFamily = Geist,
-            )
+private fun MessageBlock(item: TranscriptItem) {
+    if (item.role == "user") {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            Box(
+                Modifier.widthIn(max = 300.dp)
+                    .clip(RoundedCornerShape(22.dp))
+                    .background(Color.White.copy(alpha = 0.07f))
+                    .padding(horizontal = 16.dp, vertical = 11.dp),
+            ) {
+                Text(item.text, color = CosmosColors.text, fontFamily = Geist, fontSize = 16.sp, lineHeight = 24.sp)
+            }
         }
+    } else {
+        // Assistant / system: plain body text, no bubble (matches desktop/iOS transcript).
+        Text(item.text, color = CosmosColors.text.copy(alpha = 0.92f), fontFamily = Geist, fontSize = 16.sp, lineHeight = 24.sp)
+    }
+}
+
+@Composable
+private fun WorkingRow(chatId: String, startedAt: Long) {
+    val seed = remember(chatId) { Motion.flavourSeed(chatId) }
+    val elapsed by produceState(0L) {
+        while (true) { withInfiniteAnimationFrameMillis { value = (System.currentTimeMillis() - startedAt) / 1000 } }
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        WorkingSpinner()
+        Spacer(Modifier.width(10.dp))
+        Text(Motion.flavourWord(seed, elapsed), color = CosmosColors.textMuted, fontFamily = Geist,
+            fontWeight = FontWeight.Medium, fontSize = 14.sp)
+        Spacer(Modifier.width(8.dp))
+        Text(Motion.formatElapsed(elapsed), color = CosmosColors.textFaint, fontFamily = Geist, fontSize = 12.sp)
     }
 }
 
@@ -197,41 +233,51 @@ private fun Composer(
     onSend: () -> Unit,
     onStop: () -> Unit,
 ) {
+    val hasContent = draft.isNotBlank()
+    val buttonActive = hasContent || (working && !hasContent)
     Row(
-        Modifier.fillMaxWidth().padding(12.dp),
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        OutlinedTextField(
-            value = draft,
-            onValueChange = onDraft,
-            placeholder = { Text("Do anything…", color = CosmosColors.textFaint) },
-            modifier = Modifier.weight(1f),
-            shape = RoundedCornerShape(22.dp),
-            maxLines = 5,
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedTextColor = CosmosColors.text,
-                unfocusedTextColor = CosmosColors.text,
-                focusedBorderColor = CosmosColors.borderStrong,
-                unfocusedBorderColor = CosmosColors.border,
-                cursorColor = CosmosColors.accent,
-                focusedContainerColor = CosmosColors.surface,
-                unfocusedContainerColor = CosmosColors.surface,
-            ),
-        )
-        Spacer(Modifier.width(8.dp))
-        val send = draft.isNotBlank()
-        IconButton(
-            onClick = { if (working && !send) onStop() else onSend() },
-            modifier = Modifier
-                .clip(RoundedCornerShape(20.dp))
-                .background(if (working && !send) CosmosColors.danger else CosmosColors.accentStrong)
-                .height(44.dp).width(44.dp),
+        // Glass pill
+        Row(
+            Modifier.weight(1f)
+                .clip(RoundedCornerShape(24.dp))
+                .background(Color.White.copy(alpha = 0.04f))
+                .border(1.dp, Color.White.copy(alpha = 0.06f), RoundedCornerShape(24.dp))
+                .padding(start = 16.dp, end = 6.dp, top = 5.dp, bottom = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (working && !send) {
-                Icon(Icons.Filled.Stop, "Stop", tint = CosmosColors.text)
+            Box(Modifier.weight(1f).padding(vertical = 8.dp)) {
+                if (draft.isEmpty()) {
+                    Text("Message", color = CosmosColors.text.copy(alpha = 0.3f), fontFamily = Geist, fontSize = 16.sp)
+                }
+                BasicTextField(
+                    value = draft,
+                    onValueChange = onDraft,
+                    textStyle = TextStyle(color = CosmosColors.text, fontFamily = Geist, fontSize = 16.sp, lineHeight = 22.sp),
+                    cursorBrush = SolidColor(CosmosColors.accent),
+                    maxLines = 6,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+        Spacer(Modifier.width(8.dp))
+        // Send / Stop circle
+        Box(
+            Modifier.size(44.dp).clip(CircleShape)
+                .background(if (buttonActive) CosmosColors.text else Color.White.copy(alpha = 0.10f))
+                .clickable(enabled = buttonActive) { if (working && !hasContent) onStop() else onSend() },
+            contentAlignment = Alignment.Center,
+        ) {
+            if (working && !hasContent) {
+                Box(Modifier.size(12.dp).clip(RoundedCornerShape(3.5.dp)).background(CosmosColors.bg))
             } else {
-                Icon(Icons.Filled.ArrowUpward, "Send", tint = CosmosColors.text)
+                Icon(Icons.Filled.ArrowUpward, "Send",
+                    tint = if (buttonActive) CosmosColors.bg else CosmosColors.textFaint,
+                    modifier = Modifier.size(18.dp))
             }
         }
     }
 }
+

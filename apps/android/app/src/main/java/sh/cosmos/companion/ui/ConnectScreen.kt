@@ -1,5 +1,6 @@
 package sh.cosmos.companion.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -49,6 +50,7 @@ fun ConnectScreen(
     Column(
         Modifier
             .fillMaxSize()
+            .background(CosmosColors.bg)
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 24.dp, vertical = 40.dp),
         horizontalAlignment = Alignment.Start,
