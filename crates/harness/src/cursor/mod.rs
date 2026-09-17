@@ -35,7 +35,6 @@
 //!   parked session (parity with the previous ACP behavior).
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -43,7 +42,6 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -51,6 +49,7 @@ use zeron_proto::{
     RunRequest, SteeringMode, TodoItem, ToolCall,
 };
 
+use crate::process::{Child, ChildStdin, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 
 /// The pinned SDK (public beta 1.0.x line; inspected against 1.0.28's
@@ -64,7 +63,9 @@ const CLI_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn cursor_cli_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = crate::home_dir() {
+    // USERPROFILE-aware home (see `crate::executable::home_dir`), plus the
+    // Windows native installer location when LOCALAPPDATA is reachable.
+    if let Some(home) = crate::executable::home_dir() {
         dirs.push(home.join(".local").join("bin").join("cursor-agent"));
         dirs.push(home.join(".cursor").join("bin").join("cursor-agent"));
         // Scoop shims and the Windows installer's user-local dir.
@@ -73,6 +74,18 @@ fn cursor_cli_paths() -> Vec<PathBuf> {
     if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
         dirs.push(local.join("cursor-agent").join("cursor-agent"));
         dirs.push(local.join("Programs").join("cursor").join("cursor-agent"));
+    }
+    if cfg!(windows)
+        && let Some(local) = std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .filter(|value| !value.is_empty())
+                    .map(|home| PathBuf::from(home).join("AppData").join("Local"))
+            })
+    {
+        dirs.push(local.join("cursor-agent").join("cursor-agent"));
     }
     dirs.push(PathBuf::from("/opt/homebrew/bin/cursor-agent"));
     dirs.push(PathBuf::from("/usr/local/bin/cursor-agent"));
@@ -680,7 +693,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Str
 
 struct Session {
     child: Child,
-    stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stdout_lines: tokio::io::Lines<BufReader<crate::process::ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<String>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
@@ -858,12 +871,12 @@ async fn run_session(session: Session) {
                 interrupt_sent = true;
                 interrupted = true;
                 let _ = stdin_tx.send(json!({ "op": "interrupt" }).to_string());
-                if let Some(pid) = child.id() {
+                if let Some(pid) = crate::process::signal_target(&child) {
                     escalation = Some(tokio::spawn(async move {
                         tokio::time::sleep(interrupt_grace).await;
-                        send_signal(pid, Signal::Term);
+                        send_signal(&pid, Signal::Term);
                         tokio::time::sleep(kill_grace).await;
-                        send_signal(pid, Signal::Kill);
+                        send_signal(&pid, Signal::Kill);
                     }));
                 }
             },

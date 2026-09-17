@@ -52,9 +52,6 @@ pub const SAVE_DEBOUNCE_MS: u64 = 400;
 pub const FILES_AUTOSAVE_DELAY_DEFAULT_MS: u64 = 900;
 pub const FILES_AUTOSAVE_DELAY_MIN_MS: u64 = 100;
 pub const FILES_AUTOSAVE_DELAY_MAX_MS: u64 = 10_000;
-pub const FILES_EDITOR_FONT_SIZE_DEFAULT: f32 = 13.0;
-pub const FILES_EDITOR_FONT_SIZE_MIN: f32 = 9.0;
-pub const FILES_EDITOR_FONT_SIZE_MAX: f32 = 24.0;
 
 const FILE_NAME: &str = "ui-settings.json";
 const NEW_THREAD_BACKGROUND_DIR: &str = "new-thread-backgrounds";
@@ -588,9 +585,15 @@ pub struct UiSettings {
     pub git_history_author_display: GitHistoryAuthorDisplay,
     /// Interface and conversational-prose family. Device-local by design.
     pub ui_font_family: crate::typography::UiFontFamily,
-    /// Base size for interface and conversational prose. Code-related surfaces
-    /// retain their fixed metrics.
+    /// Base size for interface and conversational prose.
     pub ui_font_size: crate::typography::UiFontSize,
+    /// Terminal family and absolute pixel size. Only fixed-width families
+    /// qualify, including compatible Nerd Fonts.
+    pub terminal_font_family: crate::typography::UiFontFamily,
+    pub terminal_font_size: f32,
+    /// Family and absolute pixel size for code, diffs, and file editors.
+    pub code_font_family: crate::typography::UiFontFamily,
+    pub code_font_size: f32,
     /// Independently selected light and dark theme variants.
     pub theme_selection: zeron_theme::ThemeSelection,
     /// Changes pane: side-by-side diffs instead of the unified stack.
@@ -609,8 +612,6 @@ pub struct UiSettings {
     pub files_autosave_delay_ms: u64,
     /// Wrap long lines in workspace file editors and previews.
     pub files_word_wrap: bool,
-    /// Font size used by editable workspace-file buffers.
-    pub files_editor_font_size: f32,
     /// Include hidden and ignored entries in workspace file trees.
     pub files_show_all: bool,
     /// Interactive identity overlay; imported themes default to their own accent.
@@ -668,6 +669,10 @@ impl Default for UiSettings {
             git_history_author_display: GitHistoryAuthorDisplay::default(),
             ui_font_family: crate::typography::UiFontFamily::default(),
             ui_font_size: crate::typography::UiFontSize::default(),
+            terminal_font_family: crate::typography::UiFontFamily::GeistMono,
+            terminal_font_size: crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
+            code_font_family: crate::typography::UiFontFamily::GeistMono,
+            code_font_size: crate::typography::CODE_FONT_SIZE_DEFAULT,
             theme_selection: zeron_theme::ThemeSelection::default(),
             diff_split: false,
             diff_wrap: false,
@@ -676,7 +681,6 @@ impl Default for UiSettings {
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
-            files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
             files_show_all: false,
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
@@ -723,6 +727,7 @@ pub enum ShortcutId {
     ToggleChanges,
     ToggleTerminal,
     NewSession,
+    NewProject,
     NextSession,
     PrevSession,
     ArchiveSession,
@@ -730,7 +735,7 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 10 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 11 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
@@ -738,6 +743,7 @@ impl ShortcutId {
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
         ShortcutId::NewSession,
+        ShortcutId::NewProject,
         ShortcutId::NextSession,
         ShortcutId::PrevSession,
         ShortcutId::ArchiveSession,
@@ -766,6 +772,7 @@ impl ShortcutId {
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
             ShortcutId::NewSession => "New session",
+            ShortcutId::NewProject => "New project",
             ShortcutId::NextSession => "Next session",
             ShortcutId::PrevSession => "Previous session",
             ShortcutId::ArchiveSession => "Archive session",
@@ -790,6 +797,7 @@ impl ShortcutId {
             ShortcutId::ToggleChanges => "mod-r",
             ShortcutId::ToggleTerminal => "mod-j",
             ShortcutId::NewSession => "mod-n",
+            ShortcutId::NewProject => "mod-shift-n",
             // Ctrl+Tab on every platform — but spelled the way THAT platform's
             // recorder spells ctrl (see `combo_from_keystroke`). Off macOS
             // ctrl IS the primary and stores as "mod"; on macOS it is its own
@@ -834,6 +842,7 @@ pub struct KeymapConfig {
     pub toggle_changes: String,
     pub toggle_terminal: String,
     pub new_session: String,
+    pub new_project: String,
     pub next_session: String,
     pub prev_session: String,
     pub archive_session: String,
@@ -854,6 +863,7 @@ impl Default for KeymapConfig {
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
             new_session: ShortcutId::NewSession.default_combo().into(),
+            new_project: ShortcutId::NewProject.default_combo().into(),
             next_session: ShortcutId::NextSession.default_combo().into(),
             prev_session: ShortcutId::PrevSession.default_combo().into(),
             archive_session: ShortcutId::ArchiveSession.default_combo().into(),
@@ -872,6 +882,7 @@ impl KeymapConfig {
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
             ShortcutId::NewSession => &self.new_session,
+            ShortcutId::NewProject => &self.new_project,
             ShortcutId::NextSession => &self.next_session,
             ShortcutId::PrevSession => &self.prev_session,
             ShortcutId::ArchiveSession => &self.archive_session,
@@ -892,6 +903,7 @@ impl KeymapConfig {
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
             ShortcutId::NewSession => self.new_session = combo,
+            ShortcutId::NewProject => self.new_project = combo,
             ShortcutId::NextSession => self.next_session = combo,
             ShortcutId::PrevSession => self.prev_session = combo,
             ShortcutId::ArchiveSession => self.archive_session = combo,
@@ -1144,11 +1156,17 @@ impl UiSettings {
         self.files_autosave_delay_ms = self
             .files_autosave_delay_ms
             .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
-        self.files_editor_font_size = clamp_or(
-            self.files_editor_font_size,
-            FILES_EDITOR_FONT_SIZE_MIN,
-            FILES_EDITOR_FONT_SIZE_MAX,
-            FILES_EDITOR_FONT_SIZE_DEFAULT,
+        self.terminal_font_size = clamp_or(
+            self.terminal_font_size,
+            crate::typography::FONT_SIZE_MIN,
+            crate::typography::FONT_SIZE_MAX,
+            crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
+        );
+        self.code_font_size = clamp_or(
+            self.code_font_size,
+            crate::typography::FONT_SIZE_MIN,
+            crate::typography::FONT_SIZE_MAX,
+            crate::typography::CODE_FONT_SIZE_DEFAULT,
         );
         self.git_history_column_widths = self.git_history_column_widths.clamped();
         self.git_history_column_order = self.git_history_column_order.normalized();
@@ -1171,6 +1189,11 @@ impl UiSettings {
                         settings
                             .entry("appshotSoundEnabled")
                             .or_insert(serde_json::Value::Bool(previous_sound));
+                        // The files-editor size was the first user-facing code
+                        // size; it now drives every code surface.
+                        if let Some(legacy) = settings.remove("filesEditorFontSize") {
+                            settings.entry("codeFontSize").or_insert(legacy);
+                        }
                     }
                     if let Some(keymap) = value
                         .get_mut("keymap")
@@ -1311,6 +1334,34 @@ mod tests {
         ] {
             assert!(!loaded.session_sound_enabled(sound));
         }
+    }
+
+    #[test]
+    fn unknown_keys_from_a_newer_build_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth":300.0,"someFutureKey":"whatever","anotherOne":{"nested":1}}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.sidebar_width, 300.0);
+        assert_eq!(
+            loaded.terminal_font_family,
+            crate::typography::UiFontFamily::GeistMono
+        );
+        assert_eq!(
+            loaded.terminal_font_size,
+            crate::typography::TERMINAL_FONT_SIZE_DEFAULT
+        );
+        assert_eq!(
+            loaded.code_font_family,
+            crate::typography::UiFontFamily::GeistMono
+        );
+        assert_eq!(
+            loaded.code_font_size,
+            crate::typography::CODE_FONT_SIZE_DEFAULT
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1569,7 +1620,14 @@ mod tests {
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             appshots_enabled: false,
             appshot_sound_enabled: true,
-            appshot_destination: crate::appshots::AppshotDestination::NewSession,
+            // The destination is only persisted where Appshots exist (macOS and
+            // Linux); elsewhere the field is `serde(skip)` and reloads as the
+            // default, so the round trip must expect exactly that.
+            appshot_destination: if cfg!(any(target_os = "macos", target_os = "linux")) {
+                crate::appshots::AppshotDestination::NewSession
+            } else {
+                crate::appshots::AppshotDestination::Automatic
+            },
             appearance: crate::appearance::AppearanceMode::Light,
             git_history_columns: GitHistoryColumns {
                 author: false,
@@ -1600,7 +1658,10 @@ mod tests {
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
-            files_editor_font_size: 15.0,
+            terminal_font_family: crate::typography::UiFontFamily::Installed("Menlo".into()),
+            terminal_font_size: 15.0,
+            code_font_family: crate::typography::UiFontFamily::Geist,
+            code_font_size: 11.0,
             files_show_all: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
@@ -1618,6 +1679,10 @@ mod tests {
         assert!(json.contains(r#""codeFencesFitContent": true"#));
         assert!(json.contains(r#""openWebLinksInZeron": false"#));
         assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));
+        assert!(json.contains(r#""terminalFontFamily": "installed:Menlo""#));
+        assert!(json.contains(r#""terminalFontSize": 15.0"#));
+        assert!(json.contains(r#""codeFontFamily": "geist""#));
+        assert!(json.contains(r#""codeFontSize": 11.0"#));
     }
 
     #[test]
@@ -1718,8 +1783,12 @@ mod tests {
         assert!(!loaded.files_autosave_enabled);
         assert!(!loaded.files_word_wrap);
         assert_eq!(
-            loaded.files_editor_font_size,
-            FILES_EDITOR_FONT_SIZE_DEFAULT
+            loaded.code_font_size,
+            crate::typography::CODE_FONT_SIZE_DEFAULT
+        );
+        assert_eq!(
+            loaded.terminal_font_size,
+            crate::typography::TERMINAL_FONT_SIZE_DEFAULT
         );
         assert!(!loaded.files_show_all);
         assert!(
@@ -1885,12 +1954,46 @@ mod tests {
         );
         assert_eq!(
             UiSettings {
-                files_editor_font_size: 100.0,
+                code_font_size: 100.0,
                 ..Default::default()
             }
             .clamped()
-            .files_editor_font_size,
-            FILES_EDITOR_FONT_SIZE_MAX
+            .code_font_size,
+            crate::typography::FONT_SIZE_MAX
+        );
+        assert_eq!(
+            UiSettings {
+                terminal_font_size: 1.0,
+                ..Default::default()
+            }
+            .clamped()
+            .terminal_font_size,
+            crate::typography::FONT_SIZE_MIN
+        );
+        assert_eq!(
+            UiSettings {
+                code_font_size: f32::NAN,
+                ..Default::default()
+            }
+            .clamped()
+            .code_font_size,
+            crate::typography::CODE_FONT_SIZE_DEFAULT
+        );
+    }
+
+    #[test]
+    fn legacy_files_editor_font_size_becomes_the_code_font_size() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"filesEditorFontSize": 15.0}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.code_font_size, 15.0);
+        assert_eq!(
+            loaded.terminal_font_size,
+            crate::typography::TERMINAL_FONT_SIZE_DEFAULT
         );
     }
 
@@ -2011,6 +2114,19 @@ mod tests {
         assert_eq!(loaded.keymap.save_file, "");
         assert_eq!(loaded.keymap.new_session, "mod-s");
         assert!(conflicted_shortcuts(&loaded.keymap).is_empty());
+    }
+
+    #[test]
+    fn new_project_shortcut_migrates_and_persists() {
+        let mut keymap: KeymapConfig = serde_json::from_str(r#"{"newSession":"mod-alt-n"}"#).unwrap();
+        assert_eq!(keymap.get(ShortcutId::NewProject), "mod-shift-n");
+        assert_eq!(keymap.get(ShortcutId::NewSession), "mod-alt-n");
+        keymap.set(ShortcutId::NewProject, "mod-alt-p".into());
+        let mut restored: KeymapConfig =
+            serde_json::from_str(&serde_json::to_string(&keymap).unwrap()).unwrap();
+        assert_eq!(restored.get(ShortcutId::NewProject), "mod-alt-p");
+        restored.reset(ShortcutId::NewProject);
+        assert_eq!(restored.get(ShortcutId::NewProject), "mod-shift-n");
     }
 
     #[test]

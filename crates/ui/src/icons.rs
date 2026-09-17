@@ -133,6 +133,7 @@ icon_assets![
     (PEN, "pen"),
     (ARCHIVE_MINIMALISTIC, "archive-minimalistic"),
     (TRASH_BIN_MINIMALISTIC, "trash-bin-minimalistic"),
+    // Shared settings glyph: user-supplied horizontal sliders.
     (SETTINGS_MINIMALISTIC, "settings-minimalistic"),
     (LOGOUT_2, "logout-2"),
     (MAGNIFER, "magnifer"),
@@ -162,6 +163,9 @@ icon_assets![
     // plus/return ports) — the embedded set has neither.
     (BELL, "bell"),
     (VOLUME_LOUD, "volume-loud"),
+    // Hand-drawn microphone in the Solar Linear style (like the terminal/
+    // plus/return ports) — the embedded set has no mic glyph. Composer dictation.
+    (MICROPHONE, "microphone"),
     // Hand-drawn zeron glyphs (terminal-panel.tsx / composer-actions.tsx /
     // menu-check.tsx / logo.tsx).
     (TERMINAL, "terminal"),

@@ -31,7 +31,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -40,7 +39,7 @@ use futures::stream::BoxStream;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use crate::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -660,7 +659,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
 
 struct Session {
     child: Child,
-    stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stdout_lines: tokio::io::Lines<BufReader<ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<StdinMsg>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
@@ -927,10 +926,10 @@ async fn run_session(session: Session) {
                 // No protocol-level interrupt on this wire — terminate the
                 // child; the engine still gets a Done{Interrupted} below if
                 // the CLI dies before emitting `result`.
-                if let Some(pid) = child.id() {
-                    send_signal(pid, Signal::Term);
-                    let _ = child.start_kill();
+                if let Some(target) = crate::process::signal_target(&child) {
+                    send_signal(&target, Signal::Term);
                 }
+                let _ = child.start_kill();
             },
 
             _ = event_tx.closed() => break 'main,
@@ -1150,9 +1149,9 @@ mod tests {
             attachments: Vec::new(),
             worktree: None,
         };
-        let cmd = h.build_command(&exe, &request, None);
+        let mut cmd = h.build_command(&exe, &request, None);
         let args: Vec<String> = cmd
-            .as_std()
+            .as_std_mut()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
@@ -1174,7 +1173,7 @@ mod tests {
         };
         let joined = h
             .build_command(&exe, &request, None)
-            .as_std()
+            .as_std_mut()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
@@ -1189,9 +1188,9 @@ mod tests {
             resume: None,
             ..request
         };
-        let cmd = h.build_command(&exe, &request, None);
+        let mut cmd = h.build_command(&exe, &request, None);
         let joined = cmd
-            .as_std()
+            .as_std_mut()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect::<Vec<_>>()

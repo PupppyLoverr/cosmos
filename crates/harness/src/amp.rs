@@ -23,14 +23,13 @@
 //!   normalizer).
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use crate::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -343,7 +342,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
 
 struct Session {
     child: Child,
-    stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stdout_lines: tokio::io::Lines<BufReader<ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<StdinMsg>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
@@ -447,12 +446,11 @@ async fn run_session(session: Session) {
                 interrupted = true;
                 // No protocol-level interrupt on this wire — escalate
                 // straight to Term then Kill on the child.
-                if let Some(pid) = child.id() {
-                    send_signal(pid, Signal::Term);
-                    let pid_kill = pid;
+                if let Some(target) = crate::process::signal_target(&child) {
+                    send_signal(&target, Signal::Term);
                     escalation = Some(tokio::spawn(async move {
                         tokio::time::sleep(kill_grace).await;
-                        send_signal(pid_kill, Signal::Kill);
+                        send_signal(&target, Signal::Kill);
                     }));
                 }
             },
@@ -534,9 +532,9 @@ mod tests {
             attachments: Vec::new(),
             worktree: None,
         };
-        let cmd = h.build_command(&exe, &request);
+        let mut cmd = h.build_command(&exe, &request);
         let joined = cmd
-            .as_std()
+            .as_std_mut()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
@@ -567,7 +565,7 @@ mod tests {
         };
         let args: Vec<String> = h
             .build_command(&exe, &request)
-            .as_std()
+            .as_std_mut()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();

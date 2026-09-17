@@ -34,7 +34,6 @@ mod subagent_devin;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -43,7 +42,6 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
-use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -52,6 +50,7 @@ use zeron_proto::{
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
+use crate::process::{Child, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use normalize::{map_update, parse_commands, parse_session_list, preferred_allow_option};
 use subagent::SubagentTracker;
@@ -134,9 +133,9 @@ fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String 
 }
 
 /// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
-/// Shared implementation lives at [`crate::find_on_paths`]; kept re-exported
-/// here so existing callers stay put.
-pub(crate) use crate::find_on_paths;
+pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
+    crate::executable::find_on_paths(exe, extra)
+}
 
 /// Generic effort ladder for agents without their own clamping rules.
 fn default_effort_values(
@@ -171,7 +170,7 @@ fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
 
 fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = crate::home_dir() {
+    if let Some(home) = crate::executable::home_dir() {
         dirs.push(home.join(".local").join("bin").join(exe));
         dirs.push(home.join(".npm-global").join("bin").join(exe));
     }
@@ -186,7 +185,7 @@ fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
 
 fn grok_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = crate::home_dir() {
+    if let Some(home) = crate::executable::home_dir() {
         dirs.push(home.join(".local").join("bin").join("grok"));
         dirs.push(home.join(".grok").join("bin").join("grok"));
         dirs.push(home.join(".npm-global").join("bin").join("grok"));
@@ -273,7 +272,7 @@ fn grok_spec() -> AcpAgentSpec {
 
 fn devin_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = crate::home_dir() {
+    if let Some(home) = crate::executable::home_dir() {
         // The official installer's launcher symlink (the binary lives below
         // ~/.local/share/devin/cli/_versions).
         dirs.push(home.join(".local").join("bin").join("devin"));
@@ -367,7 +366,7 @@ fn devin_spec() -> AcpAgentSpec {
 
 fn hermes_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = crate::home_dir() {
+    if let Some(home) = crate::executable::home_dir() {
         dirs.push(home.join(".local").join("bin").join("hermes"));
         dirs.push(home.join(".hermes").join("bin").join("hermes"));
     }
@@ -668,12 +667,14 @@ impl AcpHarness {
     fn resolve_launch(&self) -> Result<Launch, HarnessError> {
         let spec_args: Vec<String> = self.spec.args.iter().map(|a| a.to_string()).collect();
         if let Some(p) = &self.executable {
-            return Ok(Launch::Program(p.clone(), spec_args));
+            return crate::executable::validate_native_override(p)
+                .map(|program| Launch::Program(program, spec_args));
         }
         if let Some(p) = std::env::var_os(self.spec.env_override)
             && !p.is_empty()
         {
-            return Ok(Launch::Program(PathBuf::from(p), spec_args));
+            return crate::executable::validate_native_override(&PathBuf::from(p))
+                .map(|program| Launch::Program(program, spec_args));
         }
         if let Some(found) = find_on_paths(self.spec.executable, (self.spec.extra_paths)()) {
             return Ok(Launch::Program(found, spec_args));
@@ -807,7 +808,7 @@ impl AcpHarness {
                 .await?;
             let mut commands = scan_available_commands(&init);
             if commands.is_empty() {
-                let cwd = discovery_cwd();
+                let cwd = crate::executable::home_or_current_dir();
                 let session = client
                     .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                     .await;
@@ -1012,7 +1013,7 @@ impl AcpHarness {
             client
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
-            let cwd = discovery_cwd();
+            let cwd = crate::executable::home_or_current_dir();
             let session = client
                 .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                 .await?;
@@ -1352,11 +1353,16 @@ impl Harness for AcpHarness {
     /// adapter does NOT count when the CLI itself is missing. Explicit
     /// executables (tests, `*_EXECUTABLE` overrides) always count.
     fn installed(&self) -> bool {
-        if self.executable.is_some() {
-            return true;
+        // Overrides go through the same validation as `resolve_launch`, so an
+        // override that points at nothing reports not-installed instead of an
+        // agent that shows up in the composer and then fails to launch.
+        if let Some(p) = &self.executable {
+            return crate::executable::validate_native_override(p).is_ok();
         }
-        if std::env::var_os(self.spec.env_override).is_some_and(|v| !v.is_empty()) {
-            return true;
+        if let Some(p) = std::env::var_os(self.spec.env_override)
+            && !p.is_empty()
+        {
+            return crate::executable::validate_native_override(&PathBuf::from(p)).is_ok();
         }
         find_on_paths(self.spec.cli_executable, (self.spec.cli_extra_paths)()).is_some()
     }
@@ -3246,12 +3252,12 @@ async fn run_session(session: Session) {
                     client.notify("session/cancel", Some(json!({ "sessionId": session_id })));
                     // Escalate if the agent doesn't wind down (stopReason
                     // "cancelled") within the grace periods.
-                    if let Some(pid) = child.id() {
+                    if let Some(pid) = crate::process::signal_target(&child) {
                         escalation = Some(tokio::spawn(async move {
                             tokio::time::sleep(interrupt_grace).await;
-                            send_signal(pid, Signal::Term);
+                            send_signal(&pid, Signal::Term);
                             tokio::time::sleep(kill_grace).await;
-                            send_signal(pid, Signal::Kill);
+                            send_signal(&pid, Signal::Kill);
                         }));
                     }
                 } else {
