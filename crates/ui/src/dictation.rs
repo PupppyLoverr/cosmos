@@ -94,10 +94,15 @@ mod windows_impl {
         SpeechRecognitionScenario, SpeechRecognitionTopicConstraint, SpeechRecognizer,
     };
     use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
-    use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eConsole};
+    use windows::Win32::Media::Audio::{
+        IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eConsole,
+    };
     use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+    use windows::Win32::System::Registry::{
+        HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
+    };
     use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
-    use windows::core::h;
+    use windows::core::{h, w};
 
     /// Visualizer sample cadence — 25fps of levels is plenty for bars.
     const LEVEL_POLL_MS: u64 = 40;
@@ -203,7 +208,10 @@ mod windows_impl {
 
     fn start_session(events: &UnboundedSender<DictationEvent>) -> Result<Running, String> {
         let recognizer = SpeechRecognizer::new().map_err(|e| {
-            format!("Speech recognition isn't available on this device ({})", err_text(&e))
+            format!(
+                "Speech recognition isn't available on this device ({})",
+                err_text(&e)
+            )
         })?;
 
         // Free dictation, not a grammar list.
@@ -332,15 +340,11 @@ mod windows_impl {
             .StartAsync()
             .and_then(|pending| pending.get())
             .map_err(|e| {
-                // Capture refuses most often on consent: Windows mic privacy
-                // or the online-speech-recognition toggle. Name the toggles
-                // alongside the raw error so the fix is one Settings visit.
-                let hint = if e.code().0 as u32 == 0x80070005 {
-                    "check Settings → Privacy & security → Microphone and Speech"
-                } else {
-                    "check microphone access and Windows speech settings"
-                };
-                format!("Could not start dictation — {} — {hint}", err_text(&e))
+                format!(
+                    "Could not start dictation — {} — {}",
+                    err_text(&e),
+                    consent_hint()
+                )
             })?;
 
         Ok(Running {
@@ -350,13 +354,62 @@ mod windows_impl {
         })
     }
 
+    /// The two consent gates WinRT dictation sits behind — read only on a
+    /// startup failure so the error names the exact Settings toggle instead
+    /// of guessing.
+    fn consent_hint() -> &'static str {
+        unsafe {
+            // Online speech recognition — the WinRT recognizer's master
+            // switch; absent means untouched (on by default).
+            let mut accepted = 1u32;
+            let mut len = 4u32;
+            if RegGetValueW(
+                HKEY_CURRENT_USER,
+                w!(r"Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy"),
+                w!("HasAccepted"),
+                RRF_RT_REG_DWORD,
+                None,
+                Some(&mut accepted as *mut u32 as *mut _),
+                Some(&mut len),
+            )
+            .is_ok()
+                && accepted == 0
+            {
+                return "turn on Settings → Privacy & security → Speech → Online speech recognition";
+            }
+
+            // Microphone access for the device class — only an explicit
+            // "Deny" is a block.
+            let mut value = [0u16; 8];
+            let mut len = 16u32;
+            if RegGetValueW(
+                HKEY_CURRENT_USER,
+                w!(r"Software\Microsoft\Windows\CurrentVersion\DeviceAccess\Global\{E5323777-F976-4f5b-9B55-B94699C46E44}"),
+                w!("Value"),
+                RRF_RT_REG_SZ,
+                None,
+                Some(value.as_mut_ptr() as *mut _),
+                Some(&mut len),
+            )
+            .is_ok()
+                && len >= 8
+                && value[..4] == [b'D' as u16, b'e' as u16, b'n' as u16, b'y' as u16]
+            {
+                return "turn on Settings → Privacy & security → Microphone";
+            }
+        }
+        "check microphone access and Windows speech settings"
+    }
+
     /// The default capture endpoint's peak meter — the same source the
     /// Settings microphone test reads — live while the recognizer streams.
     fn endpoint_meter() -> Option<IAudioMeterInformation> {
         unsafe {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-            let device = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole).ok()?;
+            let device = enumerator
+                .GetDefaultAudioEndpoint(eCapture, eConsole)
+                .ok()?;
             device
                 .Activate::<IAudioMeterInformation>(CLSCTX_ALL, None)
                 .ok()

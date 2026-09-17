@@ -133,6 +133,14 @@ nucleo-matcher = "0.3"
 lto = "thin"
 strip = "symbols"
 
+[profile.fastrel]
+# Release-quality test build without the thin-LTO link time. Same opt-level
+# and code as release; use for local verification when release is too slow:
+#   cargo build --profile fastrel -p zeron --bin cosmos
+inherits = "release"
+lto = false
+incremental = true
+
 [profile.dev]
 # gpui is slow unoptimized; match zed's approach for deps
 opt-level = 0
