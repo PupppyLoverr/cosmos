@@ -272,6 +272,33 @@ pub(crate) fn crash_message(
 /// shell plus curl can still drive it.
 pub const BROWSER_BRIDGE_ENV: &str = "ZERON_BROWSER_MCP";
 
+/// Applied only to the transient harness request, after journaling the user's
+/// original prompt. All providers receive the same browser routing guidance;
+/// discovery and title-only runs never receive browser instructions.
+pub fn prepare_browser_prompt(request: &mut RunRequest) {
+    if browser_bridge_url(request).is_none() {
+        return;
+    }
+    request.prompt = format!(
+        "<cosmos_browser>\n\
+         Cosmos provides its own embedded browser, visible in the desktop app. \
+         For website navigation and interaction, use the browser_* tools from \
+         the zeron-browser server (the tool prefix may appear as zeron_browser). \
+         This server controls Cosmos tabs and their signed-in cookies. Start with \
+         browser_tabs or browser_state; use browser_open if no tab exists. Prefer \
+         this browser over external browser MCP servers, standalone browsers, \
+         headless automation, or web-fetch tools unless the user explicitly requests another. \
+         If these tools are not exposed by your harness, use a shell HTTP client \
+         to POST JSON-RPC to the URL in the ZERON_BROWSER_MCP environment variable: \
+         {{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{{}}}} \
+         discovers tools; tools/call takes {{\"name\":\"browser_tabs\",\"arguments\":{{}}}}. \
+         Use Content-Type: application/json. Keep that private URL out of messages and files. \
+         If the embedded browser is unavailable, report the failure instead of silently \
+         switching to another browser.\n</cosmos_browser>\n\n{}",
+        request.prompt
+    );
+}
+
 /// The run's bridge endpoint, if the UI stamped one (local chats only).
 pub(crate) fn browser_bridge_url(request: &RunRequest) -> Option<&str> {
     zeron_proto::browser_bridge_url(request)
@@ -370,4 +397,47 @@ pub fn supports_titles(id: HarnessId) -> bool {
         id,
         HarnessId::Codex | HarnessId::ClaudeCode | HarnessId::Mock
     )
+}
+
+#[cfg(test)]
+mod browser_prompt_tests {
+    use super::*;
+    use zeron_proto::BROWSER_BRIDGE_OPTION;
+
+    fn request(prompt: &str, url: Option<&str>) -> RunRequest {
+        let mut request: RunRequest = serde_json::from_value(serde_json::json!({
+            "prompt": prompt, "cwd": ".", "sandbox": "workspace-write"
+        }))
+        .unwrap();
+        if let Some(url) = url {
+            request.model_options.insert(
+                BROWSER_BRIDGE_OPTION.into(),
+                serde_json::json!({ "url": url }),
+            );
+        }
+        request
+    }
+
+    #[test]
+    fn leaves_the_user_prompt_alone_without_a_bridge() {
+        let mut run = request("Browse the docs", None);
+        prepare_browser_prompt(&mut run);
+        assert_eq!(run.prompt, "Browse the docs");
+    }
+
+    #[test]
+    fn prepends_routing_guidance_and_keeps_the_user_prompt() {
+        let url = "http://127.0.0.1:43123/mcp/0123456789abcdef0123456789abcdef";
+        let mut run = request("Browse the docs", Some(url));
+        prepare_browser_prompt(&mut run);
+        assert!(run.prompt.starts_with("<cosmos_browser>\n"));
+        assert!(run.prompt.contains("zeron-browser"));
+        assert!(run.prompt.contains("ZERON_BROWSER_MCP"));
+        assert!(
+            run.prompt.ends_with("\n\nBrowse the docs"),
+            "{}",
+            run.prompt
+        );
+        assert_eq!(zeron_proto::browser_bridge_url(&run), Some(url));
+    }
 }

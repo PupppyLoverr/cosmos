@@ -110,11 +110,14 @@ pub fn browser_bridge_url(request: &RunRequest) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
-/// `model_options` keys carrying zeron-internal run directives (underscore-
-/// prefixed, never harness config). RuntimeConfig comparisons ignore them —
-/// they mark ONE run's behavior, not the session's runtime shape.
+/// `model_options` keys carrying zeron-internal run directives, never harness
+/// config. RuntimeConfig comparisons ignore them — they mark ONE run's
+/// behavior, not the session's runtime shape. Includes underscore-prefixed
+/// `_zeron*` keys and the host-local embedded-browser endpoint, whose URL
+/// must not restart a live runtime when a later send inherits a different
+/// window.
 pub fn is_internal_option(key: &str) -> bool {
-    key.starts_with("_zeron")
+    key.starts_with("_zeron") || key == BROWSER_BRIDGE_OPTION
 }
 
 /// One resumable harness session — a `/resume` picker row. `id` is the
@@ -663,5 +666,18 @@ mod generated_image_tests {
         assert_eq!(value["type"], "generatedImage");
         assert_eq!(value["mimeType"], "image/png");
         assert_eq!(serde_json::from_value::<AgentEvent>(value).unwrap(), event);
+    }
+}
+
+#[cfg(test)]
+mod internal_option_tests {
+    use super::*;
+
+    #[test]
+    fn browser_bridge_is_internal_and_harness_options_are_not() {
+        assert!(is_internal_option("_zeron_attach_replay"));
+        assert!(is_internal_option(BROWSER_BRIDGE_OPTION));
+        assert!(!is_internal_option("serviceTier"));
+        assert!(!is_internal_option("zeron_unrelated"));
     }
 }

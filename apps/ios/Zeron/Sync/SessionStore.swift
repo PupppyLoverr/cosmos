@@ -63,6 +63,14 @@ final class SessionStore {
     private(set) var lastSubmittedMessageId: String?
     /// Presentation state survives navigation with the warm session store.
     var expandedUserMessages: Set<String> = []
+    /// Unsent composer text. Survives leaving the session; persisted locally
+    /// so a killed app still restores it. Never synced.
+    var composerDraft: String = "" {
+        didSet { persistComposerDraft() }
+    }
+    /// Staged images for the unsent draft. In-memory only — they are already
+    /// on the photo library if the user picked them again.
+    var composerAttachments: [StagedAttachment] = []
 
     let doc = LoroDoc()
     /// The chat2 room cursor — the last server row seq folded into `doc`.
@@ -92,6 +100,23 @@ final class SessionStore {
         self.config = config
         self.offline = offline
         AttachmentImageCache.shared.configure(config: config)
+        composerDraft = UserDefaults.standard.string(forKey: Self.draftKey(chatId)) ?? ""
+    }
+
+    private static func draftKey(_ chatId: String) -> String { "composerDraft.\(chatId)" }
+
+    private func persistComposerDraft() {
+        let key = Self.draftKey(chatId)
+        if composerDraft.isEmpty {
+            UserDefaults.standard.removeObject(forKey: key)
+        } else {
+            UserDefaults.standard.set(composerDraft, forKey: key)
+        }
+    }
+
+    func clearComposerDraft() {
+        composerDraft = ""
+        composerAttachments = []
     }
 
     // MARK: Attachments (uploads target the chat's host device)

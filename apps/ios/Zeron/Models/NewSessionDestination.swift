@@ -11,6 +11,14 @@ enum NewSessionDestination: Hashable {
         return spaces.first { $0.id == id }
     }
 
+    /// Local-only key for restoring an unsent new-session draft.
+    var draftKey: String {
+        switch self {
+        case .project(let id): "project.\(id)"
+        case .projectless(let id): "host.\(id)"
+        }
+    }
+
     func deviceId(spaces: [Space], devices: [DeviceRow]) -> String? {
         switch self {
         case .project:

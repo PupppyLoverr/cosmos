@@ -21,6 +21,7 @@ struct HomeView: View {
     @State private var path: [Route] = []
     @State private var showNewSpace = false
     @State private var showProjectlessDevices = false
+    @State private var confirmSignOut = false
     // "" = All. Sticky across launches; falls back to All if the space is gone.
     @AppStorage("homeSpaceFilter") private var spaceFilter: String = ""
 
@@ -30,18 +31,10 @@ struct HomeView: View {
 
     var body: some View {
         NavigationStack(path: $path) {
-            List {
-                sessionsSection
-                // The desktop's archived shelf sits under the active list,
-                // scoped by the same space filter.
-                ArchivedSection(spaceId: selectedSpace?.id, path: $path)
+            SessionList(spaceId: selectedSpace?.id, path: $path) {
+                if let selectedSpace { path.append(.newSession(spaceId: selectedSpace.id)) }
+                else { showProjectlessDevices = true }
             }
-            .listStyle(.plain)
-            .environment(\.defaultMinListRowHeight, 10)
-            .contentMargins(.top, 2, for: .scrollContent)
-            .scrollContentBackground(.hidden)
-            .scrollEdgeEffectStyle(.soft, for: .top)
-            .background(Theme.surface.ignoresSafeArea())
             .navigationTitle("Cosmos")  // feeds the back menu; not displayed
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(removing: .title)
@@ -106,11 +99,24 @@ struct HomeView: View {
                         if model.demo != nil {
                             Text("Demo mode")
                         }
-                        Button("Sign out", role: .destructive) { model.signOut() }
+                        if (selectedSpace.map { model.chats(in: $0.id) } ?? model.overviewChats)
+                            .contains(where: \.unseen) {
+                            Button("Mark all as read", systemImage: "checkmark.circle") {
+                                model.markAllSeen(in: selectedSpace?.id)
+                            }
+                        }
+                        Button("Reconnect", systemImage: "arrow.clockwise") { model.foregrounded() }
+                        Button("Sign out", role: .destructive) { confirmSignOut = true }
                     } label: {
                         Image(systemName: "person.circle")
                     }
+                    .accessibilityLabel("Account")
                 }
+            }
+            .confirmationDialog("Sign out of Cosmos?", isPresented: $confirmSignOut, titleVisibility: .visible) {
+                Button("Sign out", role: .destructive) { model.signOut() }
+            } message: {
+                Text("Local session data will be removed from this phone. Your synced sessions remain on your account.")
             }
             .sheet(isPresented: $showNewSpace) {
                 NewSpaceSheet { spaceId in
@@ -144,6 +150,7 @@ struct HomeView: View {
                 }
             }
         }
+        .opensWebLinksInApp()
     }
 
     // MARK: Space dropdown
@@ -254,186 +261,4 @@ struct HomeView: View {
         .accessibilityLabel("New session")
         .accessibilityIdentifier("new-session")
     }
-
-    // MARK: Sessions
-
-    private var sessionsSection: some View {
-        Section {
-            let chats = selectedSpace.map { model.chats(in: $0.id) } ?? model.overviewChats
-            if chats.isEmpty {
-                Text("No sessions yet — start one with +")
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textFaint)
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-            }
-            ForEach(chats) { chat in
-                // Location shows even when scoped — without it the row's
-                // first line is just a floating dot and a timestamp.
-                ChatRow(chat: chat, showLocation: true) {
-                    path.append(.chat(chat.id))
-                }
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-                .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
-                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    Button {
-                        // withAnimation, not a value-keyed .animation: the row
-                        // leaves THIS section and lands in the archived shelf
-                        // — one coordinated List diff, or the hand-off jumps.
-                        withAnimation(Motion.resort) {
-                            model.archive(chatId: chat.id)
-                        }
-                    } label: {
-                        Label("Archive", systemImage: "archivebox")
-                    }
-                    .tint(Theme.surfaceRaised)
-                }
-            }
-            .motionAnimation(Motion.resort, value: chats.map(\.id))
-        }
-    }
-}
-
-// MARK: - Rows
-
-/// The desktop session row (shell.rs `render_chat_row`), line for line: a
-/// muted context line with the status word in the corner (dot + word, muted;
-/// Done keeps its pop with a check; Idle rows carry the time-ago there
-/// instead); the title on its own line; harness mark and branch close it out,
-/// with the mini spinner riding the row's bottom-right while Working.
-///
-/// The one addition the phone needs: the desktop row names only the space
-/// because its sidebar sits on the machine running the work. Here the Sessions
-/// list interleaves every device, and a session whose host has gone offline
-/// can't be driven at all — so the context line reads "space @ device".
-struct ChatRow: View {
-    @Environment(AppModel.self) private var model
-    let chat: Chat
-    var showLocation: Bool
-    let onSelect: () -> Void
-
-    private var subline: Color { Theme.textMuted.opacity(0.5) }
-
-    var body: some View {
-        // The 1Hz pulse (live only while something is degraded or pending)
-        // re-derives the send badge as its grace clocks advance.
-        let _ = model.connectivity.pulse
-        let indicator = model.indicator(for: chat)
-        let sendState = model.sendState(for: chat)
-        let pullRequest = model.changeRequest(for: chat)
-        ZStack(alignment: .bottomTrailing) {
-            Button(action: onSelect) {
-                content(indicator: indicator, sendState: sendState,
-                        reservesPullRequest: pullRequest != nil)
-            }
-            .buttonStyle(PressWashButtonStyle())
-            if let pullRequest {
-                PullRequestBadge(summary: pullRequest)
-                    .padding(.trailing, 8)
-                    .padding(.bottom, 6)
-                    .zIndex(1)
-            }
-        }
-    }
-
-    /// Undelivered-send override for the corner slot (shell.rs precedence:
-    /// Failed > Queued > the normal indicator). Suppresses the Working
-    /// spinner too — no fake progress on a send that hasn't left.
-    private func sendBadge(_ state: SendState) -> (label: String, color: Color)? {
-        switch state {
-        case .failed: return ("Failed", Theme.danger)
-        case .queued: return ("Queued", Theme.warning)
-        case .sending: return nil
-        }
-    }
-
-    private func content(indicator: ChatIndicator, sendState: SendState?,
-                         reservesPullRequest: Bool) -> some View {
-        let badge = sendState.flatMap(sendBadge)
-        return VStack(alignment: .leading, spacing: 2) {
-            // Line 1: space @ device, status corner (time-ago when idle).
-            HStack(spacing: 8) {
-                if showLocation {
-                    Text(location)
-                        .font(Theme.sans(13))
-                        .foregroundStyle(subline)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    Spacer(minLength: 4)
-                }
-                if let badge {
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(badge.color)
-                            .frame(width: 6, height: 6)
-                        Text(badge.label)
-                            .font(Theme.sans(12, weight: .medium))
-                            .foregroundStyle(badge.color)
-                    }
-                } else if indicator == .idle {
-                    Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
-                        .font(Theme.sans(12, weight: .medium))
-                        .foregroundStyle(subline)
-                        .fixedSize()
-                } else {
-                    StatusCorner(indicator: indicator)
-                }
-            }
-
-            // Line 2: the session title.
-            Text(chat.displayTitle)
-                .font(Theme.sans(17, weight: .medium))
-                .foregroundStyle(Theme.text)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            // Line 3: harness brand mark, then the branch when the engine
-            // stamped one; the Working spinner rides bottom-right.
-            HStack(spacing: 4) {
-                if let harness = chat.config?.harness {
-                    HarnessBadge(harness: harness, size: 11, neutral: subline)
-                }
-                if let branch = chat.branch?.trimmingCharacters(in: .whitespaces), !branch.isEmpty {
-                    LineIconView(.gitBranch, size: 11, color: subline)
-                    Text(branch)
-                        .font(Theme.sans(13))
-                        .foregroundStyle(subline)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-                Spacer(minLength: 0)
-                if indicator == .working, badge == nil {
-                    MiniSpinner()
-                }
-            }
-            .padding(.trailing, reservesPullRequest ? 46 : 0)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .contentShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    /// "space @ device" (the session header's format). The space name (not
-    /// the cwd basename) is what the desktop row shows — they differ once a
-    /// space has been renamed, or when the session runs in a worktree off to
-    /// the side. No offline marker: the dropdown carries device liveness.
-    private var location: String {
-        let space = chat.spaceId == nil ? "No project" : (
-            model.space(for: chat)?.displayName
-                ?? chat.cwd.map { ($0 as NSString).lastPathComponent }
-                ?? "?"
-        )
-        return "\(space) @ \(model.deviceName(chat.deviceId))"
-    }
-}
-
-func relativeTime(_ ms: Int64) -> String {
-    let delta = max(0, nowMs() - ms) / 1000
-    if delta < 60 { return "now" }
-    if delta < 3600 { return "\(delta / 60)m" }
-    if delta < 86_400 { return "\(delta / 3600)h" }
-    return "\(delta / 86_400)d"
 }

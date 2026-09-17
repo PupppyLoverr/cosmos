@@ -7,6 +7,7 @@ import SwiftUI
 struct SessionView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.dismiss) private var dismiss
     let chatId: String
 
     /// Width the nav bar's own controls need around a LEADING title — the
@@ -14,7 +15,7 @@ struct SessionView: View {
     /// a fixed-width item that does NOT fit gets evicted into a trailing "…"
     /// overflow menu (where a custom text stack renders as nothing) — seen on
     /// iPhone Air at 110.
-    private static let headerChromeInset: CGFloat = 170
+    private static let headerChromeInset: CGFloat = 210
 
     /// The view's own width, the only reliable basis for capping the principal
     /// toolbar item (its container proposes an unbounded width).
@@ -22,6 +23,7 @@ struct SessionView: View {
 
     /// Follow intent belongs to the session, independent of composer focus.
     @State private var scroll = ScrollState()
+    @State private var renaming = false
 
 
     private var chat: Chat? { model.chat(id: chatId) }
@@ -37,14 +39,11 @@ struct SessionView: View {
                 content(chat: chat, store: store)
                     .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewWidth = $0 }
             } else {
-                VStack(spacing: 12) {
-                    CosmosPulse()
-                    Text("Opening session…")
-                        .font(Theme.sans(12))
-                        .foregroundStyle(Theme.textFaint)
+                SessionRecoveryView(title: "Opening session…", detail: "This session may still be syncing or may no longer be available.") {
+                    model.foregrounded()
+                } close: {
+                    dismiss()
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Theme.bg)
             }
         }
         .navigationTitle(chat?.displayTitle ?? "Session")  // feeds the back menu
@@ -75,12 +74,32 @@ struct SessionView: View {
                     // frame collapses to its minimum ("S…"). Claiming the
                     // remainder of the bar outright lays the texts out with
                     // real room and truncates them properly.
-                    .frame(width: max(140, viewWidth - Self.headerChromeInset),
+                    .frame(width: max(80, viewWidth - Self.headerChromeInset),
                            alignment: .leading)
                 }
                 // Bare text on the bar, not a glass capsule.
                 .sharedBackgroundVisibility(.hidden)
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button("Rename", systemImage: "pencil") { renaming = true }
+                        Button("Reconnect", systemImage: "arrow.clockwise") { model.foregrounded() }
+                        Button(chat.archived ? "Unarchive" : "Archive",
+                               systemImage: chat.archived ? "arrow.up.bin" : "archivebox") {
+                            withAnimation(Motion.resort) {
+                                if chat.archived { model.unarchive(chatId: chat.id) }
+                                else { model.archive(chatId: chat.id) }
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                    }
+                    .accessibilityLabel("Session actions")
+                    .accessibilityIdentifier("session-actions")
+                }
             }
+        }
+        .sheet(isPresented: $renaming) {
+            if let chat { RenameSessionSheet(chat: chat) }
         }
         .onAppear {
             model.markSeen(chatId: chatId)
@@ -109,11 +128,25 @@ struct SessionView: View {
         // The composer owns real layout space. The transcript's viewport ends
         // above it, so keyboard and glass morphs cannot cover the last row.
         return VStack(spacing: 0) {
+            if chat.archived {
+                HStack {
+                    Label("Archived session", systemImage: "archivebox")
+                        .foregroundStyle(Theme.textMuted)
+                    Spacer()
+                    Button("Unarchive") { model.unarchive(chatId: chat.id) }
+                        .frame(minHeight: 44)
+                }
+                .font(Theme.sans(13))
+                .padding(.horizontal, 20)
+            }
             TranscriptView(store: store, chatId: chat.id, scroll: scroll)
                 .overlay {
                     if store.entries.isEmpty, store.pendingSends.isEmpty,
                        chat.lastMessageAt != nil {
-                        TranscriptSkeleton().background(Theme.bg)
+                        SessionRecoveryView(title: "Loading messages…", detail: "Your messages are still syncing. Check your connection and try again.") {
+                            store.kickRoom()
+                            model.foregrounded()
+                        }
                     }
                 }
                 .motionAnimation(Motion.fadeQuick, value: store.entries.isEmpty)

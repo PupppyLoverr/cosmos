@@ -1228,6 +1228,16 @@ impl RpcService for EngineRpc {
         }
         match method {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
+            methods::REGISTER_BROWSER => {
+                let url = params
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RpcError::Failed("Missing browser endpoint".into()))?;
+                self.sessions
+                    .register_browser(url)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({"ok": true}))
+            }
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
@@ -2485,6 +2495,7 @@ mod tests {
     #[test]
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
+        assert!(!forwardable(methods::REGISTER_BROWSER));
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));
         assert!(forwardable(methods::QUEUE_COMMAND));

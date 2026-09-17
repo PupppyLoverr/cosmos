@@ -240,8 +240,9 @@ struct ComposerView: View {
     let chat: Chat
     let runLive: Bool
 
+    /// Queue-edit buffer only. The live composer reads and writes
+    /// `store.composerDraft` so navigating away cannot lose unsent text.
     @State private var text = ""
-    @State private var attachments: [StagedAttachment] = []
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var showPicker = false
     @State private var uploading = false
@@ -283,6 +284,16 @@ struct ComposerView: View {
         HarnessCatalog.selectedChoice(
             for: option,
             selectedId: chat.config?.modelOptions[option.id]?.stringValue
+        )
+    }
+
+    /// Live composer text lives on the warm session store; queue edits keep a
+    /// local buffer so cancelling restores the unsent draft.
+    private var composerDraft: Binding<String> {
+        if queueEdit != nil { return $text }
+        return Binding(
+            get: { store.composerDraft },
+            set: { store.composerDraft = $0 }
         )
     }
 
@@ -346,7 +357,7 @@ struct ComposerView: View {
                 .accessibilityHint(queueEdit?.terminal == true ? "Copies the edit and restores your previous draft" : "")
             }
             ComposerShell(
-                draft: $text,
+                draft: composerDraft,
                 placeholder: editingQueuedId == nil ? "Message" : "Edit queued message",
                 sendEnabled: true,
                 sendLabel: editingQueuedId != nil ? "Save queued message"
@@ -358,9 +369,9 @@ struct ComposerView: View {
                 onSend: send,
                 onStop: { store.sendInterrupt() },
                 onAdvanceQueue: advanceQueue,
-                attachments: editingQueuedId == nil ? attachments : [],
+                attachments: editingQueuedId == nil ? store.composerAttachments : [],
                 onAttach: editingQueuedId == nil ? { showPicker = true } : nil,
-                onRemoveAttachment: { id in attachments.removeAll { $0.id == id } },
+                onRemoveAttachment: { id in store.composerAttachments.removeAll { $0.id == id } },
                 autoFocus: model.launchFocusComposer
             ) {
                 if let pullRequest = model.changeRequest(for: chat) {
@@ -446,7 +457,7 @@ struct ComposerView: View {
         .onDisappear {
             queueEditorVisible = false
             guard let lease = queueEditLease else { return }
-            text = queueEdit?.originalDraft ?? ""
+            // The live draft stayed on the store for the whole edit.
             queueEdit = nil
             queueEditBusy = false
             Task { _ = await store.finishQueuedEdit(lease, action: "cancel") }
@@ -499,7 +510,7 @@ struct ComposerView: View {
                     failed += 1
                     continue
                 }
-                attachments.append(staged)
+                store.composerAttachments.append(staged)
             }
             pickerItems = []
             if failed > 0 {
@@ -532,7 +543,7 @@ struct ComposerView: View {
                 _ = await store.finishQueuedEdit(lease, action: "cancel")
                 return
             }
-            queueEdit = QueueComposerEdit(lease: lease, originalDraft: text,
+            queueEdit = QueueComposerEdit(lease: lease, originalDraft: store.composerDraft,
                                           hasAttachments: !item.attachments.isEmpty)
             text = MessageQueue.visibleText(lease.text, attachments: item.attachments)
             uploadError = nil
@@ -574,7 +585,6 @@ struct ComposerView: View {
         queueEdit?.receive(result)
         switch result {
         case .finished:
-            text = queueEdit?.originalDraft ?? ""
             queueEdit = nil
             uploadError = nil
         case .conflict:
@@ -595,9 +605,9 @@ struct ComposerView: View {
             Task { await commitQueueEdit() }
             return
         }
-        let submittedText = text
+        let submittedText = store.composerDraft
         let prompt = submittedText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let staged = attachments
+        let staged = store.composerAttachments
         guard !runLive || model.hostSupportsMessageQueue(chat, attachments: !staged.isEmpty) else {
             uploadError = "Update the chat's engine to queue messages during a response."
             return
@@ -606,7 +616,7 @@ struct ComposerView: View {
 
         if staged.isEmpty {
             deliver(content: prompt, paths: [])
-            clearDraft(matching: submittedText)
+            clearDraft(matching: submittedText, clearAttachments: true)
             return
         }
         if model.hostSupportsQueuedAttachments(chat)
@@ -629,8 +639,7 @@ struct ComposerView: View {
             }
             store.sendWithTransfers(prompt: prompt, chat: chat, live: runLive,
                                     transfers: transfers)
-            attachments = []
-            clearDraft(matching: submittedText)
+            clearDraft(matching: submittedText, clearAttachments: true)
             return
         }
         // Legacy host-staged flow (host < 0.2.12): upload first, send after —
@@ -660,8 +669,7 @@ struct ComposerView: View {
                     paths.append(path)
                 }
                 deliver(content: withAttachments(text: prompt, paths: paths), paths: paths)
-                attachments = []
-                clearDraft(matching: submittedText)
+                clearDraft(matching: submittedText, clearAttachments: true)
             } catch {
                 uploadError = "Attachment upload failed — \(error.localizedDescription)"
             }
@@ -711,10 +719,12 @@ struct ComposerView: View {
         Task { await store.performQueueAction(id: item.id, action: action) }
     }
 
-    private func clearDraft(matching submittedText: String) {
+    private func clearDraft(matching submittedText: String, clearAttachments: Bool) {
+        if clearAttachments { store.composerAttachments = [] }
         // A legacy attachment upload can finish after the user edits the draft.
-        guard text == submittedText else { return }
-        text = ""
+        guard store.composerDraft == submittedText else { return }
+        store.composerDraft = ""
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 }
 

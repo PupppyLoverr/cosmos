@@ -16,6 +16,7 @@ struct ArchivedSection: View {
     /// Scope, matching the list above it: nil = All.
     var spaceId: String?
     @Binding var path: [Route]
+    var searchText = ""
 
     // spaces.rs INITIAL/PAGE. Both session-transient, like the desktop's.
     @State private var open = true
@@ -26,11 +27,20 @@ struct ArchivedSection: View {
     private static let rowInsets = EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12)
 
     var body: some View {
-        let archived = model.archivedChats(in: spaceId)
+        let archived = model.archivedChats(in: spaceId).filter { model.matchesSearch($0, query: searchText) }
+        let searching = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if !archived.isEmpty {
             Section {
-                header(count: archived.count)
-                if open {
+                if searching {
+                    Text("Archived (\(archived.count))")
+                        .font(Theme.sans(13, weight: .medium))
+                        .foregroundStyle(Theme.textMuted)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                } else {
+                    header(count: archived.count)
+                }
+                if open || searching {
                     // Distinct identity namespace (desktop's "archived-{id}"
                     // vs "c:{id}" FLIP keys): the SAME id in both ForEach made
                     // SwiftUI animate archiving as a cross-section MOVE — the
@@ -104,6 +114,7 @@ struct ArchivedSection: View {
             .contentShape(RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(PressWashButtonStyle())
+        .sessionRowActions(chat: chat)
         .listRowBackground(Color.clear)
         .listRowSeparator(.hidden)
         .listRowInsets(Self.rowInsets)

@@ -8135,6 +8135,19 @@ impl Composer {
                     }
                 }
 
+                // Register before either delivery path, including the first
+                // queued send before the viewport heartbeat has run.
+                if let Some(info) = browser_bridge.as_ref() {
+                    let _ = attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::REGISTER_BROWSER,
+                        serde_json::json!({"url": info.url}),
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await;
+                }
+
                 if queue {
                     // A queue row is editable UI state, so its text must stay
                     // free of the internal attachment-path trailer. The host

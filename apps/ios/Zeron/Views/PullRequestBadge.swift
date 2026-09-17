@@ -52,7 +52,7 @@ struct PullRequestBadge: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(summary.accessibilityLabel)
-        .accessibilityHint("Opens in your browser")
+        .accessibilityHint("Opens in the in-app browser")
     }
 
     private var badgeShape: RoundedRectangle {

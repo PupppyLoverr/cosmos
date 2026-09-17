@@ -541,6 +541,28 @@ final class AppModel {
     func archive(chatId: String) { setArchived(chatId: chatId, archived: true) }
     func unarchive(chatId: String) { setArchived(chatId: chatId, archived: false) }
 
+    func rename(chatId: String, title: String) {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return }
+        if let demo {
+            if let index = demo.chats.firstIndex(where: { $0.id == chatId }) {
+                demo.chats[index].title = title
+            }
+        } else {
+            workspace?.rename(chatId: chatId, title: title)
+        }
+    }
+
+    func matchesSearch(_ chat: Chat, query: String) -> Bool {
+        chat.matchesSessionSearch(query,
+            project: space(for: chat)?.displayName ?? (chat.spaceId == nil ? "No project" : ""),
+            device: deviceName(chat.deviceId))
+    }
+
+    func refreshOverview() async {
+        await workspace?.refreshOverview()
+    }
+
     private func setArchived(chatId: String, archived: Bool) {
         if let demo {
             if let ix = demo.chats.firstIndex(where: { $0.id == chatId }) {
@@ -559,6 +581,13 @@ final class AppModel {
             return
         }
         workspace?.setChatConfig(chatId: chatId, config: config)
+    }
+
+    func markAllSeen(in spaceId: String? = nil) {
+        let chats = spaceId.map { self.chats(in: $0) } ?? overviewChats
+        for chat in chats where chat.unseen {
+            markSeen(chatId: chat.id)
+        }
     }
 
     func markSeen(chatId: String) {

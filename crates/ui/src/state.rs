@@ -1763,6 +1763,7 @@ impl AppState {
         self.local_device_id = Some(engine_info.device_id.clone());
         self.engine = Some(handle.clone());
         let mut watch_tasks = Vec::with_capacity(8);
+        watch_tasks.push(spawn_browser_registration(cx, handle.clone()));
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
             watch_tasks.push(task);
         }
@@ -2082,6 +2083,31 @@ fn spawn_deferred_engine_watch(
 /// Chats watch. Boot selection is the shell's job (it lands on the first
 /// restored open tab, device-local state this entity can't see); this task
 /// only pumps frames.
+fn spawn_browser_registration(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        loop {
+            let Ok(bridge) = this.update(cx, |state, _| state.browser_bridge.clone()) else {
+                return;
+            };
+            if let Some(bridge) = bridge {
+                // Uses the local engine connection, never targetDeviceId. A
+                // bounded call lets the lease recover after an IPC outage.
+                let _ = crate::attachments::call_with_timeout(
+                    &handle,
+                    cx.background_executor(),
+                    methods::REGISTER_BROWSER,
+                    serde_json::json!({"url": bridge.url}),
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+            }
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(10))
+                .await;
+        }
+    })
+}
+
 fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
         // Resubscribe loop (same contract as the transcript watch): a daemon

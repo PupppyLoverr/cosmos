@@ -271,6 +271,16 @@ struct NewSessionView: View {
                     try? await Task.sleep(nanoseconds: 800_000_000)
                     send()
                 }
+            } else if draft.isEmpty {
+                draft = UserDefaults.standard.string(forKey: draftStorageKey) ?? ""
+            }
+        }
+        .onChange(of: draft) { _, value in
+            persistDraft(value)
+        }
+        .onChange(of: selectedHostId) { _, _ in
+            if draft.isEmpty {
+                draft = UserDefaults.standard.string(forKey: draftStorageKey) ?? ""
             }
         }
     }
@@ -435,6 +445,18 @@ struct NewSessionView: View {
             .padding(.bottom, 8)
     }
 
+    private var draftStorageKey: String {
+        "newSessionDraft.\(effectiveDestination.draftKey)"
+    }
+
+    private func persistDraft(_ value: String) {
+        if value.isEmpty {
+            UserDefaults.standard.removeObject(forKey: draftStorageKey)
+        } else {
+            UserDefaults.standard.set(value, forKey: draftStorageKey)
+        }
+    }
+
     /// Mint the chat per the checkout plan, queue the first run, swap to the
     /// live session. The atomic ordering (PRs #159/#170): anything that can
     /// FAIL stages before anything is created — a legacy attachment upload
@@ -533,6 +555,7 @@ struct NewSessionView: View {
             }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             draft = ""
+            persistDraft("")
             attachments = []
             busy = false
             // Replace the canvas with the live session (in-place swap, no

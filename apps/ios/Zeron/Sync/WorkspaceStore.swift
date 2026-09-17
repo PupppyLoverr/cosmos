@@ -134,6 +134,12 @@ final class WorkspaceStore {
                       rows: body.rows, presence: body.presence ?? [:]))
     }
 
+    /// A user refresh completes when the actual registry pull finishes.
+    func refreshOverview() async {
+        kickRoom()
+        await pullDelta()
+    }
+
     /// Flush pending op batches over HTTPS while the socket is down (LWW
     /// clocks make replays apply zero ops).
     private func pushPendingOverHTTP() async {

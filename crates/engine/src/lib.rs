@@ -17,6 +17,7 @@ use zeron_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
+mod browser;
 pub mod change_requests;
 pub mod chat2_host;
 pub mod diff_sync;

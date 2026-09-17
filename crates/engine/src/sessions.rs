@@ -85,10 +85,10 @@ struct RuntimeConfig {
 
 impl RuntimeConfig {
     fn from_request(harness_id: HarnessId, request: &RunRequest) -> Self {
-        // `_zeron_*` keys mark ONE run's behavior (an attach's replay flag),
-        // never the session's runtime shape — a stamped attach followed by an
-        // unstamped send must still route into the parked session, so
-        // internal directives are filtered out of the routing comparison.
+        // Internal keys mark ONE run's behavior (an attach's replay flag, the
+        // host-local browser endpoint), never the session's runtime shape — a
+        // stamped attach followed by an unstamped send must still route into
+        // the parked session, so they are filtered out of the comparison.
         let model_options: serde_json::Map<String, serde_json::Value> = request
             .model_options
             .iter()
@@ -141,6 +141,7 @@ struct RoutedSteer {
 }
 
 struct Inner {
+    browsers: Mutex<crate::browser::BrowserRegistry>,
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
@@ -184,6 +185,11 @@ pub struct SessionsEngine {
 }
 
 impl SessionsEngine {
+    /// A live desktop viewport renews its bridge lease over local IPC.
+    pub fn register_browser(&self, url: &str) -> Result<(), String> {
+        lock(&self.inner.browsers).renew(url, std::time::Instant::now())
+    }
+
     pub fn new(
         device_id: String,
         journal: Arc<RunJournal>,
@@ -192,6 +198,7 @@ impl SessionsEngine {
         let (sessions_tx, _) = watch::channel(Vec::new());
         Self {
             inner: Arc::new(Inner {
+                browsers: Mutex::new(Default::default()),
                 device_id,
                 journal,
                 registry,
@@ -371,6 +378,7 @@ impl SessionsEngine {
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
+        lock(&self.inner.browsers).prepare(&mut request, std::time::Instant::now());
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
@@ -1454,7 +1462,9 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
-    let mut stream = match harness.run(request, controls).await {
+    let mut harness_request = request;
+    zeron_harness::prepare_browser_prompt(&mut harness_request);
+    let mut stream = match harness.run(harness_request, controls).await {
         Ok(stream) => stream,
         Err(err) => {
             let message = err.to_string();
