@@ -28,6 +28,8 @@ fn config(
         default_harness: HarnessId::Mock,
         org_id: None,
         workos_client_id: workos_client_id.map(str::to_string),
+        firebase_custom_token_url: None,
+        firebase_refresh_url: None,
     }
 }
 
@@ -175,6 +177,21 @@ async fn serve_daemon_edge(
             serde_json::json!({
                 "accessToken": format!("e30.{claims}.sig"),
                 "refreshToken": "rotated-refresh"
+            })
+            .to_string()
+        } else if target.starts_with("/securetoken/v1/token") {
+            // Firebase-shaped refresh for Cosmos auth — the engine's staleness
+            // check reads the JWT's own iat/exp window.
+            let claims = serde_json::json!({
+                "iat": 1_000_u64,
+                "exp": 4_102_444_800_u64,
+                "org_id": "org_1"
+            });
+            let claims =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+            serde_json::json!({
+                "id_token": format!("e30.{claims}.sig"),
+                "refresh_token": "rotated-refresh"
             })
             .to_string()
         } else {
@@ -349,7 +366,10 @@ async fn revoked_captured_session_stays_on_its_synced_cache() {
     )
     .unwrap();
     let (edge_url, requests, edge_task) = rejecting_edge().await;
-    let config = config(dir.path(), edge_url, Some("client_test"), None);
+    let mut config = config(dir.path(), edge_url.clone(), Some("client_test"), None);
+    // Cosmos auth refreshes at the Firebase endpoint — the rejecting stub must
+    // be what the probe hits for revocation to be observed deterministically.
+    config.firebase_refresh_url = Some(format!("{edge_url}/securetoken/v1/token"));
     let auth = Engine::build_auth(&config).await;
     let scope = Engine::initial_workspace_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
@@ -389,12 +409,15 @@ async fn transient_refresh_failure_keeps_synced_recovery_supervisors_alive() {
         r#"{"refreshToken":"still-valid","user":{"id":"user_1","email":"u@example.com"},"orgId":"org_1"}"#,
     )
     .unwrap();
-    let config = config(
+    let mut config = config(
         dir.path(),
         "http://127.0.0.1:1".into(),
         Some("client_test"),
         None,
     );
+    // Cosmos auth refreshes at the Firebase endpoint — make the refresh path
+    // unreachable the same way the Edge is, so "offline" is not network luck.
+    config.firebase_refresh_url = Some("http://127.0.0.1:1/securetoken/v1/token".into());
     let auth = Engine::build_auth(&config).await;
     let scope = Engine::initial_workspace_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
@@ -430,7 +453,10 @@ async fn workspace_recovers_from_an_unreachable_edge_without_restarting() {
         dir.path().join("session.json"),
         r#"{"refreshToken":"still-valid","user":{"id":"user_1","email":"u@example.com"},"orgId":"org_1"}"#,
     ).unwrap();
-    let config = config(dir.path(), edge.url.clone(), Some("client_test"), None);
+    let mut config = config(dir.path(), edge.url.clone(), Some("client_test"), None);
+    // Cosmos auth refreshes at the Firebase endpoint, not the Edge's
+    // /auth/refresh — point it at the stub so "offline" is observable.
+    config.firebase_refresh_url = Some(format!("{}/securetoken/v1/token", edge.url));
     let auth = Engine::build_auth(&config).await;
     let scope = Engine::initial_workspace_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
@@ -582,6 +608,9 @@ async fn headless_sign_out_closes_joined_edge_rooms_and_stops_daemon() {
     };
     let mut engine_config = config(dir.path(), edge.url.clone(), Some("client_test"), None);
     engine_config.ipc_port = port;
+    // Cosmos auth refreshes at the Firebase endpoint — the session probe and
+    // room joins must reach the stub, not the public Google endpoint.
+    engine_config.firebase_refresh_url = Some(format!("{}/securetoken/v1/token", edge.url));
     let daemon = tokio::spawn(Engine::new(engine_config).run());
 
     let client = tokio::time::timeout(std::time::Duration::from_secs(5), async {

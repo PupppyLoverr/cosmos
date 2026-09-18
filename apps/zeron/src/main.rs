@@ -370,6 +370,10 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
         // `workos_client_id_from_env` for the dev-mode escape hatches.
         workos_client_id: workos_client_id_from_env(&edge_token),
         edge_token,
+        // Self-hosted/test Firebase endpoint overrides; production uses the
+        // Google defaults.
+        firebase_custom_token_url: std::env::var("ZERON_FIREBASE_CUSTOM_TOKEN_URL").ok(),
+        firebase_refresh_url: std::env::var("ZERON_FIREBASE_REFRESH_URL").ok(),
     }
 }
 

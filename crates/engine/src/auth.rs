@@ -1396,10 +1396,13 @@ mod tests {
             edge.room_url("/registry/org_1/ws").url().await,
             Err(zeron_sync::SyncError::TemporarilyUnavailable(message)) if &message == reason
         ));
-        assert!(matches!(
-            auth.list_orgs().await,
-            Err(EngineError::Token(TokenError::TemporarilyUnavailable(message))) if &message == reason
-        ));
+        // Woozlit personal workspaces are local state — list_orgs must not
+        // consume the network or spend a second DNS attempt.
+        assert_eq!(
+            auth.list_orgs().await.unwrap().len(),
+            1,
+            "local personal workspace survives the outage"
+        );
         assert_eq!(
             dns.calls.load(Ordering::SeqCst),
             1,

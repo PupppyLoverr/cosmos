@@ -24,6 +24,8 @@ fn config(
         default_harness: HarnessId::Mock,
         org_id: None,
         workos_client_id: workos_client_id.map(str::to_string),
+        firebase_custom_token_url: None,
+        firebase_refresh_url: None,
     }
 }
 

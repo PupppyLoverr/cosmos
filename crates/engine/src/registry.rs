@@ -824,19 +824,14 @@ mod tests {
             ]
         );
         // Antigravity and Amp mirror their drivers the same way (descriptor-
-        // stability rule): names, steering modes, effort ladders.
+        // stability rule): names, steering modes, effort ladders. Over ACP,
+        // Antigravity's effort levels live on its models, not the harness
+        // ladder.
         let agy = registry.resolve(HarnessId::Antigravity).unwrap();
         assert_eq!(agy.id(), HarnessId::Antigravity);
         assert_eq!(agy.display_name(), "Antigravity");
         assert_eq!(agy.steering_mode(), SteeringMode::TurnBoundary);
-        assert_eq!(
-            agy.reasoning_levels(),
-            &[
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High
-            ]
-        );
+        assert!(agy.reasoning_levels().is_empty());
         let amp = registry.resolve(HarnessId::Amp).unwrap();
         assert_eq!(amp.id(), HarnessId::Amp);
         assert_eq!(amp.display_name(), "Amp");

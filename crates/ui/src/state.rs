@@ -293,6 +293,8 @@ impl EngineHandle {
             default_harness: config.default_harness,
             org_id: config.org_id,
             workos_client_id: config.workos_client_id,
+            firebase_custom_token_url: None,
+            firebase_refresh_url: None,
         };
 
         // Own the data dir before opening anything under it or binding IPC —

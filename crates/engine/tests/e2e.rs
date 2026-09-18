@@ -973,11 +973,10 @@ async fn rpc_surface_over_in_memory_transport() {
         .await
         .unwrap()
         .unwrap();
-    // Delta protocol: the stream opens with a full reset frame.
-    assert_eq!(
-        initial,
-        serde_json::json!({ "reset": [], "contextUsage": null })
-    );
+    // Delta protocol: the stream opens with a full reset frame. The opening
+    // replay baseline rides along; dedicated rpc.rs tests cover its shape.
+    assert_eq!(initial["reset"], serde_json::json!([]));
+    assert_eq!(initial["contextUsage"], serde_json::Value::Null);
 
     // QueueCommand (as this device's composer would over IPC).
     let command = serde_json::to_value(SessionCommandPayload::Run {

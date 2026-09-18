@@ -118,6 +118,12 @@ pub struct EngineConfig {
     pub org_id: Option<String>,
     /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
     pub workos_client_id: Option<String>,
+    /// Firebase custom-token exchange endpoint override (self-hosted/tests);
+    /// `None` = the Google default derived from the configured API key.
+    pub firebase_custom_token_url: Option<String>,
+    /// Firebase refresh endpoint override (self-hosted/tests); `None` = the
+    /// Google default.
+    pub firebase_refresh_url: Option<String>,
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -630,6 +636,12 @@ impl Engine {
     pub async fn build_auth(config: &EngineConfig) -> Auth {
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
         auth_config.workos_client_id = config.workos_client_id.clone();
+        if let Some(url) = &config.firebase_custom_token_url {
+            auth_config.firebase_custom_token_url = url.clone();
+        }
+        if let Some(url) = &config.firebase_refresh_url {
+            auth_config.firebase_refresh_url = url.clone();
+        }
         if let Ok(base) = std::env::var("ZERON_WORKOS_API_BASE")
             && !base.trim().is_empty()
         {

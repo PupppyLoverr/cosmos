@@ -621,6 +621,10 @@ mod tools_tests {
     #[cfg(windows)]
     async fn echo_env(request: &RunRequest) -> String {
         let mut cmd = process::Command::new("cmd.exe");
+        // The child inherits this process's env — a test run inside a live
+        // Cosmos session carries a real COSMOS_TOOLS_MCP and the "unstamped"
+        // case would echo it back. Clear it so "unset" means unset.
+        cmd.env_remove(TOOLS_ENV);
         cmd.args(["/c", &format!("echo %{TOOLS_ENV}%")]);
         tools_env(&mut cmd, request);
         // Observe through the std escape hatch — the native Job-spawn path
@@ -632,6 +636,7 @@ mod tools_tests {
     #[cfg(not(windows))]
     async fn echo_env(request: &RunRequest) -> String {
         let mut cmd = process::Command::new("sh");
+        cmd.env_remove(TOOLS_ENV);
         cmd.args(["-c", &format!("echo ${TOOLS_ENV}")]);
         tools_env(&mut cmd, request);
         let output = cmd.output().await.unwrap();
