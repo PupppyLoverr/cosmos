@@ -233,6 +233,8 @@ mod tests {
             default_harness: HarnessId::Mock,
             org_id: None,
             workos_client_id: Some("client_test".into()),
+            firebase_custom_token_url: None,
+            firebase_refresh_url: None,
         }
     }
 

@@ -336,6 +336,8 @@ async fn dev_mode_is_signed_in_with_configured_bearer() {
 #[tokio::test]
 async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     let edge = StubEdge::start().await;
+    // Short-lived exchange token so the on-demand refresh below fires.
+    edge.state.token_ttl.store(20, Ordering::SeqCst);
     let dir = tempfile::tempdir().expect("tempdir");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
     assert!(auth.workos_enabled());
@@ -394,6 +396,8 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     assert!(
         matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), .. } if org == "user_1")
     );
+    // Woozlit has no org-scoped refresh; the stale exchange token triggers an
+    // on-demand refresh on the next token read instead.
     assert!(auth.token().await.is_ok());
     assert_eq!(
         edge.state
@@ -403,7 +407,7 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
             .first()
             .map(String::as_str),
         Some("refresh-1"),
-        "org refresh presents the stored refresh token"
+        "on-demand refresh presents the stored refresh token"
     );
     // Rotation persisted.
     let raw = std::fs::read_to_string(&session_file).expect("session persisted");
@@ -591,12 +595,9 @@ async fn temporary_token_errors_reach_http_and_websocket_consumers() {
         transport.fetch_rows(0).await,
         Err(zeron_sync::SyncError::TemporarilyUnavailable(_))
     ));
-    assert!(matches!(
-        auth.list_orgs().await,
-        Err(zeron_engine::EngineError::Token(
-            TokenError::TemporarilyUnavailable(_)
-        ))
-    ));
+    // Woozlit personal workspaces are local state — list_orgs stays up
+    // through the token outage and spends no extra refresh.
+    assert!(auth.list_orgs().await.is_ok());
     assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 1);
     assert!(auth.state().is_signed_in());
 }
@@ -732,7 +733,7 @@ async fn an_old_refresh_cannot_report_signed_out_after_a_new_sign_in() {
 
         auth.sign_out();
         let url = auth.start_headless_sign_in();
-        let state = query_param(&url, "state").unwrap();
+        let state = query_param(&login_callback(&url), "state").unwrap();
         auth.complete_sign_in(&format!("{state}.new-code"))
             .await
             .unwrap();

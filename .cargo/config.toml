@@ -1,0 +1,6 @@
+[target.x86_64-pc-windows-msvc]
+linker = "C:/Users/ravth/.rustup/toolchains/stable-x86_64-pc-windows-msvc/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+rustflags = ["-C", "linker-flavor=lld-link"]
+
+[alias]
+dev = "run -p zeron --bin cosmos"

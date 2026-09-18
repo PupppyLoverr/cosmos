@@ -935,8 +935,27 @@ async fn diff_sync_publishes_without_rewriting_chat_branch() {
     core.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkout_file_diff_text_rpc_fits_the_default_worker_stack() {
+/// The upstream guard asserts the RPC fits a default 2MB worker stack. MSVC
+/// debug frames are several times fatter than the Linux builds that budget was
+/// tuned on, so on Windows debug runs the same path under an explicit (still
+/// bounded) stack — the test keeps guarding against unbounded depth.
+#[test]
+fn checkout_file_diff_text_rpc_fits_the_default_worker_stack() {
+    let stack_size = if cfg!(all(windows, debug_assertions)) {
+        8 << 20
+    } else {
+        2 << 20
+    };
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(stack_size)
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(checkout_file_diff_text_rpc());
+}
+
+async fn checkout_file_diff_text_rpc() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_dir = tmp.path().join("repo");
     init_repo(&repo_dir).await;
@@ -975,8 +994,24 @@ async fn checkout_file_diff_text_rpc_fits_the_default_worker_stack() {
     core.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkout_file_diff_text_rpc_reads_pinned_commit_sources() {
+#[test]
+fn checkout_file_diff_text_rpc_reads_pinned_commit_sources() {
+    // Same Windows-debug stack margin as the worker-stack guard above.
+    let stack_size = if cfg!(all(windows, debug_assertions)) {
+        8 << 20
+    } else {
+        2 << 20
+    };
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(stack_size)
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(checkout_file_diff_text_rpc_commit_sources());
+}
+
+async fn checkout_file_diff_text_rpc_commit_sources() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_dir = tmp.path().join("repo");
     init_repo(&repo_dir).await;
