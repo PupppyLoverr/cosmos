@@ -996,7 +996,9 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
                 if !opened {
                     let url = auth.start_sign_in().await?;
                     println!("Sign in to Cosmos with your Woozlit account:\n\n  {url}\n");
-                    println!("A browser window should open. Log in on woozlit.com, then return here.");
+                    println!(
+                        "A browser window should open. Log in on woozlit.com, then return here."
+                    );
                     let _ = open_login_url(&url);
                     opened = true;
                 }

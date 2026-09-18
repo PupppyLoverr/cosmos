@@ -894,9 +894,7 @@ impl AcpHarness {
                     _ = &mut deadline => break,
                 }
             }
-            Ok::<Vec<zeron_proto::HarnessSession>, HarnessError>(
-                parse_session_list(&response),
-            )
+            Ok::<Vec<zeron_proto::HarnessSession>, HarnessError>(parse_session_list(&response))
         };
         let result = tokio::time::timeout(self.model_discovery_timeout, discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
@@ -993,8 +991,7 @@ impl AcpHarness {
             }
             Some(rows)
         };
-        let result =
-            tokio::time::timeout(self.model_discovery_timeout, discovery).await;
+        let result = tokio::time::timeout(self.model_discovery_timeout, discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
         result.ok().flatten()
     }
@@ -1420,9 +1417,11 @@ impl Harness for AcpHarness {
         let Some(root) = crate::home_dir().map(|h| h.join(".grok").join("sessions")) else {
             return Ok(probed);
         };
-        Ok(tokio::task::spawn_blocking(move || crate::sessions::scan_grok(&root))
-            .await
-            .unwrap_or_default())
+        Ok(
+            tokio::task::spawn_blocking(move || crate::sessions::scan_grok(&root))
+                .await
+                .unwrap_or_default(),
+        )
     }
 
     /// A `session/load` probe IS the transcript: the agent replays the stored
@@ -1442,8 +1441,9 @@ impl Harness for AcpHarness {
             if let Some(root) = root {
                 let id = session_id.to_string();
                 let rows = tokio::task::spawn_blocking(move || {
-                    crate::sessions::find_grok_session(&root, &id)
-                        .map(|dir| crate::sessions::grok_transcript(&dir.join("chat_history.jsonl")))
+                    crate::sessions::find_grok_session(&root, &id).map(|dir| {
+                        crate::sessions::grok_transcript(&dir.join("chat_history.jsonl"))
+                    })
                 })
                 .await
                 .unwrap_or_default();
@@ -2260,15 +2260,12 @@ async fn run_session(session: Session) {
             // and every later turn resumes the WRONG (empty) session.
             let mut attempt = 0u32;
             let loaded = loop {
-                match request_draining(&client, &mut incoming, "session/load", load.clone())
-                    .await
-                {
+                match request_draining(&client, &mut incoming, "session/load", load.clone()).await {
                     Ok(resp) => break Some(resp),
                     Err(e) => {
                         attempt += 1;
                         let msg = e.to_string();
-                        let locked =
-                            msg.contains("already open") || msg.contains("session_locked");
+                        let locked = msg.contains("already open") || msg.contains("session_locked");
                         let missing =
                             msg.contains("not found") || msg.contains("session_not_found");
                         // Locked frees when the old process exits — wait it
@@ -3876,7 +3873,11 @@ mod tests {
         );
         assert_eq!(
             models[1].reasoning_levels,
-            vec![ReasoningLevel::Low, ReasoningLevel::Medium, ReasoningLevel::High]
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High
+            ]
         );
     }
 

@@ -184,12 +184,10 @@ impl SideChat {
         });
         self.watched_doc = Some(chat_id.clone());
         self.chat_id = Some(chat_id.clone());
-        self.transcript = Some(cx.new(|cx| {
-            Transcript::for_side_chat(self.state.clone(), chat_id.clone(), cx)
-        }));
-        self.composer = Some(cx.new(|cx| {
-            Composer::new_for_chat(self.state.clone(), chat_id, seed, cx)
-        }));
+        self.transcript =
+            Some(cx.new(|cx| Transcript::for_side_chat(self.state.clone(), chat_id.clone(), cx)));
+        self.composer =
+            Some(cx.new(|cx| Composer::new_for_chat(self.state.clone(), chat_id, seed, cx)));
         self.focus_composer_once = true;
         self.failure = None;
         cx.notify();

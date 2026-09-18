@@ -6,8 +6,8 @@ use std::sync::{Arc, Barrier, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use zeron_engine::{
-    AuthState, Engine, EngineConfig, EngineCore, EngineProfile, HarnessId, WorkspaceScope,
-    default_registry,
+    Auth, AuthConfig, AuthState, Engine, EngineConfig, EngineCore, EngineProfile, HarnessId,
+    WorkspaceScope, default_registry,
 };
 
 fn config(
@@ -432,6 +432,16 @@ async fn handle_edge_request(mut stream: tokio::net::TcpStream, requests: Arc<Mu
             })
             .to_string(),
         )
+    } else if path.starts_with("/identitytoolkit/") {
+        (
+            "200 OK",
+            serde_json::json!({
+                "idToken": fake_jwt("cloud-org"),
+                "refreshToken": "refresh-1",
+                "localId": "cloud-user",
+            })
+            .to_string(),
+        )
     } else {
         ("404 Not Found", r#"{"error":"unexpected_request"}"#.into())
     };
@@ -515,12 +525,43 @@ fn query_param(url: &str, key: &str) -> Option<String> {
         .map(|(_, value)| value.to_string())
 }
 
+fn decode_query_value(value: &str) -> String {
+    let mut out = String::new();
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                out.push(byte as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn login_callback(url: &str) -> String {
+    decode_query_value(&query_param(url, "callback").expect("callback"))
+}
+
 #[tokio::test]
 async fn signing_in_does_not_activate_sync_for_the_running_local_profile() {
     let edge = RecordingEdge::start().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let config = config(dir.path(), edge.url.clone(), Some("client_test"), None);
-    let auth = Engine::build_auth(&config).await;
+    // The Woozlit exchange posts to Firebase, not the edge — point the
+    // Firebase endpoints at the recording edge like the auth.rs regressions.
+    let mut auth_config = AuthConfig::new(edge.url.clone(), dir.path());
+    auth_config.workos_client_id = Some("client_test".into());
+    auth_config.firebase_custom_token_url = format!(
+        "{}/identitytoolkit/v1/accounts:signInWithCustomToken",
+        edge.url
+    );
+    auth_config.firebase_refresh_url = format!("{}/securetoken/v1/token", edge.url);
+    let auth = Auth::new(auth_config);
     let scope = Engine::initial_workspace_scope(&auth);
     let profile = Engine::resolve_profile(&config, &auth, scope)
         .expect("resolve local profile")
@@ -533,7 +574,8 @@ async fn signing_in_does_not_activate_sync_for_the_running_local_profile() {
     assert!(runtime.core().links().is_none());
 
     let sign_in_url = auth.start_headless_sign_in();
-    let state = query_param(&sign_in_url, "state").expect("sign-in state");
+    let callback = login_callback(&sign_in_url);
+    let state = query_param(&callback, "state").expect("sign-in state");
     auth.complete_sign_in(&format!("{state}.authorization-code"))
         .await
         .expect("complete sign in");
@@ -589,7 +631,7 @@ async fn signing_in_does_not_activate_sync_for_the_running_local_profile() {
     assert_eq!(
         requests
             .iter()
-            .filter(|target| target.starts_with("/auth/exchange"))
+            .filter(|target| target.starts_with("/identitytoolkit/"))
             .count(),
         1,
         "the sign-in exchange itself is expected: {requests:?}"

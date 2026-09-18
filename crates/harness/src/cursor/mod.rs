@@ -301,7 +301,10 @@ impl CursorHarness {
         };
         let discovery = async {
             client
-                .request("initialize", crate::acp::initialize_params(HarnessId::Cursor))
+                .request(
+                    "initialize",
+                    crate::acp::initialize_params(HarnessId::Cursor),
+                )
                 .await?;
             let session = client
                 .request(
@@ -402,9 +405,11 @@ impl Harness for CursorHarness {
         let Some(root) = crate::home_dir().map(|h| h.join(".cursor").join("acp-sessions")) else {
             return Ok(Vec::new());
         };
-        Ok(tokio::task::spawn_blocking(move || crate::sessions::scan_cursor(&root))
-            .await
-            .unwrap_or_default())
+        Ok(
+            tokio::task::spawn_blocking(move || crate::sessions::scan_cursor(&root))
+                .await
+                .unwrap_or_default(),
+        )
     }
 
     async fn run(

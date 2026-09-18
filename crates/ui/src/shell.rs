@@ -501,22 +501,17 @@ fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface
 /// each turn's plan lands in its own entry, so the id distinguishes "the
 /// plan I already dismissed" from "a new plan" — plus the part's resolved
 /// flag (a plan is "ready" once its tool result lands).
-fn latest_plan_part(
-    entries: &[zeron_doc::SessionMessageEntry],
-) -> Option<(String, bool)> {
+fn latest_plan_part(entries: &[zeron_doc::SessionMessageEntry]) -> Option<(String, bool)> {
     entries.iter().rev().find_map(|entry| {
         entry
             .parts
             .iter()
             .rev()
-            .find(|part| {
-                matches!(part, zeron_doc::MessagePart::Tool { call, .. } if call.is_plan())
-            })
+            .find(
+                |part| matches!(part, zeron_doc::MessagePart::Tool { call, .. } if call.is_plan()),
+            )
             .map(|part| {
-                let resolved = matches!(
-                    part,
-                    zeron_doc::MessagePart::Tool { resolved: true, .. }
-                );
+                let resolved = matches!(part, zeron_doc::MessagePart::Tool { resolved: true, .. });
                 (entry.id.clone(), resolved)
             })
     })
@@ -2297,8 +2292,7 @@ impl Shell {
             let revision = state.read(cx).transcript_revision;
             if revision != self.plan_scan_revision {
                 self.plan_scan_revision = revision;
-                if let Some((entry_id, resolved)) =
-                    latest_plan_part(&state.read(cx).transcript)
+                if let Some((entry_id, resolved)) = latest_plan_part(&state.read(cx).transcript)
                     && resolved
                     && self.plan_acted.get(&key).map(String::as_str) != Some(entry_id.as_str())
                     && !self
@@ -3176,9 +3170,9 @@ impl Shell {
             let state = self.state.read(cx);
             state.transcript.iter().rev().find_map(|entry| {
                 entry.parts.iter().rev().find_map(|part| match part {
-                    zeron_doc::MessagePart::Tool {
-                        call, resolved, ..
-                    } => call.plan_markdown().map(|markdown| (markdown, *resolved)),
+                    zeron_doc::MessagePart::Tool { call, resolved, .. } => {
+                        call.plan_markdown().map(|markdown| (markdown, *resolved))
+                    }
                     _ => None,
                 })
             })
@@ -3223,7 +3217,7 @@ impl Shell {
             .flex_col()
             .child(
                 div()
-                    .id("plan-surface-scroll")
+                    .id("plan-scroll")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -3685,9 +3679,7 @@ impl Shell {
                 // Snooze THIS plan only: `plan_acted` keys on the owning
                 // transcript entry, so the next turn's plan still docks
                 // while this one stays closed.
-                if let Some((entry_id, _)) =
-                    latest_plan_part(&self.state.read(cx).transcript)
-                {
+                if let Some((entry_id, _)) = latest_plan_part(&self.state.read(cx).transcript) {
                     self.plan_acted.insert(key.clone(), entry_id);
                 }
             }

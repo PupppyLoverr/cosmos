@@ -16,7 +16,9 @@ enum WebLink {
             return nil
         }
         if input.contains(where: { character in
-            character.unicodeScalars.contains { $0.properties.isISOControl || $0.properties.isWhitespace }
+            character.unicodeScalars.contains(where: { scalar in
+                scalar.value <= 0x1F || (0x7F...0x9F).contains(scalar.value) || scalar.properties.isWhitespace
+            })
         }) || input.contains("\\") {
             return nil
         }
@@ -28,7 +30,15 @@ enum WebLink {
             guard index + 2 < bytes.count,
                   isHex(bytes[index + 1]), isHex(bytes[index + 2]) else { return nil }
         }
-        guard let url = URL(string: input), allowsNavigation(url) else { return nil }
+        guard var url = URL(string: input) else { return nil }
+        // Foundation's parser keeps scheme case as written; the desktop
+        // transcript_address contract is a canonical lowercase scheme.
+        if url.scheme != url.scheme?.lowercased(),
+           var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            components.scheme = url.scheme?.lowercased()
+            if let canonical = components.url { url = canonical }
+        }
+        guard allowsNavigation(url) else { return nil }
         return url
     }
 

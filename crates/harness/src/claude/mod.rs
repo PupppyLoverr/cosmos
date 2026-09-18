@@ -415,9 +415,11 @@ impl Harness for ClaudeHarness {
             return Ok(Vec::new());
         };
         let root2 = root.clone();
-        Ok(tokio::task::spawn_blocking(move || crate::sessions::scan_claude(&root2))
-            .await
-            .unwrap_or_default())
+        Ok(
+            tokio::task::spawn_blocking(move || crate::sessions::scan_claude(&root2))
+                .await
+                .unwrap_or_default(),
+        )
     }
 
     /// The session's own jsonl file is the transcript — user/assistant text

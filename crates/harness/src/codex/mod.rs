@@ -581,9 +581,11 @@ impl Harness for CodexHarness {
         let Some(root) = crate::home_dir().map(|h| h.join(".codex").join("sessions")) else {
             return Ok(Vec::new());
         };
-        Ok(tokio::task::spawn_blocking(move || crate::sessions::scan_codex(&root))
-            .await
-            .unwrap_or_default())
+        Ok(
+            tokio::task::spawn_blocking(move || crate::sessions::scan_codex(&root))
+                .await
+                .unwrap_or_default(),
+        )
     }
 
     /// The rollout file is the transcript — user/assistant message rows.
