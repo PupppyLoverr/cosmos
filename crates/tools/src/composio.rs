@@ -139,7 +139,10 @@ fn data(payload: &Value) -> &Value {
 }
 
 fn parse_search_hits(payload: &Value) -> Vec<ComposioSearchHit> {
-    fn hit<'a>(hits: &'a mut BTreeMap<String, ComposioSearchHit>, toolkit: String) -> &'a mut ComposioSearchHit {
+    fn hit<'a>(
+        hits: &'a mut BTreeMap<String, ComposioSearchHit>,
+        toolkit: String,
+    ) -> &'a mut ComposioSearchHit {
         hits.entry(toolkit.clone()).or_insert(ComposioSearchHit {
             toolkit,
             tools: Vec::new(),
@@ -275,8 +278,12 @@ fn slug_toolkit(s: &str) -> Option<String> {
     let (head, tail) = s.split_once('_')?;
     if head.is_empty()
         || tail.is_empty()
-        || !head.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        || !tail.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        || !head
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        || !tail
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     {
         return None;
     }
@@ -338,9 +345,9 @@ fn parse_app_row(key: &str, value: &Value) -> Option<ComposioApp> {
             .iter()
             .find(|a| is_active_status(a.get("status")))
             .or_else(|| {
-                accounts.iter().find(|a| {
-                    a.get("is_default").and_then(Value::as_bool) == Some(true)
-                })
+                accounts
+                    .iter()
+                    .find(|a| a.get("is_default").and_then(Value::as_bool) == Some(true))
             })
     });
     let connected = is_active_status(value.get("status")) || active_account.is_some();

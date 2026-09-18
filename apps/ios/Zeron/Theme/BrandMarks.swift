@@ -27,7 +27,7 @@ enum BrandMark: Equatable {
     /// asset says so or the mark's holes fill in solid.
     var evenOddFill: Bool {
         switch self {
-        case .hermes, .pi, .opencode, .amp, .kimi: return true
+        case .hermes, .pi, .opencode, .antigravity, .amp, .kimi: return true
         default: return false
         }
     }

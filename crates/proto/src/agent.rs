@@ -20,8 +20,8 @@ pub enum HarnessId {
     /// protocol (`opencode serve` — the same wire the opencode desktop app
     /// speaks).
     Opencode,
-    /// Google's Antigravity agent, driven over its stream-json stdin/stdout
-    /// protocol (`agy --input-format stream-json --output-format stream-json`).
+    /// google's antigravity agent over acp (`agy_acp_server`, installed from
+    /// its pinned release archive).
     Antigravity,
     /// Amp (ampcode.com), driven over its Claude-compatible stream-json
     /// execute mode (`amp --execute --stream-json --stream-json-input`).

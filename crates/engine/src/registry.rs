@@ -59,13 +59,20 @@ fn auto_enabled(id: HarnessId) -> bool {
     id != HarnessId::Mock
 }
 
+/// harnesses that stay off until the user turns them on. enabling antigravity
+/// downloads a large server and runs a browser sign-in, which detection alone
+/// must never set off.
+fn opt_in(id: HarnessId) -> bool {
+    id == HarnessId::Antigravity
+}
+
 /// A descriptor's effective enabled flag. `None` — a catalog from an engine
 /// predating the setting — falls back to detection, the same rule new devices
 /// start from (see [`HarnessRegistry::enabled_set`]).
 pub fn descriptor_enabled(descriptor: &HarnessDescriptor) -> bool {
-    descriptor
-        .enabled
-        .unwrap_or_else(|| descriptor.installed && auto_enabled(descriptor.id))
+    descriptor.enabled.unwrap_or_else(|| {
+        descriptor.installed && auto_enabled(descriptor.id) && !opt_in(descriptor.id)
+    })
 }
 
 fn describe(harness: &dyn Harness) -> HarnessDescriptor {
@@ -88,6 +95,8 @@ struct HarnessPrefsFile {
     /// so the file only records "no" — an agent installed later turns itself
     /// on without a trip to Settings.
     disabled: Vec<HarnessId>,
+    /// the user's explicit opt-ins, for the harnesses [`opt_in`] keeps off.
+    opted_in: Vec<HarnessId>,
     titles: TitleSettings,
     /// The allow-list written back when enablement was a fixed default set.
     /// Read once, folded into `disabled`, and never written again.
@@ -195,10 +204,20 @@ impl HarnessRegistry {
         // takes `slots` then `order`, so holding `order` across a probe (which
         // takes `slots`) would invert the lock order.
         let registered: Vec<HarnessId> = self.order().iter().copied().collect();
-        let disabled = self.prefs().disabled.clone();
+        let (disabled, opted_in) = {
+            let prefs = self.prefs();
+            (prefs.disabled.clone(), prefs.opted_in.clone())
+        };
         registered
             .into_iter()
-            .filter(|id| auto_enabled(*id) && !disabled.contains(id) && self.installed_for(*id))
+            .filter(|id| {
+                let chosen = if opt_in(*id) {
+                    opted_in.contains(id)
+                } else {
+                    !disabled.contains(id)
+                };
+                auto_enabled(*id) && chosen && self.installed_for(*id)
+            })
             .collect()
     }
 
@@ -231,13 +250,23 @@ impl HarnessRegistry {
         let enabled = self.enabled_set();
         match (on, enabled.contains(&id)) {
             (true, false) => {
-                self.prefs().disabled.retain(|h| *h != id);
+                let mut prefs = self.prefs();
+                if opt_in(id) {
+                    prefs.opted_in.push(id);
+                } else {
+                    prefs.disabled.retain(|h| *h != id);
+                }
             }
             (false, true) => {
                 if enabled.len() == 1 {
                     return Err("cannot disable the last enabled harness".into());
                 }
-                self.prefs().disabled.push(id);
+                let mut prefs = self.prefs();
+                if opt_in(id) {
+                    prefs.opted_in.retain(|h| *h != id);
+                } else {
+                    prefs.disabled.push(id);
+                }
             }
             _ => return Ok(()),
         }
@@ -576,27 +605,22 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::OpencodeHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::OpencodeHarness::new()) as Arc<dyn Harness>)),
     );
-    // Google Antigravity (`agy`) over its own stream-json protocol, same lazy
-    // pattern: the static descriptor mirrors AntigravityHarness exactly.
-    // Turn-boundary steering — each `user` stdin line runs one full turn —
-    // and the low/medium/high effort ladder rides the model id's suffix
-    // (agy rejects `--effort` alongside `--model`).
+    // antigravity over acp (google's agy_acp_server), same lazy pattern: the
+    // static descriptor mirrors AcpHarness::antigravity() exactly. No steering
+    // extension (turn boundaries), and effort is baked into the model ids, so
+    // the ladder lives on each model rather than the harness.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Antigravity,
             name: "Antigravity".into(),
             supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
-            reasoning_levels: vec![
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-            ],
+            reasoning_levels: Vec::new(),
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AntigravityHarness::new().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AntigravityHarness::new()) as Arc<dyn Harness>)),
+        Box::new(|| zeron_harness::AcpHarness::antigravity().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::antigravity()) as Arc<dyn Harness>)),
     );
     // Amp (`amp`) over its Claude-compatible stream-json execute mode, same
     // lazy pattern: the static descriptor mirrors AmpHarness exactly.
@@ -779,6 +803,11 @@ mod tests {
                 ReasoningLevel::Max,
             ]
         );
+        let antigravity = registry.resolve(HarnessId::Antigravity).unwrap();
+        assert_eq!(antigravity.id(), HarnessId::Antigravity);
+        assert_eq!(antigravity.display_name(), "Antigravity");
+        assert_eq!(antigravity.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(antigravity.reasoning_levels().is_empty());
         let pi = registry.resolve(HarnessId::Pi).unwrap();
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");
@@ -984,6 +1013,29 @@ mod tests {
             reloaded.enabled_set(),
             vec![HarnessId::ClaudeCode, HarnessId::Grok]
         );
+    }
+
+    #[test]
+    fn antigravity_stays_off_until_the_user_opts_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = HarnessRegistry::new();
+        registry.load_prefs(dir.path());
+        test_slot(&registry, HarnessId::ClaudeCode, true);
+        test_slot(&registry, HarnessId::Antigravity, true);
+        assert_eq!(registry.enabled_set(), vec![HarnessId::ClaudeCode]);
+
+        registry.set_enabled(HarnessId::Antigravity, true).unwrap();
+        let both = vec![HarnessId::ClaudeCode, HarnessId::Antigravity];
+        assert_eq!(registry.enabled_set(), both);
+
+        let reloaded = HarnessRegistry::new();
+        reloaded.load_prefs(dir.path());
+        test_slot(&reloaded, HarnessId::ClaudeCode, true);
+        test_slot(&reloaded, HarnessId::Antigravity, true);
+        assert_eq!(reloaded.enabled_set(), both);
+
+        reloaded.set_enabled(HarnessId::Antigravity, false).unwrap();
+        assert_eq!(reloaded.enabled_set(), vec![HarnessId::ClaudeCode]);
     }
 
     /// The mock resolves on every machine, so detection alone would enable it

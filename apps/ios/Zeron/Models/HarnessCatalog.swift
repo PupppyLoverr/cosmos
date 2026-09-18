@@ -86,7 +86,6 @@ enum HarnessCatalog {
     private static let codexMaxLadder = ["low", "medium", "high", "xhigh", "max"]
     private static let codexXhighLadder = ["low", "medium", "high", "xhigh"]
     private static let ampEffortLadder = ["minimal", "low", "medium", "high", "xhigh", "max"]
-    private static let antigravityEffortLadder = ["low", "medium", "high"]
     private static let kimiEffortLadder = ["low", "high", "max"]
     private static let codexServiceTier = [
         ModelOptionInfo(id: "serviceTier", label: "Service Tier", choices: [
@@ -145,19 +144,14 @@ enum HarnessCatalog {
                           reasoningLevels: ampEffortLadder),
             ]
         case "antigravity":
-            // Static fallback only — a reachable host answers `listModels`
-            // from `agy models`. Effort is a model-id suffix on Gemini
-            // rows; suffix-free ids (Claude through agy) have no ladder.
+            // static fallback only; a reachable host answers with the models its acp server advertises
             return [
-                ModelInfo(id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)",
-                          description: "Antigravity's default Gemini Flash",
-                          reasoningLevels: antigravityEffortLadder),
-                ModelInfo(id: "gemini-3.1-pro-high", label: "Gemini 3.1 Pro (High)",
-                          description: "Gemini Pro through Antigravity",
+                ModelInfo(id: "gemini-3.7-flash", label: "Gemini 3.7 Flash",
+                          description: "Google's fast Gemini model through Antigravity",
+                          reasoningLevels: ["low", "medium", "high"]),
+                ModelInfo(id: "gemini-3.1-pro", label: "Gemini 3.1 Pro",
+                          description: "Google's most capable Gemini model through Antigravity",
                           reasoningLevels: ["low", "high"]),
-                ModelInfo(id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6",
-                          description: "Claude Sonnet through Antigravity",
-                          reasoningLevels: []),
             ]
         case "opencode":
             // Static fallback only — a reachable host answers `listModels`

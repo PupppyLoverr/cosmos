@@ -422,11 +422,9 @@ impl ToolService {
     pub async fn poll_app_connect(&self, toolkit: &str) -> Result<ComposioApp, ToolError> {
         let toolkit = crate::composio::canonical_toolkit(toolkit);
         let upstream = self.composio_upstream().await?;
-        let apps = crate::composio::connection_status(
-            as_http(&upstream)?,
-            std::slice::from_ref(&toolkit),
-        )
-        .await?;
+        let apps =
+            crate::composio::connection_status(as_http(&upstream)?, std::slice::from_ref(&toolkit))
+                .await?;
         Ok(apps
             .into_iter()
             .find(|a| a.toolkit.eq_ignore_ascii_case(&toolkit))
