@@ -21,6 +21,7 @@ struct HomeView: View {
     @State private var path: [Route] = []
     @State private var showNewSpace = false
     @State private var showProjectlessDevices = false
+    @State private var showSettings = false
     @State private var confirmSignOut = false
     // "" = All. Sticky across launches; falls back to All if the space is gone.
     @AppStorage("homeSpaceFilter") private var spaceFilter: String = ""
@@ -106,6 +107,12 @@ struct HomeView: View {
                             }
                         }
                         Button("Reconnect", systemImage: "arrow.clockwise") { model.foregrounded() }
+                        // Sheet state must flip after the menu finishes
+                        // dismissing, or the presentation is dropped.
+                        Button("Settings", systemImage: "gear") {
+                            DispatchQueue.main.async { showSettings = true }
+                        }
+                        .accessibilityIdentifier("open-settings")
                         Button("Sign out", role: .destructive) { confirmSignOut = true }
                     } label: {
                         Image(systemName: "person.circle")
@@ -128,6 +135,9 @@ struct HomeView: View {
                     spaceFilter = ""
                     path.append(.newSession(.projectless(deviceId: deviceId)))
                 }
+            }
+            .sheet(isPresented: $showSettings) {
+                SettingsView()
             }
             .task(id: model.overviewChats.map(\.id).joined()) {
                 model.preloadSessions()

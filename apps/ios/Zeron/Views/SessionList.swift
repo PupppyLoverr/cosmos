@@ -186,6 +186,29 @@ struct ChatRow: View {
             }
         }
         .sessionRowActions(chat: chat)
+        .contextMenu {
+            Button {
+                onSelect()
+            } label: {
+                Label("Open", systemImage: "bubble.left")
+            }
+            if chat.unseen {
+                Button {
+                    model.markSeen(chatId: chat.id)
+                } label: {
+                    Label("Mark as read", systemImage: "checkmark.circle")
+                }
+            }
+            Button(role: chat.archived ? .none : .destructive) {
+                withAnimation(Motion.resort) {
+                    if chat.archived { model.unarchive(chatId: chat.id) }
+                    else { model.archive(chatId: chat.id) }
+                }
+            } label: {
+                Label(chat.archived ? "Unarchive" : "Archive",
+                      systemImage: chat.archived ? "arrow.up.bin" : "archivebox")
+            }
+        }
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
             Button {
                 withAnimation(Motion.resort) {
