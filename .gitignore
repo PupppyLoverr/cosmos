@@ -13,3 +13,5 @@ node_modules
 .wrangler
 build/
 edge/dist/
+# Machine-specific linker config (absolute toolchain paths differ per box).
+/.cargo/
