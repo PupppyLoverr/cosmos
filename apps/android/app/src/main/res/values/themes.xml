@@ -1,0 +1,12 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Dark-first Cosmos shell. Compose owns the real theming (Theme.kt);
+         this only needs to paint the window background before the first
+         frame and keep the system bars dark so there is no light flash. -->
+    <style name="Theme.Cosmos" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/cosmos_bg</item>
+        <item name="android:statusBarColor">@color/cosmos_bg</item>
+        <item name="android:navigationBarColor">@color/cosmos_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+</resources>

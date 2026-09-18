@@ -1,4 +1,7 @@
 /target
+# Built distributables live here on the build machine (large binaries — not
+# committed; reproduce with scripts/package-linux-cosmos.sh and Gradle).
+/artifacts/
 **/*.rs.bk
 # Local-only scratch space — holds signing/notary credentials, never commit.
 /ignore/
