@@ -549,13 +549,7 @@ pub(crate) fn scan_cursor(root: &Path) -> Vec<HarnessSession> {
             continue;
         }
         let cwd = value["cwd"].as_str().unwrap_or_default().to_string();
-        out.push(session(
-            id,
-            "Cursor session",
-            "",
-            cwd,
-            file_mtime_ms(&dir),
-        ));
+        out.push(session(id, "Cursor session", "", cwd, file_mtime_ms(&dir)));
     }
     out
 }
@@ -566,10 +560,9 @@ pub(crate) fn scan_antigravity(db_path: &Path) -> Vec<HarnessSession> {
     if !db_path.is_file() {
         return Vec::new();
     }
-    let Ok(conn) = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) else {
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
         return Vec::new();
     };
     let mut stmt = match conn.prepare(

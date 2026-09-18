@@ -16,6 +16,7 @@
 //   apps/landing/public/assets/zeron-app-icon.png    site logo mark (128)
 //   apps/landing/public/assets/zeron-favicon-v3.png  site favicon (128)
 //   dist/zeron.svg                                   source-art slot, re-rendered with the raster embedded
+//   dist/zeron-tray.png                              embedded tray/status-item icon (64) — Linux SNI pixmap + unbundled macOS fallback
 
 import { deflateSync, inflateSync } from "node:zlib";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -320,6 +321,10 @@ write(
 // Landing site logo mark + favicon.
 write("apps/landing/public/assets/zeron-app-icon.png", encodePng(resize(tile1024, 128)));
 write("apps/landing/public/assets/zeron-favicon-v3.png", encodePng(resize(tile1024, 128)));
+
+// Tray/status-item icon — embedded into the binary by the tray backends
+// (crates/ui/src/tray): the Linux SNI pixmap and the unbundled macOS fallback.
+write("dist/zeron-tray.png", encodePng(resize(tile1024, 64)));
 
 // dist/zeron.svg — the "source artwork" slot. The mark is raster now, so the
 // svg wraps a 512px render (keeps the file truthful for anyone opening it).

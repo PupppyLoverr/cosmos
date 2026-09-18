@@ -120,6 +120,66 @@ pub mod methods {
     pub const LOCAL_DEVICE: &str = "LocalDevice";
     /// Renew a desktop viewport's host-local embedded-browser lease.
     pub const REGISTER_BROWSER: &str = "RegisterBrowser";
+    // Cosmos Computer (device-local desktop perception/control). All are
+    // IPC-only and NEVER relay-forwarded: they report or act on whichever
+    // engine you are directly connected to — forwarding a desktop action to
+    // another machine's physical UI must be an explicit decision, not a
+    // relay side-effect.
+    /// Component/settings/capability snapshot → `zeron_computer::ComputerStatus`.
+    pub const COMPUTER_STATUS: &str = "ComputerStatus";
+    /// Persist `{enabled, semantic, screenshots, control, telemetry, …}`.
+    /// Returns the resulting `ComputerStatus`.
+    pub const COMPUTER_SET_SETTINGS: &str = "ComputerSetSettings";
+    /// Download + verify + install the pinned driver component (streams
+    /// `InstallProgress` items).
+    pub const COMPUTER_INSTALL: &str = "ComputerInstall";
+    /// Remove the installed component.
+    pub const COMPUTER_UNINSTALL: &str = "ComputerUninstall";
+    /// Live probe — driver ping + health report (OS permission grants).
+    pub const COMPUTER_PROBE: &str = "ComputerProbe";
+    /// One observe call → `zeron_computer::Observation` (screenshot rides as
+    /// a staged uploads-jail path, readable via ReadAttachmentChunk).
+    pub const COMPUTER_OBSERVE: &str = "ComputerObserve";
+    /// Subscribe to component status changes (install progress, settings,
+    /// driver liveness) — stream of `ComputerStatus` snapshots.
+    pub const WATCH_COMPUTER: &str = "WatchComputer";
+    // Cosmos Tools — the device-local merged MCP gateway (Composio Connect +
+    // user-configured MCP servers). Unlike computer, ALL of these are
+    // relay-forwardable: tool configuration is per-device account state, and
+    // Settings → Tools targets the device hosting the agent via
+    // `targetDeviceId`. Replies carry masked config only — API keys and
+    // custom-server headers never cross the wire.
+    /// Provider snapshot → `zeron_tools::ToolsSnapshot` (masked configs,
+    /// per-provider status/tool counts, merged tool total).
+    pub const LIST_TOOLS: &str = "ListTools";
+    /// Add or update one provider (`ToolProvider`; the id is stable across
+    /// edits). Returns the fresh `ToolsSnapshot`.
+    pub const UPSERT_TOOL_PROVIDER: &str = "UpsertToolProvider";
+    /// Remove one provider by id. Returns the fresh `ToolsSnapshot`.
+    pub const REMOVE_TOOL_PROVIDER: &str = "RemoveToolProvider";
+    /// `{id, enabled}` toggle. Returns the fresh `ToolsSnapshot`.
+    pub const SET_TOOL_PROVIDER_ENABLED: &str = "SetToolProviderEnabled";
+    /// `{apiKey}` — validate the Composio consumer key against Connect and
+    /// store it. Returns the provider's `ProviderStatus` (key masked).
+    pub const CONNECT_COMPOSIO: &str = "ConnectComposio";
+    /// Remove the Composio provider entirely. Returns the fresh snapshot.
+    pub const DISCONNECT_COMPOSIO: &str = "DisconnectComposio";
+    /// Per-toolkit connection state → `Vec<zeron_tools::ComposioApp>` (the
+    /// curated grid plus every remembered toolkit).
+    pub const LIST_COMPOSIO_APPS: &str = "ListComposioApps";
+    /// `{query}` — full-catalog search via `COMPOSIO_SEARCH_TOOLS` →
+    /// `Vec<zeron_tools::ComposioSearchHit>`.
+    pub const SEARCH_COMPOSIO: &str = "SearchComposio";
+    /// `{toolkit}` — initiate one app's OAuth flow → `AppConnectStart`
+    /// (carries the hosted auth URL the settings page opens).
+    pub const START_APP_CONNECT: &str = "StartAppConnect";
+    /// `{toolkit}` — poll one app's connection state → `ComposioApp`.
+    pub const POLL_APP_CONNECT: &str = "PollAppConnect";
+    /// Test a provider config WITHOUT persisting it → `ProbeResult`
+    /// (tool count + sample names, or the connect error).
+    pub const PROBE_MCP_SERVER: &str = "ProbeMcpServer";
+    /// Provider status changes — stream of `ToolsSnapshot`s.
+    pub const WATCH_TOOLS: &str = "WatchTools";
     /// This engine runtime's fixed device and workspace identity.
     pub const ENGINE_INFO: &str = "EngineInfo";
     /// Readiness barrier for the engine runtime. The call completes once stores

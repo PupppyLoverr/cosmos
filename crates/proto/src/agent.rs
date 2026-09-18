@@ -26,6 +26,8 @@ pub enum HarnessId {
     /// Amp (ampcode.com), driven over its Claude-compatible stream-json
     /// execute mode (`amp --execute --stream-json --stream-json-input`).
     Amp,
+    /// Moonshot AI's Kimi Code CLI, driven over ACP (`kimi acp`).
+    KimiCode,
     /// Test harness; never shown in production pickers.
     Mock,
 }
@@ -99,7 +101,36 @@ pub struct ModelOptionChoice {
 /// it on local-host runs only — the loopback URL is meaningless on a remote
 /// host — and title-only runs drop `model_options` entirely, so discovery
 /// probes never see it.
-pub const BROWSER_BRIDGE_OPTION: &str = "zeron_browser_bridge";
+pub const BROWSER_BRIDGE_OPTION: &str = "cosmos_browser_bridge";
+
+/// `RunRequest.model_options` key carrying the Cosmos Computer endpoint —
+/// the same loopback/token contract as the browser bridge, stamped by the
+/// engine only when the computer is enabled and healthy on THIS host.
+pub const COMPUTER_OPTION: &str = "cosmos_computer";
+
+/// `RunRequest.model_options` key carrying the Cosmos Tools gateway
+/// endpoint — the merged MCP surface (Composio + user MCP servers) every
+/// harness reaches, stamped by the engine only when THIS host has at least
+/// one enabled tool provider.
+pub const TOOLS_OPTION: &str = "cosmos_tools";
+
+/// The computer endpoint URL for this run, if the engine stamped one.
+pub fn computer_url(request: &RunRequest) -> Option<&str> {
+    request
+        .model_options
+        .get(COMPUTER_OPTION)
+        .and_then(|v| v.get("url"))
+        .and_then(serde_json::Value::as_str)
+}
+
+/// The tools gateway endpoint URL for this run, if the engine stamped one.
+pub fn tools_url(request: &RunRequest) -> Option<&str> {
+    request
+        .model_options
+        .get(TOOLS_OPTION)
+        .and_then(|v| v.get("url"))
+        .and_then(serde_json::Value::as_str)
+}
 
 /// The bridge endpoint URL for this run, if the UI stamped one.
 pub fn browser_bridge_url(request: &RunRequest) -> Option<&str> {
@@ -113,11 +144,14 @@ pub fn browser_bridge_url(request: &RunRequest) -> Option<&str> {
 /// `model_options` keys carrying zeron-internal run directives, never harness
 /// config. RuntimeConfig comparisons ignore them — they mark ONE run's
 /// behavior, not the session's runtime shape. Includes underscore-prefixed
-/// `_zeron*` keys and the host-local embedded-browser endpoint, whose URL
-/// must not restart a live runtime when a later send inherits a different
-/// window.
+/// `_zeron*` keys and the host-local embedded-browser, computer, and tools
+/// endpoints, whose URLs must not restart a live runtime when a later send
+/// inherits a different window.
 pub fn is_internal_option(key: &str) -> bool {
-    key.starts_with("_zeron") || key == BROWSER_BRIDGE_OPTION
+    key.starts_with("_zeron")
+        || key == BROWSER_BRIDGE_OPTION
+        || key == COMPUTER_OPTION
+        || key == TOOLS_OPTION
 }
 
 /// One resumable harness session — a `/resume` picker row. `id` is the
@@ -633,6 +667,68 @@ mod tests {
         );
     }
 
+    /// The plan surfaces key on shape: todos ARE the plan for most adapters;
+    /// a `Plan` unknown carries the markdown document. Anything else is not
+    /// a plan, whatever its name suggests.
+    #[test]
+    fn plan_shape_and_markdown() {
+        let todos = ToolCall::Todo {
+            items: vec![
+                TodoItem {
+                    text: "scan".into(),
+                    done: true,
+                },
+                TodoItem {
+                    text: "patch".into(),
+                    done: false,
+                },
+            ],
+        };
+        assert!(todos.is_plan());
+        assert_eq!(
+            todos.plan_markdown().as_deref(),
+            Some("- [x] scan\n- [ ] patch")
+        );
+
+        let doc = ToolCall::Unknown {
+            name: PLAN_TOOL_NAME.into(),
+            input: Some(serde_json::json!({ "plan": "# Steps\n- one" })),
+        };
+        assert!(doc.is_plan());
+        assert_eq!(doc.plan_markdown().as_deref(), Some("# Steps\n- one"));
+
+        // A plan doc whose payload never made the doc (older builds stripped
+        // Unknown inputs) is still plan-shaped, just content-less.
+        let stripped = ToolCall::Unknown {
+            name: PLAN_TOOL_NAME.into(),
+            input: None,
+        };
+        assert!(stripped.is_plan());
+        assert_eq!(stripped.plan_markdown(), None);
+
+        for call in [
+            ToolCall::Exec {
+                command: "ls".into(),
+            },
+            ToolCall::Unknown {
+                name: "Planner".into(),
+                input: Some(serde_json::json!({ "plan": "no" })),
+            },
+            ToolCall::Todo { items: vec![] },
+        ] {
+            assert_eq!(call.plan_markdown(), None);
+        }
+        assert!(
+            !ToolCall::Unknown {
+                name: "Planner".into(),
+                input: None,
+            }
+            .is_plan()
+        );
+        // An empty todo list is still plan-shaped — the chip exists.
+        assert!(ToolCall::Todo { items: vec![] }.is_plan());
+    }
+
     #[test]
     fn run_request_attachments_default_and_round_trip() {
         // Old-wire JSON without the field parses (additive compat)…
@@ -727,5 +823,34 @@ mod internal_option_tests {
         assert!(is_internal_option(BROWSER_BRIDGE_OPTION));
         assert!(!is_internal_option("serviceTier"));
         assert!(!is_internal_option("zeron_unrelated"));
+    }
+
+    /// The tools endpoint is an internal option too — a run-local loopback
+    /// URL must never read as harness config (or restart a runtime on diff).
+    #[test]
+    fn tools_option_is_internal_and_url_extracts() {
+        assert!(is_internal_option(TOOLS_OPTION));
+        assert!(is_internal_option(COMPUTER_OPTION));
+        let request = |model_options: serde_json::Map<String, serde_json::Value>| RunRequest {
+            prompt: String::new(),
+            harness: None,
+            model: None,
+            reasoning: None,
+            model_options,
+            cwd: String::new(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            auto_approve: false,
+            resume: None,
+            attachments: vec![],
+            worktree: None,
+        };
+        let stamped = request(
+            serde_json::json!({ TOOLS_OPTION: { "url": "http://127.0.0.1:9/mcp/tok" } })
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert_eq!(tools_url(&stamped), Some("http://127.0.0.1:9/mcp/tok"));
+        assert_eq!(tools_url(&request(Default::default())), None);
     }
 }

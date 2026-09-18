@@ -41,6 +41,7 @@ required-features = ["project-palette-fixture"]
 url = "2"
 zeron-proto.workspace = true
 similar.workspace = true
+zeron-computer.workspace = true
 zeron-doc.workspace = true
 zeron-engine.workspace = true
 zeron-harness.workspace = true
@@ -48,6 +49,7 @@ zeron-rpc.workspace = true
 zeron-update.workspace = true
 zeron-syntax.workspace = true
 zeron-theme.workspace = true
+zeron-tools.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
@@ -106,12 +108,21 @@ windows = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_UI_WindowsAndMessaging",
+    # Delegate global hotkey: RegisterHotKey + WM_HOTKEY (KeyboardAndMouse),
+    # popup DWM rounded corners.
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Dwm",
+    # Tray icon: Shell_NotifyIcon + WNDCLASSEXW (Gdi field types) + module icon.
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
     # Dictation: OS speech recognizer + the WASAPI capture-endpoint meter that
     # feeds the live level bars (no extra audio crates).
     "Foundation",
     "Media_SpeechRecognition",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    "Win32_System_Ole",
     "Win32_System_Registry",
     "Win32_System_WinRT",
 ] }
@@ -120,6 +131,9 @@ windows = { version = "0.61", features = [
 ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "global_shortcuts", "screenshot"] }
 atspi = { version = "0.30.0", features = ["zbus"] }
 async-io = "2"
+# StatusNotifierItem (KDE/freedesktop tray protocol) over zbus — the blocking
+# API runs the service on its own thread, matching the other tray backends.
+ksni = { version = "0.3", features = ["blocking"] }
 url = "2"
 x11rb = { version = "0.14.0", features = ["image"] }
 

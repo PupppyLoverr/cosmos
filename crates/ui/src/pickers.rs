@@ -517,6 +517,12 @@ pub struct Pickers {
     /// composer): config reads, picks persistence and "is a chat selected"
     /// checks resolve to it instead of the shell's selection.
     chat_override: Option<String>,
+    /// When set, this pickers entity is pinned to the new-session canvas no
+    /// matter what the shell has selected (the Delegate bar): `chat_id` and
+    /// `chat_row` resolve to `None` so picks read the remembered new-chat
+    /// defaults and never leak the selected session's config into a delegate
+    /// send.
+    always_new: bool,
     config: DraftConfig,
     /// Sticky last-used picks (zeron `zeron.composer.defaults:v1`): seeds the
     /// new-chat chips and is rewritten on every new-chat pick.
@@ -714,6 +720,7 @@ impl Pickers {
         Self {
             state,
             chat_override: None,
+            always_new: false,
             space_owner,
             device_owner,
             target_generation: 0,
@@ -785,13 +792,30 @@ impl Pickers {
         cx.notify();
     }
 
-    /// The chat this picker serves: the bound override, else the selection.
+    /// Pin this pickers entity to the new-session canvas regardless of the
+    /// shell's selection (the Delegate bar). Call once at construction.
+    pub fn set_always_new(&mut self, cx: &mut Context<Self>) {
+        self.draft_owner = None;
+        self.always_new = true;
+        cx.notify();
+    }
+
+    /// The chat this picker serves: the bound override, else the selection —
+    /// or always `None` for a pinned-new pickers (the Delegate bar).
     fn chat_id(&self, state: &AppState) -> Option<String> {
-        self.chat_override.clone().or_else(|| state.selected_chat.clone())
+        if self.always_new {
+            return None;
+        }
+        self.chat_override
+            .clone()
+            .or_else(|| state.selected_chat.clone())
     }
 
     /// That chat's workspace row.
     fn chat_row<'a>(&self, state: &'a AppState) -> Option<&'a zeron_proto::Chat> {
+        if self.always_new {
+            return None;
+        }
         match self.chat_override.as_deref() {
             Some(id) => state.chat_row(id),
             None => state.selected_chat_row(),
@@ -3282,7 +3306,7 @@ impl Pickers {
         // Compact tabbed layout (user request, modeled on the referenced
         // picker): the model LIST gets a fixed band of roughly seven compact
         // rows; the pinned traits tray below sizes to its sections.
-        let list_height = if self.state.read(cx).selected_chat.is_none() {
+        let list_height = if self.chat_id(&self.state.read(cx)).is_none() {
             // Keep the settings tray visible while the model list scrolls
             // within the room below the new-chat composer.
             let tray_height = if self.setting_groups(cx).is_empty() {
@@ -4468,6 +4492,8 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
         // Amp's three-bar mark, monochrome.
         HarnessId::Amp => (crate::icons::AMP_MARK, None),
+        // Moonshot's "K" mark (lobe-icons kimi.svg), monochrome.
+        HarnessId::KimiCode => (crate::icons::KIMI_MARK, None),
     }
 }
 
@@ -4743,7 +4769,7 @@ impl Render for Pickers {
             &theme,
             cx,
         );
-        let new_chat = self.state.read(cx).selected_chat.is_none();
+        let new_chat = self.chat_id(&self.state.read(cx)).is_none();
         let entity = cx.entity().downgrade();
         let model_chip = model_chip.relative().child(
             gpui::canvas(

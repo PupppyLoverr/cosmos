@@ -205,6 +205,8 @@ icon_assets![
     (ANTIGRAVITY_MARK, "antigravity-mark"),
     // Amp's three-bar mark (lobe-icons amp.svg), monochrome.
     (AMP_MARK, "amp-mark"),
+    // Kimi's "K" mark (lobe-icons kimi.svg), monochrome.
+    (KIMI_MARK, "kimi-mark"),
 ];
 
 /// Serves both the compact control-icon set and the complete file-identity

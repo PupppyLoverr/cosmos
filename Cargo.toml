@@ -7,6 +7,8 @@ members = [
     "crates/doc",
     "crates/sync",
     "crates/harness",
+    "crates/computer",
+    "crates/tools",
     "crates/engine",
     "crates/rpc",
     "crates/update",
@@ -27,6 +29,8 @@ zeron-preview = { path = "crates/preview" }
 zeron-doc = { path = "crates/doc" }
 zeron-sync = { path = "crates/sync" }
 zeron-harness = { path = "crates/harness" }
+zeron-computer = { path = "crates/computer" }
+zeron-tools = { path = "crates/tools" }
 zeron-engine = { path = "crates/engine" }
 zeron-rpc = { path = "crates/rpc" }
 zeron-update = { path = "crates/update" }

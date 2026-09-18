@@ -235,7 +235,7 @@ async fn handle_message(message: Value, tx: &mpsc::Sender<BridgeRequest>) -> Opt
             "result": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "zeron-browser", "title": "Cosmos Browser", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "cosmos-browser", "title": "Cosmos Browser", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": "This is Cosmos's built-in browser, sharing the visible tabs and signed-in cookies in the desktop app. Use these tools by default for browser tasks instead of external browser servers or headless browsers, unless the user explicitly requests another browser. Start with browser_tabs or browser_state; use browser_open if no tab exists. Take browser_screenshot when visual verification is needed."
             }
         })),

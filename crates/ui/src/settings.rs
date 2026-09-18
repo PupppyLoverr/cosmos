@@ -18,11 +18,13 @@ pub mod accounts;
 pub mod appearance;
 pub mod archived;
 pub mod composer;
+pub mod computer;
 pub mod devices;
 pub mod files;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
+pub mod tools;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -562,6 +564,21 @@ pub struct UiSettings {
     pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
+    /// Global "Delegate a task" bar — the system-wide hotkey summons a
+    /// floating composer from any app. Device-local: the hotkey belongs to
+    /// this desktop, not the synced workspace.
+    pub delegate_enabled: bool,
+    /// Keep Cosmos running in the notification area when its last window
+    /// closes (close-to-tray). The engine, the Delegate hotkey and running
+    /// tasks stay alive; the tray icon is the way back in and the clean way
+    /// out. When the tray can't be created the setting is a no-op — the app
+    /// never flips to explicit-quit without a reachable exit path.
+    /// Device-local.
+    pub keep_running_in_tray: bool,
+    /// Register Cosmos to start in the tray at login (per-OS login item:
+    /// Windows Run key, macOS LaunchAgent, Linux autostart desktop entry).
+    /// Launches land windowless on the tray icon (`--tray`). Device-local.
+    pub launch_at_login: bool,
     /// macOS viewer-side Appshot capture. Device-local because the shortcut
     /// and TCC permissions belong to this desktop.
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), serde(skip))]
@@ -659,6 +676,9 @@ impl Default for UiSettings {
             keymap: KeymapConfig::default(),
             escape_stops_active_agent: false,
             composer_send_behavior: ComposerSendBehavior::default(),
+            delegate_enabled: true,
+            keep_running_in_tray: true,
+            launch_at_login: false,
             appshots_enabled: false,
             appshot_sound_enabled: true,
             appshot_destination: crate::appshots::AppshotDestination::Automatic,
@@ -721,6 +741,7 @@ const JUMP_LABELS: [&str; JUMP_SLOTS] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
     CaptureAppshot,
+    DelegateTask,
     SaveFile,
     BrowserReload,
     ToggleSidebar,
@@ -735,8 +756,9 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 11 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 12 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
+        ShortcutId::DelegateTask,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
         ShortcutId::ToggleSidebar,
@@ -766,6 +788,7 @@ impl ShortcutId {
     pub fn label(self) -> &'static str {
         match self {
             ShortcutId::CaptureAppshot => "Capture Appshot",
+            ShortcutId::DelegateTask => "Delegate a task",
             ShortcutId::SaveFile => "Save file",
             ShortcutId::BrowserReload => "Reload browser page",
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
@@ -791,6 +814,9 @@ impl ShortcutId {
         match self {
             ShortcutId::CaptureAppshot if mac => "ctrl-alt-space",
             ShortcutId::CaptureAppshot => "mod-alt-space",
+            // Alt+Space everywhere: Spotlight owns Cmd+Space on macOS and
+            // Ctrl+Space is the input-method toggle in several locales.
+            ShortcutId::DelegateTask => "alt-space",
             ShortcutId::SaveFile => "mod-s",
             ShortcutId::BrowserReload => "mod-shift-r",
             ShortcutId::ToggleSidebar => "mod-b",
@@ -836,6 +862,7 @@ impl ShortcutId {
 pub struct KeymapConfig {
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), serde(skip))]
     pub capture_appshot: String,
+    pub delegate_task: String,
     pub save_file: String,
     pub browser_reload: String,
     pub toggle_sidebar: String,
@@ -857,6 +884,7 @@ impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
             capture_appshot: ShortcutId::CaptureAppshot.default_combo().into(),
+            delegate_task: ShortcutId::DelegateTask.default_combo().into(),
             save_file: ShortcutId::SaveFile.default_combo().into(),
             browser_reload: ShortcutId::BrowserReload.default_combo().into(),
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
@@ -876,6 +904,7 @@ impl KeymapConfig {
     pub fn get(&self, id: ShortcutId) -> &str {
         match id {
             ShortcutId::CaptureAppshot => &self.capture_appshot,
+            ShortcutId::DelegateTask => &self.delegate_task,
             ShortcutId::SaveFile => &self.save_file,
             ShortcutId::BrowserReload => &self.browser_reload,
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
@@ -897,6 +926,7 @@ impl KeymapConfig {
     pub fn set(&mut self, id: ShortcutId, combo: String) {
         match id {
             ShortcutId::CaptureAppshot => self.capture_appshot = combo,
+            ShortcutId::DelegateTask => self.delegate_task = combo,
             ShortcutId::SaveFile => self.save_file = combo,
             ShortcutId::BrowserReload => self.browser_reload = combo,
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
@@ -1618,6 +1648,9 @@ mod tests {
             },
             escape_stops_active_agent: true,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
+            delegate_enabled: false,
+            keep_running_in_tray: false,
+            launch_at_login: true,
             appshots_enabled: false,
             appshot_sound_enabled: true,
             // The destination is only persisted where Appshots exist (macOS and
@@ -2118,7 +2151,8 @@ mod tests {
 
     #[test]
     fn new_project_shortcut_migrates_and_persists() {
-        let mut keymap: KeymapConfig = serde_json::from_str(r#"{"newSession":"mod-alt-n"}"#).unwrap();
+        let mut keymap: KeymapConfig =
+            serde_json::from_str(r#"{"newSession":"mod-alt-n"}"#).unwrap();
         assert_eq!(keymap.get(ShortcutId::NewProject), "mod-shift-n");
         assert_eq!(keymap.get(ShortcutId::NewSession), "mod-alt-n");
         keymap.set(ShortcutId::NewProject, "mod-alt-p".into());

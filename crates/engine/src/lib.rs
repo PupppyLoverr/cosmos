@@ -130,6 +130,13 @@ pub struct EngineCore {
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
+    /// Cosmos Computer — the device-local desktop perception/control service
+    /// (Cua Driver). IPC-only; never relay-forwarded to another device.
+    pub computer: zeron_computer::ComputerService,
+    /// Cosmos Tools — the device-local merged MCP gateway (Composio + user
+    /// MCP servers). Management RPCs ARE relay-forwardable so Settings can
+    /// target the device hosting the agent.
+    pub tools: zeron_tools::ToolService,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
@@ -270,6 +277,19 @@ impl EngineCore {
         // Queued-attachment support: the doc host resolves `pending://` refs
         // against this store and pushes staged bytes to remote hosts.
         doc_host.set_uploads(uploads.clone());
+        // Cosmos Computer — one service per device. Screenshots staged under
+        // the uploads jail so `ReadAttachmentChunk` serves them like any
+        // other upload; the endpoint is stamped onto local runs by sessions.
+        let computer = zeron_computer::ComputerService::new(
+            data_dir.to_path_buf(),
+            profile.uploads_root().join("computer"),
+        );
+        sessions.set_computer(computer.clone());
+        // Cosmos Tools — the merged MCP gateway (Composio + user servers).
+        // Same device-local contract; Settings reaches it through the
+        // forwardable tools RPCs.
+        let tools = zeron_tools::ToolService::new(data_dir.to_path_buf());
+        sessions.set_tools(tools.clone());
         let agent_accounts_config = AgentAccountsConfig::detect(data_dir);
         sessions.set_generated_images(
             uploads.clone(),
@@ -313,6 +333,8 @@ impl EngineCore {
             diff_sync,
             spaces_sync,
             uploads,
+            computer,
+            tools,
             agent_accounts,
             device_id,
             local_import,
@@ -447,7 +469,9 @@ impl EngineCore {
             self.workspace_scope,
         )
         .with_auth(self.auth())
-        .with_previews(self.previews.clone());
+        .with_previews(self.previews.clone())
+        .with_computer(self.computer.clone())
+        .with_tools(self.tools.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }
@@ -996,7 +1020,9 @@ pub async fn terminal_sign_in(auth: &Auth) -> Result<(), EngineError> {
                 if !opened {
                     let url = auth.start_sign_in().await?;
                     println!("Sign in to Cosmos with your Woozlit account:\n\n  {url}\n");
-                    println!("A browser window should open. Log in on woozlit.com, then return here.");
+                    println!(
+                        "A browser window should open. Log in on woozlit.com, then return here."
+                    );
                     let _ = open_login_url(&url);
                     opened = true;
                 }

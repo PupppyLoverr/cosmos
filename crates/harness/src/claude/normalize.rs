@@ -808,6 +808,23 @@ mod tests {
         ));
     }
 
+    /// ExitPlanMode carries the whole plan as one `plan` markdown blob —
+    /// it decodes to the shared PLAN_TOOL_NAME shape so the doc keeps the
+    /// payload and the plan surface can read it back.
+    #[test]
+    fn exit_plan_mode_decodes_to_the_plan_call() {
+        for name in ["ExitPlanMode", "exit_plan_mode"] {
+            assert_eq!(
+                decode_tool_use(name, &json!({ "plan": "# Steps\n- one" })),
+                ToolCall::Unknown {
+                    name: PLAN_TOOL_NAME.into(),
+                    input: Some(json!({ "plan": "# Steps\n- one" })),
+                },
+                "{name}"
+            );
+        }
+    }
+
     fn normalize_one(raw: &str) -> Vec<AgentEvent> {
         let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
         Normalizer::new(HarnessId::ClaudeCode).normalize(frame, false)

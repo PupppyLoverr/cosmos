@@ -774,7 +774,7 @@ dependencies = [
  "log",
  "num-rational",
  "num-traits",
- "pastey",
+ "pastey 0.1.1",
  "rayon",
  "thiserror 2.0.20",
  "v_frame",
@@ -4548,6 +4548,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ksni"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "814b44c24cd2cb236c3b8a41c7f08237b452a8e76ecaa81f1cec40b5b678215b"
+dependencies = [
+ "futures-util",
+ "pastey 0.2.3",
+ "serde",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "kurbo"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6134,6 +6147,12 @@ name = "pastey"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
+
+[[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pathfinder_geometry"
@@ -9166,6 +9185,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -9216,6 +9236,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "futures-util",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]
@@ -11488,6 +11509,7 @@ dependencies = [
  "rustix 1.1.4",
  "serde",
  "serde_repr",
+ "tokio",
  "tracing",
  "uds_windows",
  "uuid",
@@ -11721,10 +11743,36 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
+ "zeron-computer",
  "zeron-engine",
  "zeron-rpc",
+ "zeron-tools",
  "zeron-ui",
  "zeron-update",
+]
+
+[[package]]
+name = "zeron-computer"
+version = "0.2.72"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "windows-sys 0.61.2",
+ "zeron-proto",
 ]
 
 [[package]]
@@ -11770,12 +11818,14 @@ dependencies = [
  "tracing",
  "uuid",
  "windows-sys 0.61.2",
+ "zeron-computer",
  "zeron-doc",
  "zeron-harness",
  "zeron-preview",
  "zeron-proto",
  "zeron-rpc",
  "zeron-sync",
+ "zeron-tools",
  "zeron-update",
 ]
 
@@ -11933,6 +11983,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeron-tools"
+version = "0.2.72"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "zeron-ui"
 version = "0.2.72"
 dependencies = [
@@ -11956,6 +12022,7 @@ dependencies = [
  "gpui_platform",
  "gpui_tokio",
  "image",
+ "ksni",
  "libc",
  "mermaid-rs-renderer",
  "mimalloc",
@@ -11991,6 +12058,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "wry",
  "x11rb 0.14.0",
+ "zeron-computer",
  "zeron-doc",
  "zeron-engine",
  "zeron-harness",
@@ -11998,6 +12066,7 @@ dependencies = [
  "zeron-rpc",
  "zeron-syntax",
  "zeron-theme",
+ "zeron-tools",
  "zeron-update",
 ]
 

@@ -227,7 +227,7 @@ pub(super) async fn capture() -> Result<CapturedAppshot, CaptureError> {
             .or_else(|| native.wm_class.map(|value| format!("linux-x11:{value}"))),
         window_title: native.title,
         accessibility,
-        screenshot,
+        screenshot: Some(screenshot),
         screenshot_dimensions: Some(dimensions),
         app_icon: native
             .icon_png

@@ -119,6 +119,13 @@ struct SetHarnessEnabledParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SetToolProviderEnabledParams {
+    id: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
@@ -499,6 +506,12 @@ pub struct EngineRpc {
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
+    /// Cosmos Computer — device-local desktop service. `Option` so bare test
+    /// rigs stay light; every handler fails "unavailable" without it.
+    computer: Option<zeron_computer::ComputerService>,
+    /// Cosmos Tools — device-local merged MCP gateway. Same Option contract;
+    /// unlike computer its methods ARE relay-forwardable.
+    tools: Option<zeron_tools::ToolService>,
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
@@ -540,6 +553,8 @@ impl EngineRpc {
             diff_sync,
             uploads,
             agent_accounts,
+            computer: None,
+            tools: None,
             auth: None,
             links: None,
             updater: None,
@@ -575,6 +590,30 @@ impl EngineRpc {
     pub fn with_local_import(mut self, importer: crate::local_import::LocalImporter) -> Self {
         self.local_import = Some(importer);
         self
+    }
+
+    /// Attach the Cosmos Computer service (Settings → Computer surface).
+    pub fn with_computer(mut self, computer: zeron_computer::ComputerService) -> Self {
+        self.computer = Some(computer);
+        self
+    }
+
+    /// Attach the Cosmos Tools service (Settings → Tools surface).
+    pub fn with_tools(mut self, tools: zeron_tools::ToolService) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    fn computer(&self) -> Result<&zeron_computer::ComputerService, RpcError> {
+        self.computer
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("computer service unavailable".into()))
+    }
+
+    fn tools(&self) -> Result<&zeron_tools::ToolService, RpcError> {
+        self.tools
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("tools service unavailable".into()))
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -1027,6 +1066,20 @@ fn forwardable(method: &str) -> bool {
             // Updates report/apply on the device whose binary they concern.
             | methods::UPDATE_STATUS
             | methods::APPLY_UPDATE
+            // Cosmos Tools — per-device tool configuration, retargeted by the
+            // Settings → Tools device switcher.
+            | methods::LIST_TOOLS
+            | methods::UPSERT_TOOL_PROVIDER
+            | methods::REMOVE_TOOL_PROVIDER
+            | methods::SET_TOOL_PROVIDER_ENABLED
+            | methods::CONNECT_COMPOSIO
+            | methods::DISCONNECT_COMPOSIO
+            | methods::LIST_COMPOSIO_APPS
+            | methods::SEARCH_COMPOSIO
+            | methods::START_APP_CONNECT
+            | methods::POLL_APP_CONNECT
+            | methods::PROBE_MCP_SERVER
+            | methods::WATCH_TOOLS
     )
 }
 
@@ -1041,7 +1094,69 @@ fn is_stream_method(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
             | methods::WATCH_WORKSPACE_FILES
             | methods::UPDATE_STATUS
+            | methods::WATCH_TOOLS
+            // Device-local (never reaches `forward`), listed for completeness.
+            | methods::WATCH_COMPUTER
     )
+}
+
+/// Map a classified computer error onto the wire — the stable machine
+/// code rides inside the message as `[code] …` so the settings page can
+/// match remediation hints without a dedicated error channel.
+fn computer_error(e: zeron_computer::ComputerError) -> RpcError {
+    RpcError::Failed(format!("[{}] {}", e.code(), e.message()))
+}
+
+/// The tools twin — `[code] …` carries the classified gateway error.
+fn tool_error(e: zeron_tools::ToolError) -> RpcError {
+    RpcError::Failed(format!("[{}] {}", e.code(), e.message()))
+}
+
+/// `WatchTools`: the current `ToolsSnapshot` first, then one per
+/// status-affecting change (provider add/remove/toggle, connect, failure).
+fn tools_stream(service: zeron_tools::ToolService) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold(
+        (service.subscribe_status(), service, false),
+        |(mut rx, service, emitted)| async move {
+            if emitted {
+                rx.changed().await.ok()?;
+            }
+            let value = serde_json::to_value(service.snapshot()).ok()?;
+            Some((value, (rx, service, true)))
+        },
+    )
+    .boxed()
+}
+
+/// `WatchComputer`: `{status, install}` snapshots — current value first,
+/// then one per status change or install-progress tick, whichever fires.
+fn computer_stream(
+    service: zeron_computer::ComputerService,
+) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold(
+        (
+            service.subscribe_status(),
+            service.subscribe_install(),
+            service,
+            false,
+        ),
+        |(mut status_rx, mut install_rx, service, emitted)| async move {
+            if emitted {
+                tokio::select! {
+                    changed = status_rx.changed() => changed.ok()?,
+                    changed = install_rx.changed() => changed.ok()?,
+                }
+            }
+            let install = install_rx.borrow_and_update().clone();
+            let value = serde_json::to_value(serde_json::json!({
+                "status": service.status(),
+                "install": install,
+            }))
+            .ok()?;
+            Some((value, (status_rx, install_rx, service, true)))
+        },
+    )
+    .boxed()
 }
 
 /// A watch receiver as a stream: current value first, then every change.
@@ -1238,6 +1353,133 @@ impl RpcService for EngineRpc {
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({"ok": true}))
             }
+            // Cosmos Computer (Settings → Computer). Device-local like
+            // RegisterBrowser: absent from `forwardable`, so a remote device
+            // can never drive THIS machine's physical desktop through relay.
+            methods::COMPUTER_STATUS => RpcReply::value(&self.computer()?.status()),
+            methods::COMPUTER_SET_SETTINGS => {
+                let settings: zeron_computer::ComputerSettings = parse_params(params)?;
+                self.computer()?
+                    .set_settings(settings)
+                    .map_err(computer_error)?;
+                RpcReply::value(&self.computer()?.status())
+            }
+            methods::COMPUTER_INSTALL => {
+                // Replies immediately — progress + failure ride WatchComputer.
+                self.computer()?.start_install().map_err(computer_error)?;
+                RpcReply::value(&self.computer()?.status())
+            }
+            methods::COMPUTER_UNINSTALL => {
+                self.computer()?.uninstall().await.map_err(computer_error)?;
+                RpcReply::value(&self.computer()?.status())
+            }
+            methods::COMPUTER_PROBE => RpcReply::value(&self.computer()?.probe().await),
+            methods::COMPUTER_OBSERVE => {
+                let observation = self
+                    .computer()?
+                    .observe(params)
+                    .await
+                    .map_err(computer_error)?;
+                RpcReply::value(&observation)
+            }
+            methods::WATCH_COMPUTER => {
+                let service = self.computer()?.clone();
+                Ok(RpcReply::Stream(computer_stream(service)))
+            }
+            // Cosmos Tools (Settings → Tools). Relay-forwardable — a
+            // `targetDeviceId` param forwards before reaching these arms.
+            // Every reply carries masked config; secrets never cross IPC.
+            methods::LIST_TOOLS => RpcReply::value(&self.tools()?.snapshot()),
+            methods::UPSERT_TOOL_PROVIDER => {
+                let provider: zeron_tools::ToolProvider = parse_params(params)?;
+                self.tools()?
+                    .upsert_provider(provider)
+                    .map_err(tool_error)?;
+                RpcReply::value(&self.tools()?.snapshot())
+            }
+            methods::REMOVE_TOOL_PROVIDER => {
+                let id = params
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RpcError::Failed("Missing provider id".into()))?;
+                self.tools()?.remove_provider(id).map_err(tool_error)?;
+                RpcReply::value(&self.tools()?.snapshot())
+            }
+            methods::SET_TOOL_PROVIDER_ENABLED => {
+                let p: SetToolProviderEnabledParams = parse_params(params)?;
+                self.tools()?
+                    .set_provider_enabled(&p.id, p.enabled)
+                    .map_err(tool_error)?;
+                RpcReply::value(&self.tools()?.snapshot())
+            }
+            methods::CONNECT_COMPOSIO => {
+                let key = params
+                    .get("apiKey")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RpcError::Failed("Missing Composio API key".into()))?;
+                let status = self
+                    .tools()?
+                    .connect_composio(key)
+                    .await
+                    .map_err(tool_error)?;
+                RpcReply::value(&status)
+            }
+            methods::DISCONNECT_COMPOSIO => {
+                self.tools()?.disconnect_composio().map_err(tool_error)?;
+                RpcReply::value(&self.tools()?.snapshot())
+            }
+            methods::LIST_COMPOSIO_APPS => {
+                let apps = self
+                    .tools()?
+                    .list_composio_apps()
+                    .await
+                    .map_err(tool_error)?;
+                RpcReply::value(&apps)
+            }
+            methods::SEARCH_COMPOSIO => {
+                let query = params
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let hits = self
+                    .tools()?
+                    .search_composio(query)
+                    .await
+                    .map_err(tool_error)?;
+                RpcReply::value(&hits)
+            }
+            methods::START_APP_CONNECT => {
+                let toolkit = params
+                    .get("toolkit")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RpcError::Failed("Missing toolkit".into()))?;
+                let start = self
+                    .tools()?
+                    .start_app_connect(toolkit)
+                    .await
+                    .map_err(tool_error)?;
+                RpcReply::value(&start)
+            }
+            methods::POLL_APP_CONNECT => {
+                let toolkit = params
+                    .get("toolkit")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RpcError::Failed("Missing toolkit".into()))?;
+                let app = self
+                    .tools()?
+                    .poll_app_connect(toolkit)
+                    .await
+                    .map_err(tool_error)?;
+                RpcReply::value(&app)
+            }
+            methods::PROBE_MCP_SERVER => {
+                let config: zeron_tools::ProviderConfig = parse_params(params)?;
+                RpcReply::value(&self.tools()?.probe_server(config).await)
+            }
+            methods::WATCH_TOOLS => {
+                let service = self.tools()?.clone();
+                Ok(RpcReply::Stream(tools_stream(service)))
+            }
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
@@ -1390,9 +1632,7 @@ impl RpcService for EngineRpc {
                             .parts
                             .iter()
                             .filter_map(|part| match part {
-                                zeron_doc::MessagePart::Text { text, .. } => {
-                                    Some(text.as_str())
-                                }
+                                zeron_doc::MessagePart::Text { text, .. } => Some(text.as_str()),
                                 _ => None,
                             })
                             .collect::<Vec<_>>()
@@ -2516,6 +2756,26 @@ mod tests {
         assert!(!is_stream_method(methods::READ_WORKSPACE_FILE));
         assert!(!is_stream_method(methods::WRITE_WORKSPACE_FILE));
         assert!(is_stream_method(methods::WATCH_WORKSPACE_FILES));
+        // Cosmos Tools — the Settings → Tools device switcher retargets
+        // these; only the computer surface stays device-local.
+        for method in [
+            methods::LIST_TOOLS,
+            methods::UPSERT_TOOL_PROVIDER,
+            methods::REMOVE_TOOL_PROVIDER,
+            methods::SET_TOOL_PROVIDER_ENABLED,
+            methods::CONNECT_COMPOSIO,
+            methods::DISCONNECT_COMPOSIO,
+            methods::LIST_COMPOSIO_APPS,
+            methods::SEARCH_COMPOSIO,
+            methods::START_APP_CONNECT,
+            methods::POLL_APP_CONNECT,
+            methods::PROBE_MCP_SERVER,
+            methods::WATCH_TOOLS,
+        ] {
+            assert!(forwardable(method), "{method}");
+        }
+        assert!(is_stream_method(methods::WATCH_TOOLS));
+        assert!(!forwardable(methods::WATCH_COMPUTER));
     }
 
     /// Every forwardable unary method gets a bounded reply deadline —

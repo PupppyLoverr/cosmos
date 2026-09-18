@@ -616,12 +616,7 @@ fn plan_badge(call: &ToolCall) -> Option<serde_json::Value> {
     if name != PLAN_TOOL_NAME {
         return None;
     }
-    let plan = input
-        .as_ref()?
-        .get("plan")?
-        .as_str()?
-        .trim()
-        .to_owned();
+    let plan = input.as_ref()?.get("plan")?.as_str()?.trim().to_owned();
     (!plan.is_empty()).then(|| serde_json::json!({ "plan": plan }))
 }
 
@@ -963,6 +958,111 @@ mod tests {
             }
         );
         assert_eq!(clean.subagent_model(), None);
+    }
+
+    /// The plan document is the call's whole payload: sanitize keeps exactly
+    /// `{"plan": <markdown>}` on a PLAN_TOOL_NAME unknown (whitespace trimmed,
+    /// everything else dropped), and a plan-named call with no usable plan
+    /// keeps no input at all. Still a fixpoint.
+    #[test]
+    fn sanitize_keeps_the_plan_payload_and_only_the_plan() {
+        let call = ToolCall::Unknown {
+            name: PLAN_TOOL_NAME.into(),
+            input: Some(serde_json::json!({
+                "plan": "  # Steps\n- one  ",
+                "extra": "goes away",
+            })),
+        };
+        let clean = sanitize_tool_call(&call);
+        assert_eq!(
+            clean,
+            ToolCall::Unknown {
+                name: PLAN_TOOL_NAME.into(),
+                input: Some(serde_json::json!({ "plan": "# Steps\n- one" })),
+            }
+        );
+        assert_eq!(sanitize_tool_call(&clean), clean);
+
+        for input in [
+            None,
+            Some(serde_json::json!({ "extra": "no plan key" })),
+            Some(serde_json::json!({ "plan": "   " })),
+            Some(serde_json::json!({ "plan": 7 })),
+        ] {
+            let call = ToolCall::Unknown {
+                name: PLAN_TOOL_NAME.into(),
+                input,
+            };
+            assert_eq!(
+                sanitize_tool_call(&call),
+                ToolCall::Unknown {
+                    name: PLAN_TOOL_NAME.into(),
+                    input: None,
+                }
+            );
+        }
+        // The name gates the key: a `plan` field on a non-plan call still
+        // strips like any other unknown input.
+        let call = ToolCall::Unknown {
+            name: "write_file".into(),
+            input: Some(serde_json::json!({ "plan": "not a plan call" })),
+        };
+        assert_eq!(
+            sanitize_tool_call(&call),
+            ToolCall::Unknown {
+                name: "write_file".into(),
+                input: None,
+            }
+        );
+    }
+
+    /// A Plan doc call folding through the parts map lands like any other
+    /// tool: resolved on its result, refreshable in place under the shared
+    /// live-plan id while partials stream.
+    #[test]
+    fn plan_doc_part_refreshes_in_place_and_resolves() {
+        let mut parts = Vec::new();
+        let call = |markdown: &str| AgentEvent::ToolCall {
+            id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+            call: ToolCall::Unknown {
+                name: PLAN_TOOL_NAME.into(),
+                input: Some(serde_json::json!({ "plan": markdown })),
+            },
+        };
+        fold_event_into_parts(&mut parts, &call("# draft"));
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                resolved: false,
+                ..
+            }
+        ));
+        fold_event_into_parts(&mut parts, &call("# draft\n- more"));
+        assert_eq!(parts.len(), 1);
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolResult {
+                id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+                is_error: false,
+                output: None,
+                diff: None,
+            },
+        );
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                resolved: true,
+                call: ToolCall::Unknown { name, input },
+                ..
+            } if name == PLAN_TOOL_NAME
+                && input
+                    .as_ref()
+                    .and_then(|i| i.get("plan"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("# draft\n- more")
+        ));
     }
 
     #[test]

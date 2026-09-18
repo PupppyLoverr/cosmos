@@ -1508,7 +1508,11 @@ impl Composer {
         let expected = self.queue_edit_base_text_hash.clone();
         let mut staged = self.staged().to_vec();
         let staged_appshots = self.staged_appshots().to_vec();
-        staged.extend(staged_appshots.iter().map(|shot| shot.screenshot.clone()));
+        staged.extend(
+            staged_appshots
+                .iter()
+                .filter_map(|shot| shot.screenshot.clone()),
+        );
         let mut params = serde_json::json!({
             "chatId": chat_id,
             "id": id,
@@ -1908,7 +1912,10 @@ mod tests {
             let body = crate::appshots::with_appshots(
                 user_text,
                 &[shot.clone()],
-                &std::collections::HashMap::from([(shot.screenshot.id.clone(), paths[0].clone())]),
+                &std::collections::HashMap::from([(
+                    shot.screenshot.as_ref().unwrap().id.clone(),
+                    paths[0].clone(),
+                )]),
             );
             let expected = if user_text.is_empty() {
                 crate::attachments::ATTACHMENT_ONLY_TEXT
@@ -1935,9 +1942,12 @@ mod tests {
         let body = crate::appshots::with_appshots(
             "look",
             &[shot.clone()],
-            &[(shot.screenshot.id.clone(), paths[0].clone())]
-                .into_iter()
-                .collect(),
+            &[(
+                shot.screenshot.as_ref().unwrap().id.clone(),
+                paths[0].clone(),
+            )]
+            .into_iter()
+            .collect(),
         );
         assert_eq!(
             super::queue_attachment_labels(&body, &paths),

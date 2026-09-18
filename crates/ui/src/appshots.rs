@@ -293,7 +293,10 @@ pub struct CapturedAppshot {
     pub bundle_identifier: Option<String>,
     pub window_title: Option<String>,
     pub accessibility: AccessibilitySnapshot,
-    pub screenshot: StagedAttachment,
+    /// `None` for semantic-only captures — Cosmos Computer Screen Context
+    /// observations carry the accessibility tree alone when screenshots are
+    /// disabled or the platform/driver cannot supply one.
+    pub screenshot: Option<StagedAttachment>,
     /// Pixel dimensions of the captured PNG. The composer uses these to size
     /// the native image layer explicitly instead of relying on intrinsic
     /// image layout, which can escape a clipped Appshot stage.
@@ -661,10 +664,6 @@ pub fn with_appshots(
     out.push_str("\n\n");
     out.push_str(CONTEXT_MARKER);
     for appshot in appshots {
-        let image = image_paths
-            .get(&appshot.screenshot.id)
-            .map(String::as_str)
-            .unwrap_or_default();
         out.push_str("\n<appshot app=\"");
         out.push_str(&xml_escape(&appshot.app_name));
         out.push('"');
@@ -678,9 +677,18 @@ pub fn with_appshots(
             out.push_str(&xml_escape(title));
             out.push('"');
         }
-        out.push_str(" image=\"");
-        out.push_str(&xml_escape(image));
-        out.push_str("\" accessibility-format=\"");
+        // Semantic-only captures serialize without an image attribute at
+        // all; restore treats its absence as `screenshot: None`.
+        if let Some(screenshot) = &appshot.screenshot {
+            let image = image_paths
+                .get(&screenshot.id)
+                .map(String::as_str)
+                .unwrap_or_default();
+            out.push_str(" image=\"");
+            out.push_str(&xml_escape(image));
+            out.push('"');
+        }
+        out.push_str(" accessibility-format=\"");
         out.push_str(&appshot.accessibility.format_version.to_string());
         out.push_str("\" truncated=\"");
         out.push_str(if appshot.accessibility.truncated {
@@ -738,22 +746,32 @@ pub(crate) fn restore_queued_appshots(
         if !node.has_tag_name("appshot") || node.children().any(|child| !child.is_text()) {
             return Err(invalid());
         }
-        let image = node.attribute("image").ok_or_else(invalid)?;
-        let index = paths
-            .iter()
-            .position(|path| path == image)
-            .ok_or_else(invalid)?;
-        if !used.insert(index) {
-            return Err(invalid());
-        }
-        let mut screenshot = attachments[index].clone();
-        // Older captures may already have backing-surface padding stored in
-        // their PNG. Normalize their bytes too, without changing attachment IDs.
-        if png_dimensions(screenshot.bytes()).is_some() {
-            if let Some(bytes) = trim_appshot_padding(screenshot.bytes()).map_err(|_| invalid())? {
-                screenshot.image = Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes));
+        // `image` absent → a semantic-only capture; it consumes no upload
+        // slot. Present → must resolve to exactly one uploaded attachment.
+        let screenshot = match node.attribute("image") {
+            Some(image) => {
+                let index = paths
+                    .iter()
+                    .position(|path| path == image)
+                    .ok_or_else(invalid)?;
+                if !used.insert(index) {
+                    return Err(invalid());
+                }
+                let mut screenshot = attachments[index].clone();
+                // Older captures may already have backing-surface padding
+                // stored in their PNG. Normalize their bytes too, without
+                // changing attachment IDs.
+                if png_dimensions(screenshot.bytes()).is_some()
+                    && let Some(bytes) =
+                        trim_appshot_padding(screenshot.bytes()).map_err(|_| invalid())?
+                {
+                    screenshot.image =
+                        Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes));
+                }
+                Some(screenshot)
             }
-        }
+            None => None,
+        };
         let content = node.text().unwrap_or_default();
         // Remove only the serializer's surrounding newlines, preserving content.
         let content = content.strip_prefix('\n').unwrap_or(content);
@@ -776,7 +794,7 @@ pub(crate) fn restore_queued_appshots(
                     .parse()
                     .map_err(|_| invalid())?,
             },
-            screenshot_dimensions: png_dimensions(screenshot.bytes()),
+            screenshot_dimensions: screenshot.as_ref().and_then(|s| png_dimensions(s.bytes())),
             screenshot,
             app_icon: None,
             captured_at: Utc::now(),
@@ -785,7 +803,8 @@ pub(crate) fn restore_queued_appshots(
     if shots.is_empty()
         || shots
             .iter()
-            .map(|shot| shot.screenshot.bytes().len() as u64)
+            .filter_map(|shot| shot.screenshot.as_ref())
+            .map(|screenshot| screenshot.bytes().len() as u64)
             .sum::<u64>()
             > MAX_STAGED_APPSHOT_BYTES
     {
@@ -935,11 +954,11 @@ pub(crate) mod tests {
                 content: "AXTextField: <ignore this>".into(),
                 truncated: true,
             },
-            screenshot: StagedAttachment {
+            screenshot: Some(StagedAttachment {
                 id: "image-1".into(),
                 name: "Safari Appshot.png".into(),
                 image: Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())),
-            },
+            }),
             screenshot_dimensions: Some((1440, 900)),
             app_icon: None,
             captured_at: Utc::now(),
@@ -1048,27 +1067,37 @@ pub(crate) mod tests {
     fn restored_queue_appshots_trim_legacy_padding_without_changing_attachment_identity() {
         let pixels = [[0, 0, 0, 0], [44, 55, 66, 255], [0, 0, 0, 0]].concat();
         let mut original = shot();
-        original.screenshot = crate::attachments::stage_png_bytes(
+        original.screenshot = Some(crate::attachments::stage_png_bytes(
             "Chrome.png".into(),
             fixture_png(3, 1, &pixels, png::BitDepth::Eight),
-        );
+        ));
         let path = "/host/legacy.png".to_string();
         let text = with_appshots(
             "edit",
             &[original.clone()],
-            &HashMap::from([(original.screenshot.id.clone(), path.clone())]),
+            &HashMap::from([(
+                original.screenshot.as_ref().unwrap().id.clone(),
+                path.clone(),
+            )]),
         );
         let (_, restored) =
-            restore_queued_appshots(&text, &[path], &[original.screenshot.clone()]).unwrap();
-        assert_eq!(restored[0].screenshot.id, original.screenshot.id);
+            restore_queued_appshots(&text, &[path], &[original.screenshot.clone().unwrap()])
+                .unwrap();
+        assert_eq!(
+            restored[0].screenshot.as_ref().unwrap().id,
+            original.screenshot.as_ref().unwrap().id
+        );
         assert_eq!(restored[0].screenshot_dimensions, Some((1, 1)));
         assert_eq!(restored[0].accessibility, original.accessibility);
         assert_eq!(
-            decoded_pixels(restored[0].screenshot.bytes()).1,
+            decoded_pixels(restored[0].screenshot.as_ref().unwrap().bytes()).1,
             [44, 55, 66, 255]
         );
         // The original upload remains immutable.
-        assert_eq!(png_dimensions(original.screenshot.bytes()), Some((3, 1)));
+        assert_eq!(
+            png_dimensions(original.screenshot.as_ref().unwrap().bytes()),
+            Some((3, 1))
+        );
     }
 
     #[test]
@@ -1118,13 +1147,17 @@ pub(crate) mod tests {
         let encoded = with_appshots(
             "inspect",
             &[original.clone()],
-            &HashMap::from([(original.screenshot.id.clone(), path.clone())]),
+            &HashMap::from([(
+                original.screenshot.as_ref().unwrap().id.clone(),
+                path.clone(),
+            )]),
         );
         let sources = presentations(&encoded);
         assert_eq!(sources[&path].app_name, "App� & Notes");
         assert_eq!(sources[&path].window_title.as_deref(), Some("Title���"));
         let (_, restored) =
-            restore_queued_appshots(&encoded, &[path], &[original.screenshot.clone()]).unwrap();
+            restore_queued_appshots(&encoded, &[path], &[original.screenshot.clone().unwrap()])
+                .unwrap();
         assert_eq!(restored[0].app_name, "App� & Notes");
         assert_eq!(restored[0].window_title.as_deref(), Some("Title���"));
         assert_eq!(
@@ -1143,13 +1176,16 @@ pub(crate) mod tests {
         let mut original = shot();
         original.window_title = Some("Line 1\nLine 2\t&\"".into());
         original.accessibility.content = "\n<&secret>\r\n  text\n".into();
-        let mut ordinary = original.screenshot.clone();
+        let mut ordinary = original.screenshot.clone().unwrap();
         ordinary.id = "ordinary".into();
         let paths: Vec<String> = vec!["/host/ordinary.png".into(), "/host/a&b.png".into()];
         let encoded = with_appshots(
             "inspect",
             &[original.clone()],
-            &HashMap::from([(original.screenshot.id.clone(), paths[1].clone())]),
+            &HashMap::from([(
+                original.screenshot.as_ref().unwrap().id.clone(),
+                paths[1].clone(),
+            )]),
         );
         for text in [
             encoded.clone(),
@@ -1158,7 +1194,7 @@ pub(crate) mod tests {
             let (ordinary_restored, restored) = restore_queued_appshots(
                 &text,
                 &paths,
-                &[ordinary.clone(), original.screenshot.clone()],
+                &[ordinary.clone(), original.screenshot.clone().unwrap()],
             )
             .unwrap();
             assert_eq!(ordinary_restored.len(), 1);
@@ -1170,7 +1206,10 @@ pub(crate) mod tests {
             let rebound = with_appshots(
                 "edited",
                 &restored,
-                &HashMap::from([(restored[0].screenshot.id.clone(), "/new/renamed.png".into())]),
+                &HashMap::from([(
+                    restored[0].screenshot.as_ref().unwrap().id.clone(),
+                    "/new/renamed.png".into(),
+                )]),
             );
             assert!(rebound.contains("image=\"/new/renamed.png\""));
             assert!(!rebound.contains("/host/"));
@@ -1186,7 +1225,10 @@ pub(crate) mod tests {
         let valid = with_appshots(
             "",
             &[original.clone()],
-            &HashMap::from([(original.screenshot.id.clone(), paths[0].clone())]),
+            &HashMap::from([(
+                original.screenshot.as_ref().unwrap().id.clone(),
+                paths[0].clone(),
+            )]),
         );
         for invalid in [
             valid.replace("/host/image.png", "/missing.png"),
@@ -1195,11 +1237,12 @@ pub(crate) mod tests {
             format!("{valid}\n{}", valid.split_once(CONTEXT_MARKER).unwrap().1),
         ] {
             assert!(
-                restore_queued_appshots(&invalid, &paths, &[original.screenshot.clone()]).is_err()
+                restore_queued_appshots(&invalid, &paths, &[original.screenshot.clone().unwrap()])
+                    .is_err()
             );
         }
         let (ordinary, shots) =
-            restore_queued_appshots("plain", &paths, &[original.screenshot]).unwrap();
+            restore_queued_appshots("plain", &paths, &[original.screenshot.unwrap()]).unwrap();
         assert_eq!(ordinary.len(), 1);
         assert!(shots.is_empty());
     }
@@ -1209,6 +1252,39 @@ pub(crate) mod tests {
         let shot = shot();
         let prompt = with_appshots("", &[shot], &HashMap::new());
         assert_eq!(strip_context_for_display(&prompt), "");
+    }
+
+    #[test]
+    fn semantic_only_appshots_round_trip_without_an_image_slot() {
+        let mut shot = shot();
+        shot.screenshot = None;
+        shot.screenshot_dimensions = None;
+        let expected = shot.accessibility.clone();
+        let encoded = with_appshots("check my screen", &[shot], &HashMap::new());
+        assert!(encoded.contains("<appshot app="));
+        assert!(!encoded.contains("image="));
+        // No image attribute means no presentation entry either — nothing
+        // for the queue echo to badge.
+        assert!(presentations(&encoded).is_empty());
+        // A semantic shot consumes no attachment slot: an ordinary image on
+        // the same queued draft stays ordinary through restore.
+        let ordinary = StagedAttachment {
+            id: "ordinary".into(),
+            name: "ref.png".into(),
+            image: Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())),
+        };
+        let (restored_ordinary, restored) =
+            restore_queued_appshots(&encoded, &["/host/ref.png".to_string()], &[ordinary]).unwrap();
+        assert_eq!(restored_ordinary.len(), 1);
+        assert_eq!(restored_ordinary[0].id, "ordinary");
+        assert_eq!(restored.len(), 1);
+        assert!(restored[0].screenshot.is_none());
+        assert_eq!(restored[0].screenshot_dimensions, None);
+        assert_eq!(restored[0].accessibility, expected);
+        // Re-serializing the restored shot stays image-free.
+        let rebound = with_appshots("edited", &restored, &HashMap::new());
+        assert!(rebound.contains("<appshot app="));
+        assert!(!rebound.contains("image="));
     }
 
     #[test]

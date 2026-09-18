@@ -443,7 +443,7 @@ fn capture_frontmost_window() -> Result<CapturedAppshot, CaptureError> {
             bundle_identifier: app.bundle_identifier,
             window_title: window.title,
             accessibility,
-            screenshot,
+            screenshot: Some(screenshot),
             screenshot_dimensions: Some(screenshot_dimensions),
             app_icon: app.icon_png.map(|bytes| {
                 std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes))

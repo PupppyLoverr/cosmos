@@ -72,6 +72,7 @@ enum HarnessCatalog {
         "opencode": "OpenCode",
         "antigravity": "Antigravity",
         "amp": "Amp",
+        "kimi-code": "Kimi Code",
         "mock": "Mock",
     ]
 
@@ -86,6 +87,7 @@ enum HarnessCatalog {
     private static let codexXhighLadder = ["low", "medium", "high", "xhigh"]
     private static let ampEffortLadder = ["minimal", "low", "medium", "high", "xhigh", "max"]
     private static let antigravityEffortLadder = ["low", "medium", "high"]
+    private static let kimiEffortLadder = ["low", "high", "max"]
     private static let codexServiceTier = [
         ModelOptionInfo(id: "serviceTier", label: "Service Tier", choices: [
             ModelOptionChoiceInfo(id: "default", label: "Standard"),
@@ -169,6 +171,19 @@ enum HarnessCatalog {
                 ModelInfo(id: "opencode/hy3-free", label: "Hy3 Free",
                           description: "Free tier on OpenCode Zen",
                           reasoningLevels: ["low", "medium", "high"]),
+            ]
+        case "kimi-code":
+            // Static fallback only — a reachable host answers `listModels`
+            // with the CLI's configured catalog (managed kimi-code rows plus
+            // provider models). Ids are the model-registry ids `kimi acp`
+            // advertises; k3 carries the graded low/high/max effort ladder.
+            return [
+                ModelInfo(id: "k3", label: "Kimi K3",
+                          description: "Moonshot's flagship coding model — 1M context",
+                          reasoningLevels: kimiEffortLadder),
+                ModelInfo(id: "kimi-for-coding", label: "Kimi K2.7 Code",
+                          description: "Kimi's coding model for routine development",
+                          reasoningLevels: []),
             ]
         case "codex":
             return [

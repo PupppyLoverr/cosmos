@@ -2,8 +2,9 @@
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`) and Hermes
-//! ([`AcpHarness::hermes`], `hermes acp`) — plus pi
+//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`), Hermes
+//! ([`AcpHarness::hermes`], `hermes acp`) and Kimi Code
+//! ([`AcpHarness::kimi`], `kimi acp`) — plus pi
 //! ([`AcpHarness::pi`]) via the community `pi-acp` adapter until a native
 //! driver exists. Claude, Codex and Cursor moved to native drivers
 //! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
@@ -486,6 +487,83 @@ fn pi_spec() -> AcpAgentSpec {
     }
 }
 
+/// Kimi Code's install dirs: the official installers (install.sh /
+/// install.ps1) default `KIMI_INSTALL_DIR` to `~/.kimi-code` on every
+/// platform with the binary in `bin/`; the npm-global alternative
+/// (`npm i -g @moonshot-ai/kimi-code`) lands in the usual npm bins.
+fn kimi_install_paths() -> Vec<PathBuf> {
+    let mut dirs = npm_global_bins("kimi");
+    if let Some(home) = crate::executable::home_dir() {
+        dirs.push(home.join(".kimi-code").join("bin").join("kimi"));
+    }
+    dirs
+}
+
+fn kimi_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::KimiCode,
+        display_name: "Kimi Code",
+        executable: "kimi",
+        env_override: "KIMI_EXECUTABLE",
+        // `kimi acp` is the CLI's native multi-session ACP server — there is
+        // no adapter to managed-install, and `kimi login` has to come first
+        // anyway (session/new answers AUTH_REQUIRED without it).
+        args: &["acp"],
+        npm_package: None,
+        extra_paths: kimi_install_paths,
+        cli_executable: "kimi",
+        cli_extra_paths: kimi_install_paths,
+        install_hint: "kimi (searched PATH, the login shell's PATH, ~/.kimi-code/bin, \
+             npm global bins, /opt/homebrew/bin, /usr/local/bin, and \
+             fnm/nvm/volta/pnpm/bun install dirs; install with \
+             `curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash` or \
+             `npm install -g @moonshot-ai/kimi-code`, then `kimi login`; set \
+             KIMI_EXECUTABLE to override)",
+        // session/new's `model` config option carries the user's configured
+        // catalog (the managed kimi-code rows plus every provider model) —
+        // discovered live; these managed entries are the static fallback.
+        // Ids are the bare model-registry ids the option advertises.
+        models: || {
+            vec![
+                Model {
+                    id: "k3".into(),
+                    label: "Kimi K3".into(),
+                    description: Some("Moonshot's flagship coding model — 1M context".into()),
+                    reasoning_levels: vec![
+                        ReasoningLevel::Low,
+                        ReasoningLevel::High,
+                        ReasoningLevel::Max,
+                    ],
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "kimi-for-coding".into(),
+                    label: "Kimi K2.7 Code".into(),
+                    description: Some("Kimi's coding model for routine development".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+            ]
+        },
+        // No `_session/steering` extension: steers deliver at turn boundaries.
+        steering_mode: SteeringMode::TurnBoundary,
+        // k3's graded `thinking` ladder (support_efforts low/high/max);
+        // boolean-thinking models collapse to the wire's on/off instead.
+        reasoning_levels: &[
+            ReasoningLevel::Low,
+            ReasoningLevel::High,
+            ReasoningLevel::Max,
+        ],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        model_discovery_timeout: None,
+        prompt_complete_extension: false,
+        prompt_stall: None,
+        stall_hint: "The agent process is likely wedged.",
+    }
+}
+
 /// Background-install managed npm adapters for agents whose CLI is present
 /// on this device, so a first chat never pays (or trips over) an npm run.
 /// Skips agents whose adapter is already resolvable; failures are logged and
@@ -607,6 +685,11 @@ impl AcpHarness {
     /// pi's RPC mode.
     pub fn pi() -> Self {
         Self::with_spec(pi_spec())
+    }
+
+    /// Kimi Code (`kimi acp`) — Moonshot AI's native multi-session ACP server.
+    pub fn kimi() -> Self {
+        Self::with_spec(kimi_spec())
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.
@@ -755,6 +838,8 @@ impl AcpHarness {
         block_on_install: bool,
         extra_args: &[String],
         browser_url: Option<&str>,
+        computer_url: Option<&str>,
+        tools_url: Option<&str>,
     ) -> Result<(Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
@@ -762,6 +847,12 @@ impl AcpHarness {
         cmd.args(extra_args);
         if let Some(url) = browser_url {
             cmd.env(crate::BROWSER_BRIDGE_ENV, url);
+        }
+        if let Some(url) = computer_url {
+            cmd.env(crate::COMPUTER_ENV, url);
+        }
+        if let Some(url) = tools_url {
+            cmd.env(crate::TOOLS_ENV, url);
         }
         crate::compose_child_path(&mut cmd, &exe);
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
@@ -798,7 +889,7 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[], None).await?;
+        let (mut child, _stderr) = self.spawn_agent(None, false, &[], None, None, None).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -862,7 +953,7 @@ impl AcpHarness {
     /// initialize → `session/list`. Agents that don't implement the method
     /// answer with an error we treat as "no sessions", never a failure.
     async fn discover_sessions(&self) -> Result<Vec<zeron_proto::HarnessSession>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[], None).await?;
+        let (mut child, _stderr) = self.spawn_agent(None, false, &[], None, None, None).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -894,9 +985,7 @@ impl AcpHarness {
                     _ = &mut deadline => break,
                 }
             }
-            Ok::<Vec<zeron_proto::HarnessSession>, HarnessError>(
-                parse_session_list(&response),
-            )
+            Ok::<Vec<zeron_proto::HarnessSession>, HarnessError>(parse_session_list(&response))
         };
         let result = tokio::time::timeout(self.model_discovery_timeout, discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
@@ -916,7 +1005,10 @@ impl AcpHarness {
         session_id: &str,
         cwd: &str,
     ) -> Option<Vec<zeron_proto::SessionTranscriptRow>> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[], None).await.ok()?;
+        let (mut child, _stderr) = self
+            .spawn_agent(None, false, &[], None, None, None)
+            .await
+            .ok()?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -993,8 +1085,7 @@ impl AcpHarness {
             }
             Some(rows)
         };
-        let result =
-            tokio::time::timeout(self.model_discovery_timeout, discovery).await;
+        let result = tokio::time::timeout(self.model_discovery_timeout, discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
         result.ok().flatten()
     }
@@ -1005,7 +1096,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[], None).await?;
+        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[], None, None, None).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1420,9 +1511,11 @@ impl Harness for AcpHarness {
         let Some(root) = crate::home_dir().map(|h| h.join(".grok").join("sessions")) else {
             return Ok(probed);
         };
-        Ok(tokio::task::spawn_blocking(move || crate::sessions::scan_grok(&root))
-            .await
-            .unwrap_or_default())
+        Ok(
+            tokio::task::spawn_blocking(move || crate::sessions::scan_grok(&root))
+                .await
+                .unwrap_or_default(),
+        )
     }
 
     /// A `session/load` probe IS the transcript: the agent replays the stored
@@ -1442,8 +1535,9 @@ impl Harness for AcpHarness {
             if let Some(root) = root {
                 let id = session_id.to_string();
                 let rows = tokio::task::spawn_blocking(move || {
-                    crate::sessions::find_grok_session(&root, &id)
-                        .map(|dir| crate::sessions::grok_transcript(&dir.join("chat_history.jsonl")))
+                    crate::sessions::find_grok_session(&root, &id).map(|dir| {
+                        crate::sessions::grok_transcript(&dir.join("chat_history.jsonl"))
+                    })
                 })
                 .await
                 .unwrap_or_default();
@@ -1466,6 +1560,8 @@ impl Harness for AcpHarness {
                 true,
                 &[],
                 crate::browser_bridge_url(&request),
+                crate::computer_url(&request),
+                crate::tools_url(&request),
             )
             .await?;
         let stdin = child
@@ -2239,13 +2335,15 @@ async fn run_session(session: Session) {
         let init_commands = scan_available_commands(&init);
 
         // ACP's session/new mcpServers are stdio-only — the app stamps local
-        // runs with the loopback browser bridge, which the `zeron
-        // browser-bridge` shim subprocess fronts over stdio. Discovery
-        // probes keep the empty list.
+        // runs with the loopback browser/computer/tools endpoints, which the
+        // `browser-bridge`/`computer-stdio`/`tools-stdio` shim subprocesses
+        // front over stdio. Discovery probes keep the empty list.
         let session_params = json!({
             "cwd": request.cwd,
             "mcpServers": crate::browser_bridge_acp_server(&request)
                 .into_iter()
+                .chain(crate::computer_acp_server(&request))
+                .chain(crate::tools_acp_server(&request))
                 .collect::<Vec<_>>(),
         });
         let (session_id, mut session_response) = if let Some(resume) = &request.resume {
@@ -2260,15 +2358,12 @@ async fn run_session(session: Session) {
             // and every later turn resumes the WRONG (empty) session.
             let mut attempt = 0u32;
             let loaded = loop {
-                match request_draining(&client, &mut incoming, "session/load", load.clone())
-                    .await
-                {
+                match request_draining(&client, &mut incoming, "session/load", load.clone()).await {
                     Ok(resp) => break Some(resp),
                     Err(e) => {
                         attempt += 1;
                         let msg = e.to_string();
-                        let locked =
-                            msg.contains("already open") || msg.contains("session_locked");
+                        let locked = msg.contains("already open") || msg.contains("session_locked");
                         let missing =
                             msg.contains("not found") || msg.contains("session_not_found");
                         // Locked frees when the old process exits — wait it
@@ -3876,7 +3971,11 @@ mod tests {
         );
         assert_eq!(
             models[1].reasoning_levels,
-            vec![ReasoningLevel::Low, ReasoningLevel::Medium, ReasoningLevel::High]
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High
+            ]
         );
     }
 

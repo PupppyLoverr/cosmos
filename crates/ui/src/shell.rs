@@ -38,11 +38,13 @@ use crate::rail;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::{AppearancePage, AppearanceSettingsEvent};
 use crate::settings::archived::ArchivedPage;
+use crate::settings::computer::ComputerPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::tools::{ToolsPage, ToolsPageEvent};
 use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT,
     RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
@@ -310,6 +312,7 @@ pub fn apply_keymap(
         }
     }
     crate::appshots::set_shortcut(&keymap.capture_appshot);
+    crate::delegate::set_shortcut(&keymap.delegate_task);
     cx.clear_key_bindings();
     // `clear_key_bindings` also removes the contextual editing actions that
     // gpui-base installed at startup. Reinitialize the component layer before
@@ -406,12 +409,16 @@ pub enum SettingsSection {
     Files,
     Notifications,
     Shortcuts,
+    /// Cosmos Computer — Screen Context + the optional local driver component.
+    Computer,
+    /// Cosmos Tools — Composio apps, MCP servers, and the computer summary.
+    Tools,
     Appshots,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 11] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
@@ -419,6 +426,8 @@ impl SettingsSection {
         SettingsSection::Files,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
+        SettingsSection::Computer,
+        SettingsSection::Tools,
         SettingsSection::Appshots,
         SettingsSection::Archived,
     ];
@@ -434,6 +443,8 @@ impl SettingsSection {
             SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
+            SettingsSection::Computer => "Computer",
+            SettingsSection::Tools => "Tools",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
         }
@@ -501,22 +512,17 @@ fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface
 /// each turn's plan lands in its own entry, so the id distinguishes "the
 /// plan I already dismissed" from "a new plan" — plus the part's resolved
 /// flag (a plan is "ready" once its tool result lands).
-fn latest_plan_part(
-    entries: &[zeron_doc::SessionMessageEntry],
-) -> Option<(String, bool)> {
+fn latest_plan_part(entries: &[zeron_doc::SessionMessageEntry]) -> Option<(String, bool)> {
     entries.iter().rev().find_map(|entry| {
         entry
             .parts
             .iter()
             .rev()
-            .find(|part| {
-                matches!(part, zeron_doc::MessagePart::Tool { call, .. } if call.is_plan())
-            })
+            .find(
+                |part| matches!(part, zeron_doc::MessagePart::Tool { call, .. } if call.is_plan()),
+            )
             .map(|part| {
-                let resolved = matches!(
-                    part,
-                    zeron_doc::MessagePart::Tool { resolved: true, .. }
-                );
+                let resolved = matches!(part, zeron_doc::MessagePart::Tool { resolved: true, .. });
                 (entry.id.clone(), resolved)
             })
     })
@@ -1454,6 +1460,9 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
+    computer_page: Option<Entity<ComputerPage>>,
+    tools_page: Option<Entity<ToolsPage>>,
+    tools_sub: Option<Subscription>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     files_settings_sub: Option<Subscription>,
@@ -1714,6 +1723,7 @@ impl Shell {
         });
         crate::appshots::set_enabled(settings.appshots_enabled);
         crate::appshots::set_capture_sound_enabled(settings.appshot_sound_enabled);
+        crate::delegate::set_enabled(settings.delegate_enabled);
         // Bind the customizable shortcuts from the persisted keymap.
         apply_keymap(cx, &settings.keymap, settings.composer_send_behavior);
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
@@ -1728,6 +1738,8 @@ impl Shell {
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
+            Some("settings/computer") => Route::Settings(SettingsSection::Computer),
+            Some("settings/tools") => Route::Settings(SettingsSection::Tools),
             Some("settings/appshots") => Route::Settings(SettingsSection::Appshots),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
@@ -1856,6 +1868,9 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
+            computer_page: None,
+            tools_page: None,
+            tools_sub: None,
             shortcuts_sub: None,
             notifications_sub: None,
             files_settings_sub: None,
@@ -2297,8 +2312,7 @@ impl Shell {
             let revision = state.read(cx).transcript_revision;
             if revision != self.plan_scan_revision {
                 self.plan_scan_revision = revision;
-                if let Some((entry_id, resolved)) =
-                    latest_plan_part(&state.read(cx).transcript)
+                if let Some((entry_id, resolved)) = latest_plan_part(&state.read(cx).transcript)
                     && resolved
                     && self.plan_acted.get(&key).map(String::as_str) != Some(entry_id.as_str())
                     && !self
@@ -3176,9 +3190,9 @@ impl Shell {
             let state = self.state.read(cx);
             state.transcript.iter().rev().find_map(|entry| {
                 entry.parts.iter().rev().find_map(|part| match part {
-                    zeron_doc::MessagePart::Tool {
-                        call, resolved, ..
-                    } => call.plan_markdown().map(|markdown| (markdown, *resolved)),
+                    zeron_doc::MessagePart::Tool { call, resolved, .. } => {
+                        call.plan_markdown().map(|markdown| (markdown, *resolved))
+                    }
                     _ => None,
                 })
             })
@@ -3685,9 +3699,7 @@ impl Shell {
                 // Snooze THIS plan only: `plan_acted` keys on the owning
                 // transcript entry, so the next turn's plan still docks
                 // while this one stays closed.
-                if let Some((entry_id, _)) =
-                    latest_plan_part(&self.state.read(cx).transcript)
-                {
+                if let Some((entry_id, _)) = latest_plan_part(&self.state.read(cx).transcript) {
                     self.plan_acted.insert(key.clone(), entry_id);
                 }
             }
@@ -4336,6 +4348,37 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Computer => {
+                if self.computer_page.is_none() {
+                    let state = self.state.clone();
+                    self.computer_page = Some(cx.new(|cx| ComputerPage::new(state, cx)));
+                }
+                match &self.computer_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Tools => {
+                if self.tools_page.is_none() {
+                    let state = self.state.clone();
+                    let page = cx.new(|cx| ToolsPage::new(state, cx));
+                    // The Computer group's "Manage" link asks the shell to
+                    // navigate — routing is the shell's job, not the page's.
+                    self.tools_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &ToolsPageEvent, cx| match *event {
+                            ToolsPageEvent::OpenComputerSettings => {
+                                this.open_settings(SettingsSection::Computer, cx);
+                            }
+                        },
+                    ));
+                    self.tools_page = Some(page);
+                }
+                match &self.tools_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Shortcuts | SettingsSection::Appshots => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
@@ -4345,6 +4388,9 @@ impl Shell {
                     let appshots_enabled = self.settings.appshots_enabled;
                     let appshot_sound_enabled = self.settings.appshot_sound_enabled;
                     let appshot_destination = self.settings.appshot_destination;
+                    let delegate_enabled = self.settings.delegate_enabled;
+                    let keep_running_in_tray = self.settings.keep_running_in_tray;
+                    let launch_at_login = self.settings.launch_at_login;
                     let page = cx.new(|cx| {
                         ShortcutsPage::new(
                             state,
@@ -4354,6 +4400,9 @@ impl Shell {
                             appshots_enabled,
                             appshot_sound_enabled,
                             appshot_destination,
+                            delegate_enabled,
+                            keep_running_in_tray,
+                            launch_at_login,
                             cx,
                         )
                     });
@@ -4381,6 +4430,19 @@ impl Shell {
                                     crate::appshots::set_capture_sound_enabled(*sound_enabled);
                                     this.settings.appshot_destination = *destination;
                                     crate::appshots::set_enabled(*enabled);
+                                }
+                                ShortcutsEvent::DelegateChanged { enabled } => {
+                                    this.settings.delegate_enabled = *enabled;
+                                    crate::delegate::set_enabled(*enabled);
+                                }
+                                ShortcutsEvent::TrayChanged {
+                                    keep_running,
+                                    launch_at_login,
+                                } => {
+                                    this.settings.keep_running_in_tray = *keep_running;
+                                    this.settings.launch_at_login = *launch_at_login;
+                                    crate::tray::set_keep_running(&this.state, *keep_running, cx);
+                                    crate::tray::sync_autostart(*launch_at_login);
                                 }
                             }
                             apply_keymap(
@@ -5895,6 +5957,8 @@ impl Shell {
             SettingsSection::Files => icons::FOLDER,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
+            SettingsSection::Computer => icons::EYE,
+            SettingsSection::Tools => icons::SETTINGS_MINIMALISTIC,
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
@@ -10853,10 +10917,7 @@ mod tests {
             plan_entry("e1", doc_plan("# a"), true),
             plan_entry("e2", todo_plan, false),
         ];
-        assert_eq!(
-            latest_plan_part(&entries),
-            Some(("e2".to_owned(), false))
-        );
+        assert_eq!(latest_plan_part(&entries), Some(("e2".to_owned(), false)));
         // Non-plan entries after the plan don't hide it — the scan keeps
         // walking back until a plan part turns up.
         let mut tail = entries.clone();

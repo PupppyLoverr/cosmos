@@ -215,20 +215,37 @@ impl ClaudeHarness {
             cmd.arg("--settings");
             cmd.arg(Value::Object(settings).to_string());
         }
-        // The app stamps local runs with the loopback embedded-browser
-        // bridge; `--mcp-config` merges alongside the user's own servers
-        // (strict mode stays title-only), and the env var is the uniform
-        // fallback every harness gets.
+        // The app stamps local runs with the loopback embedded-browser and
+        // computer endpoints; `--mcp-config` merges alongside the user's own
+        // servers (strict mode stays title-only), and the env vars are the
+        // uniform fallback every harness gets. Both servers ride ONE flag —
+        // whether claude merges repeated --mcp-config args is not
+        // guaranteed.
+        let mut mcp_servers = serde_json::Map::new();
         if let Some(url) = crate::browser_bridge_url(request) {
-            cmd.arg("--mcp-config").arg(
-                serde_json::json!({
-                    "mcpServers": {
-                        "zeron-browser": {"type": "http", "url": url}
-                    }
-                })
-                .to_string(),
+            mcp_servers.insert(
+                "cosmos-browser".into(),
+                serde_json::json!({"type": "http", "url": url}),
             );
             cmd.env(crate::BROWSER_BRIDGE_ENV, url);
+        }
+        if let Some(url) = crate::computer_url(request) {
+            mcp_servers.insert(
+                "cosmos-computer".into(),
+                serde_json::json!({"type": "http", "url": url}),
+            );
+            cmd.env(crate::COMPUTER_ENV, url);
+        }
+        if let Some(url) = crate::tools_url(request) {
+            mcp_servers.insert(
+                "cosmos-tools".into(),
+                serde_json::json!({"type": "http", "url": url}),
+            );
+            cmd.env(crate::TOOLS_ENV, url);
+        }
+        if !mcp_servers.is_empty() {
+            cmd.arg("--mcp-config")
+                .arg(serde_json::json!({"mcpServers": mcp_servers}).to_string());
         }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
@@ -415,9 +432,11 @@ impl Harness for ClaudeHarness {
             return Ok(Vec::new());
         };
         let root2 = root.clone();
-        Ok(tokio::task::spawn_blocking(move || crate::sessions::scan_claude(&root2))
-            .await
-            .unwrap_or_default())
+        Ok(
+            tokio::task::spawn_blocking(move || crate::sessions::scan_claude(&root2))
+                .await
+                .unwrap_or_default(),
+        )
     }
 
     /// The session's own jsonl file is the transcript — user/assistant text

@@ -23,6 +23,11 @@ struct Cli {
     /// Open a Cosmos conversation URL.
     #[arg(value_name = "URL")]
     open_url: Option<String>,
+    /// Boot windowless into the system tray — the launch-at-login entry
+    /// points here. Falls back to a normal window when the tray icon
+    /// can't be installed (never an invisible process with no exit).
+    #[arg(long, hide = true)]
+    tray: bool,
     #[cfg(windows)]
     #[arg(long, hide = true)]
     wait_for_exit: Option<u32>,
@@ -59,6 +64,20 @@ enum Command {
     /// harnesses without an HTTP-MCP channel (ACP agents) spawn this as a
     /// server subprocess — stdout is protocol traffic, so it skips logging.
     BrowserBridge {
+        /// Loopback MCP endpoint stamped on the run request.
+        #[arg(long)]
+        url: String,
+    },
+    /// Stdio MCP front for Cosmos Computer — the same contract as
+    /// `browser-bridge`, pointing at the engine's loopback computer endpoint.
+    ComputerStdio {
+        /// Loopback MCP endpoint stamped on the run request.
+        #[arg(long)]
+        url: String,
+    },
+    /// Stdio MCP front for the Cosmos Tools gateway — the same contract as
+    /// `computer-stdio`, pointing at the engine's loopback tools endpoint.
+    ToolsStdio {
         /// Loopback MCP endpoint stamped on the run request.
         #[arg(long)]
         url: String,
@@ -129,6 +148,12 @@ fn main() -> anyhow::Result<()> {
     // tracing layer (which writes to stdout) installs.
     if let Some(Command::BrowserBridge { url }) = &cli.command {
         return zeron_ui::browser::bridge::serve_stdio(url);
+    }
+    if let Some(Command::ComputerStdio { url }) = &cli.command {
+        return zeron_computer::stdio::serve_stdio(url);
+    }
+    if let Some(Command::ToolsStdio { url }) = &cli.command {
+        return zeron_tools::stdio::serve_stdio(url);
     }
     #[cfg(windows)]
     if let Some(pid) = cli.wait_for_exit {
@@ -229,6 +254,12 @@ fn main() -> anyhow::Result<()> {
         Some(Command::BrowserBridge { .. }) => {
             unreachable!("browser-bridge dispatches before tracing init")
         }
+        Some(Command::ComputerStdio { .. }) => {
+            unreachable!("computer-stdio dispatches before tracing init")
+        }
+        Some(Command::ToolsStdio { .. }) => {
+            unreachable!("tools-stdio dispatches before tracing init")
+        }
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),
             DaemonCommand::Uninstall => daemon::uninstall(),
@@ -238,6 +269,33 @@ fn main() -> anyhow::Result<()> {
             DaemonCommand::Status => daemon::status(),
         },
         None => {
+            // Hidden diagnostic: `ZERON_DICTATION_PROBE=1 cosmos.exe` runs the
+            // recognizer startup inside the real binary before gpui exists —
+            // splits "process context" failures from "app state" failures.
+            // `=ole` mimics the app's apartment mix (STA main + MTA worker),
+            // `=delayed` launches the app and probes 20s in — the full
+            // runtime state the mic button sees.
+            #[cfg(windows)]
+            let dictation_probe = if let Some(mode) = std::env::var_os("ZERON_DICTATION_PROBE") {
+                let mode = mode.to_string_lossy().into_owned();
+                if mode == "delayed" {
+                    Some(std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_secs(20));
+                        match zeron_ui::dictation::Dictation::probe("inline") {
+                            Ok(report) => println!("dictation probe[delayed]: {report}"),
+                            Err(reason) => println!("dictation probe[delayed]: {reason}"),
+                        }
+                    }))
+                } else {
+                    match zeron_ui::dictation::Dictation::probe(&mode) {
+                        Ok(report) => println!("dictation probe[{mode:?}]: {report}"),
+                        Err(reason) => println!("dictation probe[{mode:?}]: {reason}"),
+                    }
+                    return Ok(());
+                }
+            } else {
+                None
+            };
             let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
             // Headed: the UI probes ZERON_IPC_PORT and connects to a running
             // daemon, or embeds the engine in-process (ARCHITECTURE §1).
@@ -253,7 +311,14 @@ fn main() -> anyhow::Result<()> {
                 org_id: std::env::var("ZERON_ORG_ID").ok(),
                 default_harness: zeron_ui::HarnessId::ClaudeCode,
                 initial_url: cli.open_url,
+                start_in_tray: cli.tray,
             });
+            // A forwarded/short-lived run must still let the delayed probe
+            // report before the process exits.
+            #[cfg(windows)]
+            if let Some(probe) = dictation_probe {
+                let _ = probe.join();
+            }
             Ok(())
         }
     }
@@ -322,6 +387,7 @@ fn harness_from_env() -> zeron_engine::HarnessId {
         Ok("opencode") => zeron_engine::HarnessId::Opencode,
         Ok("antigravity" | "agy") => zeron_engine::HarnessId::Antigravity,
         Ok("amp") => zeron_engine::HarnessId::Amp,
+        Ok("kimi" | "kimi-code") => zeron_engine::HarnessId::KimiCode,
         _ => zeron_engine::HarnessId::ClaudeCode,
     }
 }

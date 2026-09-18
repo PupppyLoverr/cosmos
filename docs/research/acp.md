@@ -71,6 +71,30 @@
   `-32015 "already open in another process"` while a previous `devin acp`
   still holds the session — the shared driver's fresh-session fallback covers
   that, at the cost of Devin-side context.
+- **Kimi Code registered** (2026-09-18): `AcpHarness::kimi()` runs Moonshot
+  AI's native multi-session ACP server (`kimi acp`; install via
+  `curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash` /
+  `irm https://code.kimi.com/kimi-code/install.ps1 | iex` — both default
+  `KIMI_INSTALL_DIR` to `~/.kimi-code` with the binary in `bin/` — or
+  `npm install -g @moonshot-ai/kimi-code`; `KIMI_EXECUTABLE` overrides). No
+  adapter exists and none is needed: the CLI IS the ACP server, so no npm
+  managed-install fallback (`kimi login` must precede sessions anyway —
+  `session/new` answers `AUTH_REQUIRED -32000` without it). No
+  `_session/steering` extension → turn-boundary steering. The session
+  carries the locked 4-mode taxonomy (`default`/`plan`/`auto`/`yolo`); the
+  generic no-prompts preference lands on `yolo`, matching the CLI's own
+  unattended mode. Model + effort ride `session/set_config_option`: the
+  `model` select advertises the user's configured catalog as bare
+  model-registry ids (`k3`, `kimi-for-coding`, … — config.toml aliases like
+  `kimi-code/k3` are NOT what the wire carries), and the `thinking` select
+  (category `thought_level`) carries `off` plus the model's declared
+  `support_efforts` (k3: `low`/`high`/`max`; boolean-thinking models keep
+  `off`/`on`, `always_thinking` drops `off`) → descriptor ladder
+  `[low, high, max]` via the generic preference list. `session/list`,
+  `session/load` and `session/resume` are all implemented, so the shared
+  resume/transcript probes work unmodified. Verified against
+  MoonshotAI/kimi-code `packages/acp-server` (config-options.ts, modes.ts,
+  model-catalog.ts) + the kimi-code docs, not a live handshake.
 - **ACP is the source of truth for model lists** (2026-08-08; preference
   order inverted 2026-08-09): `models()` runs a short-lived probe
   (initialize → `session/new`, the `discover_commands` pattern) and reads

@@ -142,6 +142,13 @@ struct RoutedSteer {
 
 struct Inner {
     browsers: Mutex<crate::browser::BrowserRegistry>,
+    /// Cosmos Computer — the device-local desktop service (wired at engine
+    /// assembly). Its loopback MCP endpoint is stamped onto local runs the
+    /// same way the browser bridge is; absent in bare tests.
+    computer: OnceLock<zeron_computer::ComputerService>,
+    /// Cosmos Tools — the device-local merged MCP gateway (Composio + user
+    /// MCP servers). Same stamping seam as computer; absent in bare tests.
+    tools: OnceLock<zeron_tools::ToolService>,
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
@@ -199,6 +206,8 @@ impl SessionsEngine {
         Self {
             inner: Arc::new(Inner {
                 browsers: Mutex::new(Default::default()),
+                computer: OnceLock::new(),
+                tools: OnceLock::new(),
                 device_id,
                 journal,
                 registry,
@@ -214,6 +223,19 @@ impl SessionsEngine {
                 turn_listener: OnceLock::new(),
             }),
         }
+    }
+
+    /// Wire the device-local Cosmos Computer service (called once at engine
+    /// assembly). `dispatch_inner` stamps its loopback endpoint onto runs
+    /// only while the service reports ready on THIS host.
+    pub fn set_computer(&self, computer: zeron_computer::ComputerService) {
+        let _ = self.inner.computer.set(computer);
+    }
+
+    /// Wire the device-local Cosmos Tools service (called once at engine
+    /// assembly). Same stamping contract as [`set_computer`].
+    pub fn set_tools(&self, tools: zeron_tools::ToolService) {
+        let _ = self.inner.tools.set(tools);
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -379,6 +401,30 @@ impl SessionsEngine {
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
         lock(&self.inner.browsers).prepare(&mut request, std::time::Instant::now());
+        // Cosmos Computer rides the same seam: engine-stamped only, only while
+        // the service is enabled + ready on THIS host, and always re-stamped so
+        // a stale/remote endpoint can never survive into a local run.
+        request.model_options.remove(zeron_proto::COMPUTER_OPTION);
+        if let Some(computer) = self.inner.computer.get()
+            && let Some(url) = computer.endpoint_url()
+        {
+            request.model_options.insert(
+                zeron_proto::COMPUTER_OPTION.into(),
+                serde_json::json!({ "url": url }),
+            );
+        }
+        // Cosmos Tools identical: the merged MCP gateway stamps only while at
+        // least one provider is enabled on THIS host; stale options are always
+        // removed first.
+        request.model_options.remove(zeron_proto::TOOLS_OPTION);
+        if let Some(tools) = self.inner.tools.get()
+            && let Some(url) = tools.endpoint_url()
+        {
+            request.model_options.insert(
+                zeron_proto::TOOLS_OPTION.into(),
+                serde_json::json!({ "url": url }),
+            );
+        }
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
@@ -1464,6 +1510,8 @@ async fn drive_run(
     });
     let mut harness_request = request;
     zeron_harness::prepare_browser_prompt(&mut harness_request);
+    zeron_harness::prepare_computer_prompt(&mut harness_request);
+    zeron_harness::prepare_tools_prompt(&mut harness_request);
     let mut stream = match harness.run(harness_request, controls).await {
         Ok(stream) => stream,
         Err(err) => {

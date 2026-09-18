@@ -7,7 +7,7 @@
 import SwiftUI
 
 enum BrandMark: Equatable {
-    case claude, openai, cursor, devin, grok, hermes, pi, opencode, antigravity, amp
+    case claude, openai, cursor, devin, grok, hermes, pi, opencode, antigravity, amp, kimi
 
     var viewBox: CGSize {
         switch self {
@@ -19,7 +19,7 @@ enum BrandMark: Equatable {
         case .hermes: return CGSize(width: 24, height: 24)
         case .pi: return CGSize(width: 800, height: 800)
         case .opencode: return CGSize(width: 24, height: 30)
-        case .antigravity, .amp: return CGSize(width: 24, height: 24)
+        case .antigravity, .amp, .kimi: return CGSize(width: 24, height: 24)
         }
     }
 
@@ -27,7 +27,7 @@ enum BrandMark: Equatable {
     /// asset says so or the mark's holes fill in solid.
     var evenOddFill: Bool {
         switch self {
-        case .hermes, .pi, .opencode, .amp: return true
+        case .hermes, .pi, .opencode, .amp, .kimi: return true
         default: return false
         }
     }
@@ -57,6 +57,10 @@ enum BrandMark: Equatable {
             return "M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z"
         case .amp:
             return "M15.087 23.18 12.03 24l-2.097-7.823-5.738 5.738-2.251-2.251 5.718-5.719-7.769-2.082.82-3.057 11.294 3.08 3.08 11.295zM19.505 18.762l-3.057.82-2.564-9.573-9.572-2.564.819-3.057 11.295 3.079 3.08 11.295zM23.893 14.374l-3.057.82-2.565-9.572L8.7 3.057 9.52 0l11.295 3.08 3.079 11.294z"
+        case .kimi:
+            // kimi-mark.svg's two paths (accent square + "K") as one string —
+            // both render identically under this single-path fill.
+            return "M21.846 0a1.923 1.923 0 110 3.846H20.15a.226.226 0 01-.227-.226V1.923C19.923.861 20.784 0 21.846 0zM11.065 11.199l7.257-7.2c.137-.136.06-.41-.116-.41H14.3a.164.164 0 00-.117.051l-7.82 7.756c-.122.12-.302.013-.302-.179V3.82c0-.127-.083-.23-.185-.23H3.186c-.103 0-.186.103-.186.23V19.77c0 .128.083.23.186.23h2.69c.103 0 .186-.102.186-.23v-3.25c0-.069.025-.135.069-.178l2.424-2.406a.158.158 0 01.205-.023l6.484 4.772a7.677 7.677 0 003.453 1.283c.108.012.2-.095.2-.23v-3.06c0-.117-.07-.212-.164-.227a5.028 5.028 0 01-2.027-.807l-5.613-4.064c-.117-.078-.132-.279-.028-.381z"
         }
     }
 
@@ -71,6 +75,7 @@ enum BrandMark: Equatable {
         case "opencode": return .opencode
         case "antigravity": return .antigravity
         case "amp": return .amp
+        case "kimi-code": return .kimi
         default: return .claude  // claude-code + mock share the mark, like the desktop
         }
     }

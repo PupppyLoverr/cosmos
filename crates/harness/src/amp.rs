@@ -25,11 +25,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use crate::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -186,13 +186,26 @@ impl AmpHarness {
         if request.auto_approve {
             cmd.arg("--dangerously-allow-all");
         }
-        // The app stamps local runs with the loopback embedded-browser
-        // bridge; amp's `--mcp-config` takes a server-name → config map
-        // (`url` for remote servers) and outranks settings-file servers.
+        // The app stamps local runs with the loopback embedded-browser and
+        // computer endpoints; amp's `--mcp-config` takes a server-name →
+        // config map (`url` for remote servers) and outranks settings-file
+        // servers. One flag carries both servers.
+        let mut mcp_config = serde_json::Map::new();
         if let Some(url) = crate::browser_bridge_url(request) {
-            cmd.arg("--mcp-config")
-                .arg(serde_json::json!({"zeron-browser": {"url": url}}).to_string());
+            mcp_config.insert("cosmos-browser".into(), serde_json::json!({"url": url}));
             cmd.env(crate::BROWSER_BRIDGE_ENV, url);
+        }
+        if let Some(url) = crate::computer_url(request) {
+            mcp_config.insert("cosmos-computer".into(), serde_json::json!({"url": url}));
+            cmd.env(crate::COMPUTER_ENV, url);
+        }
+        if let Some(url) = crate::tools_url(request) {
+            mcp_config.insert("cosmos-tools".into(), serde_json::json!({"url": url}));
+            cmd.env(crate::TOOLS_ENV, url);
+        }
+        if !mcp_config.is_empty() {
+            cmd.arg("--mcp-config")
+                .arg(serde_json::Value::Object(mcp_config).to_string());
         }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);

@@ -623,6 +623,27 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AmpHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AmpHarness::new()) as Arc<dyn Harness>)),
     );
+    // Kimi Code over ACP (`kimi acp`), same lazy pattern: the static
+    // descriptor mirrors AcpHarness::kimi() exactly. No `_session/steering`
+    // extension (turn boundaries); the effort ladder rides the `thinking`
+    // config option's graded values (k3 advertises low/high/max).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::KimiCode,
+            name: "Kimi Code".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::High,
+                ReasoningLevel::Max,
+            ],
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AcpHarness::kimi().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::kimi()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -704,7 +725,8 @@ mod tests {
                 HarnessId::Pi,
                 HarnessId::Opencode,
                 HarnessId::Antigravity,
-                HarnessId::Amp
+                HarnessId::Amp,
+                HarnessId::KimiCode
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -798,6 +820,18 @@ mod tests {
                 ReasoningLevel::Medium,
                 ReasoningLevel::High,
                 ReasoningLevel::XHigh,
+                ReasoningLevel::Max
+            ]
+        );
+        let kimi = registry.resolve(HarnessId::KimiCode).unwrap();
+        assert_eq!(kimi.id(), HarnessId::KimiCode);
+        assert_eq!(kimi.display_name(), "Kimi Code");
+        assert_eq!(kimi.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(
+            kimi.reasoning_levels(),
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::High,
                 ReasoningLevel::Max
             ]
         );

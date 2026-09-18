@@ -1037,7 +1037,10 @@ mod tests {
     #[test]
     fn appshot_cards_follow_their_exact_image_reference() {
         let shot = crate::appshots::tests::shot();
-        let paths = HashMap::from([(shot.screenshot.id.clone(), "/remote/a & b.png".to_string())]);
+        let paths = HashMap::from([(
+            shot.screenshot.as_ref().unwrap().id.clone(),
+            "/remote/a & b.png".to_string(),
+        )]);
         let body = crate::appshots::with_appshots("Look here", &[shot], &paths);
         let message = with_attachments(
             &body,

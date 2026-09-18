@@ -275,8 +275,11 @@ async function activeRunPresent() {
     const opts = { cwd: agentCwd };
     if (agentStore) opts.store = agentStore;
     const record = await Agent.get(agent.agentId, opts);
-    if (record && typeof record === "object" && "activeRunId" in record) {
-      return record.activeRunId != null;
+    // SDKAgentInfo.status mirrors the most recent run's execution state —
+    // "running" IS the live lease. Records without a status fall through
+    // to the run list for a direct look.
+    if (record && typeof record === "object" && typeof record.status === "string") {
+      return record.status === "running";
     }
   } catch {
     // getAgent is best-effort; fall through to the run list.

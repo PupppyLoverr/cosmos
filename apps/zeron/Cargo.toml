@@ -16,6 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 zeron-engine.workspace = true
+zeron-computer.workspace = true
+zeron-tools.workspace = true
 zeron-rpc.workspace = true
 zeron-ui.workspace = true
 zeron-update.workspace = true

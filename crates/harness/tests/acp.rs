@@ -610,7 +610,7 @@ async fn hung_handshake_errors_instead_of_spinning_forever() {
     );
 }
 #[test]
-fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
+fn acp_descriptor_surfaces_match_registry_expectations() {
     let devin = AcpHarness::devin();
     assert_eq!(devin.id(), HarnessId::Devin);
     assert_eq!(devin.display_name(), "Devin");
@@ -638,6 +638,20 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
             zeron_proto::ReasoningLevel::Medium,
             zeron_proto::ReasoningLevel::High,
             zeron_proto::ReasoningLevel::XHigh,
+            zeron_proto::ReasoningLevel::Max,
+        ]
+    );
+
+    let kimi = AcpHarness::kimi();
+    assert_eq!(kimi.id(), HarnessId::KimiCode);
+    assert_eq!(kimi.display_name(), "Kimi Code");
+    assert!(kimi.supports_steering());
+    assert_eq!(kimi.steering_mode(), SteeringMode::TurnBoundary);
+    assert_eq!(
+        kimi.reasoning_levels(),
+        &[
+            zeron_proto::ReasoningLevel::Low,
+            zeron_proto::ReasoningLevel::High,
             zeron_proto::ReasoningLevel::Max,
         ]
     );

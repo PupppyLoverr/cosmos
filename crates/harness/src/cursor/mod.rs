@@ -301,7 +301,10 @@ impl CursorHarness {
         };
         let discovery = async {
             client
-                .request("initialize", crate::acp::initialize_params(HarnessId::Cursor))
+                .request(
+                    "initialize",
+                    crate::acp::initialize_params(HarnessId::Cursor),
+                )
                 .await?;
             let session = client
                 .request(
@@ -402,9 +405,11 @@ impl Harness for CursorHarness {
         let Some(root) = crate::home_dir().map(|h| h.join(".cursor").join("acp-sessions")) else {
             return Ok(Vec::new());
         };
-        Ok(tokio::task::spawn_blocking(move || crate::sessions::scan_cursor(&root))
-            .await
-            .unwrap_or_default())
+        Ok(
+            tokio::task::spawn_blocking(move || crate::sessions::scan_cursor(&root))
+                .await
+                .unwrap_or_default(),
+        )
     }
 
     async fn run(
@@ -417,6 +422,8 @@ impl Harness for CursorHarness {
         cmd.args(&args);
         crate::compose_child_path(&mut cmd, &exe);
         crate::browser_bridge_env(&mut cmd, &request);
+        crate::computer_env(&mut cmd, &request);
+        crate::tools_env(&mut cmd, &request);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -1201,6 +1208,69 @@ mod tests {
         assert!(matches!(
             decode_tool("somethingNew", &json!({})),
             ToolCall::Unknown { .. }
+        ));
+    }
+
+    /// The plan document: `createPlan`'s `{plan: markdown}` decodes to the
+    /// shared PLAN_TOOL_NAME shape (doc keeps the payload, the surface reads
+    /// it back), and every phase of the call rides the live-plan id so
+    /// streaming partials and repeat calls refresh ONE chip.
+    #[test]
+    fn create_plan_decodes_and_rides_the_live_plan_id() {
+        assert_eq!(
+            decode_tool("createPlan", &json!({ "plan": "# Steps\n- one" })),
+            ToolCall::Unknown {
+                name: PLAN_TOOL_NAME.into(),
+                input: Some(json!({ "plan": "# Steps\n- one" })),
+            }
+        );
+        // A streaming partial (the shim re-emits createPlan/updateTodos
+        // partials as start frames carrying the full args snapshot).
+        let partial: Value = serde_json::from_str(
+            r##"{"ev":"tool","phase":"start","id":"call_1","name":"createPlan","args":{"plan":"# d"}}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            map_shim_frame(&partial, false),
+            vec![AgentEvent::ToolCall {
+                id: LIVE_PLAN_TOOL_ID.into(),
+                call: decode_tool("createPlan", &json!({ "plan": "# d" })),
+            }]
+        );
+        // Completion: the resolved pair lands under the same id, so the
+        // plan's own result is what flips it ready.
+        let done: Value = serde_json::from_str(
+            r##"{"ev":"tool","phase":"end","id":"call_1","name":"createPlan","args":{"plan":"# done"},"error":false}"##,
+        )
+        .unwrap();
+        assert!(matches!(
+            &map_shim_frame(&done, false)[..],
+            [
+                AgentEvent::ToolCall { id, .. },
+                AgentEvent::ToolResult {
+                    id: result_id,
+                    is_error: false,
+                    ..
+                },
+            ] if id == LIVE_PLAN_TOOL_ID && result_id == LIVE_PLAN_TOOL_ID
+        ));
+        // updateTodos rides the same id — both plan forms share the chip.
+        let todos: Value = serde_json::from_str(
+            r#"{"ev":"tool","phase":"start","id":"call_2","name":"updateTodos","args":{"todos":[{"content":"one","status":"pending"}]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &map_shim_frame(&todos, false)[..],
+            [AgentEvent::ToolCall { id, .. }] if id == LIVE_PLAN_TOOL_ID
+        ));
+        // Non-plan tools keep their wire ids.
+        let other: Value = serde_json::from_str(
+            r#"{"ev":"tool","phase":"start","id":"call_3","name":"shell","args":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &map_shim_frame(&other, false)[..],
+            [AgentEvent::ToolCall { id, .. }] if id == "call_3"
         ));
     }
 

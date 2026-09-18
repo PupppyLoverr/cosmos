@@ -25,11 +25,13 @@ pub mod comments;
 pub mod composer;
 mod composer_dock;
 mod context_usage;
+pub(crate) mod delegate;
 pub mod dictation;
 pub mod edge_fade;
 pub mod file_icons;
 pub mod files;
 pub mod frost;
+pub(crate) mod global_hotkey;
 pub mod history;
 pub mod icons;
 pub(crate) mod image_media;
@@ -58,12 +60,15 @@ pub mod terminal;
 pub mod theme;
 pub mod theme_library;
 pub mod transcript;
+pub(crate) mod tray;
 pub mod typography;
 mod workspace_links;
 
 use std::path::PathBuf;
 
-use futures::{FutureExt as _, StreamExt as _};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use futures::FutureExt as _;
+use futures::StreamExt as _;
 use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 pub use state::EngineBootConfig;
@@ -100,6 +105,11 @@ pub struct UiConfig {
     pub default_harness: HarnessId,
     /// Conversation URL passed by the OS on a cold launch.
     pub initial_url: Option<String>,
+    /// `--tray` (the launch-at-login entry): boot windowless into the tray —
+    /// engine, global hotkey and icon up, no main window. Falls back to a
+    /// normal windowed boot when the tray icon can't be installed: a
+    /// windowless process with `QuitMode::Default` would have no exit path.
+    pub start_in_tray: bool,
 }
 
 impl UiConfig {
@@ -157,7 +167,10 @@ pub fn run_app(config: UiConfig) {
     // around the still-running engine — zed does the same via `on_reopen`
     // (crates/zed/src/main.rs `app.on_reopen`).
     app.on_reopen(|cx| {
-        if cx.windows().is_empty()
+        // The DelegateBar popup survives the main window closing (close-to-
+        // tray) — an empty `windows()` check would miss the reopen, so look
+        // for a Shell root specifically.
+        if shell_window(cx).is_none()
             && let Some(reopen) = cx.try_global::<ReopenState>()
         {
             let (state, boot) = (reopen.state.clone(), reopen.boot.clone());
@@ -232,6 +245,9 @@ pub fn run_app(config: UiConfig) {
         // doc snapshots before the process exits (remote engines outlive us).
         let quit_state = state.clone();
         cx.on_app_quit(move |cx| {
+            // NIM_DELETE before anything async — the process must not exit
+            // with a ghost icon still in the notification area.
+            tray::shutdown();
             settings::flush(cx);
             let shutdown =
                 quit_state.read(cx).engine().cloned().map(|handle| {
@@ -249,7 +265,26 @@ pub fn run_app(config: UiConfig) {
             state: state.clone(),
             boot: config.boot(),
         });
-        open_main_window(state, config.boot(), cx);
+        // The delegate hotkey bridge lives for the whole app run — it must
+        // work with zero normal windows or Alt+Space couldn't summon the bar
+        // while the app sits in the tray. The combo is applied here too:
+        // `Shell::new`/`apply_keymap` only run when a window opens, and a
+        // --tray boot may never open one.
+        delegate::start(state.clone(), config.boot().data_dir.clone(), cx);
+        delegate::set_shortcut(&ui_settings.keymap.delegate_task);
+        delegate::set_enabled(ui_settings.delegate_enabled);
+        // Close-to-tray: the icon must be CONFIRMED before QuitMode::Explicit
+        // — explicit quit with a failed tray strands the process windowless
+        // with no reachable exit.
+        let tray_live = ui_settings.keep_running_in_tray && tray::start(&state, cx);
+        if tray_live {
+            cx.set_quit_mode(gpui::QuitMode::Explicit);
+        }
+        tray::sync_autostart(ui_settings.launch_at_login);
+        let windowless = config.start_in_tray && tray_live;
+        if !windowless {
+            open_main_window(state, config.boot(), cx);
+        }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         start_appshot_service(config.boot().data_dir, cx);
         // Native menu bar — macOS gets the standard app menu (About/Services/
@@ -260,26 +295,39 @@ pub fn run_app(config: UiConfig) {
         // synchronously, so `set_menus` reads the final bindings for the ⌘-key
         // equivalents (gpui snapshots the keymap at set time).
         cx.set_menus(app_menus::app_menus());
-        cx.activate(true);
+        // A `--tray` login launch shouldn't steal focus for no window.
+        if !windowless {
+            cx.activate(true);
+        }
     });
+}
+
+/// The main Shell window, if one is open. `cx.windows()` also counts the
+/// DelegateBar popup, so "is the app windowless" must check the root type —
+/// with only the bar alive after close-to-tray, an `is_empty` test would
+/// wrongly skip the reopen.
+fn shell_window(cx: &App) -> Option<gpui::WindowHandle<shell::Shell>> {
+    cx.windows()
+        .into_iter()
+        .find_map(|window| window.downcast::<shell::Shell>())
 }
 
 /// A clicked banner: bring Zeron forward on that chat through the sidebar's
 /// own path (chat route + composer focus), reopening the main window first if
 /// ⌘W closed it.
-fn open_notified_chat(chat_id: String, state: &gpui::Entity<state::AppState>, cx: &mut App) {
+pub(crate) fn open_notified_chat(
+    chat_id: String,
+    state: &gpui::Entity<state::AppState>,
+    cx: &mut App,
+) {
     cx.activate(true);
-    if cx.windows().is_empty()
+    if shell_window(cx).is_none()
         && let Some(reopen) = cx.try_global::<ReopenState>()
     {
         let (state, boot) = (reopen.state.clone(), reopen.boot.clone());
         open_main_window(state, boot, cx);
     }
-    let shell = cx
-        .windows()
-        .into_iter()
-        .find_map(|window| window.downcast::<shell::Shell>());
-    match shell {
+    match shell_window(cx) {
         Some(shell) => {
             let _ = shell.update(cx, |shell, window, cx| {
                 window.activate_window();
@@ -287,6 +335,24 @@ fn open_notified_chat(chat_id: String, state: &gpui::Entity<state::AppState>, cx
             });
         }
         None => state.update(cx, |state, cx| state.select_chat(Some(chat_id), cx)),
+    }
+}
+
+/// Tray "Open Cosmos": activate the shell when it's open, rebuild it through
+/// `ReopenState` when the last window closed — the same re-entry a
+/// notification click takes.
+pub(crate) fn open_main(cx: &mut App) {
+    cx.activate(true);
+    match shell_window(cx) {
+        Some(shell) => {
+            let _ = shell.update(cx, |_, window, _| window.activate_window());
+        }
+        None => {
+            if let Some(reopen) = cx.try_global::<ReopenState>() {
+                let (state, boot) = (reopen.state.clone(), reopen.boot.clone());
+                open_main_window(state, boot, cx);
+            }
+        }
     }
 }
 

@@ -70,6 +70,14 @@ impl Dictation {
         let _ = self.stop.send(());
         // `thread` detaches on drop — the worker unwinds itself.
     }
+
+    /// Run the recognizer startup path in the calling process and report the
+    /// outcome — the `ZERON_DICTATION_PROBE` escape hatch that answers "does
+    /// `StartAsync` fail here too?" without the app's runtime state around it.
+    #[cfg(windows)]
+    pub fn probe(mode: &str) -> Result<String, String> {
+        windows_impl::probe(mode)
+    }
 }
 
 impl Drop for Dictation {
@@ -92,6 +100,7 @@ mod windows_impl {
         SpeechContinuousRecognitionResultGeneratedEventArgs, SpeechContinuousRecognitionSession,
         SpeechRecognitionHypothesisGeneratedEventArgs, SpeechRecognitionResultStatus,
         SpeechRecognitionScenario, SpeechRecognitionTopicConstraint, SpeechRecognizer,
+        SpeechRecognizerState,
     };
     use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
     use windows::Win32::Media::Audio::{
@@ -336,22 +345,76 @@ mod windows_impl {
         // Non-fatal: without the endpoint meter the bars idle-sway instead.
         let meter = endpoint_meter();
 
-        session
+        // StartAsync throws a bare InvalidOperation (0x80131509) when the
+        // shared engine isn't Idle — a stale session from a crashed attempt
+        // or another speech client — so read the state and name it, and give
+        // a just-settling engine one retry before surfacing the error.
+        if let Ok(state) = recognizer.State()
+            && state != SpeechRecognizerState::Idle
+        {
+            return Err(format!(
+                "Speech recognizer is busy ({state:?}) — close voice typing or other dictation apps, then retry"
+            ));
+        }
+        let started = session
             .StartAsync()
             .and_then(|pending| pending.get())
-            .map_err(|e| {
-                format!(
-                    "Could not start dictation — {} — {}",
-                    err_text(&e),
-                    consent_hint()
-                )
-            })?;
+            .or_else(|_| {
+                std::thread::sleep(Duration::from_millis(400));
+                session.StartAsync().and_then(|pending| pending.get())
+            });
+        started.map_err(|e| {
+            format!(
+                "Could not start dictation — {} — {}",
+                err_text(&e),
+                consent_hint()
+            )
+        })?;
 
         Ok(Running {
             recognizer,
             session,
             meter,
         })
+    }
+
+    /// The startup path run synchronously — identical to what the worker
+    /// thread does, callable from a test or the app itself for diagnosis.
+    ///
+    /// `mode` selects the calling context: `"ole"` first puts the calling
+    /// thread in an STA (what gpui's `OleInitialize` does on the main
+    /// thread) and runs the session on a spawned MTA worker — the exact
+    /// apartment mix the app uses; `"aumid"` stamps an AppUserModelID like
+    /// gpui's platform init does; anything else runs it inline.
+    pub fn probe(mode: &str) -> Result<String, String> {
+        if mode == "ole" || mode == "aumid" {
+            unsafe {
+                use windows::Win32::System::Ole::OleInitialize;
+                let _ = OleInitialize(None);
+                if mode == "aumid" {
+                    let id = windows::core::HSTRING::from("com.cosmos.app");
+                    let _ = windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
+                        windows::core::PCWSTR(id.as_ptr()),
+                    );
+                }
+            }
+            let join = std::thread::spawn(probe_worker);
+            return join
+                .join()
+                .unwrap_or_else(|_| Err("probe thread panicked".into()));
+        }
+        probe_worker()
+    }
+
+    fn probe_worker() -> Result<String, String> {
+        let (tx, _rx) = futures::channel::mpsc::unbounded();
+        unsafe {
+            let _ = RoInitialize(RO_INIT_MULTITHREADED);
+        }
+        let running = start_session(&tx)?;
+        let metered = running.meter.is_some();
+        let _ = running.session.StopAsync().and_then(|p| p.get());
+        Ok(format!("session started, metered={metered}"))
     }
 
     #[cfg(test)]
@@ -362,17 +425,7 @@ mod windows_impl {
         #[test]
         #[ignore = "needs a live mic and speech service"]
         fn probe_start_session() {
-            let (tx, _rx) = futures::channel::mpsc::unbounded();
-            unsafe {
-                let _ = super::RoInitialize(super::RO_INIT_MULTITHREADED);
-            }
-            match super::start_session(&tx) {
-                Ok(running) => {
-                    println!("session started, metered={}", running.meter.is_some());
-                    let _ = running.session.StopAsync().and_then(|p| p.get());
-                }
-                Err(reason) => panic!("{reason}"),
-            }
+            super::probe("inline").unwrap();
         }
     }
 

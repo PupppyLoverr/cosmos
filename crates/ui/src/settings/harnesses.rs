@@ -50,6 +50,7 @@ pub fn blurb(harness: HarnessId) -> &'static str {
         HarnessId::Opencode => "SST's opencode agent (opencode CLI).",
         HarnessId::Antigravity => "Google's Antigravity agent (agy CLI).",
         HarnessId::Amp => "Sourcegraph's Amp agent (amp CLI).",
+        HarnessId::KimiCode => "Moonshot AI's Kimi Code agent (kimi CLI).",
         HarnessId::Mock => "Scripted test harness.",
     }
 }
@@ -67,6 +68,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Opencode => "opencode",
         HarnessId::Antigravity => "agy",
         HarnessId::Amp => "amp",
+        HarnessId::KimiCode => "kimi",
         HarnessId::Mock => "mock",
     }
 }

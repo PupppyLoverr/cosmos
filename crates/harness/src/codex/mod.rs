@@ -581,9 +581,11 @@ impl Harness for CodexHarness {
         let Some(root) = crate::home_dir().map(|h| h.join(".codex").join("sessions")) else {
             return Ok(Vec::new());
         };
-        Ok(tokio::task::spawn_blocking(move || crate::sessions::scan_codex(&root))
-            .await
-            .unwrap_or_default())
+        Ok(
+            tokio::task::spawn_blocking(move || crate::sessions::scan_codex(&root))
+                .await
+                .unwrap_or_default(),
+        )
     }
 
     /// The rollout file is the transcript — user/assistant message rows.
@@ -650,6 +652,7 @@ impl CodexHarness {
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
         crate::browser_bridge_env(&mut cmd, &request);
+        crate::tools_env(&mut cmd, &request);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -877,15 +880,29 @@ async fn run_session(session: Session) {
         if let Some(tier) = &service_tier {
             p.insert("serviceTier".into(), Value::String(tier.clone()));
         }
-        // The app stamps local runs with the loopback embedded-browser
-        // bridge; codex's config overrides MERGE with the user's file, so
-        // this adds one server without touching their configuration.
+        // The app stamps local runs with the loopback embedded-browser and
+        // computer endpoints; codex's config overrides MERGE with the user's
+        // file, so this adds servers without touching their configuration.
         if let Some(url) = crate::browser_bridge_url(&request) {
             p.entry("config")
                 .or_insert_with(|| json!({}))
                 .as_object_mut()
                 .unwrap()
-                .insert("mcp_servers.zeron-browser.url".into(), url.into());
+                .insert("mcp_servers.cosmos-browser.url".into(), url.into());
+        }
+        if let Some(url) = crate::computer_url(&request) {
+            p.entry("config")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .unwrap()
+                .insert("mcp_servers.cosmos-computer.url".into(), url.into());
+        }
+        if let Some(url) = crate::tools_url(&request) {
+            p.entry("config")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .unwrap()
+                .insert("mcp_servers.cosmos-tools.url".into(), url.into());
         }
         p
     };

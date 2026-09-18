@@ -46,6 +46,14 @@ final class HarnessCatalogTests: XCTestCase {
         XCTAssertEqual(BrandMark.forHarness("antigravity"), .antigravity)
     }
 
+    func testKimiFallbackLabelsAndMark() {
+        XCTAssertEqual(HarnessCatalog.label(for: "kimi-code"), "Kimi Code")
+        let models = HarnessCatalog.models(for: "kimi-code")
+        XCTAssertEqual(models.first?.id, "k3")
+        XCTAssertEqual(models.first?.reasoningLevels, ["low", "high", "max"])
+        XCTAssertEqual(BrandMark.forHarness("kimi-code"), .kimi)
+    }
+
     func testWorkingFlavourLeadsWithCosmosing() {
         XCTAssertEqual(Motion.flavourWords.first, "Cosmosing")
     }

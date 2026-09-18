@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt as _;
 use gpui::{
     AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
@@ -22,7 +23,6 @@ use gpui::{
     TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
     prelude::*, px, quad, relative, size,
 };
-use futures::StreamExt as _;
 use unicode_segmentation::UnicodeSegmentation;
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
@@ -1125,7 +1125,7 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
             }
             MentionLinkKind::Chat => (chat_mention_id_is_safe(&target)
                 && percent_encode_path(&target) == encoded)
-            .then(|| (target, false, unescape_mention_label(label))),
+                .then(|| (target, false, unescape_mention_label(label))),
         });
         if let Some((path, is_dir, basename)) = parsed {
             links.push(FileMentionLink {
@@ -1418,11 +1418,9 @@ pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)>
         .map(|(link, display)| SentMentionSpan {
             range: display.clone(),
             path: SharedString::from(match link.kind {
-                MentionLinkKind::File => format!(
-                    "{}{}",
-                    link.path,
-                    if link.is_dir { "/" } else { "" }
-                ),
+                MentionLinkKind::File => {
+                    format!("{}{}", link.path, if link.is_dir { "/" } else { "" })
+                }
                 // The tooltip reads the conversation title, not its id.
                 MentionLinkKind::Chat => link.basename.clone(),
             }),
@@ -1442,6 +1440,10 @@ enum EditKind {
 const GENERIC_COMPOSER_CONTEXT: &str = "Composer";
 const MESSAGE_COMPOSER_CONTEXT: &str = "MessageComposer";
 const PALETTE_SEARCH_CONTEXT: &str = "PaletteSearch";
+/// Draft/attachment key for the Delegate bar's always-new composer
+/// (`crate::delegate`) — distinct from any real chat id (UUIDs) and from the
+/// "" canvas key, so the bar's stash never collides with shell state.
+const DELEGATE_DRAFT_KEY: &str = "delegate";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageEnterBindingAction {
@@ -4309,6 +4311,12 @@ pub struct Composer {
     /// indicators — resolves to it instead of the shell's selection, so the
     /// surface is independent of main-pane navigation.
     target_chat: Option<String>,
+    /// Delegate-bar mode (`crate::delegate`): the composer lives in the
+    /// floating popup, always mints a FRESH session on send, and never drives
+    /// shell navigation — no `select_chat`, no new-thread transition, and the
+    /// shell's selection never leaks in as the send target. The bar stays put
+    /// while the run lands in the sidebar.
+    delegate: bool,
     /// A context preamble prepended to the FIRST prompt this composer sends
     /// (the side chat's seed digest — the source conversation's tail so the
     /// fresh session starts with its context). Not rendered in the echo;
@@ -4625,7 +4633,18 @@ impl Composer {
             ComposerInputEvent::DictationApplied => this.on_input_edited(cx),
         });
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
-        Self::build(state, input, pickers, observe, pickers_observe, picker_focus, input_events, current_key, None, cx)
+        Self::build(
+            state,
+            input,
+            pickers,
+            observe,
+            pickers_observe,
+            picker_focus,
+            input_events,
+            current_key,
+            None,
+            cx,
+        )
     }
 
     /// A composer bound to a specific chat (the side-chat surface) — same
@@ -4732,6 +4751,105 @@ impl Composer {
         composer
     }
 
+    /// The Delegate bar's composer (`crate::delegate`): same machinery as the
+    /// shell composer but pinned to the new-session canvas — every send mints
+    /// a fresh chat regardless of what the main window has selected, and the
+    /// popup never navigates the shell. Drafts, staged attachments and picks
+    /// persist under the dedicated "delegate" key while the bar is dismissed
+    /// (the entity itself is kept alive app-wide by `delegate::view`).
+    pub fn new_delegate(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        cx.on_release(|this, cx| this.release_queue_previews(cx))
+            .detach();
+        let input = cx.new(|cx| {
+            let mut input = ComposerInput::with_context(
+                "Delegate a task to Cosmos…",
+                MESSAGE_COMPOSER_CONTEXT,
+                cx,
+            );
+            input.enable_mentions();
+            input
+        });
+        let pickers = cx.new(|cx| {
+            let mut pickers = Pickers::new(state.clone(), cx);
+            pickers.set_always_new(cx);
+            pickers
+        });
+        let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        let picker_focus = cx.subscribe(
+            &pickers,
+            |this: &mut Self, _, _: &crate::pickers::ReturnComposerFocus, cx| {
+                this.focus_pending = true;
+                cx.notify();
+            },
+        );
+        let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
+        let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
+            ComposerInputEvent::Submitted => this.on_submit(cx),
+            ComposerInputEvent::ModifiedSubmitted => this.on_modified_submit(cx),
+            ComposerInputEvent::Edited => {
+                if this.dictation.is_some() {
+                    this.stop_dictation(cx);
+                }
+                if this.resume.open {
+                    this.dismiss_resume(cx);
+                }
+                this.on_input_edited(cx)
+            }
+            ComposerInputEvent::CursorMoved => this.on_input_edited(cx),
+            ComposerInputEvent::ViewportChanged => cx.notify(),
+            ComposerInputEvent::MentionNavigate(delta) => {
+                if this.resume.open {
+                    this.move_resume(*delta, cx)
+                } else if this.slash.token.is_some() {
+                    this.move_slash(*delta, cx)
+                } else {
+                    this.move_mention(*delta, cx)
+                }
+            }
+            ComposerInputEvent::MentionAccept => {
+                if this.resume.open {
+                    this.accept_resume(cx)
+                } else if this.slash.token.is_some() {
+                    this.accept_slash(cx)
+                } else {
+                    this.accept_mention(cx)
+                }
+            }
+            ComposerInputEvent::MentionDismiss => {
+                if this.resume.open {
+                    this.dismiss_resume(cx)
+                } else if this.slash.token.is_some() {
+                    this.dismiss_slash(cx)
+                } else {
+                    this.dismiss_mention(cx)
+                }
+            }
+            ComposerInputEvent::PastedImages(images) => {
+                let staged = images
+                    .iter()
+                    .map(|image| attachments::stage_clipboard_image(image.clone()))
+                    .collect();
+                this.add_staged(staged, cx);
+            }
+            ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
+            ComposerInputEvent::DictationApplied => this.on_input_edited(cx),
+        });
+        let mut composer = Self::build(
+            state,
+            input,
+            pickers,
+            observe,
+            pickers_observe,
+            picker_focus,
+            input_events,
+            DELEGATE_DRAFT_KEY.to_string(),
+            None,
+            cx,
+        );
+        composer.delegate = true;
+        composer
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build(
         state: Entity<AppState>,
@@ -4749,6 +4867,7 @@ impl Composer {
             state,
             input,
             target_chat,
+            delegate: false,
             pending_context: None,
             queue_edit_draft: None,
             pickers,
@@ -4884,13 +5003,23 @@ impl Composer {
     /// The chat this composer drives: its bound side-chat target when set,
     /// else the shell's selected conversation. EVERY chat-keyed read in the
     /// send path goes through here so a bound composer is independent of
-    /// main-pane navigation.
+    /// main-pane navigation. The delegate bar always reports `None` — its
+    /// sends mint a fresh session rather than landing in whatever chat the
+    /// shell happens to have selected.
     fn target_chat_id(&self, state: &AppState) -> Option<String> {
-        self.target_chat.clone().or_else(|| state.selected_chat.clone())
+        if self.delegate {
+            return None;
+        }
+        self.target_chat
+            .clone()
+            .or_else(|| state.selected_chat.clone())
     }
 
     /// The bound/selected chat's workspace row.
     fn target_chat_row<'a>(&self, state: &'a AppState) -> Option<&'a zeron_proto::Chat> {
+        if self.delegate {
+            return None;
+        }
         match self.target_chat.as_deref() {
             Some(id) => state.chat_row(id),
             None => state.selected_chat_row(),
@@ -4899,6 +5028,13 @@ impl Composer {
 
     pub fn is_sending(&self) -> bool {
         self.sending
+    }
+
+    /// True while a modal-ish flow owns the composer (file picker, a
+    /// question wizard). The Delegate bar defers its blur-dismissal on this
+    /// so the popup isn't torn down mid-flow.
+    pub fn has_modal_task(&self) -> bool {
+        self.picker_task.is_some() || self.wizard.is_some()
     }
 
     pub(crate) fn can_edit_queue_in_composer(&self) -> bool {
@@ -4955,7 +5091,11 @@ impl Composer {
             .get(&key)
             .into_iter()
             .flatten()
-            .map(|shot| shot.screenshot.bytes().len() as u64)
+            .map(|shot| {
+                shot.screenshot
+                    .as_ref()
+                    .map_or(0, |image| image.bytes().len() as u64)
+            })
             .sum::<u64>();
         let saved_bytes = self
             .queue_edit_draft
@@ -4964,12 +5104,19 @@ impl Composer {
             .map(|(_, _, shots)| {
                 shots
                     .iter()
-                    .map(|shot| shot.screenshot.bytes().len() as u64)
+                    .map(|shot| {
+                        shot.screenshot
+                            .as_ref()
+                            .map_or(0, |image| image.bytes().len() as u64)
+                    })
                     .sum::<u64>()
             })
             .unwrap_or_default();
         let staged_bytes = staged_bytes.saturating_add(saved_bytes);
-        let incoming = appshot.screenshot.bytes().len() as u64;
+        let incoming = appshot
+            .screenshot
+            .as_ref()
+            .map_or(0, |image| image.bytes().len() as u64);
         if incoming > attachments::MAX_ATTACHMENT_BYTES
             || staged_bytes.saturating_add(incoming) > appshots::MAX_STAGED_APPSHOT_BYTES
         {
@@ -5293,13 +5440,15 @@ impl Composer {
             - 2.0 * APPSHOT_IMAGE_INSET;
         for (ix, appshot) in appshots.iter().enumerate() {
             let group: SharedString = format!("composer-appshot-{}", appshot.id).into();
-            let preview = crate::attachments::PreviewImage::new(
-                appshot.screenshot.name.clone(),
-                appshot.screenshot.image.clone(),
-            );
-            let preview_on_key = preview.clone();
-            let preview_on_a11y = preview.clone();
-            let composer_for_preview = cx.entity().downgrade();
+            // Semantic-only captures (Cosmos Computer Screen Context) have no
+            // image to preview — the card shows a context tile instead and is
+            // not clickable.
+            let preview = appshot.screenshot.as_ref().map(|screenshot| {
+                crate::attachments::PreviewImage::new(
+                    screenshot.name.clone(),
+                    screenshot.image.clone(),
+                )
+            });
             let remove_id = appshot.id.clone();
             let remove_on_key_id = remove_id.clone();
             let remove_on_a11y_id = remove_id.clone();
@@ -5311,7 +5460,11 @@ impl Composer {
                 .map(str::to_owned)
                 .unwrap_or_else(|| appshot.app_name.clone())
                 .into();
-            let preview_label: SharedString = format!("Preview {source}").into();
+            let preview_label: SharedString = if preview.is_some() {
+                format!("Preview {source}").into()
+            } else {
+                format!("{source} screen context").into()
+            };
             let remove_label: SharedString = format!("Remove {source}").into();
             let preview_aria = preview_label.clone();
             let remove_aria = remove_label.clone();
@@ -5330,7 +5483,6 @@ impl Composer {
                 .items_center()
                 .rounded(px(14.0))
                 .overflow_hidden()
-                .cursor_pointer()
                 .hover(|style| style.bg(crate::theme::ink(0.045)))
                 .tooltip(move |_, cx| {
                     cx.new(|_| AppshotActionTooltip(preview_label.clone()))
@@ -5344,32 +5496,40 @@ impl Composer {
                         .bg(crate::theme::ink(0.06))
                         .border_1()
                         .border_color(theme.accent)
-                })
-                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                        cx.stop_propagation();
-                        preview_on_key.viewer.reset();
-                        this.preview = Some(preview_on_key.clone());
-                        this.preview_focus_pending = true;
-                        cx.notify();
-                    }
-                }))
-                .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
-                    composer_for_preview
-                        .update(cx, |this, cx| {
-                            preview_on_a11y.viewer.reset();
-                            this.preview = Some(preview_on_a11y.clone());
+                });
+            if let Some(preview) = preview {
+                let preview_on_key = preview.clone();
+                let preview_on_a11y = preview.clone();
+                let composer_for_preview = cx.entity().downgrade();
+                card = card
+                    .cursor_pointer()
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            cx.stop_propagation();
+                            preview_on_key.viewer.reset();
+                            this.preview = Some(preview_on_key.clone());
                             this.preview_focus_pending = true;
                             cx.notify();
-                        })
-                        .ok();
-                })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    preview.viewer.reset();
-                    this.preview = Some(preview.clone());
-                    this.preview_focus_pending = true;
-                    cx.notify();
-                }))
+                        }
+                    }))
+                    .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
+                        composer_for_preview
+                            .update(cx, |this, cx| {
+                                preview_on_a11y.viewer.reset();
+                                this.preview = Some(preview_on_a11y.clone());
+                                this.preview_focus_pending = true;
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        preview.viewer.reset();
+                        this.preview = Some(preview.clone());
+                        this.preview_focus_pending = true;
+                        cx.notify();
+                    }));
+            }
+            let mut card = card
                 .child(
                     div()
                         .id(("composer-appshot-preview", ix))
@@ -5382,8 +5542,8 @@ impl Composer {
                         .justify_center()
                         .overflow_hidden()
                         .rounded(px(12.0))
-                        .child(
-                            div()
+                        .child(match &appshot.screenshot {
+                            Some(screenshot) => div()
                                 .w(px(image_width))
                                 .h(px(image_height))
                                 .flex_none()
@@ -5394,12 +5554,28 @@ impl Composer {
                                     44.0,
                                     false,
                                     true,
-                                    img(appshot.screenshot.image.clone())
+                                    img(screenshot.image.clone())
                                         .w(px(image_width))
                                         .h(px(image_height))
                                         .object_fit(ObjectFit::Contain),
-                                )),
-                        ),
+                                ))
+                                .into_any_element(),
+                            None => div()
+                                .w(px(image_width))
+                                .h(px(image_height))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.0))
+                                .bg(crate::theme::ink(0.05))
+                                .child(
+                                    crate::icons::icon(crate::icons::EYE)
+                                        .size(px(28.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .into_any_element(),
+                        }),
                 )
                 .child(
                     div()
@@ -5521,8 +5697,7 @@ impl Composer {
     }
 
     fn sync_mention_controls(&mut self, cx: &mut Context<Self>) {
-        let open =
-            self.mention.token.is_some() || self.slash.token.is_some() || self.resume.open;
+        let open = self.mention.token.is_some() || self.slash.token.is_some() || self.resume.open;
         let has_selection = if self.resume.open {
             self.resume.active.is_some()
         } else if self.slash.token.is_some() {
@@ -5756,7 +5931,12 @@ impl Composer {
         if !query.is_empty() {
             let titles: Vec<&str> = chats
                 .iter()
-                .map(|c| c.title.as_deref().filter(|t| !t.trim().is_empty()).unwrap_or("Untitled"))
+                .map(|c| {
+                    c.title
+                        .as_deref()
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or("Untitled")
+                })
                 .collect();
             let indices = crate::popover::filter_indices(&query, &titles);
             chats = indices.into_iter().map(|ix| chats[ix].clone()).collect();
@@ -5914,8 +6094,16 @@ impl Composer {
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         if categories_open {
             let categories = [
-                ("Files and folders", "Browse this folder's files", MentionMode::Files),
-                ("Chats", "Reference another conversation", MentionMode::Chats),
+                (
+                    "Files and folders",
+                    "Browse this folder's files",
+                    MentionMode::Files,
+                ),
+                (
+                    "Chats",
+                    "Reference another conversation",
+                    MentionMode::Chats,
+                ),
             ];
             let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(categories.len());
             for (ix, (title, hint, mode)) in categories.iter().enumerate() {
@@ -5956,7 +6144,13 @@ impl Composer {
                         .into_any_element(),
                 );
             }
-            card = card.child(div().id("mention-categories").flex().flex_col().children(rows));
+            card = card.child(
+                div()
+                    .id("mention-categories")
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            );
         } else if self.mention.mode == MentionMode::Chats {
             if self.mention.chat_results.is_empty() {
                 card = card.child(
@@ -6261,11 +6455,7 @@ impl Composer {
             description: "Resume a past agent session in this chat".into(),
             input_hint: None,
         }];
-        if let Some(cached) = self
-            .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
-        {
+        if let Some(cached) = self.slash.harness.and_then(|h| self.slash_cache.get(&h)) {
             commands.extend(cached.iter().cloned());
         }
         commands
@@ -6530,7 +6720,9 @@ impl Composer {
                     model: None,
                     reasoning: None,
                     model_options: Default::default(),
-                    sandbox: other.map(|c| c.sandbox).unwrap_or(SandboxLevel::WorkspaceWrite),
+                    sandbox: other
+                        .map(|c| c.sandbox)
+                        .unwrap_or(SandboxLevel::WorkspaceWrite),
                 },
             }
         };
@@ -6602,9 +6794,9 @@ impl Composer {
                         composer.resume.open = false;
                         composer.sync_mention_controls(cx);
                         if existing.is_none() {
-                            composer.state.update(cx, |s, cx| {
-                                s.select_chat(Some(chat_id.clone()), cx)
-                            });
+                            composer
+                                .state
+                                .update(cx, |s, cx| s.select_chat(Some(chat_id.clone()), cx));
                         }
                     }
                     Err(err) => {
@@ -6945,8 +7137,7 @@ impl Composer {
                         let mut meta = session.cwd.clone();
                         if let Some(updated) = session.updated_at {
                             let ago = crate::state::format_time_ago(
-                                chrono::DateTime::from_timestamp_millis(updated)
-                                    .unwrap_or(now),
+                                chrono::DateTime::from_timestamp_millis(updated).unwrap_or(now),
                                 now,
                             );
                             meta = if meta.is_empty() {
@@ -7169,7 +7360,13 @@ impl Composer {
         let (key, pending, edited_row_exists) = {
             let s = self.state.read(cx);
             (
-                self.target_chat_id(&s).unwrap_or_default(),
+                // The delegate bar pins its own draft key: shell navigation
+                // must never swap its text out from under it.
+                if self.delegate {
+                    self.current_key.clone()
+                } else {
+                    self.target_chat_id(&s).unwrap_or_default()
+                },
                 pending_input_request(&s.transcript),
                 editing_id
                     .as_ref()
@@ -7666,7 +7863,7 @@ impl Composer {
         staged.extend(
             staged_appshots
                 .iter()
-                .map(|appshot| appshot.screenshot.clone()),
+                .filter_map(|appshot| appshot.screenshot.clone()),
         );
         // `typed` keeps the user's own words for the failure hand-back below:
         // restoring the folded prompt would paste the comment block into the
@@ -7835,14 +8032,17 @@ impl Composer {
             status: None,
             continuation_of: None,
         };
-        self.launching_new_chat = is_new;
-        if is_new {
+        // A canvas send navigates the shell to the minted session; a delegate
+        // send must not — the bar stays put and the session lands in the
+        // sidebar without disturbing whatever the main window was showing.
+        self.launching_new_chat = is_new && !self.delegate;
+        if is_new && !self.delegate {
             cx.emit(ComposerEvent::NewThreadTransitionStarted);
         }
         // A queued message is not in the transcript yet — the queue panel is
         // its echo, and it gets a real bubble when the host sends it.
         self.state.update(cx, |s, cx| {
-            if is_new {
+            if is_new && !self.delegate {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
             if should_publish_optimistic_echo(queue) {
@@ -8819,6 +9019,84 @@ impl Composer {
             }
         }
     }
+
+    /// The Delegate bar's single-row chrome (`crate::delegate`): utility
+    /// buttons, the input, the model chip and Send on one line — the same
+    /// controls the compact pill shows, without the flip machinery a
+    /// floating card doesn't need. Staged attachments/appshots still get
+    /// their strips above the row.
+    fn render_delegate_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = Theme::of(cx).clone();
+        let mode = self.button_mode(cx);
+        let send_button = self.render_send_button(mode, cx);
+        let attach = div()
+            .id("delegate-attach")
+            .size(px(28.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .cursor_pointer()
+            .role(gpui::Role::Button)
+            .aria_label("Attach files")
+            .bg(motion::hover_blend(
+                "delegate-attach",
+                gpui::transparent_black(),
+                crate::theme::ink(0.10),
+            ))
+            .on_hover(motion::hover_listener("delegate-attach"))
+            .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
+            .child(
+                crate::icons::icon(crate::icons::PAPERCLIP)
+                    .size(px(16.0))
+                    .text_color(theme.text_muted),
+            );
+        let strip = self.render_attachment_strip(&theme, cx);
+        let appshot_strip = self.render_appshot_strip(&theme, window, cx);
+        let failure = self.failure.clone().filter(|_| {
+            self.failure_key.is_none() || self.failure_key.as_deref() == Some(DELEGATE_DRAFT_KEY)
+        });
+
+        crate::popover::popover_card(&theme)
+            .w_full()
+            .flex()
+            .flex_col()
+            .rounded(px(14.0))
+            .children(appshot_strip)
+            .children(strip)
+            .child(
+                div()
+                    .h(px(48.0))
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .pl(px(10.0))
+                    .pr(px(10.0))
+                    .gap(px(ACTION_UTILITY_GAP))
+                    .child(attach)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(6.0))
+                            .child(self.render_input_with_completion()),
+                    )
+                    .child(div().flex_none().min_w_0().child(self.pickers.clone()))
+                    .child(div().flex_none().child(send_button)),
+            )
+            .when_some(failure, |el, message| {
+                el.child(
+                    div()
+                        .px(px(14.0))
+                        .pb(px(10.0))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.danger)
+                        .child(message),
+                )
+            })
+    }
 }
 
 /// The completion popups' floating rails run through
@@ -8848,6 +9126,12 @@ impl Render for Composer {
             self.focus_pending = false;
             let focus = self.input.focus_handle(cx);
             window.focus(&focus, cx);
+        }
+        // The Delegate bar renders its own single-row chrome — the shell
+        // composer's flip/dock/layout machinery is meaningless in a floating
+        // card of fixed width.
+        if self.delegate {
+            return self.render_delegate_bar(window, cx);
         }
         let theme = Theme::of(cx).clone();
         let wizard_active = self.wizard.is_some();
@@ -9365,12 +9649,8 @@ impl Render for Composer {
                 })
                 .role(gpui::Role::Button)
                 .aria_label(label)
-                .tooltip(move |_, cx| {
-                    cx.new(|_| AppshotActionTooltip(label.into())).into()
-                })
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.toggle_dictation(window, cx)
-                }))
+                .tooltip(move |_, cx| cx.new(|_| AppshotActionTooltip(label.into())).into())
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_dictation(window, cx)))
                 .child(if dictating {
                     div()
                         .flex()
@@ -9464,6 +9744,9 @@ impl Render for Composer {
         let model_travel = (surface_width
             - PILL_BORDER_V
             - 12.0
+            - 28.0
+            - ACTION_UTILITY_GAP
+            // Screen Context joins the utility cluster beside the paperclip.
             - 28.0
             - ACTION_UTILITY_GAP
             - self
@@ -9594,6 +9877,10 @@ impl Render for Composer {
                                 .pl(px(12.0))
                                 .relative()
                                 .top(px(-cluster_dy))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(ACTION_UTILITY_GAP))
                                 .child(attach),
                         )
                         .child(
@@ -11507,8 +11794,12 @@ mod appshot_rebase_tests {
                 original.accessibility
             );
             assert_eq!(
-                composer.staged_appshots()[0].screenshot.id,
-                original.screenshot.id
+                composer.staged_appshots()[0]
+                    .screenshot
+                    .as_ref()
+                    .unwrap()
+                    .id,
+                original.screenshot.as_ref().unwrap().id
             );
             assert_eq!(composer.staged_appshots()[1].id, "fresh");
             assert!(!composer.appshots.contains_key("minted"));

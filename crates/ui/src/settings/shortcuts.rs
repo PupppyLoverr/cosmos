@@ -54,6 +54,13 @@ pub enum ShortcutsEvent {
         sound_enabled: bool,
         destination: AppshotDestination,
     },
+    /// The Delegate bar's global hotkey toggle changed — persist + re-apply.
+    DelegateChanged { enabled: bool },
+    /// Close-to-tray / launch-at-login changed — persist + apply live.
+    TrayChanged {
+        keep_running: bool,
+        launch_at_login: bool,
+    },
 }
 
 pub struct ShortcutsPage {
@@ -74,6 +81,9 @@ pub struct ShortcutsPage {
     appshots_enabled: bool,
     appshot_sound_enabled: bool,
     appshot_destination: AppshotDestination,
+    delegate_enabled: bool,
+    keep_running_in_tray: bool,
+    launch_at_login: bool,
     appshot_capabilities: AppshotCapabilities,
     capture_access_prompted: bool,
     semantic_access_prompted: bool,
@@ -93,10 +103,16 @@ impl ShortcutsPage {
         appshots_enabled: bool,
         appshot_sound_enabled: bool,
         appshot_destination: AppshotDestination,
+        delegate_enabled: bool,
+        keep_running_in_tray: bool,
+        launch_at_login: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        cx.on_release(|_, _| crate::appshots::set_recording(false))
-            .detach();
+        cx.on_release(|_, _| {
+            crate::appshots::set_recording(false);
+            crate::delegate::set_recording(false);
+        })
+        .detach();
         Self {
             appshots_page: false,
             appshots_focus_pending: false,
@@ -112,6 +128,9 @@ impl ShortcutsPage {
             appshots_enabled,
             appshot_sound_enabled,
             appshot_destination,
+            delegate_enabled,
+            keep_running_in_tray,
+            launch_at_login,
             appshot_capabilities: crate::appshots::capabilities(),
             capture_access_prompted: false,
             semantic_access_prompted: false,
@@ -134,6 +153,7 @@ impl ShortcutsPage {
     fn start_recording(&mut self, id: ShortcutId, window: &mut Window, cx: &mut Context<Self>) {
         self.recording = Some(id);
         crate::appshots::set_recording(true);
+        crate::delegate::set_recording(true);
         let page = cx.entity().downgrade();
         // Bound actions run before Div key listeners. Intercept first so a
         // conflicting chord is recorded/refused instead of running its action.
@@ -158,6 +178,7 @@ impl ShortcutsPage {
         self.recording_blur = None;
         self.recording_interceptor = None;
         crate::appshots::set_recording(false);
+        crate::delegate::set_recording(false);
     }
 
     fn commit(&mut self, cx: &mut Context<Self>) {
@@ -194,6 +215,36 @@ impl ShortcutsPage {
         });
     }
 
+    fn set_delegate_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.delegate_enabled != enabled {
+            self.delegate_enabled = enabled;
+            cx.emit(ShortcutsEvent::DelegateChanged { enabled });
+            cx.notify();
+        }
+    }
+
+    fn set_keep_running_in_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.keep_running_in_tray != enabled {
+            self.keep_running_in_tray = enabled;
+            cx.emit(ShortcutsEvent::TrayChanged {
+                keep_running: enabled,
+                launch_at_login: self.launch_at_login,
+            });
+            cx.notify();
+        }
+    }
+
+    fn set_launch_at_login(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.launch_at_login != enabled {
+            self.launch_at_login = enabled;
+            cx.emit(ShortcutsEvent::TrayChanged {
+                keep_running: self.keep_running_in_tray,
+                launch_at_login: enabled,
+            });
+            cx.notify();
+        }
+    }
+
     fn record_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
         let Some(recording) = self.recording else {
             return;
@@ -212,9 +263,14 @@ impl ShortcutsPage {
             }
             RecordOutcome::Ignored => {}
             RecordOutcome::Set(combo) => {
-                if recording == ShortcutId::CaptureAppshot
-                    && crate::appshots::validate_shortcut(&combo).is_err()
-                {
+                let global_shortcut_invalid = match recording {
+                    ShortcutId::CaptureAppshot => {
+                        crate::appshots::validate_shortcut(&combo).is_err()
+                    }
+                    ShortcutId::DelegateTask => crate::delegate::validate_shortcut(&combo).is_err(),
+                    _ => false,
+                };
+                if global_shortcut_invalid {
                     self.conflict_notice = Some(
                         format!(
                             "Use {} with a letter, number, function key or navigation key.",
@@ -464,7 +520,8 @@ pub fn modifier_send_label(is_macos: bool) -> &'static str {
 /// extends the match and appears on the page by construction
 /// (`every_shortcut_lands_in_a_rendered_group` holds the other half: its group
 /// name must be listed here).
-const GROUP_ORDER: [&str; 7] = [
+const GROUP_ORDER: [&str; 8] = [
+    "Delegate",
     "Files",
     "Browser",
     "Panels",
@@ -478,6 +535,7 @@ const GROUP_ORDER: [&str; 7] = [
 fn group(id: ShortcutId) -> &'static str {
     match id {
         ShortcutId::CaptureAppshot => "Appshots",
+        ShortcutId::DelegateTask => "Delegate",
         ShortcutId::SaveFile => "Files",
         ShortcutId::BrowserReload => "Browser",
         ShortcutId::ToggleSidebar | ShortcutId::ToggleChanges | ShortcutId::ToggleTerminal => {
@@ -499,6 +557,7 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::CaptureAppshot => {
             "Capture the focused application from anywhere on your desktop."
         }
+        ShortcutId::DelegateTask => "Summon the Cosmos delegate bar from any application.",
         ShortcutId::SaveFile => "Save the active workspace file.",
         ShortcutId::BrowserReload => "Reload the focused browser tab.",
         ShortcutId::ToggleSidebar => "Show or hide sessions and settings navigation.",
@@ -688,6 +747,70 @@ impl Render for ShortcutsPage {
                 let ix = ShortcutId::ALL.iter().position(|&a| a == id).unwrap_or(0);
                 card = card.child(self.render_row(id, ix, gx, recording, &theme, cx));
             }
+            if name == "Delegate" {
+                let delegate_enabled = self.delegate_enabled;
+                let keep_running_in_tray = self.keep_running_in_tray;
+                let launch_at_login = self.launch_at_login;
+                let toggle_row =
+                    |title: &'static str,
+                     description: &'static str,
+                     control: gpui::Stateful<gpui::Div>| {
+                        widgets::card_row(&theme, false)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(widgets::row_title(&theme, title))
+                                    .child(
+                                        div()
+                                            .mt(px(2.0))
+                                            .text_size(crate::typography::ui_rems(12.0))
+                                            .text_color(theme.text_muted)
+                                            .child(SharedString::from(description)),
+                                    ),
+                            )
+                            .child(control)
+                    };
+                card = card
+                    .child(toggle_row(
+                        "Enabled",
+                        "Register the global shortcut with the OS.",
+                        widgets::toggle_switch(&theme, delegate_enabled)
+                            .id("delegate-enabled-toggle")
+                            .cursor_pointer()
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.set_delegate_enabled(!delegate_enabled, cx);
+                                }),
+                            ),
+                    ))
+                    .child(toggle_row(
+                        "Keep running in tray",
+                        "Closing the window leaves Cosmos in the system tray — delegated tasks keep running and the global shortcut still works.",
+                        widgets::toggle_switch(&theme, keep_running_in_tray)
+                            .id("keep-running-in-tray-toggle")
+                            .cursor_pointer()
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.set_keep_running_in_tray(!keep_running_in_tray, cx);
+                                }),
+                            ),
+                    ))
+                    .child(toggle_row(
+                        "Launch at login",
+                        "Start Cosmos in the tray when you sign in.",
+                        widgets::toggle_switch(&theme, launch_at_login)
+                            .id("launch-at-login-toggle")
+                            .cursor_pointer()
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.set_launch_at_login(!launch_at_login, cx);
+                                }),
+                            ),
+                    ));
+            }
             groups.push(
                 div()
                     .flex()
@@ -836,6 +959,9 @@ mod tests {
                 false,
                 false,
                 AppshotDestination::Automatic,
+                false,
+                false,
+                false,
                 cx,
             );
             page.show_appshots(true);
@@ -929,6 +1055,9 @@ mod tests {
                 false,
                 true,
                 AppshotDestination::Automatic,
+                false,
+                false,
+                false,
                 cx,
             )
         });
