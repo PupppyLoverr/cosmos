@@ -4,16 +4,38 @@
 
 import SwiftUI
 
+enum Appearance: String, CaseIterable {
+    case system, light, dark
+
+    var scheme: ColorScheme? {
+        switch self {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .system: "System"
+        case .light: "Light"
+        case .dark: "Dark"
+        }
+    }
+}
+
 @main
 struct ZeronApp: App {
     @State private var model = AppModel()
     @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("cosmosAppearance") private var appearance = Appearance.system.rawValue
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environment(model)
-                .preferredColorScheme(.dark)
+                .preferredColorScheme(
+                    Appearance(rawValue: appearance)?.scheme)
                 // Monochrome controls: glass buttons, toolbar icons, and
                 // toggles render white like the desktop — accent stays paint
                 // for status/markdown, never chrome.

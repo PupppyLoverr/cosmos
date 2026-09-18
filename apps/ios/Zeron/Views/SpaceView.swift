@@ -128,7 +128,6 @@ struct NewSpaceSheet: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .presentationCornerRadius(32)
-        .preferredColorScheme(.dark)
         .task(id: selectedDeviceId) {
             await load(path: nil)
         }

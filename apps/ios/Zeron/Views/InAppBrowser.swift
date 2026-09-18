@@ -139,7 +139,6 @@ struct InAppBrowser: View {
                 }
             }
         }
-        .preferredColorScheme(.dark)
         .presentationBackground(Theme.bg)
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
@@ -158,8 +157,8 @@ private struct CosmosWebView: UIViewRepresentable {
         config.defaultWebpagePreferences.preferredContentMode = .mobile
         let view = WKWebView(frame: .zero, configuration: config)
         view.allowsBackForwardNavigationGestures = true
-        view.backgroundColor = UIColor.black
-        view.scrollView.backgroundColor = UIColor.black
+        view.backgroundColor = UIColor(Theme.bg)
+        view.scrollView.backgroundColor = UIColor(Theme.bg)
         view.isOpaque = false
         view.navigationDelegate = context.coordinator
         view.uiDelegate = context.coordinator

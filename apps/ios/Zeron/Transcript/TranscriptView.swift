@@ -31,8 +31,7 @@ struct TranscriptView: View {
                     .modifier(TranscriptTailProbe(rowID: row.id,
                         isTail: row.id == rows.last?.id || (row.entryId == runway && row.turnStart),
                         chatId: chatId))
-                    .environment(\.dynamicTypeSize, dynamicTypeSize)
-                    .environment(\.colorScheme, .dark))
+                    .environment(\.dynamicTypeSize, dynamicTypeSize))
             }
             .modifier(TranscriptViewportProbe(chatId: chatId))
             .background(Theme.bg)
