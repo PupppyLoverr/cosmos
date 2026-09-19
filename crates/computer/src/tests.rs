@@ -806,10 +806,7 @@ mod linux_regression {
             status.capabilities.window_targeting,
             session != Some("wayland")
         );
-        assert_eq!(
-            status.capabilities.background,
-            session != Some("wayland")
-        );
+        assert_eq!(status.capabilities.background, session != Some("wayland"));
         let note = status.permissions.note.unwrap_or_default();
         if session == Some("wayland") {
             assert!(

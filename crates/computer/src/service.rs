@@ -456,8 +456,7 @@ impl ComputerService {
             capabilities: StatusCapabilities {
                 semantic: settings.semantic,
                 screenshots: settings.screenshots,
-                background: settings.control.acts()
-                    && linux_session_label() != Some("wayland"),
+                background: settings.control.acts() && linux_session_label() != Some("wayland"),
                 foreground: settings.control == ControlMode::FullControl,
                 wayland_background_limited: linux_session_label() == Some("wayland"),
                 live_watch: settings.screenshots,

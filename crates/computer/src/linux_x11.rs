@@ -307,7 +307,10 @@ pub fn xdotool_key(token: &str) -> String {
 }
 
 pub fn hotkey_chord(keys: &[String]) -> String {
-    keys.iter().map(|k| xdotool_key(k)).collect::<Vec<_>>().join("+")
+    keys.iter()
+        .map(|k| xdotool_key(k))
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 async fn activate(window_id: i64) -> Result<(), ComputerError> {
@@ -386,17 +389,19 @@ async fn act(request: &ActionRequest) -> Result<ActionOutcome, ComputerError> {
     if let Some(id) = window_id {
         activate(id).await?;
     }
+    let id_s = window_id.map(|id| id.to_string());
     let summary = match request.tool.as_str() {
         "computer_type_text" => {
             let text = args
                 .get("text")
                 .and_then(Value::as_str)
                 .ok_or_else(|| ComputerError::InvalidArgs("text required".into()))?;
-            run_cmd(
-                "xdotool",
-                &["type", "--clearmodifiers", "--delay", "8", "--", text],
-            )
-            .await?;
+            let mut argv = vec!["type"];
+            if let Some(id) = &id_s {
+                argv.extend(["--window", id.as_str()]);
+            }
+            argv.extend(["--clearmodifiers", "--delay", "8", "--", text]);
+            run_cmd("xdotool", &argv).await?;
             format!("typed {} chars via X11", text.chars().count())
         }
         "computer_hotkey" => {
@@ -409,7 +414,12 @@ async fn act(request: &ActionRequest) -> Result<ActionOutcome, ComputerError> {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect();
             let chord = hotkey_chord(&tokens);
-            run_cmd("xdotool", &["key", "--clearmodifiers", &chord]).await?;
+            let mut argv = vec!["key"];
+            if let Some(id) = &id_s {
+                argv.extend(["--window", id.as_str()]);
+            }
+            argv.extend(["--clearmodifiers", chord.as_str()]);
+            run_cmd("xdotool", &argv).await?;
             format!("hotkey {chord} via X11")
         }
         "computer_press_key" => {
@@ -418,13 +428,17 @@ async fn act(request: &ActionRequest) -> Result<ActionOutcome, ComputerError> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| ComputerError::InvalidArgs("key required".into()))?;
             let mapped = xdotool_key(key);
-            run_cmd("xdotool", &["key", "--clearmodifiers", &mapped]).await?;
+            let mut argv = vec!["key"];
+            if let Some(id) = &id_s {
+                argv.extend(["--window", id.as_str()]);
+            }
+            argv.extend(["--clearmodifiers", mapped.as_str()]);
+            run_cmd("xdotool", &argv).await?;
             format!("press {mapped} via X11")
         }
         "computer_focus_app" => {
-            let id = window_id.ok_or_else(|| {
-                ComputerError::InvalidArgs("focus needs pid or windowId".into())
-            })?;
+            let id = window_id
+                .ok_or_else(|| ComputerError::InvalidArgs("focus needs pid or windowId".into()))?;
             format!("focused window {} via wmctrl", hex_window(id))
         }
         "computer_set_window_frame" => {
@@ -483,7 +497,11 @@ async fn act(request: &ActionRequest) -> Result<ActionOutcome, ComputerError> {
                 "right" => "7",
                 _ => "5",
             };
-            let amount = args.get("amount").and_then(Value::as_i64).unwrap_or(3).max(1);
+            let amount = args
+                .get("amount")
+                .and_then(Value::as_i64)
+                .unwrap_or(3)
+                .max(1);
             for _ in 0..amount.min(20) {
                 run_cmd("xdotool", &["click", button]).await?;
             }

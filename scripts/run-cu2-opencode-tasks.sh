@@ -9,7 +9,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ART="${COSMOS_CU_ART:-$ROOT/artifacts/linux/computer-use}"
 mkdir -p "$ART" /tmp/cosmos-cu2 /opt/cursor/artifacts/videos
 REPORT="$ART/opencode-report.txt"
-: > "$REPORT"
+ONLY="${1:-all}"
+if [[ "$ONLY" != "parallel" ]]; then
+  : > "$REPORT"
+fi
 log() { printf '%s\n' "$*" | tee -a "$REPORT"; }
 
 COSMOS_BIN="${COSMOS_BIN:-$ROOT/target/debug/cosmos}"
@@ -75,8 +78,6 @@ if ! rg -q 'computer_observe' "$ART/tools-list.txt"; then
   log "FAIL: Cosmos MCP did not list computer_observe"
   exit 3
 fi
-
-ONLY="${1:-all}"
 
 task2() {
   local rec
