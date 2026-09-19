@@ -11,12 +11,19 @@ export default function SignInScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Sign-in can be the root route when deep-linked — router.back() then
+  // throws GO_BACK unhandled and swallows the completed session.
+  const leave = () => {
+    if (router.canGoBack()) router.back();
+    else router.replace('/(tabs)');
+  };
+
   const signIn = async () => {
     setBusy(true);
     setError(null);
     try {
       await client.signIn();
-      router.back();
+      leave();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -36,7 +43,7 @@ export default function SignInScreen() {
         <Pressable onPress={() => void signIn()} disabled={busy} style={[styles.btn, { backgroundColor: t.accent, opacity: busy ? 0.6 : 1 }]}>
           {busy ? <ActivityIndicator color="#fff" /> : <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }}>Continue</Text>}
         </Pressable>
-        <Pressable onPress={() => router.back()} style={styles.cancel}>
+        <Pressable onPress={leave} style={styles.cancel}>
           <Text style={{ color: t.textSecondary }}>Not now</Text>
         </Pressable>
       </View>
