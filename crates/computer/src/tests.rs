@@ -717,6 +717,10 @@ async fn invoke_menu_recovers_when_driver_leaves_menu_open() {
             "role": "AXWindow",
             "depth": 0,
             "frame": {"x": 100.0, "y": 80.0, "w": 500.0, "h": 400.0}
+        }, {
+            "element_index": 1,
+            "role": "AXMenuItem",
+            "label": "Save…"
         }]
     });
     let states = json!({"401": [menu_state, closed_state]});
@@ -762,6 +766,9 @@ async fn invoke_menu_recovers_when_driver_leaves_menu_open() {
     assert_eq!(calls[1]["name"], json!("press_key"));
     assert_eq!(calls[1]["args"]["scope"], json!("desktop"));
     assert_eq!(calls[1]["args"]["key"], json!("return"));
+    assert!(!calls.iter().any(|call| {
+        call["name"] == json!("press_key") && call["args"]["key"] == json!("escape")
+    }));
 }
 
 #[cfg(unix)]
@@ -788,6 +795,10 @@ async fn invoke_menu_does_not_recover_when_menu_is_closed() {
             "role": "AXWindow",
             "depth": 0,
             "frame": {"x": 100.0, "y": 80.0, "w": 500.0, "h": 400.0}
+        }, {
+            "element_index": 1,
+            "role": "AXMenuItem",
+            "label": "Save…"
         }]
     }});
     let actions = json!({

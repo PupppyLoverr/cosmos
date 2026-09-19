@@ -404,6 +404,23 @@ impl CuaBackend {
         segment.to_string()
     }
 
+    /// Closed menu items remain in the AX tree but have no frame.
+    fn open_menu_item_visible(state: &WindowState, segment: &str) -> bool {
+        let normalized_segment = Self::normalized_menu_segment(segment);
+        digest::find(state, segment, Some("AXMenuItem"), 5)
+            .into_iter()
+            .any(|hit| {
+                hit.frame.is_some()
+                    && hit
+                        .label
+                        .as_deref()
+                        .or(hit.value.as_deref())
+                        .is_some_and(|label| {
+                            Self::normalized_menu_segment(label) == normalized_segment
+                        })
+            })
+    }
+
     fn menu_path_from_state(state: &WindowState, requested: &[String]) -> Option<Vec<String>> {
         let titles: Vec<String> = state
             .elements
@@ -527,16 +544,7 @@ impl CuaBackend {
         else {
             return Ok(None);
         };
-        let normalized_segment = Self::normalized_menu_segment(segment);
-        let has_matching_menu_item = digest::find(&state, segment, Some("AXMenuItem"), 5)
-            .into_iter()
-            .any(|hit| {
-                hit.label
-                    .as_deref()
-                    .or(hit.value.as_deref())
-                    .is_some_and(|label| Self::normalized_menu_segment(label) == normalized_segment)
-            });
-        if !has_matching_menu_item {
+        if !Self::open_menu_item_visible(&state, segment) {
             return Ok(None);
         }
         let type_select_segment = Self::menu_type_select_segment(segment);
@@ -556,15 +564,7 @@ impl CuaBackend {
         else {
             return Ok(None);
         };
-        let still_open = digest::find(&state_after_type_select, segment, Some("AXMenuItem"), 5)
-            .into_iter()
-            .any(|hit| {
-                hit.label
-                    .as_deref()
-                    .or(hit.value.as_deref())
-                    .is_some_and(|label| Self::normalized_menu_segment(label) == normalized_segment)
-            });
-        if !still_open {
+        if !Self::open_menu_item_visible(&state_after_type_select, segment) {
             return Ok(Some(format!(
                 " (driver's menu press left the menu open; completed \"{segment}\" via menu type-select + Return)"
             )));
