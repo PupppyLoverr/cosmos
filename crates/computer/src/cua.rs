@@ -50,6 +50,9 @@ pub struct CuaBackend {
     /// This backend's unique driver session label.
     session: String,
     version: Option<String>,
+    /// One in-flight driver call at a time. Overlapping `list_windows` after
+    /// a cancelled AT-SPI walk is how the Linux stdio child wedges.
+    call_lock: tokio::sync::Mutex<()>,
 }
 
 impl CuaBackend {
@@ -85,6 +88,7 @@ impl CuaBackend {
             client,
             session: format!("{SESSION_LABEL_PREFIX}-{}", std::process::id()),
             version: None,
+            call_lock: tokio::sync::Mutex::new(()),
         };
         // Name the shared session up-front — `start_session` is idempotent and
         // this also proves the session tools exist before first real use.
@@ -104,6 +108,7 @@ impl CuaBackend {
             client: backend.client,
             session: backend.session,
             version,
+            call_lock: backend.call_lock,
         })
     }
 
@@ -162,7 +167,18 @@ impl CuaBackend {
     /// label (tools that accept it — the label is ignored by the rest), then
     /// on a dead-session refusal revives the session and retries ONCE. All
     /// other errors pass through untouched.
-    async fn call(&self, tool: &str, mut args: Value) -> Result<Value, ComputerError> {
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, ComputerError> {
+        self.call_with_timeout(tool, args, crate::mcp_client::CALL_TIMEOUT)
+            .await
+    }
+
+    async fn call_with_timeout(
+        &self,
+        tool: &str,
+        mut args: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value, ComputerError> {
+        let _guard = self.call_lock.lock().await;
         if let Some(obj) = args.as_object_mut()
             && !obj.contains_key("session")
         {
@@ -173,10 +189,14 @@ impl CuaBackend {
         {
             self.ensure_named_session(label).await?;
         }
-        match self.client.call_tool(tool, args.clone()).await {
+        match self
+            .client
+            .call_tool_timeout(tool, args.clone(), timeout)
+            .await
+        {
             Err(error) if Self::is_session_ended(&error) => {
                 self.start_session().await?;
-                self.client.call_tool(tool, args).await
+                self.client.call_tool_timeout(tool, args, timeout).await
             }
             other => other,
         }
@@ -1063,8 +1083,8 @@ impl ComputerBackend for CuaBackend {
     }
 
     async fn inspect(&self, kind: &InspectKind) -> Result<Value, ComputerError> {
-        let (tool, args) = match kind {
-            InspectKind::Apps => ("list_apps", json!({})),
+        let (tool, args, pid, on_screen_only) = match kind {
+            InspectKind::Apps => ("list_apps", json!({}), None, false),
             InspectKind::Windows {
                 pid,
                 on_screen_only,
@@ -1074,16 +1094,34 @@ impl ComputerBackend for CuaBackend {
                     "pid": pid,
                     "on_screen_only": on_screen_only,
                 }),
+                *pid,
+                *on_screen_only,
             ),
         };
         let mut args = args;
         strip_nulls(&mut args);
-        let result = self.call(tool, args).await?;
-        Ok(result
-            .get("structuredContent")
-            .cloned()
-            .or_else(|| result_text(&result).and_then(|t| serde_json::from_str(&t).ok()))
-            .unwrap_or(result))
+        let timeout = if tool == "list_windows" || tool == "list_apps" {
+            crate::mcp_client::INSPECT_TIMEOUT
+        } else {
+            crate::mcp_client::CALL_TIMEOUT
+        };
+        match self.call_with_timeout(tool, args, timeout).await {
+            Ok(result) => Ok(result
+                .get("structuredContent")
+                .cloned()
+                .or_else(|| result_text(&result).and_then(|t| serde_json::from_str(&t).ok()))
+                .unwrap_or(result)),
+            Err(error) => {
+                #[cfg(target_os = "linux")]
+                if tool == "list_windows" {
+                    if let Ok(fallback) = crate::linux_x11::list_windows(pid, on_screen_only).await
+                    {
+                        return Ok(fallback);
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn act(&self, request: &ActionRequest) -> Result<ActionOutcome, ComputerError> {

@@ -144,6 +144,8 @@ pub mod methods {
     pub const COMPUTER_TOOL_CALL: &str = "ComputerToolCall";
     /// Cancel in-flight wait/scroll and mark Computer Use stopped.
     pub const COMPUTER_STOP: &str = "ComputerStop";
+    /// Remote hybrid approval: `approve` | `deny` | `pause` | `stop`.
+    pub const COMPUTER_DECIDE: &str = "ComputerDecide";
     /// First-time pairing request from a remote device. Forwards to the
     /// target desktop; the desktop user must Approve.
     pub const COMPUTER_REQUEST_TRUST: &str = "ComputerRequestTrust";

@@ -1065,3 +1065,83 @@ fn pairing_is_required_before_authorize() {
     assert_eq!(status.trusted_devices.len(), 1);
     assert!(status.capabilities.remote_control);
 }
+
+#[tokio::test]
+async fn remote_sensitive_action_parks_until_approve() {
+    let backend = Arc::new(MockComputer::working());
+    let (service, _dir) = service(enabled_settings(ControlMode::FullControl), backend);
+    let parked = service
+        .dispatch_tool(
+            "computer_type_text",
+            json!({
+                "_remoteCaller": true,
+                "pid": 1,
+                "text": "hello"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(parked.text.contains("approval_required"), "{}", parked.text);
+    assert!(service.pending_remote_action().is_some());
+    let approved = service.decide("approve", None).await.unwrap();
+    assert_eq!(approved["decision"], "approve");
+    assert_eq!(approved["ran"], "computer_type_text");
+}
+
+#[tokio::test]
+async fn remote_stop_blocks_later_sensitive_actions() {
+    let backend = Arc::new(MockComputer::working());
+    let (service, _dir) = service(enabled_settings(ControlMode::FullControl), backend);
+    service.decide("stop", Some("from test")).await.unwrap();
+    let err = service
+        .dispatch_tool(
+            "computer_click",
+            json!({ "_remoteCaller": true, "pid": 1, "elementIndex": 0 }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "stopped");
+}
+
+#[tokio::test]
+async fn observe_clears_repeated_failure_budget() {
+    let backend = Arc::new(MockComputer::with_mode(crate::mock::MockMode::Stale));
+    let (service, _dir) = service(enabled_settings(ControlMode::FullControl), backend);
+    for _ in 0..3 {
+        let _ = service
+            .dispatch_tool(
+                "computer_click",
+                json!({ "pid": 1, "elementIndex": 0, "snapshotId": "s00000001" }),
+            )
+            .await;
+    }
+    service
+        .dispatch_tool("computer_observe", json!({ "pid": 1, "scope": "window" }))
+        .await
+        .unwrap();
+    let after = service
+        .dispatch_tool(
+            "computer_click",
+            json!({ "pid": 1, "elementIndex": 0, "snapshotId": "s00000001" }),
+        )
+        .await;
+    assert!(
+        after
+            .as_ref()
+            .err()
+            .map(|e| e.code() != "repeated_failure")
+            .unwrap_or(true),
+        "observe should reset the loop-breaker: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn local_mcp_sensitive_actions_do_not_require_phone_approval() {
+    let backend = Arc::new(MockComputer::working());
+    let (service, _dir) = service(enabled_settings(ControlMode::FullControl), backend);
+    let reply = service
+        .dispatch_tool("computer_type_text", json!({ "pid": 1, "text": "local" }))
+        .await
+        .unwrap();
+    assert!(!reply.text.contains("approval_required"));
+}

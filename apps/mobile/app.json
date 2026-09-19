@@ -1,0 +1,57 @@
+{
+  "expo": {
+    "name": "Cosmos",
+    "slug": "cosmos-mobile",
+    "scheme": "cosmos",
+    "version": "0.2.77",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-notifications",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Attach photos to a desktop Cosmos session.",
+          "cameraPermission": "Capture a photo to send to the selected desktop session."
+        }
+      ],
+      "expo-document-picker",
+      "./plugins/with-android-share.js"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "sh.cosmos.mobile"
+    },
+    "android": {
+      "package": "sh.cosmos.mobile",
+      "adaptiveIcon": {
+        "backgroundColor": "#060606",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": true,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.INTERNET"
+      ],
+      "intentFilters": [
+        {
+          "action": "SEND",
+          "category": ["DEFAULT"],
+          "data": [{ "mimeType": "image/*" }, { "mimeType": "*/*" }]
+        }
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    }
+  }
+}

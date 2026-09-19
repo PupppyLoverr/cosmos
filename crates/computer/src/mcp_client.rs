@@ -20,7 +20,10 @@ use crate::ComputerError;
 /// take several seconds, verify_state waits for stability, and invoke_menu
 /// can block on a modal. Timed-out calls get an MCP `notifications/cancelled`
 /// so the driver can abort in-flight work instead of landing a late effect.
-const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Inventory (`list_windows` / `list_apps`) must not sit behind a 60s AT-SPI
+/// hang — Linux X11 fallback kicks in after this.
+pub const INSPECT_TIMEOUT: Duration = Duration::from_secs(12);
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 /// A single tools/call payload or response can carry a screenshot or a large
 /// UIA tree — bound it well above the 256KB HTTP bridge cap but below
@@ -208,11 +211,20 @@ impl McpClient {
     /// `tools/call` shorthand — returns the CallTool result payload and maps
     /// `isError: true` into a classified [`ComputerError`].
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, ComputerError> {
+        self.call_tool_timeout(name, arguments, CALL_TIMEOUT).await
+    }
+
+    pub async fn call_tool_timeout(
+        &self,
+        name: &str,
+        arguments: Value,
+        timeout: Duration,
+    ) -> Result<Value, ComputerError> {
         let result = self
             .call_inner(
                 "tools/call",
                 json!({ "name": name, "arguments": arguments }),
-                CALL_TIMEOUT,
+                timeout,
             )
             .await?;
         if result.get("isError").and_then(Value::as_bool) == Some(true) {

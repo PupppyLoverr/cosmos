@@ -25,6 +25,8 @@ pub mod cua;
 pub mod digest;
 pub mod endpoint;
 pub mod install;
+#[cfg(target_os = "linux")]
+pub mod linux_x11;
 pub mod mcp_client;
 pub mod mock;
 pub mod notify;

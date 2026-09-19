@@ -1032,9 +1032,10 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         methods::RESUME_SESSION => Duration::from_secs(60),
         // ChatContext is a local doc read — interactive, fails fast.
         methods::CHAT_CONTEXT => Duration::from_secs(15),
-        methods::COMPUTER_TOOL_CALL | methods::COMPUTER_OBSERVE | methods::COMPUTER_STOP => {
-            Duration::from_secs(90)
-        }
+        methods::COMPUTER_TOOL_CALL
+        | methods::COMPUTER_OBSERVE
+        | methods::COMPUTER_STOP
+        | methods::COMPUTER_DECIDE => Duration::from_secs(90),
         _ => Duration::from_secs(30),
     }
 }
@@ -1140,6 +1141,7 @@ fn forwardable(method: &str) -> bool {
             | methods::COMPUTER_OBSERVE
             | methods::COMPUTER_TOOL_CALL
             | methods::COMPUTER_STOP
+            | methods::COMPUTER_DECIDE
             | methods::COMPUTER_REQUEST_TRUST
             | methods::COMPUTER_REVOKE_TRUST
             | methods::COMPUTER_TRUST_STATUS
@@ -1584,10 +1586,20 @@ impl RpcService for EngineRpc {
                     .get("name")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| RpcError::Failed("Missing computer tool name".into()))?;
-                let arguments = params
+                let mut arguments = params
                     .get("arguments")
                     .cloned()
                     .unwrap_or(serde_json::json!({}));
+                if params
+                    .get("callerDeviceId")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .is_some()
+                {
+                    if let Some(obj) = arguments.as_object_mut() {
+                        obj.insert("_remoteCaller".into(), serde_json::json!(true));
+                    }
+                }
                 let reply = self
                     .computer()?
                     .dispatch_tool(name, arguments)
@@ -1606,6 +1618,20 @@ impl RpcService for EngineRpc {
                     .unwrap_or("stopped remotely");
                 self.computer()?.stop(reason);
                 RpcReply::value(&serde_json::json!({ "ok": true, "reason": reason }))
+            }
+            methods::COMPUTER_DECIDE => {
+                self.authorize_computer(&params)?;
+                let decision = params
+                    .get("decision")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RpcError::Failed("Missing decision".into()))?;
+                let reason = params.get("reason").and_then(serde_json::Value::as_str);
+                let value = self
+                    .computer()?
+                    .decide(decision, reason)
+                    .await
+                    .map_err(computer_error)?;
+                RpcReply::value(&value)
             }
             methods::COMPUTER_REQUEST_TRUST => {
                 let device_id = params
@@ -3195,6 +3221,7 @@ mod tests {
             methods::COMPUTER_OBSERVE,
             methods::COMPUTER_TOOL_CALL,
             methods::COMPUTER_STOP,
+            methods::COMPUTER_DECIDE,
             methods::COMPUTER_REQUEST_TRUST,
             methods::COMPUTER_REVOKE_TRUST,
             methods::COMPUTER_TRUST_STATUS,

@@ -67,6 +67,48 @@ struct Inner {
     pins: Mutex<HashMap<String, (i64, Option<i64>)>>,
     /// Watch Live subscriber count — screenshots stream only while > 0.
     live_watchers: std::sync::atomic::AtomicU32,
+    /// Remote (paired phone) sensitive-action gate.
+    remote_gate: Mutex<RemoteGate>,
+    pending_remote: Mutex<Option<PendingRemote>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteGate {
+    /// Sensitive remote actions park until ComputerDecide(approve).
+    RequireApproval,
+    /// Operator approved — subsequent sensitive actions run.
+    Continue,
+    Paused,
+    Stopped,
+}
+
+struct PendingRemote {
+    id: String,
+    name: String,
+    args: Value,
+}
+
+fn is_sensitive_computer_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "computer_click"
+            | "computer_double_click"
+            | "computer_right_click"
+            | "computer_type_text"
+            | "computer_set_value"
+            | "computer_press_key"
+            | "computer_hotkey"
+            | "computer_scroll"
+            | "computer_scroll_until"
+            | "computer_drag"
+            | "computer_invoke_menu"
+            | "computer_set_window_frame"
+            | "computer_launch_app"
+            | "computer_close_app"
+            | "computer_focus_app"
+            | "computer_clipboard_write"
+            | "computer_move_cursor"
+    )
 }
 
 struct Endpoint {
@@ -127,6 +169,8 @@ impl ComputerService {
                 pairing: Mutex::new(pairing),
                 pins: Mutex::new(HashMap::new()),
                 live_watchers: std::sync::atomic::AtomicU32::new(0),
+                remote_gate: Mutex::new(RemoteGate::RequireApproval),
+                pending_remote: Mutex::new(None),
             }),
         }
     }
@@ -190,7 +234,84 @@ impl ComputerService {
     /// action after a fresh observe still works. Remote STOP uses this.
     pub fn stop(&self, reason: &str) {
         self.inner.cancel_epoch.fetch_add(1, Ordering::SeqCst);
+        *self.inner.remote_gate.lock().unwrap() = RemoteGate::Stopped;
+        self.inner.pending_remote.lock().unwrap().take();
         self.emit_notice(NoticeKind::Stopped, "Computer Use stopped", reason);
+    }
+
+    /// Hybrid remote approvals: safe observe tools always run. Sensitive
+    /// tools from a paired phone park until APPROVE / DENY / PAUSE / STOP.
+    pub async fn decide(
+        &self,
+        decision: &str,
+        reason: Option<&str>,
+    ) -> Result<Value, ComputerError> {
+        match decision {
+            "approve" => {
+                *self.inner.remote_gate.lock().unwrap() = RemoteGate::Continue;
+                let pending = self.inner.pending_remote.lock().unwrap().take();
+                if let Some(pending) = pending {
+                    let reply = Box::pin(self.dispatch_tool(&pending.name, pending.args)).await?;
+                    Ok(json!({
+                        "ok": true,
+                        "decision": "approve",
+                        "id": pending.id,
+                        "ran": pending.name,
+                        "text": reply.text,
+                    }))
+                } else {
+                    Ok(json!({
+                        "ok": true,
+                        "decision": "approve",
+                        "ran": Value::Null,
+                    }))
+                }
+            }
+            "deny" => {
+                *self.inner.remote_gate.lock().unwrap() = RemoteGate::RequireApproval;
+                let pending = self.inner.pending_remote.lock().unwrap().take();
+                self.emit_notice(
+                    NoticeKind::Stopped,
+                    "Computer action denied",
+                    reason.unwrap_or("denied from a remote client"),
+                );
+                Ok(json!({
+                    "ok": true,
+                    "decision": "deny",
+                    "dropped": pending.map(|p| p.name),
+                }))
+            }
+            "pause" => {
+                *self.inner.remote_gate.lock().unwrap() = RemoteGate::Paused;
+                let pending = self.inner.pending_remote.lock().unwrap().take();
+                self.emit_notice(
+                    NoticeKind::ComputerForeground,
+                    "Computer Use paused",
+                    reason.unwrap_or("paused from a remote client"),
+                );
+                Ok(json!({
+                    "ok": true,
+                    "decision": "pause",
+                    "dropped": pending.map(|p| p.name),
+                }))
+            }
+            "stop" => {
+                self.stop(reason.unwrap_or("stopped from a remote client"));
+                Ok(json!({ "ok": true, "decision": "stop" }))
+            }
+            other => Err(ComputerError::InvalidArgs(format!(
+                "decision must be approve|deny|pause|stop, got {other}"
+            ))),
+        }
+    }
+
+    pub fn pending_remote_action(&self) -> Option<Value> {
+        self.inner.pending_remote.lock().unwrap().as_ref().map(|p| {
+            json!({
+                "id": p.id,
+                "name": p.name,
+            })
+        })
     }
 
     pub fn cancel_epoch(&self) -> u64 {
@@ -584,11 +705,52 @@ impl ComputerService {
         }
         if name == "computer_stop" {
             let reason = get_str(&args, "reason").unwrap_or("stopped by caller");
+            *self.inner.remote_gate.lock().unwrap() = RemoteGate::Stopped;
+            self.inner.pending_remote.lock().unwrap().take();
             self.stop(reason);
             return Ok(ToolReply::text(format!("stopped: {reason}")));
         }
 
         let isolation = take_isolation(&mut args);
+        if isolation.remote && is_sensitive_computer_tool(name) {
+            match *self.inner.remote_gate.lock().unwrap() {
+                RemoteGate::Stopped => {
+                    return Err(ComputerError::refused(
+                        "stopped",
+                        "Computer Use was STOPPED from a remote client",
+                    ));
+                }
+                RemoteGate::Paused => {
+                    return Err(ComputerError::refused(
+                        "paused",
+                        "Computer Use is paused — APPROVE to continue",
+                    ));
+                }
+                RemoteGate::Continue => {}
+                RemoteGate::RequireApproval => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    *self.inner.pending_remote.lock().unwrap() = Some(PendingRemote {
+                        id: id.clone(),
+                        name: name.to_string(),
+                        args: args.clone(),
+                    });
+                    self.emit_notice(
+                        NoticeKind::ApprovalRequired,
+                        "Computer action needs approval",
+                        &format!("{name} from a paired device"),
+                    );
+                    return Ok(ToolReply::text(
+                        serde_json::to_string_pretty(&json!({
+                            "pending": true,
+                            "id": id,
+                            "name": name,
+                            "decision": "approval_required",
+                        }))
+                        .unwrap_or_default(),
+                    ));
+                }
+            }
+        }
         if name == "computer_pin_window" {
             let pid = get_i64(&args, "pid").ok_or_else(|| {
                 ComputerError::InvalidArgs("computer_pin_window needs 'pid'".into())
@@ -623,11 +785,29 @@ impl ComputerService {
         {
             obj.insert("_session".into(), json!(session));
         }
+
+        // Linux global inventory does not need the Cua stdio child — and must
+        // not wait on it. Per-pid lists go through the driver so GTK dialogs
+        // that share an X11 window still show up. `ensure_backend` stays lazy
+        // for observe/act.
+        if name == "computer_list_windows" && get_i64(&args, "pid").is_none() {
+            let on_screen_only = get_bool(&args, "onScreenOnly").unwrap_or(false);
+            #[cfg(target_os = "linux")]
+            if let Ok(value) = crate::linux_x11::list_windows(None, on_screen_only).await {
+                return Ok(ToolReply::text(
+                    serde_json::to_string_pretty(&value).unwrap_or_default(),
+                ));
+            }
+        }
+
         let backend = self.ensure_backend().await?;
 
-        match name {
+        let result = match name {
             "computer_observe" => {
                 let observation = self.observe_with(&*backend, &settings, &args).await?;
+                if let Ok(mut map) = self.inner.failures.lock() {
+                    map.clear();
+                }
                 Ok(self.observation_reply(&observation, &settings, &args))
             }
             "computer_list_apps" => {
@@ -637,9 +817,17 @@ impl ComputerService {
                 ))
             }
             "computer_list_windows" => {
+                let pid = get_i64(&args, "pid");
+                let on_screen_only = get_bool(&args, "onScreenOnly").unwrap_or(false);
+                #[cfg(target_os = "linux")]
+                if let Ok(value) = crate::linux_x11::list_windows(pid, on_screen_only).await {
+                    return Ok(ToolReply::text(
+                        serde_json::to_string_pretty(&value).unwrap_or_default(),
+                    ));
+                }
                 let kind = InspectKind::Windows {
-                    pid: get_i64(&args, "pid"),
-                    on_screen_only: get_bool(&args, "onScreenOnly").unwrap_or(false),
+                    pid,
+                    on_screen_only,
                 };
                 let value = backend.inspect(&kind).await?;
                 Ok(ToolReply::text(
@@ -693,7 +881,15 @@ impl ComputerService {
                     .await
             }
             _ => Err(ComputerError::InvalidArgs(format!("unknown tool '{name}'"))),
+        };
+        if let Err(error) = &result
+            && error.code() == "driver_unavailable"
+        {
+            // A timed-out stdio child stays wedged; drop so the next call
+            // respawns `cua-driver mcp` instead of waiting another 60s.
+            self.drop_backend();
         }
+        result
     }
 
     /// The control-mode gate. Every action lands here before the backend
@@ -1394,6 +1590,7 @@ struct Isolation {
     session: Option<String>,
     pin_pid: Option<i64>,
     pin_window: Option<i64>,
+    remote: bool,
 }
 
 fn take_isolation(args: &mut Value) -> Isolation {
@@ -1401,6 +1598,11 @@ fn take_isolation(args: &mut Value) -> Isolation {
         session: take_str(args, "_cosmosSession").or_else(|| take_str(args, "session")),
         pin_pid: take_i64(args, "_cosmosPinPid"),
         pin_window: take_i64(args, "_cosmosPinWindow"),
+        remote: args
+            .as_object_mut()
+            .and_then(|o| o.remove("_remoteCaller"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     }
 }
 
