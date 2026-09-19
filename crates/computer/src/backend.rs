@@ -224,6 +224,11 @@ pub struct ActionOutcome {
 
 #[async_trait::async_trait]
 pub trait ComputerBackend: Send + Sync {
+    /// Whether the underlying driver process is still reachable; a dead backend is dropped and respawned on next use.
+    fn is_alive(&self) -> bool {
+        true
+    }
+
     /// Cheap liveness probe (e.g. `tools/list`).
     async fn ping(&self) -> Result<(), ComputerError>;
 

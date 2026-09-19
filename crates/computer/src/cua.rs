@@ -1915,6 +1915,10 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 
 #[async_trait::async_trait]
 impl ComputerBackend for CuaBackend {
+    fn is_alive(&self) -> bool {
+        self.client.is_alive()
+    }
+
     async fn ping(&self) -> Result<(), ComputerError> {
         self.call("get_screen_size", json!({})).await.map(|_| ())
     }

@@ -8,7 +8,7 @@
 //! - `COSMOS_COMPUTER_MOCK_SCREENSHOT`  when `1`, observe returns a 1×1 PNG
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 
@@ -29,6 +29,7 @@ const PIXEL_PNG: &[u8] = &[
 
 pub struct MockComputer {
     mode: MockMode,
+    alive: AtomicBool,
     pub calls: AtomicUsize,
     /// Last action tool the mock saw (asserted in service tests).
     pub last_action: Mutex<Option<String>>,
@@ -61,6 +62,7 @@ impl MockComputer {
     pub fn with_mode(mode: MockMode) -> Self {
         Self {
             mode,
+            alive: AtomicBool::new(true),
             calls: AtomicUsize::new(0),
             last_action: Mutex::new(None),
             last_delivery: Mutex::new(None),
@@ -71,10 +73,18 @@ impl MockComputer {
     pub fn working() -> Self {
         Self::with_mode(MockMode::Full)
     }
+
+    pub fn set_alive(&self, alive: bool) {
+        self.alive.store(alive, Ordering::Release);
+    }
 }
 
 #[async_trait::async_trait]
 impl ComputerBackend for MockComputer {
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
     async fn ping(&self) -> Result<(), ComputerError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         match self.mode {

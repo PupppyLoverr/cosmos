@@ -8,6 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::backend::{ActionRequest, ComputerBackend, Delivery, ObserveRequest, ObserveScope};
 use crate::cua::{CuaBackend, pid_from_launch_result};
+#[cfg(unix)]
+use crate::mcp_client::McpClient;
 use crate::mock::MockComputer;
 use crate::service::ComputerService;
 use crate::{
@@ -1745,6 +1747,62 @@ async fn unknown_element_outside_target_window_returns_original_error() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("element_outside_target_window"));
+}
+
+#[tokio::test]
+async fn dead_backend_is_evicted_and_respawned() {
+    let dead = Arc::new(MockComputer::working());
+    dead.set_alive(false);
+    let fresh = Arc::new(MockComputer::working());
+    let (service, _data) = service(enabled_settings(ControlMode::Background), dead.clone());
+    service.set_spawn_backend_for_test(fresh.clone());
+    service.install_session_backend_for_test("dead-session", dead);
+
+    let probe = service.probe().await;
+
+    assert!(probe.driver_ok);
+    assert!(fresh.calls.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    assert_eq!(service.session_backend_count_for_test(), 0);
+    assert_eq!(service.last_error_for_test(), None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_client_marks_itself_dead_after_child_exits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("fake-driver");
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("id") is None:
+        continue
+    if request["method"] == "initialize":
+        result = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "fake"}}
+    elif request["method"] == "tools/list":
+        result = {"tools": [{"name": "fake"}]}
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+        break
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+
+    let client = McpClient::spawn(&script, &[], &[]).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert!(!client.is_alive());
 }
 
 /// A service with saved settings and an injected mock backend — exercises

@@ -38,6 +38,8 @@ struct Inner {
     screenshot_dir: PathBuf,
     settings: RwLock<ComputerSettings>,
     backend: Mutex<Option<Arc<dyn ComputerBackend>>>,
+    #[cfg(test)]
+    test_spawn_backend: Mutex<Option<Arc<dyn ComputerBackend>>>,
     /// Per-session backend views keyed by MCP-connection label: concurrent
     /// agents each drive a distinct driver-side session (own cursor,
     /// recording, idle lifecycle) over the shared driver process instead of
@@ -104,6 +106,8 @@ impl ComputerService {
                 screenshot_dir,
                 settings: RwLock::new(settings),
                 backend: Mutex::new(None),
+                #[cfg(test)]
+                test_spawn_backend: Mutex::new(None),
                 session_backends: Mutex::new(HashMap::new()),
                 spawn_lock: tokio::sync::Mutex::new(()),
                 last_error: Mutex::new(None),
@@ -1169,12 +1173,24 @@ impl ComputerService {
     }
 
     async fn ensure_backend(&self) -> Result<Arc<dyn ComputerBackend>, ComputerError> {
-        if let Some(backend) = self.inner.backend.lock().unwrap().as_ref() {
+        if let Some(backend) = self.inner.backend.lock().unwrap().as_ref()
+            && backend.is_alive()
+        {
             return Ok(backend.clone());
         }
         let _spawn = self.inner.spawn_lock.lock().await;
-        if let Some(backend) = self.inner.backend.lock().unwrap().as_ref() {
-            return Ok(backend.clone());
+        {
+            let mut backend = self.inner.backend.lock().unwrap();
+            if let Some(cached) = backend.as_ref() {
+                if cached.is_alive() {
+                    return Ok(cached.clone());
+                }
+                backend.take();
+                self.inner.session_backends.lock().unwrap().clear();
+                *self.inner.last_error.lock().unwrap() =
+                    Some("the computer driver exited; restarting".into());
+                self.bump_status();
+            }
         }
         let backend = self.spawn_backend().await.map_err(|error| {
             *self.inner.last_error.lock().unwrap() = Some(error.message());
@@ -1188,6 +1204,10 @@ impl ComputerService {
     }
 
     async fn spawn_backend(&self) -> Result<Arc<dyn ComputerBackend>, ComputerError> {
+        #[cfg(test)]
+        if let Some(backend) = self.inner.test_spawn_backend.lock().unwrap().clone() {
+            return Ok(backend);
+        }
         if let Some(mock) = crate::mock::MockComputer::from_env() {
             return Ok(Arc::new(mock));
         }
@@ -1205,6 +1225,35 @@ impl ComputerService {
         let settings = self.settings();
         let backend = crate::cua::CuaBackend::spawn(&self.inner.paths, &settings, &install).await?;
         Ok(Arc::new(backend))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_spawn_backend_for_test(&self, backend: Arc<dyn ComputerBackend>) {
+        *self.inner.test_spawn_backend.lock().unwrap() = Some(backend);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_session_backend_for_test(
+        &self,
+        label: &str,
+        backend: Arc<dyn ComputerBackend>,
+    ) {
+        *self.inner.backend.lock().unwrap() = Some(backend.clone());
+        self.inner
+            .session_backends
+            .lock()
+            .unwrap()
+            .insert(label.into(), backend);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_backend_count_for_test(&self) -> usize {
+        self.inner.session_backends.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_error_for_test(&self) -> Option<String> {
+        self.inner.last_error.lock().unwrap().clone()
     }
 
     /// Kill the driver. Settings changes and uninstalls call this — the next

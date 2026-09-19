@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,6 +36,7 @@ pub struct McpClient {
     pending: Pending,
     next_id: AtomicU64,
     child: Mutex<Child>,
+    alive: Arc<AtomicBool>,
     /// Advertised tools, captured after `tools/list` during handshake.
     tools: Mutex<Vec<String>>,
 }
@@ -82,11 +83,13 @@ impl McpClient {
             .ok_or_else(|| ComputerError::Internal("driver stdin missing".into()))?;
 
         let pending: Pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let alive = Arc::new(AtomicBool::new(true));
         let client = Self {
             stdin: tokio::sync::Mutex::new(stdin),
             pending: pending.clone(),
             next_id: AtomicU64::new(1),
             child: Mutex::new(child),
+            alive: alive.clone(),
             tools: Mutex::new(Vec::new()),
         };
 
@@ -128,6 +131,7 @@ impl McpClient {
                         }
                     }
                     Ok(None) | Err(_) => {
+                        alive.store(false, Ordering::Release);
                         // EOF: fail every pending call so callers don't hang.
                         let mut map = pending.lock().unwrap_or_else(|p| p.into_inner());
                         for (_, tx) in std::mem::take(&mut *map) {
@@ -196,6 +200,10 @@ impl McpClient {
         self.child.lock().unwrap_or_else(|p| p.into_inner()).id()
     }
 
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
     /// Names of the driver's advertised tools (post-handshake).
     pub fn tools(&self) -> Vec<String> {
         self.tools.lock().unwrap_or_else(|p| p.into_inner()).clone()
@@ -255,6 +263,7 @@ impl McpClient {
             .await
         };
         if let Err(e) = write {
+            self.alive.store(false, Ordering::Release);
             self.pending
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -282,12 +291,16 @@ impl McpClient {
                 })
                 .to_string();
                 let mut stdin = self.stdin.lock().await;
-                let _ = async move {
+                if async move {
                     stdin.write_all(cancel.as_bytes()).await?;
                     stdin.write_all(b"\n").await?;
                     stdin.flush().await
                 }
-                .await;
+                .await
+                .is_err()
+                {
+                    self.alive.store(false, Ordering::Release);
+                }
                 Err(ComputerError::Unavailable(format!(
                     "the computer driver did not answer `{method}` in time (cancel sent)"
                 )))
@@ -299,14 +312,18 @@ impl McpClient {
     pub async fn notify(&self, method: &str, params: Value) -> Result<(), ComputerError> {
         let line = json!({"jsonrpc":"2.0","method":method,"params":params}).to_string();
         let mut stdin = self.stdin.lock().await;
-        async move {
+        let result = async move {
             stdin.write_all(line.as_bytes()).await?;
             stdin.write_all(b"\n").await?;
             stdin.flush().await
         }
-        .await
-        .map_err(|e: std::io::Error| {
-            ComputerError::Unavailable(format!("could not write to the computer driver: {e}"))
-        })
+        .await;
+        if let Err(e) = result {
+            self.alive.store(false, Ordering::Release);
+            return Err(ComputerError::Unavailable(format!(
+                "could not write to the computer driver: {e}"
+            )));
+        }
+        Ok(())
     }
 }
