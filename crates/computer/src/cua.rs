@@ -47,6 +47,14 @@ use crate::{
 /// respawn inside the TTL window with `session_unavailable`.
 const SESSION_LABEL_PREFIX: &str = "cosmos";
 
+#[derive(Clone, Copy)]
+struct CachedElement {
+    pid: i64,
+    window_id: i64,
+    frame: ElementFrame,
+    window_bounds: Option<ElementFrame>,
+}
+
 pub struct CuaBackend {
     /// Shared driver MCP subprocess — `Arc` so per-session views of the same
     /// transport stay cheap (one `cua-driver mcp` process multiplexes every
@@ -59,6 +67,9 @@ pub struct CuaBackend {
     /// retargeted observes; shared across session views so an alias learned
     /// by one caller routes every later action on that window.
     sheet_owners: Arc<Mutex<HashMap<(i64, i64), i64>>>,
+    /// Snapshot element frames used to fall back to screen-point actions when
+    /// an out-of-process sheet rejects a token addressed to its owner window.
+    element_frames: Arc<Mutex<HashMap<String, CachedElement>>>,
 }
 
 impl CuaBackend {
@@ -95,6 +106,7 @@ impl CuaBackend {
             session: format!("{SESSION_LABEL_PREFIX}-{}", std::process::id()),
             version: None,
             sheet_owners: Arc::new(Mutex::new(HashMap::new())),
+            element_frames: Arc::new(Mutex::new(HashMap::new())),
         };
         // Name the shared session up-front — `start_session` is idempotent and
         // this also proves the session tools exist before first real use.
@@ -115,6 +127,7 @@ impl CuaBackend {
             session: backend.session,
             version,
             sheet_owners: backend.sheet_owners,
+            element_frames: backend.element_frames,
         })
     }
 
@@ -129,6 +142,7 @@ impl CuaBackend {
             session: format!("{}-{}", self.session, label),
             version: self.version.clone(),
             sheet_owners: self.sheet_owners.clone(),
+            element_frames: self.element_frames.clone(),
         }
     }
 
@@ -191,6 +205,111 @@ impl CuaBackend {
                     || message.contains("off_space_or_ax_unresolved")
             }
             _ => false,
+        }
+    }
+
+    fn is_element_outside_target_window(error: &ComputerError) -> bool {
+        matches!(
+            error,
+            ComputerError::Refused { message, .. }
+                if message
+                    .to_ascii_lowercase()
+                    .contains("element_outside_target_window")
+        )
+    }
+
+    fn cache_window_state(&self, state: &WindowState) {
+        let mut cache = self
+            .element_frames
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Keep the cache bounded without retaining bookkeeping for snapshot
+        // generations; a fresh observation repopulates entries after a clear.
+        if cache.len() > 20_000 {
+            cache.clear();
+        }
+        for element in &state.elements {
+            let (Some(token), Some(frame)) = (element.token.as_ref(), element.frame) else {
+                continue;
+            };
+            cache.insert(
+                token.clone(),
+                CachedElement {
+                    pid: state.pid,
+                    window_id: state.window_id,
+                    frame,
+                    window_bounds: state.window_bounds,
+                },
+            );
+        }
+    }
+
+    async fn retry_out_of_process_sheet(
+        &self,
+        tool: &str,
+        call_args: &Value,
+        first_error: &ComputerError,
+    ) -> Option<Result<(Value, String), ComputerError>> {
+        let token = call_args.get("element_token").and_then(Value::as_str)?;
+        let cached = self
+            .element_frames
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(token)
+            .copied()?;
+        if call_args.get("pid").and_then(Value::as_i64) != Some(cached.pid)
+            || call_args.get("window_id").and_then(Value::as_i64) != Some(cached.window_id)
+        {
+            return None;
+        }
+        let bounds = cached.window_bounds?;
+        let x = bounds.x + cached.frame.x + cached.frame.w / 2.0;
+        let y = bounds.y + cached.frame.y + cached.frame.h / 2.0;
+        let fallback_note = format!(
+            " (element lives in an out-of-process sheet; fell back to a screen-point action at ({x:.0},{y:.0}))"
+        );
+        match tool {
+            "click" | "double_click" | "right_click" => {
+                let result = self
+                    .call(tool, json!({ "scope": "desktop", "x": x, "y": y }))
+                    .await;
+                Some(result.map(|result| (result, fallback_note)))
+            }
+            "set_value" => {
+                let value = call_args.get("value").and_then(Value::as_str)?;
+                let click = self
+                    .call("click", json!({ "scope": "desktop", "x": x, "y": y }))
+                    .await;
+                if click.is_err() {
+                    return Some(Err(first_error.clone()));
+                }
+                let key = self
+                    .call(
+                        "press_key",
+                        json!({
+                            "scope": "desktop",
+                            "key": "a",
+                            "modifiers": ["command"],
+                        }),
+                    )
+                    .await;
+                if key.is_err() {
+                    return Some(Err(first_error.clone()));
+                }
+                let typed = self
+                    .call("type_text", json!({ "scope": "desktop", "text": value }))
+                    .await;
+                Some(typed.map(|result| (result, fallback_note)))
+            }
+            "type_text" => {
+                let text = call_args.get("text").and_then(Value::as_str)?;
+                Some(
+                    self.call("type_text", json!({ "scope": "desktop", "text": text }))
+                        .await
+                        .map(|result| (result, fallback_note)),
+                )
+            }
+            _ => None,
         }
     }
 
@@ -700,7 +819,7 @@ impl CuaBackend {
             notes.push(format!("truncated: {reason}"));
         }
         let note = (!notes.is_empty()).then(|| notes.join("; "));
-        Ok(WindowState {
+        let state = WindowState {
             snapshot_id: structured
                 .get("snapshot_id")
                 .and_then(Value::as_str)
@@ -744,7 +863,9 @@ impl CuaBackend {
                 .unwrap_or(0) as u32,
             note,
             screenshot,
-        })
+        };
+        self.cache_window_state(&state);
+        Ok(state)
     }
 
     /// `get_window_state` → Observation: the compact digest by default; the
@@ -1058,6 +1179,7 @@ impl CuaBackend {
         } else {
             None
         };
+        let mut element_fallback_note = None;
         let mut menu_path_note = None;
         let result = match self.call(tool, call_args.clone()).await {
             Err(error) if tool == "invoke_menu" && Self::is_menu_path_not_found(&error) => {
@@ -1071,6 +1193,31 @@ impl CuaBackend {
                         result
                     }
                     Err(original) => return Err(original),
+                }
+            }
+            Err(error)
+                if Self::is_element_outside_target_window(&error)
+                    && call_args
+                        .get("element_token")
+                        .and_then(Value::as_str)
+                        .is_some()
+                    && matches!(
+                        tool,
+                        "click" | "double_click" | "right_click" | "set_value" | "type_text"
+                    ) =>
+            {
+                match self
+                    .retry_out_of_process_sheet(tool, &call_args, &error)
+                    .await
+                {
+                    Some(Ok((result, note))) => {
+                        element_fallback_note = Some(note);
+                        result
+                    }
+                    Some(Err(_)) | None if Self::is_ax_window_unresolved(&error) => {
+                        self.retarget_call(tool, &call_args, error).await?
+                    }
+                    Some(Err(_)) | None => return Err(error),
                 }
             }
             Err(error) if Self::is_ax_window_unresolved(&error) && tool != "launch_app" => {
@@ -1132,6 +1279,9 @@ impl CuaBackend {
             summary.push_str(&note);
         }
         if let Some(note) = menu_path_note {
+            summary.push_str(&note);
+        }
+        if let Some(note) = element_fallback_note {
             summary.push_str(&note);
         }
         #[cfg(target_os = "macos")]

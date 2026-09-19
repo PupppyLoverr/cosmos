@@ -829,6 +829,237 @@ async fn token_conflict_retargets_without_stale_snapshot_fields() {
     assert!(set_values[1]["args"].get("element_index").is_none());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn element_outside_target_window_falls_back_to_screen_click() {
+    let pid = 67439;
+    let token = "s00000113:90";
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 688,
+        "title": "Save",
+        "app_name": "TextEdit",
+        "z_index": 98,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({
+        "688": {
+            "snapshot_id": "s00000113",
+            "pid": pid,
+            "window_id": 688,
+            "window_bounds": {"x": 100.0, "y": 200.0, "w": 500.0, "h": 400.0},
+            "elements": [{
+                "element_index": 90,
+                "element_token": token,
+                "role": "AXButton",
+                "label": "Save",
+                "frame": {"x": 20.0, "y": 30.0, "w": 40.0, "h": 20.0}
+            }]
+        }
+    });
+    let actions = json!({
+        "click": [
+            {"error": "click: element_outside_target_window (refused)"},
+            {"result": {"content": [{"type": "text", "text": "clicked"}]}}
+        ]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    backend
+        .observe(&ObserveRequest {
+            scope: ObserveScope::Window {
+                pid,
+                window_id: Some(688),
+            },
+            semantic: true,
+            screenshot: false,
+            max_elements: 100,
+            full_tree: false,
+            max_dimension: 1200,
+            screenshot_dir: screenshots.path().into(),
+        })
+        .await
+        .unwrap();
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_click".into(),
+            args: json!({
+                "pid": pid,
+                "windowId": 688,
+                "elementToken": token,
+                "snapshotId": "s00000113",
+                "elementIndex": 90
+            }),
+            delivery: crate::backend::Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.summary.contains("out-of-process sheet"));
+    assert!(outcome.summary.contains("(140,240)"));
+    let calls: Vec<Value> = std::fs::read_to_string(data.path().join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|call: &Value| call.get("name").and_then(Value::as_str) == Some("click"))
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1]["args"]["scope"], json!("desktop"));
+    assert_eq!(calls[1]["args"]["x"], json!(140.0));
+    assert_eq!(calls[1]["args"]["y"], json!(240.0));
+    assert!(calls[1]["args"].get("element_token").is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn element_outside_target_window_set_value_falls_back_in_order() {
+    let pid = 67439;
+    let token = "s00000113:90";
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 688,
+        "title": "Save",
+        "app_name": "TextEdit",
+        "z_index": 98,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({
+        "688": {
+            "snapshot_id": "s00000113",
+            "pid": pid,
+            "window_id": 688,
+            "window_bounds": {"x": 100.0, "y": 200.0, "w": 500.0, "h": 400.0},
+            "elements": [{
+                "element_index": 90,
+                "element_token": token,
+                "role": "AXTextField",
+                "label": "File name",
+                "frame": {"x": 20.0, "y": 30.0, "w": 40.0, "h": 20.0}
+            }]
+        }
+    });
+    let actions = json!({
+        "set_value": [
+            {"error": "set_value: element_outside_target_window (refused)"}
+        ],
+        "click": [{"result": {"content": [{"type": "text", "text": "clicked"}]}}],
+        "press_key": [{"result": {"content": [{"type": "text", "text": "selected"}]}}],
+        "type_text": [{"result": {"content": [{"type": "text", "text": "typed"}]}}]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    backend
+        .observe(&ObserveRequest {
+            scope: ObserveScope::Window {
+                pid,
+                window_id: Some(688),
+            },
+            semantic: true,
+            screenshot: false,
+            max_elements: 100,
+            full_tree: false,
+            max_dimension: 1200,
+            screenshot_dir: screenshots.path().into(),
+        })
+        .await
+        .unwrap();
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_set_value".into(),
+            args: json!({
+                "pid": pid,
+                "windowId": 688,
+                "elementToken": token,
+                "snapshotId": "s00000113",
+                "elementIndex": 90,
+                "value": "report.txt"
+            }),
+            delivery: crate::backend::Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.summary.contains("out-of-process sheet"));
+    let calls: Vec<Value> = std::fs::read_to_string(data.path().join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let tool_calls: Vec<&Value> = calls
+        .iter()
+        .filter(|call| call.get("name").and_then(Value::as_str).is_some())
+        .collect();
+    let names: Vec<&str> = tool_calls
+        .iter()
+        .filter_map(|call| call.get("name").and_then(Value::as_str))
+        .collect();
+    let set = tool_calls
+        .iter()
+        .position(|call| call.get("name").and_then(Value::as_str) == Some("set_value"))
+        .unwrap();
+    assert_eq!(
+        &names[set..set + 4],
+        &["set_value", "click", "press_key", "type_text"]
+    );
+    let press = &tool_calls[set + 2]["args"];
+    assert_eq!(press["scope"], json!("desktop"));
+    assert_eq!(press["key"], json!("a"));
+    assert_eq!(press["modifiers"], json!(["command"]));
+    assert_eq!(tool_calls[set + 3]["args"]["scope"], json!("desktop"));
+    assert_eq!(tool_calls[set + 3]["args"]["text"], json!("report.txt"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unknown_element_outside_target_window_returns_original_error() {
+    let pid = 67439;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 688,
+        "title": "Save",
+        "app_name": "TextEdit",
+        "z_index": 98,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let actions = json!({
+        "click": [{"error": "click: element_outside_target_window (refused)"}]
+    });
+    let (backend, _data, screenshots) =
+        scripted_cua_backend_with_actions(windows, json!({}), actions).await;
+    let error = backend
+        .act(&ActionRequest {
+            tool: "computer_click".into(),
+            args: json!({
+                "pid": pid,
+                "windowId": 688,
+                "elementToken": "s00000113:999"
+            }),
+            delivery: crate::backend::Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("element_outside_target_window"));
+}
+
 /// A service with saved settings and an injected mock backend — exercises
 /// the real dispatch/policy path without a driver install.
 fn service(
