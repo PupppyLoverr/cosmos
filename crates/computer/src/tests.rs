@@ -45,6 +45,15 @@ async fn scripted_cua_backend(
     windows: Value,
     states: Value,
 ) -> (CuaBackend, tempfile::TempDir, tempfile::TempDir) {
+    scripted_cua_backend_with_actions(windows, states, json!({})).await
+}
+
+#[cfg(unix)]
+async fn scripted_cua_backend_with_actions(
+    windows: Value,
+    states: Value,
+    actions: Value,
+) -> (CuaBackend, tempfile::TempDir, tempfile::TempDir) {
     use std::os::unix::fs::PermissionsExt;
 
     let data = tempfile::tempdir().unwrap();
@@ -53,6 +62,7 @@ async fn scripted_cua_backend(
     let binary = install_dir.join("cua-driver");
     let windows = serde_json::to_string(&serde_json::to_string(&windows).unwrap()).unwrap();
     let states = serde_json::to_string(&serde_json::to_string(&states).unwrap()).unwrap();
+    let actions = serde_json::to_string(&serde_json::to_string(&actions).unwrap()).unwrap();
     let calls = serde_json::to_string(
         &serde_json::to_string(&data.path().join("calls.jsonl").display().to_string()).unwrap(),
     )
@@ -64,7 +74,9 @@ import sys
 
 windows = json.loads({windows})
 states = json.loads({states})
+actions = json.loads({actions})
 calls_path = json.loads({calls})
+action_indexes = {{}}
 
 for line in sys.stdin:
     request = json.loads(line)
@@ -94,6 +106,18 @@ for line in sys.stdin:
             result = {{"structuredContent": {{"windows": windows}}}}
         elif name == "get_window_state":
             result = {{"structuredContent": states[str(args["window_id"])]}}
+        elif name in actions:
+            responses = actions[name]
+            index = action_indexes.get(name, 0)
+            action_indexes[name] = index + 1
+            response = responses[min(index, len(responses) - 1)]
+            if "error" in response:
+                result = {{
+                    "isError": True,
+                    "content": [{{"type": "text", "text": response["error"]}}]
+                }}
+            else:
+                result = response.get("result", {{}})
         else:
             result = {{}}
     else:
@@ -521,6 +545,288 @@ async fn invoke_menu_raises_explicit_window_first() {
         Some(401),
         "focus call must target the requested window"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_menu_normalizes_semantic_ellipsis_path() {
+    let pid = 42;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 401,
+        "title": "Untitled",
+        "app_name": "TextEdit",
+        "z_index": 95,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({
+        "401": {
+            "pid": pid,
+            "window_id": 401,
+            "app_name": "TextEdit",
+            "window_title": "Untitled",
+            "elements": [
+                {"element_index": 0, "role": "AXMenuBarItem", "label": "File"},
+                {"element_index": 1, "role": "AXMenuItem", "label": "Save…"}
+            ]
+        }
+    });
+    let actions = json!({
+        "invoke_menu": [
+            {"error": "invoke_menu: path segment 1 was not found (refused)"},
+            {"result": {"content": [{"type": "text", "text": "menu invoked"}]}}
+        ]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_invoke_menu".into(),
+            args: json!({"pid": pid, "windowId": 401, "path": "File > Save"}),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.summary.contains("menu path normalized"));
+    let calls = std::fs::read_to_string(data.path().join("calls.jsonl")).unwrap();
+    let invokes: Vec<Value> = calls
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|call| call.get("name").and_then(Value::as_str) == Some("invoke_menu"))
+        .collect();
+    assert_eq!(invokes.len(), 2);
+    assert_eq!(invokes[1]["args"]["path"], json!(["File", "Save…"]));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_menu_uses_ellipsis_fallback_without_menu_items() {
+    let pid = 42;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 401,
+        "title": "Untitled",
+        "app_name": "TextEdit",
+        "z_index": 95,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({
+        "401": {
+            "pid": pid,
+            "window_id": 401,
+            "app_name": "TextEdit",
+            "window_title": "Untitled",
+            "elements": []
+        }
+    });
+    let actions = json!({
+        "invoke_menu": [
+            {"error": "invoke_menu: path segment 1 was not found (refused)"},
+            {"result": {"content": [{"type": "text", "text": "menu invoked"}]}}
+        ]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_invoke_menu".into(),
+            args: json!({"pid": pid, "windowId": 401, "path": "File > Save"}),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.summary.contains("menu path normalized"));
+    let calls = std::fs::read_to_string(data.path().join("calls.jsonl")).unwrap();
+    let invokes: Vec<Value> = calls
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|call| call.get("name").and_then(Value::as_str) == Some("invoke_menu"))
+        .collect();
+    assert_eq!(invokes.len(), 2);
+    assert_eq!(invokes[1]["args"]["path"], json!(["File", "Save…"]));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sheet_owner_alias_routes_actions_to_owner_window() {
+    let pid = 42;
+    let windows = json!([
+        {
+            "pid": pid,
+            "window_id": 613,
+            "title": "Save",
+            "app_name": "TextEdit",
+            "z_index": 98,
+            "is_on_screen": true,
+            "minimized": false
+        },
+        {
+            "pid": pid,
+            "window_id": 587,
+            "title": "Untitled",
+            "app_name": "TextEdit",
+            "z_index": 78,
+            "is_on_screen": true,
+            "minimized": false
+        }
+    ]);
+    let states = json!({
+        "613": {
+            "pid": pid,
+            "window_id": 613,
+            "app_name": "TextEdit",
+            "window_title": "Save",
+            "degraded": true,
+            "degraded_reason": "ax_window_unresolved: Save sheet",
+            "elements": []
+        },
+        "587": {
+            "pid": pid,
+            "window_id": 587,
+            "app_name": "TextEdit",
+            "window_title": "Untitled",
+            "elements": [
+                {"element_index": 0, "role": "AXSheet", "label": "Save"},
+                {"element_index": 1, "role": "AXButton", "label": "Save"}
+            ]
+        }
+    });
+    let actions = json!({
+        "set_value": [
+            {"result": {"content": [{"type": "text", "text": "value set"}]}}
+        ]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    backend
+        .observe(&ObserveRequest {
+            scope: ObserveScope::Window {
+                pid,
+                window_id: Some(613),
+            },
+            semantic: true,
+            screenshot: false,
+            max_elements: 100,
+            full_tree: false,
+            max_dimension: 1200,
+            screenshot_dir: screenshots.path().into(),
+        })
+        .await
+        .unwrap();
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_set_value".into(),
+            args: json!({
+                "pid": pid,
+                "windowId": 613,
+                "elementToken": "s000000d6:121",
+                "snapshotId": "s000000d6",
+                "elementIndex": 121,
+                "value": "new value"
+            }),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.summary.contains("is a sheet of window 587"));
+    let calls = std::fs::read_to_string(data.path().join("calls.jsonl")).unwrap();
+    let set_values: Vec<Value> = calls
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|call| call.get("name").and_then(Value::as_str) == Some("set_value"))
+        .collect();
+    assert_eq!(set_values.len(), 1);
+    assert_eq!(set_values[0]["args"]["window_id"], json!(587));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn token_conflict_retargets_without_stale_snapshot_fields() {
+    let pid = 42;
+    let windows = json!([
+        {
+            "pid": pid,
+            "window_id": 613,
+            "title": "Save",
+            "app_name": "TextEdit",
+            "z_index": 98,
+            "is_on_screen": true,
+            "minimized": false
+        },
+        {
+            "pid": pid,
+            "window_id": 587,
+            "title": "Untitled",
+            "app_name": "TextEdit",
+            "z_index": 78,
+            "is_on_screen": true,
+            "minimized": false
+        }
+    ]);
+    let states = json!({});
+    let actions = json!({
+        "set_value": [
+            {"error": "set_value: element_token conflicts with element_index, snapshot_id, or window_id (refused)"},
+            {"result": {"content": [{"type": "text", "text": "value set"}]}}
+        ]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    backend
+        .act(&ActionRequest {
+            tool: "computer_set_value".into(),
+            args: json!({
+                "pid": pid,
+                "windowId": 613,
+                "elementToken": "s000000d6:121",
+                "snapshotId": "s000000d6",
+                "elementIndex": 121,
+                "value": "new value"
+            }),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    let calls = std::fs::read_to_string(data.path().join("calls.jsonl")).unwrap();
+    let set_values: Vec<Value> = calls
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|call| call.get("name").and_then(Value::as_str) == Some("set_value"))
+        .collect();
+    assert_eq!(set_values.len(), 2);
+    assert_eq!(set_values[1]["args"]["window_id"], json!(587));
+    assert_eq!(
+        set_values[1]["args"]["element_token"],
+        json!("s000000d6:121")
+    );
+    assert!(set_values[1]["args"].get("snapshot_id").is_none());
+    assert!(set_values[1]["args"].get("element_index").is_none());
 }
 
 /// A service with saved settings and an injected mock backend — exercises

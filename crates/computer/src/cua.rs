@@ -22,8 +22,9 @@
 //! replace the element map per `(pid, window_id)`; stale handles fail closed
 //! driver-side and surface here as `stale_element` — the harness re-observes.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
@@ -54,6 +55,7 @@ pub struct CuaBackend {
     /// This backend's unique driver session label.
     session: String,
     version: Option<String>,
+    sheet_owners: Mutex<HashMap<(i64, i64), i64>>,
 }
 
 impl CuaBackend {
@@ -89,6 +91,7 @@ impl CuaBackend {
             client: Arc::new(client),
             session: format!("{SESSION_LABEL_PREFIX}-{}", std::process::id()),
             version: None,
+            sheet_owners: Mutex::new(HashMap::new()),
         };
         // Name the shared session up-front — `start_session` is idempotent and
         // this also proves the session tools exist before first real use.
@@ -108,6 +111,7 @@ impl CuaBackend {
             client: backend.client,
             session: backend.session,
             version,
+            sheet_owners: Mutex::new(HashMap::new()),
         })
     }
 
@@ -121,6 +125,7 @@ impl CuaBackend {
             client: self.client.clone(),
             session: format!("{}-{}", self.session, label),
             version: self.version.clone(),
+            sheet_owners: Mutex::new(HashMap::new()),
         }
     }
 
@@ -174,10 +179,13 @@ impl CuaBackend {
     pub(crate) fn is_ax_window_unresolved(error: &ComputerError) -> bool {
         match error {
             ComputerError::Refused { code, message } => {
+                let message = message.to_ascii_lowercase();
                 code == "ax_window_unresolved"
                     || message.contains("ax_window_unresolved")
                     || message.contains("element_outside_target_window")
-                    || message.contains("no AX window")
+                    || message.contains("no ax window")
+                    || message.contains("element_token conflicts")
+                    || message.contains("off_space_or_ax_unresolved")
             }
             _ => false,
         }
@@ -198,6 +206,114 @@ impl CuaBackend {
                 || element.role.eq_ignore_ascii_case("sheet")
                 || element.role.eq_ignore_ascii_case("dialog")
         })
+    }
+
+    fn is_menu_path_not_found(error: &ComputerError) -> bool {
+        match error {
+            ComputerError::Refused { message, .. } => {
+                let message = message.to_ascii_lowercase();
+                message.contains("path segment") && message.contains("not found")
+            }
+            _ => false,
+        }
+    }
+
+    fn normalized_menu_segment(segment: &str) -> String {
+        let mut segment = segment.trim();
+        segment = segment.strip_suffix('…').unwrap_or(segment).trim_end();
+        segment = segment.strip_suffix("...").unwrap_or(segment).trim_end();
+        segment.to_lowercase()
+    }
+
+    fn menu_path_from_state(state: &WindowState, requested: &[String]) -> Option<Vec<String>> {
+        let titles: Vec<String> = state
+            .elements
+            .iter()
+            .filter(|element| {
+                matches!(
+                    element.role.to_ascii_lowercase().as_str(),
+                    "axmenubaritem" | "axmenuitem" | "menubaritem" | "menuitem"
+                )
+            })
+            .filter_map(|element| {
+                element
+                    .label
+                    .as_deref()
+                    .or(element.value.as_deref())
+                    .map(str::to_string)
+            })
+            .collect();
+        requested
+            .iter()
+            .map(|segment| {
+                let normalized = Self::normalized_menu_segment(segment);
+                titles
+                    .iter()
+                    .find(|title| Self::normalized_menu_segment(title) == normalized)
+                    .cloned()
+            })
+            .collect()
+    }
+
+    async fn retry_invoke_menu(
+        &self,
+        call_args: &Value,
+        first_error: ComputerError,
+        screenshot_dir: &Path,
+    ) -> Result<(Value, Vec<String>), ComputerError> {
+        let Some(requested) = call_args
+            .get("path")
+            .and_then(Value::as_array)
+            .map(|segments| {
+                segments
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|segments| !segments.is_empty())
+        else {
+            return Err(first_error);
+        };
+        let resolved = match (
+            call_args.get("pid").and_then(Value::as_i64),
+            call_args.get("window_id").and_then(Value::as_i64),
+        ) {
+            (Some(pid), Some(window_id)) => {
+                let window = self.list_windows(Some(pid)).await.ok().and_then(|windows| {
+                    windows.into_iter().find(|window| {
+                        window.get("window_id").and_then(Value::as_i64) == Some(window_id)
+                    })
+                });
+                match window {
+                    Some(window) => self
+                        .window_state_inner(&window, true, false, 2000, 1440, screenshot_dir, None)
+                        .await
+                        .ok()
+                        .and_then(|state| Self::menu_path_from_state(&state, &requested)),
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        let path = resolved.unwrap_or_else(|| {
+            let mut fallback = requested.clone();
+            if let Some(last) = fallback.last_mut() {
+                let base = last
+                    .trim()
+                    .trim_end_matches('…')
+                    .trim_end_matches("...")
+                    .trim_end();
+                *last = format!("{base}…");
+            }
+            fallback
+        });
+        let mut retry_args = call_args.clone();
+        retry_args["path"] = json!(path);
+        match self.call("invoke_menu", retry_args).await {
+            Ok(result) => Ok((result, path)),
+            Err(_) => Err(first_error),
+        }
     }
 
     /// `verify_state`/`window_state`/`act` retarget for sheet windows: when
@@ -252,6 +368,12 @@ impl CuaBackend {
             };
             let mut retry = call_args.clone();
             retry["window_id"] = json!(candidate_id);
+            if retry.get("element_token").and_then(Value::as_str).is_some() {
+                if let Some(retry_obj) = retry.as_object_mut() {
+                    retry_obj.remove("snapshot_id");
+                    retry_obj.remove("element_index");
+                }
+            }
             if let (Some(x), Some(y)) = (
                 obj.get("x").and_then(Value::as_f64),
                 obj.get("y").and_then(Value::as_f64),
@@ -898,6 +1020,24 @@ impl CuaBackend {
                 call_args["window_id"] = json!(id);
             }
         }
+        let mut sheet_owner_note = None;
+        if let (Some(pid), Some(window_id)) = (
+            call_args.get("pid").and_then(Value::as_i64),
+            call_args.get("window_id").and_then(Value::as_i64),
+        ) {
+            let owner = self
+                .sheet_owners
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&(pid, window_id))
+                .copied();
+            if let Some(owner) = owner.filter(|owner| *owner != window_id) {
+                call_args["window_id"] = json!(owner);
+                sheet_owner_note = Some(format!(
+                    " (window {window_id} is a sheet of window {owner}; addressed {owner})"
+                ));
+            }
+        }
         let raised_invoke_menu_window = if tool == "invoke_menu" {
             let pid = call_args.get("pid").and_then(Value::as_i64);
             let window_id = call_args.get("window_id").and_then(Value::as_i64);
@@ -915,7 +1055,21 @@ impl CuaBackend {
         } else {
             None
         };
+        let mut menu_path_note = None;
         let result = match self.call(tool, call_args.clone()).await {
+            Err(error) if tool == "invoke_menu" && Self::is_menu_path_not_found(&error) => {
+                match self
+                    .retry_invoke_menu(&call_args, error.clone(), &request.screenshot_dir)
+                    .await
+                {
+                    Ok((result, path)) => {
+                        menu_path_note =
+                            Some(format!(" (menu path normalized to {})", path.join(" > ")));
+                        result
+                    }
+                    Err(original) => return Err(original),
+                }
+            }
             Err(error) if Self::is_ax_window_unresolved(&error) && tool != "launch_app" => {
                 // Sheet windows: retarget to the owning window (window-local
                 // x,y translated by the CG-bounds delta when present).
@@ -970,6 +1124,12 @@ impl CuaBackend {
             summary.push_str(&format!(
                 " (raised window {window_id} first so the menu command targets it)"
             ));
+        }
+        if let Some(note) = sheet_owner_note {
+            summary.push_str(&note);
+        }
+        if let Some(note) = menu_path_note {
+            summary.push_str(&note);
         }
         #[cfg(target_os = "macos")]
         if tool == "launch_app"
@@ -1062,19 +1222,28 @@ impl CuaBackend {
         else {
             return primary;
         };
+        let requested_window_id = window.get("window_id").and_then(Value::as_i64);
+        if let Some(requested_window_id) = requested_window_id {
+            self.sheet_owners
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert((pid, requested_window_id), state.window_id);
+        }
         let note = if Self::has_sheet_or_dialog(&state) {
             format!(
-                "sheet/dialog window {} unresolved on the CG↔AX map; showing its owning window {} ({}) — sheet elements are inside this tree",
+                "sheet/dialog window {} unresolved on the CG↔AX map; showing its owning window {} ({}) — sheet elements are inside this tree — address actions with windowId {}",
                 window.get("window_id").and_then(Value::as_i64).unwrap_or(0),
                 state.window_id,
-                state.window_title.as_deref().unwrap_or("untitled")
+                state.window_title.as_deref().unwrap_or("untitled"),
+                state.window_id
             )
         } else {
             format!(
-                "sheet/dialog window {} unresolved on the CG↔AX map; showing on-screen sibling window {} ({}) — could not confirm the owning window: no sheet subtree found in it; re-observe the app's other windows",
+                "sheet/dialog window {} unresolved on the CG↔AX map; showing on-screen sibling window {} ({}) — could not confirm the owning window: no sheet subtree found in it; re-observe the app's other windows — address actions with windowId {}",
                 window.get("window_id").and_then(Value::as_i64).unwrap_or(0),
                 state.window_id,
-                state.window_title.as_deref().unwrap_or("untitled")
+                state.window_title.as_deref().unwrap_or("untitled"),
+                state.window_id
             )
         };
         state.note = Some(match state.note {
