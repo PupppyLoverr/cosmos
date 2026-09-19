@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeron_computer::{ComputerService, ComputerSettings};
 
 fn data_dir() -> PathBuf {
@@ -41,22 +42,35 @@ fn usage() -> ! {
     std::process::exit(1);
 }
 
-async fn mcp_call(
-    client: &reqwest::Client,
-    url: &str,
-    method: &str,
-    params: Value,
-) -> Result<Value, String> {
-    let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-    let resp = client
-        .post(url)
-        .header("content-type", "application/json")
-        .body(body.to_string())
-        .send()
+async fn mcp_call(url: &str, method: &str, params: Value) -> Result<Value, String> {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
+    let parsed = url::Url::parse(url).map_err(|e| e.to_string())?;
+    let addr = format!(
+        "{}:{}",
+        parsed.host_str().ok_or("no host")?,
+        parsed.port().unwrap_or(80)
+    );
+    let mut stream = tokio::net::TcpStream::connect(&addr)
         .await
-        .map_err(|e| format!("http: {e}"))?;
-    let text = resp.text().await.map_err(|e| format!("read: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("parse: {e} — {text}"))
+        .map_err(|e| format!("connect: {e}"))?;
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        parsed.path(),
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    stream.shutdown().await.ok();
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| format!("read: {e}"))?;
+    let raw = String::from_utf8_lossy(&buf);
+    let text = raw.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+    serde_json::from_str(text).map_err(|e| format!("parse: {e} — {text}"))
 }
 
 /// Unwrap one MCP tools/call reply: `{result.content[]}` or `{error}`.
@@ -255,8 +269,7 @@ async fn main() {
                 eprintln!("endpoint unavailable — service disabled?");
                 std::process::exit(3);
             };
-            let client = reqwest::Client::new();
-            let init = mcp_call(&client, &url, "initialize", json!({})).await;
+            let init = mcp_call(&url, "initialize", json!({})).await;
             match init {
                 Ok(v) => {
                     let name = v["result"]["serverInfo"]["name"].as_str().unwrap_or("?");
@@ -269,7 +282,7 @@ async fn main() {
                 }
             }
             match cmd.as_str() {
-                "tools" => match mcp_call(&client, &url, "tools/list", json!({})).await {
+                "tools" => match mcp_call(&url, "tools/list", json!({})).await {
                     Ok(v) => {
                         let tools = v["result"]["tools"].as_array().cloned().unwrap_or_default();
                         for t in &tools {
@@ -291,7 +304,6 @@ async fn main() {
                         .unwrap_or(json!({}));
                     let t0 = Instant::now();
                     match mcp_call(
-                        &client,
                         &url,
                         "tools/call",
                         json!({"name": "computer_observe", "arguments": arguments}),
@@ -321,7 +333,6 @@ async fn main() {
                     });
                     let t0 = Instant::now();
                     match mcp_call(
-                        &client,
                         &url,
                         "tools/call",
                         json!({"name": name, "arguments": arguments}),
