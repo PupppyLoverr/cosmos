@@ -5,7 +5,8 @@ import { router, Stack } from 'expo-router';
 import { useCosmos, useSnapshot } from '../../../lib/client';
 import { Chat, Session } from '../../../lib/protocol';
 import { useTheme, spacing, radii, statusColor, type } from '../../../lib/theme';
-import { EmptyState, ConnectionBadge, Avatar, IconButton, Tag, Chip } from '../../../components/bits';
+import { EmptyState, ConnectionBadge, IconButton, Tag, Chip } from '../../../components/bits';
+import { HarnessMark } from '../../../components/harness-mark';
 
 function indicator(chat: Chat, sessions: Session[]): string {
   const live = sessions.find((s) => s.chatId === chat.id);
@@ -176,7 +177,7 @@ export default function SessionsScreen() {
               onLongPress={() => chatActions(client, chat)}
               style={({ pressed }) => [styles.chatRow, pressed && { backgroundColor: t.surface }]}
             >
-              <Avatar name={title} tintKey={chat.id} size={40} status={ind} />
+              <HarnessMark harness={chat.config?.harness} size={40} status={ind} />
               <View style={styles.chatBody}>
                 <View style={styles.chatTop}>
                   <Text style={[type.callout, styles.chatTitle, { color: t.text }]} numberOfLines={1}>{title}</Text>
