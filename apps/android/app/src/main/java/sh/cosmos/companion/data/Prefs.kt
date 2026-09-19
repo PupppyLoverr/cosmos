@@ -3,6 +3,7 @@ package sh.cosmos.companion.data
 import android.content.Context
 import java.util.UUID
 import sh.cosmos.companion.net.Connection
+import sh.cosmos.companion.theme.ThemeMode
 
 /** Small SharedPreferences-backed store for the last connection + a stable
  *  device id (the phone is a peer device; its id persists across launches). */
@@ -39,6 +40,21 @@ class Prefs(context: Context) {
             deviceName = sp.getString("deviceName", "Cosmos Android") ?: "Cosmos Android",
             mode = sp.getString("mode", "dev") ?: "dev",
         )
+    }
+
+    fun themeMode(): ThemeMode = when (sp.getString("themeMode", "system")) {
+        "dark" -> ThemeMode.Dark
+        "light" -> ThemeMode.Light
+        else -> ThemeMode.System
+    }
+
+    fun saveThemeMode(mode: ThemeMode) {
+        val value = when (mode) {
+            ThemeMode.System -> "system"
+            ThemeMode.Dark -> "dark"
+            ThemeMode.Light -> "light"
+        }
+        sp.edit().putString("themeMode", value).apply()
     }
 
     fun clear() {

@@ -126,6 +126,34 @@ data class SpaceInfo(val id: String, val path: String, val name: String?, val de
     val displayName: String get() = name?.takeIf { it.isNotEmpty() } ?: path.substringAfterLast('/')
 }
 
+/** Host-published chat2 tail sidecar (`SessionTail` in crates/doc). */
+@Serializable
+data class SessionTail(
+    val chatId: String? = null,
+    val schemaVersion: Int = 0,
+    val messages: List<TailMessage> = emptyList(),
+    val totalMessages: Int = 0,
+    val updatedAt: Long = 0,
+)
+
+@Serializable
+data class TailMessage(
+    val id: String = "",
+    val role: String = "assistant",
+    val parts: List<TailPart> = emptyList(),
+    val createdAt: Long = 0,
+    val deviceId: String? = null,
+    val status: String? = null,
+)
+
+@Serializable
+data class TailPart(
+    val id: String = "",
+    val kind: String = "text",
+    val text: String? = null,
+    val reasoning: String? = null,
+)
+
 data class DeviceInfo(
     val id: String,
     val name: String,
