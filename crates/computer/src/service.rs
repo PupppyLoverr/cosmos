@@ -1431,9 +1431,9 @@ impl ComputerService {
         settings: &ComputerSettings,
         args: &Value,
     ) -> Result<Observation, ComputerError> {
-        let scope = match get_str(args, "scope").unwrap_or("frontmost") {
-            "desktop" => ObserveScope::Desktop,
-            "window" => {
+        let scope = match get_str(args, "scope") {
+            Some("desktop") => ObserveScope::Desktop,
+            Some("window") => {
                 let pid = get_i64(args, "pid").ok_or_else(|| {
                     ComputerError::InvalidArgs("scope 'window' needs 'pid'".into())
                 })?;
@@ -1442,6 +1442,10 @@ impl ComputerService {
                     window_id: get_i64(args, "windowId"),
                 }
             }
+            Some("frontmost") | None if get_i64(args, "pid").is_some() => ObserveScope::Window {
+                pid: get_i64(args, "pid").unwrap(),
+                window_id: get_i64(args, "windowId"),
+            },
             _ => ObserveScope::Frontmost,
         };
         backend

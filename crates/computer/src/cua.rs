@@ -268,6 +268,13 @@ impl CuaBackend {
             if pid == Some(own_pid) || (driver_pid.is_some() && pid == driver_pid) {
                 continue;
             }
+            let title = window.get("title").and_then(Value::as_str).unwrap_or("");
+            let app = window.get("app_name").and_then(Value::as_str).unwrap_or("");
+            if matches!(title, "xfce4-panel" | "plank" | "Desktop")
+                || matches!(app, "Xfce4-panel" | "Plank" | "Xfdesktop")
+            {
+                continue;
+            }
             match window.get("z_index").and_then(Value::as_i64) {
                 Some(z) => {
                     any_z = true;
