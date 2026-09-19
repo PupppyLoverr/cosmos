@@ -34,6 +34,7 @@ use crate::backend::{
 };
 use crate::digest;
 use crate::mcp_client::McpClient;
+use crate::menu::{NativeMenuOutcome, normalized_menu_segment};
 use crate::{
     ComputerError, ComputerPaths, ComputerSettings, InstallState, Observation, ObservedWindow,
     StagedScreenshot,
@@ -72,7 +73,10 @@ pub struct CuaBackend {
     /// Snapshot element frames used to fall back to screen-point actions when
     /// an out-of-process sheet rejects a token addressed to its owner window.
     element_frames: Arc<Mutex<HashMap<String, CachedElement>>>,
+    native_menu: Option<NativeMenuPress>,
 }
+
+pub(crate) type NativeMenuPress = Arc<dyn Fn(i32, &[String]) -> NativeMenuOutcome + Send + Sync>;
 
 impl CuaBackend {
     /// Spawn `cua-driver mcp` for an installed component. The permission
@@ -103,12 +107,18 @@ impl CuaBackend {
         };
         let env = settings.driver_env(manifest.as_deref());
         let client = McpClient::spawn(&binary, &env, &[]).await?;
+        #[cfg(target_os = "macos")]
+        let native_menu: Option<NativeMenuPress> =
+            Some(Arc::new(crate::macos_menu::press_menu_path));
+        #[cfg(not(target_os = "macos"))]
+        let native_menu = None;
         let backend = Self {
             client: Arc::new(client),
             session: format!("{SESSION_LABEL_PREFIX}-{}", std::process::id()),
             version: None,
             sheet_owners: Arc::new(Mutex::new(HashMap::new())),
             element_frames: Arc::new(Mutex::new(HashMap::new())),
+            native_menu,
         };
         // Name the shared session up-front — `start_session` is idempotent and
         // this also proves the session tools exist before first real use.
@@ -130,7 +140,14 @@ impl CuaBackend {
             version,
             sheet_owners: backend.sheet_owners,
             element_frames: backend.element_frames,
+            native_menu: backend.native_menu,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_native_menu(mut self, native_menu: NativeMenuPress) -> Self {
+        self.native_menu = Some(native_menu);
+        self
     }
 
     /// A session-scoped view of this backend: same driver MCP transport, a
@@ -145,6 +162,7 @@ impl CuaBackend {
             version: self.version.clone(),
             sheet_owners: self.sheet_owners.clone(),
             element_frames: self.element_frames.clone(),
+            native_menu: self.native_menu.clone(),
         }
     }
 
@@ -391,10 +409,7 @@ impl CuaBackend {
     }
 
     fn normalized_menu_segment(segment: &str) -> String {
-        let mut segment = segment.trim();
-        segment = segment.strip_suffix('…').unwrap_or(segment).trim_end();
-        segment = segment.strip_suffix("...").unwrap_or(segment).trim_end();
-        segment.to_lowercase()
+        normalized_menu_segment(segment)
     }
 
     fn menu_type_select_segment(segment: &str) -> String {
@@ -1365,7 +1380,53 @@ impl CuaBackend {
         };
         let mut element_fallback_note = None;
         let mut menu_path_note = None;
-        let result = match self.call(tool, call_args.clone()).await {
+        let mut native_menu_note = None;
+        let result = if tool == "invoke_menu" {
+            let native = self
+                .native_menu
+                .as_ref()
+                .zip(call_args.get("pid").and_then(Value::as_i64))
+                .zip(call_args.get("path").and_then(Value::as_array))
+                .and_then(|((press, pid), path)| {
+                    i32::try_from(pid).ok().map(|pid| {
+                        press(
+                            pid,
+                            &path
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                });
+            match native {
+                Some(NativeMenuOutcome::Pressed) => {
+                    native_menu_note =
+                        Some(" (dispatched natively via accessibility menu press)".into());
+                    Ok(json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "menu invoked"
+                    }]
+                    }))
+                }
+                Some(NativeMenuOutcome::NotFound { segment, available }) => {
+                    native_menu_note = Some(format!(
+                        " (native menu lookup: segment '{segment}' not found; available: {})",
+                        available.join(", ")
+                    ));
+                    self.call(tool, call_args.clone()).await
+                }
+                Some(NativeMenuOutcome::Unavailable(message)) => {
+                    native_menu_note = Some(format!(" (native menu press unavailable: {message})"));
+                    self.call(tool, call_args.clone()).await
+                }
+                None => self.call(tool, call_args.clone()).await,
+            }
+        } else {
+            self.call(tool, call_args.clone()).await
+        };
+        let result = match result {
             Err(error) if tool == "invoke_menu" && Self::is_menu_path_not_found(&error) => {
                 match self
                     .retry_invoke_menu(&call_args, error.clone(), &request.screenshot_dir)
@@ -1484,6 +1545,9 @@ impl CuaBackend {
             summary.push_str(&note);
         }
         if let Some(note) = menu_path_note {
+            summary.push_str(&note);
+        }
+        if let Some(note) = native_menu_note {
             summary.push_str(&note);
         }
         if let Some(note) = invoke_menu_recovery_note {

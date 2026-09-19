@@ -25,7 +25,10 @@ pub mod cua;
 pub mod digest;
 pub mod endpoint;
 pub mod install;
+#[cfg(target_os = "macos")]
+mod macos_menu;
 pub mod mcp_client;
+pub(crate) mod menu;
 pub mod mock;
 pub mod service;
 pub mod stdio;

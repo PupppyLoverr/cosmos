@@ -10,6 +10,7 @@ use crate::backend::{ActionRequest, ComputerBackend, Delivery, ObserveRequest, O
 use crate::cua::{CuaBackend, pid_from_launch_result};
 #[cfg(unix)]
 use crate::mcp_client::McpClient;
+use crate::menu::{NativeMenuOutcome, normalized_menu_segment};
 use crate::mock::MockComputer;
 use crate::service::ComputerService;
 use crate::{
@@ -694,6 +695,174 @@ async fn invoke_menu_dispatches_when_app_never_reports_active() {
         list_apps < invoke,
         "activation polling must precede dispatch"
     );
+}
+
+#[test]
+fn normalized_menu_segment_strips_ellipsis_and_whitespace() {
+    assert_eq!(normalized_menu_segment("Save…"), "save");
+    assert_eq!(normalized_menu_segment("Save..."), "save");
+    assert_eq!(normalized_menu_segment(" save "), "save");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_menu_prefers_native_press_and_skips_driver() {
+    let pid = 42;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 401,
+        "title": "Untitled",
+        "app_name": "TextEdit",
+        "z_index": 95,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({"401": {
+        "pid": pid,
+        "window_id": 401,
+        "app_name": "TextEdit",
+        "window_title": "Untitled",
+        "elements": []
+    }});
+    let actions = json!({
+        "list_apps": [{"result": {"structuredContent": {"apps": [{"pid": pid, "active": true}]}}}]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    let received = Arc::new(std::sync::Mutex::new(None));
+    let received_by_press = Arc::clone(&received);
+    let backend = backend.with_native_menu(Arc::new(move |received_pid, segments| {
+        *received_by_press.lock().unwrap() = Some((received_pid, segments.to_vec()));
+        NativeMenuOutcome::Pressed
+    }));
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_invoke_menu".into(),
+            args: json!({"pid": pid, "windowId": 401, "path": "File > Save"}),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.summary.contains("dispatched natively"));
+    assert_eq!(
+        *received.lock().unwrap(),
+        Some((pid as i32, vec!["File".into(), "Save".into()]))
+    );
+    let calls = std::fs::read_to_string(data.path().join("calls.jsonl")).unwrap();
+    assert!(!calls.contains("\"name\": \"invoke_menu\""));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_menu_falls_back_to_driver_when_native_path_missing() {
+    let pid = 42;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 401,
+        "title": "Untitled",
+        "app_name": "TextEdit",
+        "z_index": 95,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({"401": {
+        "pid": pid,
+        "window_id": 401,
+        "app_name": "TextEdit",
+        "window_title": "Untitled",
+        "elements": []
+    }});
+    let actions = json!({
+        "list_apps": [{"result": {"structuredContent": {"apps": [{"pid": pid, "active": true}]}}}],
+        "invoke_menu": [{"result": {"content": [{"type": "text", "text": "menu invoked"}]}}]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    let backend = backend.with_native_menu(Arc::new(|_, _| NativeMenuOutcome::NotFound {
+        segment: "Save".into(),
+        available: vec!["New".into(), "Open…".into()],
+    }));
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_invoke_menu".into(),
+            args: json!({"pid": pid, "windowId": 401, "path": "File > Save"}),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.summary.contains("native menu lookup"));
+    let calls = std::fs::read_to_string(data.path().join("calls.jsonl")).unwrap();
+    assert!(calls.contains("\"name\": \"invoke_menu\""));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_menu_native_press_still_refuses_when_menu_stays_open() {
+    let pid = 42;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 401,
+        "title": "Untitled",
+        "app_name": "TextEdit",
+        "z_index": 95,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let menu_state = json!({
+        "pid": pid,
+        "window_id": 401,
+        "app_name": "TextEdit",
+        "window_title": "Untitled",
+        "window_bounds": {"x": 100.0, "y": 80.0, "w": 500.0, "h": 400.0},
+        "elements": [{
+            "element_index": 1,
+            "role": "AXMenuItem",
+            "label": "Save…",
+            "frame": {"x": 200.0, "y": 100.0, "w": 80.0, "h": 20.0}
+        }]
+    });
+    let states = json!({"401": [menu_state.clone(), menu_state.clone(), menu_state]});
+    let actions = json!({
+        "list_apps": [{"result": {"structuredContent": {"apps": [{"pid": pid, "active": true}]}}}],
+        "type_text": [{"result": {"content": [{"type": "text", "text": "typed"}]}}],
+        "press_key": [{"result": {"content": [{"type": "text", "text": "pressed"}]}}]
+    });
+    let (backend, _data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    let backend = backend.with_native_menu(Arc::new(|_, _| NativeMenuOutcome::Pressed));
+    let error = backend
+        .act(&ActionRequest {
+            tool: "computer_invoke_menu".into(),
+            args: json!({"pid": pid, "windowId": 401, "path": "File > Save"}),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .expect_err("persistent menu should not report success");
+    assert!(matches!(
+        error,
+        ComputerError::Refused { ref code, ref message }
+            if code == "suspected_noop"
+                && message.contains("menu type-select + Return")
+                && message.contains("menu command not confirmed")
+    ));
 }
 
 #[cfg(unix)]
