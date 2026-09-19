@@ -55,7 +55,10 @@ pub struct CuaBackend {
     /// This backend's unique driver session label.
     session: String,
     version: Option<String>,
-    sheet_owners: Mutex<HashMap<(i64, i64), i64>>,
+    /// (pid, unresolved sheet CG window) → owning AX window, learned by
+    /// retargeted observes; shared across session views so an alias learned
+    /// by one caller routes every later action on that window.
+    sheet_owners: Arc<Mutex<HashMap<(i64, i64), i64>>>,
 }
 
 impl CuaBackend {
@@ -91,7 +94,7 @@ impl CuaBackend {
             client: Arc::new(client),
             session: format!("{SESSION_LABEL_PREFIX}-{}", std::process::id()),
             version: None,
-            sheet_owners: Mutex::new(HashMap::new()),
+            sheet_owners: Arc::new(Mutex::new(HashMap::new())),
         };
         // Name the shared session up-front — `start_session` is idempotent and
         // this also proves the session tools exist before first real use.
@@ -111,7 +114,7 @@ impl CuaBackend {
             client: backend.client,
             session: backend.session,
             version,
-            sheet_owners: Mutex::new(HashMap::new()),
+            sheet_owners: backend.sheet_owners,
         })
     }
 
@@ -125,7 +128,7 @@ impl CuaBackend {
             client: self.client.clone(),
             session: format!("{}-{}", self.session, label),
             version: self.version.clone(),
-            sheet_owners: Mutex::new(HashMap::new()),
+            sheet_owners: self.sheet_owners.clone(),
         }
     }
 
