@@ -101,6 +101,10 @@ struct SettingsView: View {
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
+        // Presented sheets don't re-render when the root's scheme override
+        // flips — apply it on the sheet content itself so the segmented
+        // control visibly themes this sheet.
+        .preferredColorScheme(Appearance(rawValue: appearance)?.scheme)
     }
 
     private var statusColor: Color {
