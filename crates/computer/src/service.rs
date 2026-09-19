@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-use crate::backend::{ComputerBackend, Delivery, InspectKind, ObserveRequest, ObserveScope};
+use crate::backend::{
+    ComputerBackend, Delivery, ElementFrame, InspectKind, ObserveRequest, ObserveScope,
+    WindowElement, WindowState,
+};
 use crate::digest;
 use crate::install::{self, InstallProgress};
 use crate::surface;
@@ -83,6 +86,9 @@ impl ComputerService {
     /// attachment-staging jail (the engine passes its uploads root so the UI
     /// can read staged PNGs through the attachment-chunk RPC).
     pub fn new(data_dir: PathBuf, screenshot_dir: PathBuf) -> Self {
+        // The driver writes staged PNGs into `screenshot_dir` per call; it
+        // must exist or every capture fails ENOENT.
+        let _ = std::fs::create_dir_all(&screenshot_dir);
         let settings = load_settings(&data_dir);
         let (install_tx, _) = watch::channel(InstallProgress::Idle);
         let (status_tx, _) = watch::channel(());
@@ -458,9 +464,15 @@ impl ComputerService {
                 let expect = args.get("expect").cloned().ok_or_else(|| {
                     ComputerError::InvalidArgs("needs 'expect' predicates".into())
                 })?;
-                let outcome = backend
-                    .verify(pid, get_i64(&args, "windowId"), expect)
-                    .await?;
+                let outcome = verify_predicates(
+                    &*backend,
+                    &settings,
+                    &self.inner.screenshot_dir,
+                    pid,
+                    get_i64(&args, "windowId"),
+                    expect,
+                )
+                .await?;
                 Ok(ToolReply::text(
                     serde_json::to_string_pretty(&outcome).unwrap_or_default(),
                 ))
@@ -589,17 +601,28 @@ impl ComputerService {
         let window_id = get_i64(args, "windowId");
         if let Some(expect) = args.get("expect") {
             match (pid, window_id) {
-                (Some(pid), _) => match backend.verify(pid, window_id, expect.clone()).await {
-                    Ok(verification) => {
-                        text.push_str("\n--- verification ---\n");
-                        text.push_str(
-                            &serde_json::to_string_pretty(&verification).unwrap_or_default(),
-                        );
+                (Some(pid), _) => {
+                    match verify_predicates(
+                        backend,
+                        settings,
+                        &self.inner.screenshot_dir,
+                        pid,
+                        window_id,
+                        expect.clone(),
+                    )
+                    .await
+                    {
+                        Ok(verification) => {
+                            text.push_str("\n--- verification ---\n");
+                            text.push_str(
+                                &serde_json::to_string_pretty(&verification).unwrap_or_default(),
+                            );
+                        }
+                        Err(error) => {
+                            text.push_str(&format!("\n--- verification failed to run: {error}"));
+                        }
                     }
-                    Err(error) => {
-                        text.push_str(&format!("\n--- verification failed to run: {error}"));
-                    }
-                },
+                }
                 _ => {
                     text.push_str("\n--- 'expect' skipped: needs pid (+windowId) to bind the check")
                 }
@@ -745,7 +768,15 @@ impl ComputerService {
         let semantic_cap = settings.inspect_max_elements.min(600);
         if let Some(selector) = condition.get("element") {
             let expect = json!([{ "element": { "selector": selector, "exists": true } }]);
-            let outcome = backend.verify(pid, window_id, expect).await?;
+            let outcome = verify_predicates(
+                backend,
+                settings,
+                &self.inner.screenshot_dir,
+                pid,
+                window_id,
+                expect,
+            )
+            .await?;
             // verify_state reports `status` = satisfied|unsatisfied|unknown —
             // `unknown` is NOT success.
             let satisfied = outcome.get("status").and_then(Value::as_str) == Some("satisfied");
@@ -753,7 +784,16 @@ impl ComputerService {
         }
         if let Some(selector) = condition.get("elementGone") {
             let expect = json!([{ "element": { "selector": selector, "exists": true } }]);
-            return match backend.verify(pid, window_id, expect).await {
+            return match verify_predicates(
+                backend,
+                settings,
+                &self.inner.screenshot_dir,
+                pid,
+                window_id,
+                expect,
+            )
+            .await
+            {
                 Ok(outcome) => Ok(
                     if outcome.get("status").and_then(Value::as_str) == Some("satisfied") {
                         None
@@ -1137,4 +1177,251 @@ fn get_i64(args: &Value, key: &str) -> Option<i64> {
 
 fn get_u32(args: &Value, key: &str) -> Option<u32> {
     args.get(key).and_then(Value::as_u64).map(|v| v as u32)
+}
+
+/// `verify_state`-compatible predicates evaluated locally against one
+/// fresh `window_state` snapshot. The driver's own element predicates
+/// return `observation_unavailable` (0.28.2) even when observe works, so
+/// Cosmos evaluates them itself — same vocabulary, same reply shape.
+async fn verify_predicates(
+    backend: &dyn ComputerBackend,
+    settings: &ComputerSettings,
+    screenshot_dir: &std::path::Path,
+    pid: i64,
+    window_id: Option<i64>,
+    expect: Value,
+) -> Result<Value, ComputerError> {
+    let predicates = match normalize_expect(expect) {
+        Value::Array(items) => items,
+        single => vec![single],
+    };
+    let wants_elements = predicates.iter().any(|p| p.get("element").is_some());
+    // get_window_state refuses a bare "nothing to return" call — window-only
+    // predicates still pass semantic:true capped at one element.
+    let state = backend
+        .window_state(
+            pid,
+            window_id,
+            true,
+            false,
+            if wants_elements {
+                settings.inspect_max_elements.min(1_200)
+            } else {
+                1
+            },
+            0,
+            screenshot_dir,
+            None,
+        )
+        .await?;
+    let started = Instant::now();
+    let mut verdicts = Vec::with_capacity(predicates.len());
+    let mut all_satisfied = true;
+    for (index, predicate) in predicates.iter().enumerate() {
+        let (status, observed, unknown_reason) = eval_predicate(predicate, &state);
+        if status != "satisfied" {
+            all_satisfied = false;
+        }
+        verdicts.push(json!({
+            "index": index,
+            "status": status,
+            "observed_json": observed,
+            "unknown_reason": unknown_reason,
+        }));
+    }
+    Ok(json!({
+        "status": if all_satisfied { "satisfied" } else { "unsatisfied" },
+        "predicates": verdicts,
+        "samples": 1,
+        "stable": true,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    }))
+}
+
+/// The surface schema documents verify predicates in camelCase
+/// (`labelContains`, `valueEquals`); the driver's `verify_state` only
+/// accepts snake_case — normalize object keys recursively before
+/// forwarding. Values are untouched.
+fn normalize_expect(expect: Value) -> Value {
+    match expect {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (camel_to_snake_case(&k), normalize_expect(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(normalize_expect).collect()),
+        scalar => scalar,
+    }
+}
+
+fn camel_to_snake_case(key: &str) -> String {
+    if !key.chars().any(|c| c.is_ascii_uppercase()) {
+        return key.to_string();
+    }
+    let mut out = String::with_capacity(key.len() + 4);
+    for ch in key.chars() {
+        if ch.is_ascii_uppercase() {
+            out.push('_');
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// One predicate verdict — mirrors the driver's verify_state entries:
+/// (status, observed_json, unknown_reason).
+fn eval_predicate(
+    predicate: &Value,
+    state: &WindowState,
+) -> (&'static str, String, Option<String>) {
+    if let Some(element) = predicate.get("element") {
+        let selector = element
+            .get("selector")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let matches: Vec<&WindowElement> = state
+            .elements
+            .iter()
+            .filter(|e| selector_matches(e, &selector))
+            .collect();
+        // Asserted flags (enabled/selected/checked/focused/value_equals)
+        // must hold on a matched element.
+        let qualified: Vec<&&WindowElement> = matches
+            .iter()
+            .filter(|e| element_flags_satisfied(element, e))
+            .collect();
+        let want_exists = element
+            .get("exists")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let satisfied = want_exists == !qualified.is_empty();
+        let observed = json!({
+            "matches": qualified.len(),
+            "first": qualified.first().map(|e| json!({
+                "role": e.role,
+                "label": e.label,
+                "value": e.value,
+                "enabled": e.enabled,
+                "selected": e.selected,
+            })),
+            "elements_truncated": state.returned_element_count < state.total_element_count,
+        });
+        return (
+            if satisfied {
+                "satisfied"
+            } else {
+                "unsatisfied"
+            },
+            observed.to_string(),
+            None,
+        );
+    }
+    if let Some(window) = predicate.get("window") {
+        let exists = state.window_id != 0;
+        let mut satisfied = window
+            .get("exists")
+            .and_then(Value::as_bool)
+            .map(|want| want == exists)
+            .unwrap_or(true);
+        if let Some(bounds) = window.get("bounds") {
+            satisfied &= bounds_match(bounds, state.window_bounds);
+        }
+        let observed = json!({
+            "exists": exists,
+            "bounds": state.window_bounds,
+            "title": state.window_title,
+        });
+        return (
+            if satisfied {
+                "satisfied"
+            } else {
+                "unsatisfied"
+            },
+            observed.to_string(),
+            None,
+        );
+    }
+    (
+        "unknown",
+        "{}".to_string(),
+        Some("unsupported predicate".into()),
+    )
+}
+
+/// Selector match — `role` tolerates the driver's `AX` prefixes and common
+/// aliases; `label_contains` is a case-insensitive substring on the label.
+fn selector_matches(e: &WindowElement, selector: &Value) -> bool {
+    if let Some(role) = selector.get("role").and_then(Value::as_str) {
+        if !role_matches(&e.role, role) {
+            return false;
+        }
+    }
+    if let Some(label) = selector.get("label_contains").and_then(Value::as_str) {
+        if !e
+            .label
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains(&label.to_lowercase())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn role_matches(actual: &str, want: &str) -> bool {
+    let strip = |role: &str| role.to_lowercase().trim_start_matches("ax").to_string();
+    let (have, want) = (strip(actual), strip(want));
+    have == want
+        || have.contains(&want)
+        || want.contains(&have)
+        || matches!(
+            (want.as_str(), have.as_str()),
+            ("edit", "textarea")
+                | ("edit", "textfield")
+                | ("input", "textarea")
+                | ("input", "textfield")
+                | ("link", "textlink")
+        )
+}
+
+/// Asserted element flags — absent assertions pass; asserted flags must
+/// hold (an absent driver flag can't satisfy an assertion).
+fn element_flags_satisfied(predicate: &Value, e: &WindowElement) -> bool {
+    let flag = |name: &str, actual: Option<bool>| -> bool {
+        match predicate.get(name).and_then(Value::as_bool) {
+            Some(want) => actual == Some(want),
+            None => true,
+        }
+    };
+    flag("enabled", Some(e.enabled))
+        && flag("selected", e.selected)
+        && flag("checked", e.checked)
+        && flag("focused", e.focused)
+        && match predicate.get("value_equals").and_then(Value::as_str) {
+            Some(want) => {
+                let value = e.value.as_deref().unwrap_or_default();
+                value == want || value.trim() == want || value.contains(want)
+            }
+            None => true,
+        }
+}
+
+fn bounds_match(want: &Value, actual: Option<ElementFrame>) -> bool {
+    let Some(actual) = actual else { return false };
+    let close = |key: &str, got: f64| {
+        want.get(key)
+            .and_then(Value::as_f64)
+            .map(|w| (got - w).abs() <= 1.0)
+            .unwrap_or(true)
+    };
+    close("x", actual.x)
+        && close("y", actual.y)
+        && close("w", actual.w)
+        && close("h", actual.h)
+        && close("width", actual.w)
+        && close("height", actual.h)
 }
