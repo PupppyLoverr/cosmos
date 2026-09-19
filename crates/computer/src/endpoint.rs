@@ -20,6 +20,12 @@ const MAX_BODY: usize = 256 * 1024;
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Accept loop — the service binds the listener and spawns this per endpoint.
+/// Per-connection suffixes on the driver session label — every accepted MCP
+/// connection (one `zeron computer-stdio` shim = one agent run) drives its own
+/// named driver session, so concurrent agents never share cursor/recording
+/// state or collide on the process-wide label.
+static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub async fn serve(listener: tokio::net::TcpListener, token: String, service: ComputerService) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -36,6 +42,10 @@ async fn serve_connection(
     service: ComputerService,
     token: String,
 ) {
+    let session_label = format!(
+        "s{}",
+        NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let mut buffer = Vec::with_capacity(4096);
     loop {
         let request = match read_request(&mut stream, &mut buffer).await {
@@ -84,7 +94,7 @@ async fn serve_connection(
         };
         let mut replies = Vec::new();
         for message in messages {
-            if let Some(reply) = handle_message(message, &service).await {
+            if let Some(reply) = handle_message(message, &service, &session_label).await {
                 replies.push(reply);
             }
         }
@@ -151,7 +161,11 @@ fn find_sequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-async fn handle_message(message: Value, service: &ComputerService) -> Option<Value> {
+async fn handle_message(
+    message: Value,
+    service: &ComputerService,
+    session_label: &str,
+) -> Option<Value> {
     let id = message.get("id").cloned().unwrap_or(Value::Null);
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
@@ -180,8 +194,11 @@ async fn handle_message(message: Value, service: &ComputerService) -> Option<Val
                     json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":format!("Unknown tool: {tool}")}}),
                 );
             }
-            let outcome =
-                tokio::time::timeout(CALL_TIMEOUT, service.dispatch_tool(tool, args)).await;
+            let outcome = tokio::time::timeout(
+                CALL_TIMEOUT,
+                service.dispatch_tool_for(Some(session_label), tool, args),
+            )
+            .await;
             let reply = match outcome {
                 Ok(Ok(reply)) => reply,
                 Ok(Err(error)) => {

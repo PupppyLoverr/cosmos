@@ -313,6 +313,20 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "computer_recording",
+            "description": "Control your own session's action recording. action 'start' begins a session-scoped trajectory capture (per-action before/after state + screenshots + a screen video finalized on 'stop') written to outputDir; 'stop' finalizes it; 'status' reports state. Only use this when the user asked to record — it is off by default.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["start", "stop", "status"], "description": "What to do."},
+                    "outputDir": {"type": "string", "description": "For 'start': absolute directory for turn folders + recording.mp4 (created if missing)."},
+                    "recordVideo": {"type": "boolean", "description": "For 'start': capture the main display to recording.mp4 (default true)."},
+                },
+                "required": ["action"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "computer_move_cursor",
             "description": "Move the AGENT'S OWN overlay cursor to window-local (x,y) — the visible pointer the user sees as 'the agent's hand'. Never the user's physical cursor. Optional; visual feedback only.",
             "inputSchema": {

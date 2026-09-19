@@ -270,5 +270,27 @@ pub trait ComputerBackend: Send + Sync {
         None
     }
 
+    /// A view of this backend bound to `label`: concurrent agents each get a
+    /// distinct driver-side session (own cursor, recording, lifecycle) instead
+    /// of all calls sharing the process-wide label. Backends without driver
+    /// sessions return None and the caller falls back to the shared backend.
+    fn session_scoped(&self, _label: &str) -> Option<std::sync::Arc<dyn ComputerBackend>> {
+        None
+    }
+
+    /// Session-scoped driver utilities that are neither observe nor UI act:
+    /// recording controls today (`computer_recording` → `start_recording` /
+    /// `stop_recording` / `get_recording_state`). The result is the driver's
+    /// structured payload verbatim. Backends without driver sessions refuse.
+    async fn session_tool(
+        &self,
+        _tool: &str,
+        _args: &serde_json::Value,
+    ) -> Result<serde_json::Value, ComputerError> {
+        Err(ComputerError::Unavailable(
+            "backend has no session utilities".into(),
+        ))
+    }
+
     fn describe(&self) -> BackendDescriptor;
 }

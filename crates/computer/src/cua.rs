@@ -23,6 +23,7 @@
 //! driver-side and surface here as `stale_element` — the harness re-observes.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
@@ -46,7 +47,10 @@ use crate::{
 const SESSION_LABEL_PREFIX: &str = "cosmos";
 
 pub struct CuaBackend {
-    client: McpClient,
+    /// Shared driver MCP subprocess — `Arc` so per-session views of the same
+    /// transport stay cheap (one `cua-driver mcp` process multiplexes every
+    /// named session; each label gets its own cursor/recording/lifecycle).
+    client: Arc<McpClient>,
     /// This backend's unique driver session label.
     session: String,
     version: Option<String>,
@@ -82,7 +86,7 @@ impl CuaBackend {
         let env = settings.driver_env(manifest.as_deref());
         let client = McpClient::spawn(&binary, &env, &[]).await?;
         let backend = Self {
-            client,
+            client: Arc::new(client),
             session: format!("{SESSION_LABEL_PREFIX}-{}", std::process::id()),
             version: None,
         };
@@ -105,6 +109,19 @@ impl CuaBackend {
             session: backend.session,
             version,
         })
+    }
+
+    /// A session-scoped view of this backend: same driver MCP transport, a
+    /// different `session` label on every call. One MCP connection multiplexes
+    /// any number of named sessions, so concurrent agents each get their own
+    /// driver-side lifecycle (cursor overlay, recording, idle-TTL cleanup)
+    /// instead of all writes landing in the process-wide `cosmos-<pid>` name.
+    pub fn session_scoped(&self, label: &str) -> Self {
+        Self {
+            client: self.client.clone(),
+            session: format!("{}-{}", self.session, label),
+            version: self.version.clone(),
+        }
     }
 
     /// `start_session` for this backend's label — creates or revives it.
@@ -133,17 +150,107 @@ impl CuaBackend {
         }
     }
 
-    /// Is this error the driver's dead-session refusal?
+    /// Is this error the driver's dead-session refusal? The driver's phrasing
+    /// varies across versions ("session 'x' has ended", "Call start_session…"),
+    /// so match case-insensitively on the message as well as the wire code.
     pub(crate) fn is_session_ended(error: &ComputerError) -> bool {
         match error {
             ComputerError::Refused { code, message } => {
+                let m = message.to_lowercase();
                 code == "session_ended"
                     || Self::is_session_unavailable(error)
-                    || message.contains("session has ended")
-                    || message.contains("call start_session")
+                    || m.contains("has ended")
+                    || m.contains("call start_session")
+                    || m.contains("start_session with this id")
             }
             _ => false,
         }
+    }
+
+    /// The CG-window → AX-window mapping failure for sheet/dialog windows:
+    /// the driver sees the CG window but its AX node hangs under the parent,
+    /// so the lookup can't resolve. Surfaced as `ax_window_unresolved` (or the
+    /// message text when the code isn't propagated).
+    pub(crate) fn is_ax_window_unresolved(error: &ComputerError) -> bool {
+        match error {
+            ComputerError::Refused { code, message } => {
+                code == "ax_window_unresolved"
+                    || message.contains("ax_window_unresolved")
+                    || message.contains("element_outside_target_window")
+                    || message.contains("no AX window")
+            }
+            _ => false,
+        }
+    }
+
+    /// `verify_state`/`window_state`/`act` retarget for sheet windows: when
+    /// `window_id` can't resolve on the CG↔AX map, try the app's other
+    /// on-screen windows (topmost first). For pixel actions the window-local
+    /// `x,y` are translated by the CG-bounds delta — the sheet's screen
+    /// position projected into the owning window's coordinate space.
+    async fn retarget_call(
+        &self,
+        tool: &str,
+        call_args: &Value,
+        first_error: ComputerError,
+    ) -> Result<Value, ComputerError> {
+        let Some(obj) = call_args.as_object() else {
+            return Err(first_error);
+        };
+        let (Some(pid), Some(window_id)) = (
+            obj.get("pid").and_then(Value::as_i64),
+            obj.get("window_id").and_then(Value::as_i64),
+        ) else {
+            return Err(first_error);
+        };
+        let sheet_origin = self
+            .list_windows(Some(pid))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|w| w.get("window_id").and_then(Value::as_i64) == Some(window_id))
+            .and_then(|w| w.get("bounds").cloned());
+        let (sx, sy) = sheet_origin
+            .as_ref()
+            .map(|b| {
+                (
+                    b.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                    b.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        let siblings = self.list_windows(Some(pid)).await.unwrap_or_default();
+        let mut alternates: Vec<Value> = siblings
+            .into_iter()
+            .filter(|w| w.get("window_id").and_then(Value::as_i64) != Some(window_id))
+            .filter(|w| w.get("minimized").and_then(Value::as_bool) != Some(true))
+            .filter(|w| w.get("is_on_screen").and_then(Value::as_bool) != Some(false))
+            .collect();
+        alternates.sort_by_key(|w| {
+            std::cmp::Reverse(w.get("z_index").and_then(Value::as_i64).unwrap_or(0))
+        });
+        for candidate in alternates {
+            let Some(candidate_id) = candidate.get("window_id").and_then(Value::as_i64) else {
+                continue;
+            };
+            let mut retry = call_args.clone();
+            retry["window_id"] = json!(candidate_id);
+            if let (Some(x), Some(y)) = (
+                obj.get("x").and_then(Value::as_f64),
+                obj.get("y").and_then(Value::as_f64),
+            ) {
+                if let Some(pb) = candidate.get("bounds") {
+                    let px = pb.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+                    let py = pb.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+                    retry["x"] = json!(x + sx - px);
+                    retry["y"] = json!(y + sy - py);
+                }
+            }
+            if let Ok(result) = self.call(tool, retry).await {
+                return Ok(result);
+            }
+        }
+        Err(first_error)
     }
 
     /// Is this error the stale-lease refusal (`session is not available to
@@ -152,7 +259,10 @@ impl CuaBackend {
     pub(crate) fn is_session_unavailable(error: &ComputerError) -> bool {
         match error {
             ComputerError::Refused { code, message } => {
-                code == "session_unavailable" || message.contains("not available to this transport")
+                code == "session_unavailable"
+                    || message
+                        .to_lowercase()
+                        .contains("not available to this transport")
             }
             _ => false,
         }
@@ -169,7 +279,13 @@ impl CuaBackend {
             obj.insert("session".into(), json!(self.session));
         }
         match self.client.call_tool(tool, args.clone()).await {
-            Err(error) if Self::is_session_ended(&error) => {
+            Err(error)
+                if Self::is_session_ended(&error) || Self::is_session_unavailable(&error) =>
+            {
+                // First use of a per-agent label (or its TTL expiry) reads as
+                // `session_unavailable`; a stale same-name lease from a dead
+                // transport reads `session_ended`. `start_session` resolves
+                // both, then the call retries once.
                 self.start_session().await?;
                 self.client.call_tool(tool, args).await
             }
@@ -678,7 +794,14 @@ impl CuaBackend {
                 call_args["window_id"] = json!(id);
             }
         }
-        let result = self.call(tool, call_args).await?;
+        let result = match self.call(tool, call_args.clone()).await {
+            Err(error) if Self::is_ax_window_unresolved(&error) && tool != "launch_app" => {
+                // Sheet windows: retarget to the owning window (window-local
+                // x,y translated by the CG-bounds delta when present).
+                self.retarget_call(tool, &call_args, error).await?
+            }
+            other => other?,
+        };
         let details = result.get("structuredContent").cloned();
         let mut summary = result_text(&result).unwrap_or_else(|| format!("{tool} completed"));
         // Surface the driver's effect report inline — a successful tool call
@@ -989,16 +1112,67 @@ impl ComputerBackend for CuaBackend {
         query: Option<&str>,
     ) -> Result<WindowState, ComputerError> {
         let window = self.window_for(pid, window_id).await?;
-        self.window_state_inner(
-            &window,
-            semantic,
-            screenshot,
-            max_elements,
-            max_dimension,
-            screenshot_dir,
-            query,
-        )
-        .await
+        let primary = self
+            .window_state_inner(
+                &window,
+                semantic,
+                screenshot,
+                max_elements,
+                max_dimension,
+                screenshot_dir,
+                query,
+            )
+            .await;
+        // Sheets/dialogs own a CG window id but hang off the PARENT window's
+        // AX tree — the driver's CG↔AX map then reports ax_window_unresolved
+        // even though the content is reachable. Retry the app's other
+        // on-screen windows (topmost first): the parent's snapshot exposes the
+        // sheet subtree, and its element tokens resolve against the parent.
+        let Err(error) = &primary else {
+            return primary;
+        };
+        if !Self::is_ax_window_unresolved(error) {
+            return primary;
+        }
+        let siblings = self.list_windows(Some(pid)).await.unwrap_or_default();
+        let mut alternates: Vec<&Value> = siblings
+            .iter()
+            .filter(|w| {
+                w.get("window_id").and_then(Value::as_i64)
+                    != window.get("window_id").and_then(Value::as_i64)
+            })
+            .filter(|w| w.get("minimized").and_then(Value::as_bool) != Some(true))
+            .filter(|w| w.get("is_on_screen").and_then(Value::as_bool) != Some(false))
+            .collect();
+        alternates.sort_by_key(|w| {
+            std::cmp::Reverse(w.get("z_index").and_then(Value::as_i64).unwrap_or(0))
+        });
+        for candidate in alternates {
+            let retry = self
+                .window_state_inner(
+                    candidate,
+                    semantic,
+                    screenshot,
+                    max_elements,
+                    max_dimension,
+                    screenshot_dir,
+                    query,
+                )
+                .await;
+            let Ok(mut state) = retry else { continue };
+            let note = format!(
+                "sheet/dialog window {} unresolved on the CG↔AX map; showing its owning window {} ({}) — sheet elements are inside this tree",
+                window.get("window_id").and_then(Value::as_i64).unwrap_or(0),
+                state.window_id,
+                state.window_title.as_deref().unwrap_or("untitled")
+            );
+            state.note = Some(match state.note {
+                Some(existing) => format!("{existing}; {note}"),
+                None => note,
+            });
+            return Ok(state);
+        }
+        primary
     }
 
     async fn verify(
@@ -1018,12 +1192,16 @@ impl ComputerBackend for CuaBackend {
                 .and_then(Value::as_i64)
                 .ok_or_else(|| ComputerError::Internal("window record has no window_id".into()))?,
         };
-        let result = self
-            .call(
-                "verify_state",
-                json!({ "pid": pid, "window_id": window_id, "expect": expect }),
-            )
-            .await?;
+        let verify_args = json!({ "pid": pid, "window_id": window_id, "expect": expect });
+        let result = match self.call("verify_state", verify_args.clone()).await {
+            Err(error) if Self::is_ax_window_unresolved(&error) => {
+                // Sheets/dialogs: the caller pinned the CG window id of a
+                // sheet; its AX content lives under the owning window.
+                self.retarget_call("verify_state", &verify_args, error)
+                    .await?
+            }
+            other => other?,
+        };
         Ok(result
             .get("structuredContent")
             .cloned()
@@ -1061,6 +1239,33 @@ impl ComputerBackend for CuaBackend {
 
     async fn health_report(&self) -> Option<Value> {
         self.health_report().await
+    }
+
+    fn session_scoped(&self, label: &str) -> Option<Arc<dyn ComputerBackend>> {
+        Some(Arc::new(self.session_scoped(label)))
+    }
+
+    async fn session_tool(&self, tool: &str, args: &Value) -> Result<Value, ComputerError> {
+        // Recording is session-scoped driver-side, so `self.session` (this
+        // backend's label) routes it to the right agent's trajectory.
+        let (driver_tool, mut call_args) = match tool {
+            "start" => ("start_recording", args.clone()),
+            "stop" => ("stop_recording", args.clone()),
+            "status" => ("get_recording_state", args.clone()),
+            other => {
+                return Err(ComputerError::InvalidArgs(format!(
+                    "unknown session tool '{other}'"
+                )));
+            }
+        };
+        strip_nulls(&mut call_args);
+        let result = self.call(driver_tool, call_args).await?;
+        Ok(result
+            .get("structuredContent")
+            .cloned()
+            .or_else(|| result_text(&result).and_then(|t| serde_json::from_str(&t).ok()))
+            .or_else(|| result_text(&result).map(Value::String))
+            .unwrap_or(result))
     }
 
     fn describe(&self) -> BackendDescriptor {

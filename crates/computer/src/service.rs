@@ -38,6 +38,11 @@ struct Inner {
     screenshot_dir: PathBuf,
     settings: RwLock<ComputerSettings>,
     backend: Mutex<Option<Arc<dyn ComputerBackend>>>,
+    /// Per-session backend views keyed by MCP-connection label: concurrent
+    /// agents each drive a distinct driver-side session (own cursor,
+    /// recording, idle lifecycle) over the shared driver process instead of
+    /// all writes landing in the process-wide label.
+    session_backends: Mutex<HashMap<String, Arc<dyn ComputerBackend>>>,
     /// Serializes backend spawns so two concurrent calls can't double-spawn.
     spawn_lock: tokio::sync::Mutex<()>,
     last_error: Mutex<Option<String>>,
@@ -99,6 +104,7 @@ impl ComputerService {
                 screenshot_dir,
                 settings: RwLock::new(settings),
                 backend: Mutex::new(None),
+                session_backends: Mutex::new(HashMap::new()),
                 spawn_lock: tokio::sync::Mutex::new(()),
                 last_error: Mutex::new(None),
                 endpoint: Mutex::new(None),
@@ -420,7 +426,23 @@ impl ComputerService {
     /// The ONE funnel for `tools/call` — the HTTP endpoint and the engine's
     /// `ComputerToolCall` RPC both come through here, so control-mode policy
     /// is enforced in exactly one place.
+    /// `dispatch_tool` on the process-wide default session (settings pages,
+    /// probes, the RPC `ComputerObserve` path — anything not tied to one
+    /// agent's MCP connection).
     pub async fn dispatch_tool(&self, name: &str, args: Value) -> Result<ToolReply, ComputerError> {
+        self.dispatch_tool_for(None, name, args).await
+    }
+
+    /// Dispatch on a named driver session: the endpoint passes one label per
+    /// accepted MCP connection, so concurrent agents' actions ride distinct
+    /// driver sessions (no shared cursor/recording state, no cross-agent
+    /// snapshot crosstalk on the session-scoped driver state).
+    pub async fn dispatch_tool_for(
+        &self,
+        session: Option<&str>,
+        name: &str,
+        args: Value,
+    ) -> Result<ToolReply, ComputerError> {
         // `computer_status` answers even when disabled — it's how a harness
         // learns the computer exists and why it isn't usable.
         if name == "computer_status" {
@@ -433,7 +455,7 @@ impl ComputerService {
         if !settings.enabled {
             return Err(ComputerError::Disabled);
         }
-        let backend = self.ensure_backend().await?;
+        let backend = self.ensure_backend_for(session).await?;
 
         match name {
             "computer_observe" => {
@@ -497,6 +519,27 @@ impl ComputerService {
                     text.push_str(&serde_json::to_string_pretty(details).unwrap_or_default());
                 }
                 Ok(ToolReply::text(text))
+            }
+            "computer_recording" => {
+                let action = get_str(&args, "action").ok_or_else(|| {
+                    ComputerError::InvalidArgs("computer_recording needs 'action'".into())
+                })?;
+                let mut tool_args = json!({
+                    "output_dir": get_str(&args, "outputDir"),
+                    "record_video": get_bool(&args, "recordVideo"),
+                });
+                if let Some(obj) = tool_args.as_object_mut() {
+                    obj.retain(|_, v| !v.is_null());
+                }
+                if action == "start" && get_str(&args, "outputDir").is_none() {
+                    return Err(ComputerError::InvalidArgs(
+                        "computer_recording 'start' needs 'outputDir'".into(),
+                    ));
+                }
+                let value = backend.session_tool(action, &tool_args).await?;
+                Ok(ToolReply::text(
+                    serde_json::to_string_pretty(&value).unwrap_or_default(),
+                ))
             }
             name if surface::is_action_tool(name) => {
                 self.dispatch_action(&*backend, &settings, name, &args)
@@ -1095,6 +1138,36 @@ impl ComputerService {
 
     // -- backend lifecycle -----------------------------------------------------
 
+    /// Resolve the backend for one driver session label. `None` (or a
+    /// backend kind without session views — the mock) yields the shared
+    /// process-wide backend; a live label gets its own session-scoped view,
+    /// created on first use.
+    async fn ensure_backend_for(
+        &self,
+        session: Option<&str>,
+    ) -> Result<Arc<dyn ComputerBackend>, ComputerError> {
+        let shared = self.ensure_backend().await?;
+        let Some(label) = session else {
+            return Ok(shared);
+        };
+        if let Some(backend) = self.inner.session_backends.lock().unwrap().get(label) {
+            return Ok(backend.clone());
+        }
+        let Some(scoped) = shared.session_scoped(label) else {
+            return Ok(shared);
+        };
+        // Register the label driver-side before first use — the same
+        // revive-on-death path `call` runs keeps it alive thereafter.
+        scoped.ping().await?;
+        let scoped: Arc<dyn ComputerBackend> = scoped;
+        self.inner
+            .session_backends
+            .lock()
+            .unwrap()
+            .insert(label.to_string(), scoped.clone());
+        Ok(scoped)
+    }
+
     async fn ensure_backend(&self) -> Result<Arc<dyn ComputerBackend>, ComputerError> {
         if let Some(backend) = self.inner.backend.lock().unwrap().as_ref() {
             return Ok(backend.clone());
@@ -1138,6 +1211,7 @@ impl ComputerService {
     /// use respawns lazily. `kill_on_drop` does the actual teardown.
     fn drop_backend(&self) {
         drop(self.inner.backend.lock().unwrap().take());
+        self.inner.session_backends.lock().unwrap().clear();
     }
 }
 

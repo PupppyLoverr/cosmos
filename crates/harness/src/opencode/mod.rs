@@ -1918,6 +1918,11 @@ fn mime_for(path: &str) -> &'static str {
         Some("jpg") | Some("jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        Some("tif") | Some("tiff") => "image/tiff",
+        Some("avif") => "image/avif",
+        Some("heic") => "image/heic",
         Some("pdf") => "application/pdf",
         _ => "application/octet-stream",
     }
