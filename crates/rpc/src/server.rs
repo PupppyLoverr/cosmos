@@ -155,22 +155,33 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
     // Native viewports dial this socket with a bare `connect_async` and send
     // no `Origin` header. A browser always attaches `Origin` to a WebSocket
     // handshake and cannot forge or suppress it from script, and WebSockets
-    // are exempt from the Same-Origin Policy — so only rejecting any handshake
-    // that carries `Origin` keeps a page the user happens to visit from
-    // reaching this local socket. Keep this check.
+    // are exempt from the Same-Origin Policy — so rejecting any handshake
+    // that carries a non-loopback `Origin` keeps a page the user happens to
+    // visit from reaching this local socket. Keep this check.
+    //
+    // Loopback origins (`http://localhost:*`, `http://127.0.0.1:*`,
+    // `http://[::1]:*`) are admitted: a page served by a local server is
+    // equivalent in privilege to a local process, which can already dial
+    // this socket without any Origin at all. React Native / Expo Go clients
+    // always send `Origin: http://localhost:8081` and cannot suppress it,
+    // so without this carve-out the mobile app can never pair locally.
     //
     // The large `Err` (ErrorResponse) is the shape tungstenite's Callback
     // trait requires; it can't be boxed away here.
     #[allow(clippy::result_large_err)]
     let reject_cross_origin = |req: &HandshakeRequest, resp: HandshakeResponse| {
         if let Some(origin) = req.headers().get("origin") {
-            tracing::warn!(
-                origin = %String::from_utf8_lossy(origin.as_bytes()),
-                "rpc: rejecting handshake carrying an Origin header (cross-origin browser dial)"
-            );
-            let mut err = ErrorResponse::new(Some("origin not allowed on local IPC".to_string()));
-            *err.status_mut() = StatusCode::FORBIDDEN;
-            return Err(err);
+            let origin_str = String::from_utf8_lossy(origin.as_bytes());
+            if !origin_is_loopback(&origin_str) {
+                tracing::warn!(
+                    origin = %origin_str,
+                    "rpc: rejecting handshake carrying a non-local Origin header (cross-origin browser dial)"
+                );
+                let mut err =
+                    ErrorResponse::new(Some("origin not allowed on local IPC".to_string()));
+                *err.status_mut() = StatusCode::FORBIDDEN;
+                return Err(err);
+            }
         }
         Ok(resp)
     };
@@ -215,4 +226,29 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
 
     serve_connection(service, out_tx, in_rx).await;
     pump.abort();
+}
+
+/// Whether an `Origin` header value names a loopback host (`localhost`,
+/// `127.0.0.1`, `[::1]` — any scheme, any port). Pages served from a local
+/// server are as privileged as any local process, which needs no Origin to
+/// reach this socket, so admitting them does not widen the threat surface.
+/// Anything else is treated as a remote web page and rejected.
+fn origin_is_loopback(origin: &str) -> bool {
+    let authority = origin
+        .split("://")
+        .nth(1)
+        .unwrap_or(origin)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    // authority is `host`, `host:port`, `[v6]`, or `[v6]:port`.
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".localhost")
+        || host == "127.0.0.1"
+        || host == "::1"
 }
