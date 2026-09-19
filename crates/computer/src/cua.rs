@@ -269,12 +269,20 @@ impl CuaBackend {
         call_args: &Value,
         first_error: &ComputerError,
     ) -> Option<Result<(Value, String), ComputerError>> {
-        let token = call_args.get("element_token").and_then(Value::as_str)?;
+        let token = call_args
+            .get("element_token")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                let snapshot_id = call_args.get("snapshot_id").and_then(Value::as_str)?;
+                let element_index = call_args.get("element_index").and_then(Value::as_i64)?;
+                Some(format!("{snapshot_id}:{element_index}"))
+            })?;
         let cached = self
             .element_frames
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(token)
+            .get(&token)
             .cloned()?;
         if call_args.get("pid").and_then(Value::as_i64) != Some(cached.pid) {
             return None;
@@ -1229,10 +1237,18 @@ impl CuaBackend {
             }
             Err(error)
                 if Self::is_element_outside_target_window(&error)
-                    && call_args
+                    && (call_args
                         .get("element_token")
                         .and_then(Value::as_str)
                         .is_some()
+                        || (call_args
+                            .get("snapshot_id")
+                            .and_then(Value::as_str)
+                            .is_some()
+                            && call_args
+                                .get("element_index")
+                                .and_then(Value::as_i64)
+                                .is_some()))
                     && matches!(
                         tool,
                         "click" | "double_click" | "right_click" | "set_value" | "type_text"
