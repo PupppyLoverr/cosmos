@@ -80,7 +80,9 @@ pub struct WindowElement {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
     pub enabled: bool,
-    /// Element frame in window-local pixels (`None` for offscreen/virtual).
+    /// Element frame in screen pixels as reported by the driver (`None` for
+    /// offscreen/virtual); frames are window-local only when the driver's
+    /// window root frame is at the origin.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame: Option<ElementFrame>,
     pub depth: u32,

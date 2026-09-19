@@ -868,11 +868,16 @@ async fn element_outside_target_window_falls_back_to_screen_click() {
             "window_id": 688,
             "window_bounds": {"x": 100.0, "y": 200.0, "w": 500.0, "h": 400.0},
             "elements": [{
+                "element_index": 0,
+                "role": "AXWindow",
+                "depth": 0,
+                "frame": {"x": 100.0, "y": 200.0, "w": 500.0, "h": 400.0}
+            }, {
                 "element_index": 90,
                 "element_token": token,
-                "role": "AXButton",
+                "role": "AXMenuItem",
                 "label": "Save",
-                "frame": {"x": 20.0, "y": 30.0, "w": 40.0, "h": 20.0}
+                "frame": {"x": 120.0, "y": 230.0, "w": 40.0, "h": 20.0}
             }]
         }
     });
@@ -919,7 +924,11 @@ async fn element_outside_target_window_falls_back_to_screen_click() {
         })
         .await
         .unwrap();
-    assert!(outcome.summary.contains("out-of-process sheet"));
+    assert!(
+        outcome
+            .summary
+            .contains("menu item lives in the menu-bar window")
+    );
     assert!(outcome.summary.contains("(140,240)"));
     let calls: Vec<Value> = std::fs::read_to_string(data.path().join("calls.jsonl"))
         .unwrap()
@@ -932,6 +941,181 @@ async fn element_outside_target_window_falls_back_to_screen_click() {
     assert_eq!(calls[1]["args"]["x"], json!(140.0));
     assert_eq!(calls[1]["args"]["y"], json!(240.0));
     assert!(calls[1]["args"].get("element_token").is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn element_outside_target_window_local_frame_adds_window_bounds() {
+    let pid = 67439;
+    let token = "s00000114:90";
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 688,
+        "title": "Save",
+        "app_name": "TextEdit",
+        "z_index": 98,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({
+        "688": {
+            "snapshot_id": "s00000114",
+            "pid": pid,
+            "window_id": 688,
+            "window_bounds": {"x": 100.0, "y": 200.0, "w": 500.0, "h": 400.0},
+            "elements": [{
+                "element_index": 0,
+                "role": "AXWindow",
+                "depth": 0,
+                "frame": {"x": 0.0, "y": 0.0, "w": 500.0, "h": 400.0}
+            }, {
+                "element_index": 90,
+                "element_token": token,
+                "role": "AXButton",
+                "label": "Save",
+                "frame": {"x": 20.0, "y": 30.0, "w": 40.0, "h": 20.0}
+            }]
+        }
+    });
+    let actions = json!({
+        "click": [
+            {"error": "click: element_outside_target_window (refused)"},
+            {"result": {"content": [{"type": "text", "text": "clicked"}]}}
+        ]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    backend
+        .observe(&ObserveRequest {
+            scope: ObserveScope::Window {
+                pid,
+                window_id: Some(688),
+            },
+            semantic: true,
+            screenshot: false,
+            max_elements: 100,
+            full_tree: false,
+            max_dimension: 1200,
+            screenshot_dir: screenshots.path().into(),
+        })
+        .await
+        .unwrap();
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_click".into(),
+            args: json!({
+                "pid": pid,
+                "windowId": 688,
+                "elementToken": token,
+                "snapshotId": "s00000114",
+                "elementIndex": 90
+            }),
+            delivery: crate::backend::Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.summary.contains("(140,240)"));
+    let calls: Vec<Value> = std::fs::read_to_string(data.path().join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|call: &Value| call.get("name").and_then(Value::as_str) == Some("click"))
+        .collect();
+    assert_eq!(calls[1]["args"]["x"], json!(140.0));
+    assert_eq!(calls[1]["args"]["y"], json!(240.0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn element_outside_target_window_absolute_frame_without_bounds_falls_back() {
+    let pid = 67439;
+    let token = "s00000115:90";
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 688,
+        "title": "Save",
+        "app_name": "TextEdit",
+        "z_index": 98,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({
+        "688": {
+            "snapshot_id": "s00000115",
+            "pid": pid,
+            "window_id": 688,
+            "elements": [{
+                "element_index": 0,
+                "role": "AXWindow",
+                "depth": 0,
+                "frame": {"x": 100.0, "y": 200.0, "w": 500.0, "h": 400.0}
+            }, {
+                "element_index": 90,
+                "element_token": token,
+                "role": "AXButton",
+                "label": "Save",
+                "frame": {"x": 120.0, "y": 230.0, "w": 40.0, "h": 20.0}
+            }]
+        }
+    });
+    let actions = json!({
+        "click": [
+            {"error": "click: element_outside_target_window (refused)"},
+            {"result": {"content": [{"type": "text", "text": "clicked"}]}}
+        ]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    backend
+        .observe(&ObserveRequest {
+            scope: ObserveScope::Window {
+                pid,
+                window_id: Some(688),
+            },
+            semantic: true,
+            screenshot: false,
+            max_elements: 100,
+            full_tree: false,
+            max_dimension: 1200,
+            screenshot_dir: screenshots.path().into(),
+        })
+        .await
+        .unwrap();
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_click".into(),
+            args: json!({
+                "pid": pid,
+                "windowId": 688,
+                "elementToken": token,
+                "snapshotId": "s00000115",
+                "elementIndex": 90
+            }),
+            delivery: crate::backend::Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.summary.contains("(140,240)"));
+    let calls: Vec<Value> = std::fs::read_to_string(data.path().join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|call: &Value| call.get("name").and_then(Value::as_str) == Some("click"))
+        .collect();
+    assert_eq!(calls[1]["args"]["x"], json!(140.0));
+    assert_eq!(calls[1]["args"]["y"], json!(240.0));
 }
 
 #[cfg(unix)]
@@ -955,11 +1139,16 @@ async fn element_outside_target_window_set_value_falls_back_in_order() {
             "window_id": 688,
             "window_bounds": {"x": 100.0, "y": 200.0, "w": 500.0, "h": 400.0},
             "elements": [{
+                "element_index": 0,
+                "role": "AXWindow",
+                "depth": 0,
+                "frame": {"x": 100.0, "y": 200.0, "w": 500.0, "h": 400.0}
+            }, {
                 "element_index": 90,
                 "element_token": token,
                 "role": "AXTextField",
                 "label": "File name",
-                "frame": {"x": 20.0, "y": 30.0, "w": 40.0, "h": 20.0}
+                "frame": {"x": 120.0, "y": 230.0, "w": 40.0, "h": 20.0}
             }]
         }
     });

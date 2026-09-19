@@ -47,12 +47,14 @@ use crate::{
 /// respawn inside the TTL window with `session_unavailable`.
 const SESSION_LABEL_PREFIX: &str = "cosmos";
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CachedElement {
     pid: i64,
     window_id: i64,
     frame: ElementFrame,
     window_bounds: Option<ElementFrame>,
+    screen_absolute: bool,
+    role: String,
 }
 
 pub struct CuaBackend {
@@ -219,6 +221,21 @@ impl CuaBackend {
     }
 
     fn cache_window_state(&self, state: &WindowState) {
+        let screen_absolute = match state.window_bounds {
+            None => true,
+            Some(bounds) => state
+                .elements
+                .iter()
+                .find(|element| {
+                    element.frame.is_some()
+                        && (element.role.eq_ignore_ascii_case("AXWindow")
+                            || element.role.to_ascii_lowercase().ends_with("window"))
+                })
+                .and_then(|element| element.frame)
+                .is_some_and(|frame| {
+                    (frame.x - bounds.x).abs() <= 1.0 && (frame.y - bounds.y).abs() <= 1.0
+                }),
+        };
         let mut cache = self
             .element_frames
             .lock()
@@ -239,6 +256,8 @@ impl CuaBackend {
                     window_id: state.window_id,
                     frame,
                     window_bounds: state.window_bounds,
+                    screen_absolute,
+                    role: element.role.clone(),
                 },
             );
         }
@@ -256,16 +275,31 @@ impl CuaBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(token)
-            .copied()?;
+            .cloned()?;
         if call_args.get("pid").and_then(Value::as_i64) != Some(cached.pid) {
             return None;
         }
-        let bounds = cached.window_bounds?;
-        let x = bounds.x + cached.frame.x + cached.frame.w / 2.0;
-        let y = bounds.y + cached.frame.y + cached.frame.h / 2.0;
-        let fallback_note = format!(
-            " (element lives in an out-of-process sheet; fell back to a screen-point action at ({x:.0},{y:.0}))"
-        );
+        let (x, y) = if cached.screen_absolute {
+            (
+                cached.frame.x + cached.frame.w / 2.0,
+                cached.frame.y + cached.frame.h / 2.0,
+            )
+        } else {
+            let bounds = cached.window_bounds?;
+            (
+                bounds.x + cached.frame.x + cached.frame.w / 2.0,
+                bounds.y + cached.frame.y + cached.frame.h / 2.0,
+            )
+        };
+        let fallback_note = if cached.role.to_ascii_lowercase().starts_with("axmenu") {
+            format!(
+                " (menu item lives in the menu-bar window; fell back to a screen-point click at ({x:.0},{y:.0}))"
+            )
+        } else {
+            format!(
+                " (element lives in an out-of-process sheet; fell back to a screen-point action at ({x:.0},{y:.0}))"
+            )
+        };
         match tool {
             "click" | "double_click" | "right_click" => {
                 let result = self
