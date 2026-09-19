@@ -183,6 +183,14 @@ impl CuaBackend {
         }
     }
 
+    fn is_ax_unresolved_state(state: &WindowState) -> bool {
+        state.elements.is_empty()
+            && state
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("ax_window_unresolved"))
+    }
+
     /// `verify_state`/`window_state`/`act` retarget for sheet windows: when
     /// `window_id` can't resolve on the CG↔AX map, try the app's other
     /// on-screen windows (topmost first). For pixel actions the window-local
@@ -613,7 +621,7 @@ impl CuaBackend {
         request: &ObserveRequest,
     ) -> Result<Observation, ComputerError> {
         let state = self
-            .window_state_inner(
+            .window_state_retargeted(
                 window,
                 request.semantic,
                 request.screenshot,
@@ -945,6 +953,87 @@ impl CuaBackend {
             observe: None,
         })
     }
+
+    async fn window_state_retargeted(
+        &self,
+        window: &Value,
+        semantic: bool,
+        screenshot: bool,
+        max_elements: u32,
+        max_dimension: u32,
+        screenshot_dir: &Path,
+        query: Option<&str>,
+    ) -> Result<WindowState, ComputerError> {
+        let primary = self
+            .window_state_inner(
+                window,
+                semantic,
+                screenshot,
+                max_elements,
+                max_dimension,
+                screenshot_dir,
+                query,
+            )
+            .await;
+        let unresolved = match &primary {
+            Err(error) => Self::is_ax_window_unresolved(error),
+            Ok(state) => semantic && Self::is_ax_unresolved_state(state),
+        };
+        if !unresolved {
+            return primary;
+        }
+        // Sheets/dialogs own a CG window id but hang off the PARENT window's
+        // AX tree — the driver's CG↔AX map then reports ax_window_unresolved
+        // even though the content is reachable. Retry the app's other
+        // on-screen windows (topmost first): the parent's snapshot exposes the
+        // sheet subtree, and its element tokens resolve against the parent.
+        let pid = window
+            .get("pid")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let siblings = self.list_windows(Some(pid)).await.unwrap_or_default();
+        let mut alternates: Vec<&Value> = siblings
+            .iter()
+            .filter(|w| {
+                w.get("window_id").and_then(Value::as_i64)
+                    != window.get("window_id").and_then(Value::as_i64)
+            })
+            .filter(|w| w.get("minimized").and_then(Value::as_bool) != Some(true))
+            .filter(|w| w.get("is_on_screen").and_then(Value::as_bool) != Some(false))
+            .collect();
+        alternates.sort_by_key(|w| {
+            std::cmp::Reverse(w.get("z_index").and_then(Value::as_i64).unwrap_or(0))
+        });
+        for candidate in alternates {
+            let retry = self
+                .window_state_inner(
+                    candidate,
+                    semantic,
+                    screenshot,
+                    max_elements,
+                    max_dimension,
+                    screenshot_dir,
+                    query,
+                )
+                .await;
+            let Ok(mut state) = retry else { continue };
+            if Self::is_ax_unresolved_state(&state) {
+                continue;
+            }
+            let note = format!(
+                "sheet/dialog window {} unresolved on the CG↔AX map; showing its owning window {} ({}) — sheet elements are inside this tree",
+                window.get("window_id").and_then(Value::as_i64).unwrap_or(0),
+                state.window_id,
+                state.window_title.as_deref().unwrap_or("untitled")
+            );
+            state.note = Some(match state.note {
+                Some(existing) => format!("{existing}; {note}"),
+                None => note,
+            });
+            return Ok(state);
+        }
+        primary
+    }
 }
 
 /// Shared target/addressing args for action tools — `pid`/`window_id`/
@@ -1256,67 +1345,16 @@ impl ComputerBackend for CuaBackend {
         query: Option<&str>,
     ) -> Result<WindowState, ComputerError> {
         let window = self.window_for(pid, window_id).await?;
-        let primary = self
-            .window_state_inner(
-                &window,
-                semantic,
-                screenshot,
-                max_elements,
-                max_dimension,
-                screenshot_dir,
-                query,
-            )
-            .await;
-        // Sheets/dialogs own a CG window id but hang off the PARENT window's
-        // AX tree — the driver's CG↔AX map then reports ax_window_unresolved
-        // even though the content is reachable. Retry the app's other
-        // on-screen windows (topmost first): the parent's snapshot exposes the
-        // sheet subtree, and its element tokens resolve against the parent.
-        let Err(error) = &primary else {
-            return primary;
-        };
-        if !Self::is_ax_window_unresolved(error) {
-            return primary;
-        }
-        let siblings = self.list_windows(Some(pid)).await.unwrap_or_default();
-        let mut alternates: Vec<&Value> = siblings
-            .iter()
-            .filter(|w| {
-                w.get("window_id").and_then(Value::as_i64)
-                    != window.get("window_id").and_then(Value::as_i64)
-            })
-            .filter(|w| w.get("minimized").and_then(Value::as_bool) != Some(true))
-            .filter(|w| w.get("is_on_screen").and_then(Value::as_bool) != Some(false))
-            .collect();
-        alternates.sort_by_key(|w| {
-            std::cmp::Reverse(w.get("z_index").and_then(Value::as_i64).unwrap_or(0))
-        });
-        for candidate in alternates {
-            let retry = self
-                .window_state_inner(
-                    candidate,
-                    semantic,
-                    screenshot,
-                    max_elements,
-                    max_dimension,
-                    screenshot_dir,
-                    query,
-                )
-                .await;
-            let Ok(mut state) = retry else { continue };
-            let note = format!(
-                "sheet/dialog window {} unresolved on the CG↔AX map; showing its owning window {} ({}) — sheet elements are inside this tree",
-                window.get("window_id").and_then(Value::as_i64).unwrap_or(0),
-                state.window_id,
-                state.window_title.as_deref().unwrap_or("untitled")
-            );
-            state.note = Some(match state.note {
-                Some(existing) => format!("{existing}; {note}"),
-                None => note,
-            });
-            return Ok(state);
-        }
-        primary
+        self.window_state_retargeted(
+            &window,
+            semantic,
+            screenshot,
+            max_elements,
+            max_dimension,
+            screenshot_dir,
+            query,
+        )
+        .await
     }
 
     async fn verify(

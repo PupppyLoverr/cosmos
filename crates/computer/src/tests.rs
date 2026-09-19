@@ -6,10 +6,13 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::cua::pid_from_launch_result;
+use crate::backend::{ComputerBackend, ObserveRequest, ObserveScope};
+use crate::cua::{CuaBackend, pid_from_launch_result};
 use crate::mock::MockComputer;
 use crate::service::ComputerService;
-use crate::{ComputerError, ComputerSettings, ControlMode, save_settings};
+use crate::{
+    ComputerError, ComputerPaths, ComputerSettings, ControlMode, InstallState, save_settings,
+};
 
 fn enabled_settings(control: ControlMode) -> ComputerSettings {
     ComputerSettings {
@@ -35,6 +38,233 @@ fn pid_from_launch_result_parses_summary_text() {
         "content": [{"text": "Launched TextEdit (pid 584) in background."}]
     });
     assert_eq!(pid_from_launch_result(&result), Some(584));
+}
+
+#[cfg(unix)]
+async fn scripted_cua_backend(
+    windows: Value,
+    states: Value,
+) -> (CuaBackend, tempfile::TempDir, tempfile::TempDir) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let data = tempfile::tempdir().unwrap();
+    let install_dir = data.path().join("driver");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    let binary = install_dir.join("cua-driver");
+    let windows = serde_json::to_string(&serde_json::to_string(&windows).unwrap()).unwrap();
+    let states = serde_json::to_string(&serde_json::to_string(&states).unwrap()).unwrap();
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+windows = json.loads({windows})
+states = json.loads({states})
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    method = request["method"]
+    if method == "initialize":
+        result = {{"protocolVersion": "2025-06-18", "capabilities": {{}}, "serverInfo": {{"name": "fake-cua", "version": "test"}}}}
+    elif method == "tools/list":
+        result = {{"tools": [{{"name": "start_session"}}, {{"name": "get_config"}}, {{"name": "list_windows"}}, {{"name": "get_window_state"}}]}}
+    elif method == "tools/call":
+        params = request["params"]
+        name = params["name"]
+        args = params.get("arguments", {{}})
+        if name == "start_session":
+            result = {{}}
+        elif name == "get_config":
+            result = {{"content": [{{"type": "text", "text": "{{\"version\":\"test\"}}"}}]}}
+        elif name == "list_windows":
+            result = {{"structuredContent": {{"windows": windows}}}}
+        elif name == "get_window_state":
+            result = {{"structuredContent": states[str(args["window_id"])]}}
+        else:
+            result = {{}}
+    else:
+        result = {{}}
+    print(json.dumps({{"jsonrpc": "2.0", "id": request_id, "result": result}}), flush=True)
+"#,
+    );
+    std::fs::write(&binary, script).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let paths = ComputerPaths::new(data.path());
+    let install = InstallState {
+        version: "test".into(),
+        tag: "test".into(),
+        asset: "test".into(),
+        sha256: "test".into(),
+        install_dir,
+        installed_at: chrono::Utc::now(),
+    };
+    let settings = ComputerSettings {
+        enabled: true,
+        screenshots: false,
+        ..ComputerSettings::default()
+    };
+    let backend = CuaBackend::spawn(&paths, &settings, &install)
+        .await
+        .expect("fake Cua driver should spawn");
+    let screenshots = tempfile::tempdir().unwrap();
+    (backend, data, screenshots)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sheet_window_degraded_ok_retargets_to_owning_window() {
+    let pid = 42;
+    let windows = json!([
+        {
+            "pid": pid,
+            "window_id": 374,
+            "title": "Save",
+            "app_name": "TextEdit",
+            "z_index": 98,
+            "is_on_screen": true,
+            "minimized": false
+        },
+        {
+            "pid": pid,
+            "window_id": 324,
+            "title": "Untitled 2",
+            "app_name": "TextEdit",
+            "z_index": 78,
+            "is_on_screen": true,
+            "minimized": false
+        },
+        {
+            "pid": pid,
+            "window_id": 320,
+            "title": "Untitled",
+            "app_name": "TextEdit",
+            "z_index": 77,
+            "is_on_screen": false,
+            "minimized": false
+        }
+    ]);
+    let states = json!({
+        "374": {
+            "pid": pid,
+            "window_id": 374,
+            "app_name": "TextEdit",
+            "window_title": "Save",
+            "degraded": true,
+            "degraded_reason": "ax_window_unresolved: Save sheet",
+            "elements": []
+        },
+        "320": {
+            "pid": pid,
+            "window_id": 320,
+            "app_name": "TextEdit",
+            "window_title": "Untitled",
+            "degraded": true,
+            "degraded_reason": "ax_window_unresolved: stale window",
+            "elements": []
+        },
+        "324": {
+            "pid": pid,
+            "window_id": 324,
+            "app_name": "TextEdit",
+            "window_title": "Untitled 2",
+            "elements": [
+                {"element_index": 0, "role": "AXSheet", "label": "Save", "depth": 0},
+                {"element_index": 1, "role": "AXButton", "label": "Save", "depth": 1}
+            ]
+        }
+    });
+    let (backend, _data, screenshots) = scripted_cua_backend(windows, states).await;
+    let state = backend
+        .window_state(
+            pid,
+            Some(374),
+            true,
+            false,
+            100,
+            1200,
+            screenshots.path(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.window_id, 324);
+    assert!(!state.elements.is_empty());
+    assert!(
+        state
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("unresolved on the CG↔AX map"))
+    );
+
+    let observation = backend
+        .observe(&ObserveRequest {
+            scope: ObserveScope::Window {
+                pid,
+                window_id: Some(374),
+            },
+            semantic: true,
+            screenshot: false,
+            max_elements: 100,
+            full_tree: false,
+            max_dimension: 1200,
+            screenshot_dir: screenshots.path().into(),
+        })
+        .await
+        .unwrap();
+    let observed_window = observation.window.unwrap();
+    assert_eq!(observed_window.window_id, Some(324));
+    assert!(observation.text.contains("Save"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn degraded_window_without_resolvable_sibling_is_returned_as_is() {
+    let pid = 42;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 374,
+        "title": "Save",
+        "app_name": "TextEdit",
+        "z_index": 98,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({
+        "374": {
+            "pid": pid,
+            "window_id": 374,
+            "app_name": "TextEdit",
+            "window_title": "Save",
+            "degraded": true,
+            "degraded_reason": "ax_window_unresolved: Save sheet",
+            "elements": []
+        }
+    });
+    let (backend, _data, screenshots) = scripted_cua_backend(windows, states).await;
+    let state = backend
+        .window_state(
+            pid,
+            Some(374),
+            true,
+            false,
+            100,
+            1200,
+            screenshots.path(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.window_id, 374);
+    assert!(state.elements.is_empty());
+    assert!(
+        state
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("ax_window_unresolved"))
+    );
 }
 
 /// A service with saved settings and an injected mock backend — exercises
