@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "Cosmos",
+    "slug": "cosmos-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "cosmos",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "sh.zeron.mobile",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Attach photos from the camera to a session.",
+        "NSPhotoLibraryUsageDescription": "Attach photos from your library to a session.",
+        "NSLocalNetworkUsageDescription": "Find Cosmos desktops on this network to connect to them directly."
+      }
+    },
+    "android": {
+      "package": "sh.zeron.mobile",
+      "adaptiveIcon": {
+        "backgroundColor": "#0B0B0C",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-notifications"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
