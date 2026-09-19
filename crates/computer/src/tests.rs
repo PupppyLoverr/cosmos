@@ -667,7 +667,7 @@ async fn sheet_owner_alias_routes_actions_to_owner_window() {
     let windows = json!([
         {
             "pid": pid,
-            "window_id": 613,
+            "window_id": 688,
             "title": "Save",
             "app_name": "TextEdit",
             "z_index": 98,
@@ -676,7 +676,7 @@ async fn sheet_owner_alias_routes_actions_to_owner_window() {
         },
         {
             "pid": pid,
-            "window_id": 587,
+            "window_id": 700,
             "title": "Untitled",
             "app_name": "TextEdit",
             "z_index": 78,
@@ -685,30 +685,40 @@ async fn sheet_owner_alias_routes_actions_to_owner_window() {
         }
     ]);
     let states = json!({
-        "613": {
+        "688": {
             "pid": pid,
-            "window_id": 613,
+            "window_id": 688,
             "app_name": "TextEdit",
             "window_title": "Save",
             "degraded": true,
             "degraded_reason": "ax_window_unresolved: Save sheet",
             "elements": []
         },
-        "587": {
+        "700": {
             "pid": pid,
-            "window_id": 587,
+            "window_id": 700,
             "app_name": "TextEdit",
             "window_title": "Untitled",
+            "window_bounds": {"x": 100.0, "y": 200.0, "w": 500.0, "h": 400.0},
             "elements": [
                 {"element_index": 0, "role": "AXSheet", "label": "Save"},
-                {"element_index": 1, "role": "AXButton", "label": "Save"}
+                {
+                    "element_index": 1,
+                    "element_token": "s000000d6:121",
+                    "role": "AXTextField",
+                    "label": "File name",
+                    "frame": {"x": 20.0, "y": 30.0, "w": 40.0, "h": 20.0}
+                }
             ]
         }
     });
     let actions = json!({
         "set_value": [
-            {"result": {"content": [{"type": "text", "text": "value set"}]}}
-        ]
+            {"error": "set_value: element_outside_target_window (refused)"}
+        ],
+        "click": [{"result": {"content": [{"type": "text", "text": "clicked"}]}}],
+        "press_key": [{"result": {"content": [{"type": "text", "text": "selected"}]}}],
+        "type_text": [{"result": {"content": [{"type": "text", "text": "typed"}]}}]
     });
     let (backend, data, screenshots) =
         scripted_cua_backend_with_actions(windows, states, actions).await;
@@ -716,7 +726,7 @@ async fn sheet_owner_alias_routes_actions_to_owner_window() {
         .observe(&ObserveRequest {
             scope: ObserveScope::Window {
                 pid,
-                window_id: Some(613),
+                window_id: Some(688),
             },
             semantic: true,
             screenshot: false,
@@ -732,7 +742,7 @@ async fn sheet_owner_alias_routes_actions_to_owner_window() {
             tool: "computer_set_value".into(),
             args: json!({
                 "pid": pid,
-                "windowId": 613,
+                "windowId": 688,
                 "elementToken": "s000000d6:121",
                 "snapshotId": "s000000d6",
                 "elementIndex": 121,
@@ -748,7 +758,8 @@ async fn sheet_owner_alias_routes_actions_to_owner_window() {
         })
         .await
         .unwrap();
-    assert!(outcome.summary.contains("is a sheet of window 587"));
+    assert!(outcome.summary.contains("is a sheet of window 700"));
+    assert!(outcome.summary.contains("out-of-process sheet"));
     let calls = std::fs::read_to_string(data.path().join("calls.jsonl")).unwrap();
     let set_values: Vec<Value> = calls
         .lines()
@@ -756,7 +767,14 @@ async fn sheet_owner_alias_routes_actions_to_owner_window() {
         .filter(|call| call.get("name").and_then(Value::as_str) == Some("set_value"))
         .collect();
     assert_eq!(set_values.len(), 1);
-    assert_eq!(set_values[0]["args"]["window_id"], json!(587));
+    assert_eq!(set_values[0]["args"]["window_id"], json!(700));
+    let clicks: Vec<Value> = calls
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|call| call.get("name").and_then(Value::as_str) == Some("click"))
+        .collect();
+    assert_eq!(clicks.len(), 1);
+    assert_eq!(clicks[0]["args"]["scope"], json!("desktop"));
 }
 
 #[cfg(unix)]

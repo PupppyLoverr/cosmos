@@ -257,9 +257,7 @@ impl CuaBackend {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(token)
             .copied()?;
-        if call_args.get("pid").and_then(Value::as_i64) != Some(cached.pid)
-            || call_args.get("window_id").and_then(Value::as_i64) != Some(cached.window_id)
-        {
+        if call_args.get("pid").and_then(Value::as_i64) != Some(cached.pid) {
             return None;
         }
         let bounds = cached.window_bounds?;
