@@ -710,6 +710,19 @@ pub struct StatusCapabilities {
     /// At least one remote device is paired for Computer Use.
     #[serde(default)]
     pub remote_control: bool,
+    /// Linux X11: Cosmos can inject keys/clicks from the window list when
+    /// Cua's AT-SPI stdio child is wedged. Not a shell escape hatch — agents
+    /// still only call `computer_*`.
+    #[serde(default)]
+    pub x11_input_fallback: bool,
+    /// Wayland pixels go through xdg-desktop-portal ScreenCast. X11 captures
+    /// drawables directly (no portal grant).
+    #[serde(default)]
+    pub portal_capture: bool,
+    /// Unique window ids exist and can be pinned. False on Wayland where
+    /// AT-SPI matching is best-effort.
+    #[serde(default)]
+    pub window_targeting: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

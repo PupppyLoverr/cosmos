@@ -52,10 +52,13 @@ Shell is fine for reading/writing files, `ls`, `cat`, compiling — not for clic
 
 ## Linux notes (X11)
 
-- Background delivery uses AT-SPI / XSendEvent — do not raise windows unless Full Control + explicit escalation.
-- Wayland (if `computer_status.session` is `wayland`): background often `background_unavailable`; unique window ids for AT-SPI matching are unreliable. Report that honestly.
-- GTK apps may need accessibility (`GTK_A11Y=1`) to appear in the tree.
-- The Cosmos GPUI window itself may be missing from `list_windows`.
+- `computer_list_windows` and semantic-less `computer_observe` use the X11 client list (milliseconds). Pass `windowId`.
+- `computer_hotkey.keys` MUST be an array (`["ctrl","s"]`, `["escape"]`), never the string `"ctrl+s"`.
+- When AT-SPI / Cua stdio hangs, Cosmos still performs type/hotkey/click/focus/clipboard through its X11 input path. You still only call `computer_*`.
+- Background delivery via AT-SPI is often unavailable; if you get `background_unavailable`, retry once with `deliveryMode: "foreground"` under Full Control.
+- Wayland (if `computer_status.session` is `wayland`): portal capture, no unique window targeting, background often refused. Do not fake Wayland support.
+- GTK apps may need `GTK_A11Y=1` for a real accessibility tree.
+- The Cosmos GPUI window itself is omitted from `list_windows` (AT-SPI walks hang on it).
 
 ## Isolation
 

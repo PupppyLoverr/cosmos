@@ -10,6 +10,7 @@ import {
 } from "react-native";
 import { useApp } from "../../src/state/store";
 import { palette } from "../../src/ui/theme";
+import { androidRipple } from "../../src/ui/press";
 
 export default function ComputerScreen() {
   const app = useApp();
@@ -90,10 +91,11 @@ export default function ComputerScreen() {
         stopLive.current?.();
         stopLive.current = null;
         setLive(false);
+        await host?.computerStop("stopped from Android");
       }
       const result = await host?.computerDecide(decision, `${decision} from Android`);
       setActivity(JSON.stringify(result, null, 2));
-      if (decision === "stop") setActivity("stopped");
+      if (decision === "stop") setActivity("stopped — desktop Computer control halted");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     }
@@ -161,6 +163,7 @@ function Btn({
   return (
     <Pressable
       onPress={onPress}
+      android_ripple={androidRipple(danger ? "#ffffff30" : c.raised)}
       style={{
         borderWidth: 1,
         borderColor: danger ? c.danger : c.border,

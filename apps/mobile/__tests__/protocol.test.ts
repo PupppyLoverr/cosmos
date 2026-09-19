@@ -23,7 +23,7 @@ import {
   RPC_HEADER,
   ControlRpcMux,
 } from "../src/protocol/relay.ts";
-import { randomPairingToken } from "../src/protocol/computer.ts";
+import { randomPairingToken, pairingParams, computerOnline } from "../src/protocol/computer.ts";
 import { deliveryForPush } from "../src/protocol/notices.ts";
 import { parseShareUrl } from "../src/protocol/share.ts";
 import { formatLastSeen, trustLabel } from "../src/protocol/types.ts";
@@ -186,5 +186,32 @@ describe("share + last seen + trust labels", () => {
     assert.equal(trustLabel({ hasToken: true, pending: true, trusted: false }), "pending");
     assert.equal(trustLabel({ hasToken: true, pending: false, trusted: true }), "trusted");
     assert.equal(trustLabel({ hasToken: false, pending: false, trusted: false }), "none");
+  });
+
+  it("pairingParams always names the target machine", () => {
+    const params = pairingParams(
+      {
+        edgeUrl: "https://edge.example",
+        userId: "u",
+        orgId: "o",
+        token: "t",
+        deviceId: "phone-1",
+        deviceName: "Pixel",
+        mode: "dev",
+      },
+      "linux-desktop",
+      "pairing-secret",
+      { scope: "frontmost" },
+    );
+    assert.equal(params.targetDeviceId, "linux-desktop");
+    assert.equal(params.callerDeviceId, "phone-1");
+    assert.equal(params.pairingToken, "pairing-secret");
+    assert.equal(params.scope, "frontmost");
+  });
+
+  it("computerOnline only when the desktop reports ready", () => {
+    assert.equal(computerOnline(null), false);
+    assert.equal(computerOnline({ state: "missing", platform: "linux" }), false);
+    assert.equal(computerOnline({ state: "ready", platform: "linux" }), true);
   });
 });

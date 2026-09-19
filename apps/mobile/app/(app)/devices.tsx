@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View, useColorScheme } from "react-native";
 import { useApp } from "../../src/state/store";
 import { palette } from "../../src/ui/theme";
+import { androidRipple } from "../../src/ui/press";
 import {
   computerCapable,
   deviceOnline,
@@ -67,6 +68,7 @@ export default function DevicesScreen() {
           <Pressable
             key={d.id}
             onPress={() => app.selectHost(d.id)}
+            android_ripple={androidRipple(c.raised)}
             style={[
               styles.card,
               {
@@ -92,6 +94,7 @@ export default function DevicesScreen() {
             <View style={styles.actions}>
               <Pressable
                 onPress={() => app.requestPairing()}
+                android_ripple={androidRipple(c.raised)}
                 style={[styles.btn, { borderColor: c.border }]}
               >
                 <Text style={{ color: c.text }}>Request trust</Text>

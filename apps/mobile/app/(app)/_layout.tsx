@@ -1,5 +1,5 @@
 import { Tabs } from "expo-router";
-import { useColorScheme } from "react-native";
+import { Platform, useColorScheme } from "react-native";
 import { palette } from "../../src/ui/theme";
 
 export default function AppTabs() {
@@ -11,9 +11,12 @@ export default function AppTabs() {
         tabBarStyle: {
           backgroundColor: c.surface,
           borderTopColor: c.border,
+          elevation: Platform.OS === "android" ? 8 : 0,
         },
         tabBarActiveTintColor: c.accent,
         tabBarInactiveTintColor: c.faint,
+        tabBarLabelStyle: { fontWeight: "600", fontSize: 12 },
+        animation: Platform.OS === "android" ? "shift" : "fade",
       }}
     >
       <Tabs.Screen name="index" options={{ title: "Sessions" }} />

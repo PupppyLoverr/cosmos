@@ -27,6 +27,9 @@ pub const OBSERVE_TIMEOUT: Duration = Duration::from_secs(8);
 /// Inventory (`list_windows` / `list_apps`) must not sit behind a 60s AT-SPI
 /// hang — Linux X11 fallback kicks in after this.
 pub const INSPECT_TIMEOUT: Duration = Duration::from_secs(12);
+/// Click/type/hotkey should fail fast so Linux X11 input can take over
+/// instead of parking the stdio child for a full minute.
+pub const ACTION_TIMEOUT: Duration = Duration::from_secs(8);
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 /// A single tools/call payload or response can carry a screenshot or a large
 /// UIA tree — bound it well above the 256KB HTTP bridge cap but below

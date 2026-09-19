@@ -17,6 +17,7 @@ import * as FileSystem from "expo-file-system";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useApp } from "../../src/state/store";
 import { palette, indicatorColor } from "../../src/ui/theme";
+import { androidRipple } from "../../src/ui/press";
 import { bytesFromBase64 } from "../../src/protocol/upload";
 import type { StagedAttachment, TranscriptItem } from "../../src/protocol/types";
 import { sessionIndicator } from "../../src/protocol/types";
@@ -166,7 +167,11 @@ export default function SessionScreen() {
         </Text>
       ) : null}
       <View style={[styles.composer, { borderTopColor: c.border, backgroundColor: c.surface }]}>
-        <Pressable onPress={attachPhoto} style={styles.iconBtn}>
+        <Pressable
+          onPress={attachPhoto}
+          android_ripple={androidRipple(c.raised)}
+          style={styles.iconBtn}
+        >
           <Text style={{ color: c.muted }}>+</Text>
         </Pressable>
         <TextInput
@@ -178,13 +183,18 @@ export default function SessionScreen() {
           style={[styles.field, { color: c.text }]}
         />
         {session?.status === "working" ? (
-          <Pressable onPress={stop} style={[styles.send, { backgroundColor: c.danger }]}>
+          <Pressable
+            onPress={stop}
+            android_ripple={androidRipple("#ffffff40")}
+            style={[styles.send, { backgroundColor: c.danger }]}
+          >
             <Text style={{ color: "white", fontWeight: "700" }}>Stop</Text>
           </Pressable>
         ) : (
           <Pressable
             onPress={send}
             disabled={busy}
+            android_ripple={androidRipple("#ffffff40")}
             style={[styles.send, { backgroundColor: c.accent, opacity: busy ? 0.6 : 1 }]}
           >
             <Text style={{ color: "white", fontWeight: "700" }}>{busy ? "…" : "Send"}</Text>
@@ -192,14 +202,17 @@ export default function SessionScreen() {
         )}
       </View>
       <View style={styles.attachRow}>
-        <Pressable onPress={attachFile}>
-          <Text style={{ color: c.accent }}>File</Text>
-        </Pressable>
-        <Pressable onPress={attachClipboard}>
-          <Text style={{ color: c.accent }}>Clipboard</Text>
-        </Pressable>
-        <Pressable onPress={attachCamera}>
+        <Pressable onPress={attachCamera} android_ripple={androidRipple(c.raised)}>
           <Text style={{ color: c.accent }}>Camera</Text>
+        </Pressable>
+        <Pressable onPress={attachPhoto} android_ripple={androidRipple(c.raised)}>
+          <Text style={{ color: c.accent }}>Photos</Text>
+        </Pressable>
+        <Pressable onPress={attachFile} android_ripple={androidRipple(c.raised)}>
+          <Text style={{ color: c.accent }}>Files</Text>
+        </Pressable>
+        <Pressable onPress={attachClipboard} android_ripple={androidRipple(c.raised)}>
+          <Text style={{ color: c.accent }}>Clipboard</Text>
         </Pressable>
       </View>
     </KeyboardAvoidingView>

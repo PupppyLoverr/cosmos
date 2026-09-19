@@ -5,6 +5,7 @@ import { useRouter } from "expo-router";
 import { useApp } from "../../src/state/store";
 import { palette, indicatorColor } from "../../src/ui/theme";
 import { sessionIndicator } from "../../src/protocol/types";
+import { androidFabElevation, androidRipple } from "../../src/ui/press";
 
 export default function SessionsScreen() {
   const app = useApp();
@@ -56,6 +57,7 @@ export default function SessionsScreen() {
           return (
             <Pressable
               onPress={() => router.push(`/session/${item.chatId}`)}
+              android_ripple={androidRipple(c.raised)}
               style={[styles.row, { borderBottomColor: c.border }]}
             >
               <View style={[styles.dot, { backgroundColor: indicatorColor[ind] ?? c.idle }]} />
@@ -73,7 +75,8 @@ export default function SessionsScreen() {
       />
       <Pressable
         onPress={() => router.push("/(app)/new")}
-        style={[styles.fab, { backgroundColor: c.accent }]}
+        android_ripple={androidRipple("#ffffff40", true)}
+        style={[styles.fab, { backgroundColor: c.accent, elevation: androidFabElevation }]}
       >
         <Text style={styles.fabText}>New</Text>
       </Pressable>

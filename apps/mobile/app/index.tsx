@@ -85,7 +85,7 @@ export default function SignInScreen() {
   return (
     <KeyboardAvoidingView
       style={[styles.wrap, { backgroundColor: c.bg }]}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
       <View style={styles.hero}>
         <View style={[styles.mark, { backgroundColor: c.accent }]} />

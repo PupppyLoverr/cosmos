@@ -90,6 +90,10 @@ export interface ComputerStatus {
     foreground?: boolean;
     liveWatch?: boolean;
     remoteControl?: boolean;
+    waylandBackgroundLimited?: boolean;
+    x11InputFallback?: boolean;
+    portalCapture?: boolean;
+    windowTargeting?: boolean;
   };
   pendingTrust?: TrustPublic[];
   trustedDevices?: TrustPublic[];

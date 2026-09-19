@@ -408,6 +408,15 @@ impl CuaBackend {
                          app={app} title={title} pid={pid} windowId={window_id}\n\
                          Semantic AT-SPI tree unavailable this pass — re-observe or use computer_list_windows."
                     );
+                    let screenshot = if screenshot {
+                        let dest = screenshot_dir
+                            .join(format!("computer-x11-{}.png", uuid::Uuid::new_v4()));
+                        crate::linux_x11::capture_window(Some(window_id), &dest)
+                            .await
+                            .ok()
+                    } else {
+                        None
+                    };
                     return Ok(WindowState {
                         snapshot_id: "x11-fallback".into(),
                         pid,
@@ -420,7 +429,7 @@ impl CuaBackend {
                         returned_element_count: 0,
                         total_element_count: 0,
                         note: Some(text),
-                        screenshot: None,
+                        screenshot,
                     });
                 }
                 return Err(error);
@@ -794,7 +803,19 @@ impl CuaBackend {
                 call_args["window_id"] = json!(id);
             }
         }
-        let result = self.call(tool, call_args).await?;
+        let result = match self
+            .call_with_timeout(tool, call_args, crate::mcp_client::ACTION_TIMEOUT)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                #[cfg(target_os = "linux")]
+                if let Some(outcome) = crate::linux_x11::try_act(request).await {
+                    return Ok(outcome);
+                }
+                return Err(error);
+            }
+        };
         let details = result.get("structuredContent").cloned();
         let mut summary = result_text(&result).unwrap_or_else(|| format!("{tool} completed"));
         // Surface the driver's effect report inline — a successful tool call
@@ -1190,6 +1211,10 @@ impl ComputerBackend for CuaBackend {
     }
 
     async fn act(&self, request: &ActionRequest) -> Result<ActionOutcome, ComputerError> {
+        #[cfg(target_os = "linux")]
+        if let Some(outcome) = crate::linux_x11::try_act(request).await {
+            return Ok(outcome);
+        }
         self.act_inner(request).await
     }
 
@@ -1204,7 +1229,7 @@ impl ComputerBackend for CuaBackend {
             platform: crate::platform_label(),
             semantic: true,
             screenshots: true,
-            background_control: true,
+            background_control: crate::linux_session_label() != Some("wayland"),
             foreground_control: true,
         }
     }

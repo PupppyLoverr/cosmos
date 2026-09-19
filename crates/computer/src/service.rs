@@ -456,11 +456,15 @@ impl ComputerService {
             capabilities: StatusCapabilities {
                 semantic: settings.semantic,
                 screenshots: settings.screenshots,
-                background: settings.control.acts(),
+                background: settings.control.acts()
+                    && linux_session_label() != Some("wayland"),
                 foreground: settings.control == ControlMode::FullControl,
                 wayland_background_limited: linux_session_label() == Some("wayland"),
                 live_watch: settings.screenshots,
                 remote_control,
+                x11_input_fallback: linux_session_label() == Some("x11"),
+                portal_capture: linux_session_label() == Some("wayland"),
+                window_targeting: linux_session_label() != Some("wayland"),
             },
             permissions: self.permission_hints(),
             last_error,
@@ -528,7 +532,10 @@ impl ComputerService {
             )
         } else if cfg!(target_os = "linux") {
             Some(
-                "X11: window capture and AT-SPI semantic text are Ready when the registry is running. Background delivery is generally available; a minimized or obscured window may still refuse."
+                "X11: native drawable capture (no portal). Unique window ids exist for targeting. \
+                 AT-SPI trees often hang on GTK/Qt — Cosmos then observes from the X11 client list \
+                 and injects keys/clicks after focusing the target. Raw keyboard is not background-safe; \
+                 use deliveryMode foreground when a background action is refused."
                     .into(),
             )
         } else {

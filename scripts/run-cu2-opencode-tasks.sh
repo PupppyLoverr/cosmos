@@ -135,7 +135,15 @@ os.environ['COSMOS_COMPUTER_MCP']=Path('/tmp/cosmos-cu2-mcp.url').read_text().st
 m=SourceFileLoader('c','/workspace/scripts/cosmos-computer-mcp.py').load_module()
 c=m.CosmosComputer(session='mover')
 try:
-    c.call('computer_set_window_frame', {'pid': 30271, 'x': 80, 'y': 80, 'width': 900, 'height': 600, 'deliveryMode': 'foreground'})
+    raw=c.call('computer_list_windows', {})
+    data=json.loads(raw) if raw.strip().startswith('{') else {}
+    pad=next((w for w in data.get('windows') or [] if w.get('app_name')=='Mousepad'), None)
+    if pad:
+        wid=pad.get('windowId') or pad.get('window_id')
+        c.call('computer_set_window_frame', {
+            'pid': pad['pid'], 'windowId': wid, 'window_id': wid,
+            'x': 80, 'y': 80, 'width': 900, 'height': 600, 'deliveryMode': 'foreground'
+        })
 finally:
     c.close()
 PY

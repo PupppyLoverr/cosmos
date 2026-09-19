@@ -14,10 +14,12 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use crate::ComputerError;
+use crate::backend::{ActionOutcome, ActionRequest};
+use crate::{ComputerError, StagedScreenshot};
 
 const WMCTRL_TIMEOUT: Duration = Duration::from_secs(4);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(8);
+const INPUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Parse `wmctrl -lpG` stdout into Cua-shaped window records.
 ///
@@ -223,7 +225,7 @@ pub fn observation_from_record(record: &Value) -> crate::Observation {
         .and_then(Value::as_i64);
     let text = format!(
         "X11 window app={app} title={title} pid={pid:?} windowId={window_id:?}\n\
-         Semantic AT-SPI tree skipped (GTK/Qt inspect hangs this session). Re-observe with includeScreenshot if you need pixels."
+         Semantic AT-SPI tree skipped (GTK/Qt inspect hangs this session). Keyboard/click tools use the X11 input path when Cua is wedged."
     );
     crate::Observation {
         scope: "window".into(),
@@ -239,6 +241,290 @@ pub fn observation_from_record(record: &Value) -> crate::Observation {
         screenshot: None,
         modality: "semantic".into(),
     }
+}
+
+async fn run_cmd(program: &str, args: &[&str]) -> Result<String, ComputerError> {
+    let child = Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| ComputerError::Unavailable(format!("{program}: {e}")))?;
+    let output = tokio::time::timeout(INPUT_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| ComputerError::Unavailable(format!("{program} timed out")))?
+        .map_err(|e| ComputerError::Unavailable(format!("{program}: {e}")))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(ComputerError::Unavailable(format!(
+            "{program} failed: {err}"
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn hex_window(id: i64) -> String {
+    format!("0x{id:x}")
+}
+
+/// Map Cosmos `computer_hotkey` tokens to xdotool key names.
+pub fn xdotool_key(token: &str) -> String {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "ctrl" | "control" | "ctl" => "ctrl".into(),
+        "alt" | "option" => "alt".into(),
+        "shift" => "shift".into(),
+        "super" | "meta" | "win" | "cmd" => "super".into(),
+        "escape" | "esc" => "Escape".into(),
+        "enter" | "return" => "Return".into(),
+        "tab" => "Tab".into(),
+        "space" => "space".into(),
+        "backspace" => "BackSpace".into(),
+        "delete" | "del" => "Delete".into(),
+        "home" => "Home".into(),
+        "end" => "End".into(),
+        "pageup" | "page_up" => "Page_Up".into(),
+        "pagedown" | "page_down" => "Page_Down".into(),
+        "up" => "Up".into(),
+        "down" => "Down".into(),
+        "left" => "Left".into(),
+        "right" => "Right".into(),
+        "f1" => "F1".into(),
+        "f2" => "F2".into(),
+        "f3" => "F3".into(),
+        "f4" => "F4".into(),
+        "f5" => "F5".into(),
+        "f6" => "F6".into(),
+        "f7" => "F7".into(),
+        "f8" => "F8".into(),
+        "f9" => "F9".into(),
+        "f10" => "F10".into(),
+        "f11" => "F11".into(),
+        "f12" => "F12".into(),
+        other if other.len() == 1 => other.to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn hotkey_chord(keys: &[String]) -> String {
+    keys.iter().map(|k| xdotool_key(k)).collect::<Vec<_>>().join("+")
+}
+
+async fn activate(window_id: i64) -> Result<(), ComputerError> {
+    let hex = hex_window(window_id);
+    let _ = run_cmd("wmctrl", &["-i", "-a", &hex]).await;
+    Ok(())
+}
+
+async fn window_id_from_args(args: &Value) -> Option<i64> {
+    if let Some(id) = args.get("windowId").and_then(Value::as_i64) {
+        return Some(id);
+    }
+    let pid = args.get("pid").and_then(Value::as_i64)?;
+    window_record(pid, None)
+        .await
+        .ok()?
+        .get("windowId")
+        .and_then(Value::as_i64)
+}
+
+/// Capture one X11 window (or the root) to `dest` with ImageMagick `import`.
+pub async fn capture_window(
+    window_id: Option<i64>,
+    dest: &Path,
+) -> Result<StagedScreenshot, ComputerError> {
+    let dest_s = dest.to_string_lossy().into_owned();
+    if let Some(id) = window_id {
+        let hex = hex_window(id);
+        run_cmd("import", &["-window", &hex, &dest_s]).await?;
+    } else {
+        run_cmd("import", &["-window", "root", &dest_s]).await?;
+    }
+    let meta = tokio::fs::metadata(dest)
+        .await
+        .map_err(|e| ComputerError::Unavailable(format!("screenshot: {e}")))?;
+    Ok(StagedScreenshot {
+        path: dest.to_path_buf(),
+        width: None,
+        height: None,
+        bytes: meta.len(),
+    })
+}
+
+/// True when this tool can run on X11 without an accessibility token.
+pub fn can_handle(tool: &str, args: &Value) -> bool {
+    match tool {
+        "computer_type_text" => args.get("text").and_then(Value::as_str).is_some(),
+        "computer_hotkey" => args.get("keys").and_then(Value::as_array).is_some(),
+        "computer_press_key" => args.get("key").and_then(Value::as_str).is_some(),
+        "computer_set_window_frame"
+        | "computer_focus_app"
+        | "computer_clipboard_read"
+        | "computer_clipboard_write"
+        | "computer_scroll" => true,
+        "computer_click" | "computer_double_click" | "computer_right_click" => {
+            args.get("elementToken").is_none() && args.get("elementIndex").is_none()
+        }
+        _ => false,
+    }
+}
+
+/// Fast Linux input path. Agents still only call Cosmos `computer_*` tools.
+pub async fn try_act(request: &ActionRequest) -> Option<ActionOutcome> {
+    if !can_handle(&request.tool, &request.args) {
+        return None;
+    }
+    match act(request).await {
+        Ok(outcome) => Some(outcome),
+        Err(_) => None,
+    }
+}
+
+async fn act(request: &ActionRequest) -> Result<ActionOutcome, ComputerError> {
+    let args = &request.args;
+    let window_id = window_id_from_args(args).await;
+    if let Some(id) = window_id {
+        activate(id).await?;
+    }
+    let summary = match request.tool.as_str() {
+        "computer_type_text" => {
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ComputerError::InvalidArgs("text required".into()))?;
+            run_cmd(
+                "xdotool",
+                &["type", "--clearmodifiers", "--delay", "8", "--", text],
+            )
+            .await?;
+            format!("typed {} chars via X11", text.chars().count())
+        }
+        "computer_hotkey" => {
+            let keys = args
+                .get("keys")
+                .and_then(Value::as_array)
+                .ok_or_else(|| ComputerError::InvalidArgs("keys array required".into()))?;
+            let tokens: Vec<String> = keys
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            let chord = hotkey_chord(&tokens);
+            run_cmd("xdotool", &["key", "--clearmodifiers", &chord]).await?;
+            format!("hotkey {chord} via X11")
+        }
+        "computer_press_key" => {
+            let key = args
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ComputerError::InvalidArgs("key required".into()))?;
+            let mapped = xdotool_key(key);
+            run_cmd("xdotool", &["key", "--clearmodifiers", &mapped]).await?;
+            format!("press {mapped} via X11")
+        }
+        "computer_focus_app" => {
+            let id = window_id.ok_or_else(|| {
+                ComputerError::InvalidArgs("focus needs pid or windowId".into())
+            })?;
+            format!("focused window {} via wmctrl", hex_window(id))
+        }
+        "computer_set_window_frame" => {
+            let id = window_id.ok_or_else(|| {
+                ComputerError::InvalidArgs("set_window_frame needs pid or windowId".into())
+            })?;
+            let x = args.get("x").and_then(Value::as_i64).unwrap_or(0);
+            let y = args.get("y").and_then(Value::as_i64).unwrap_or(0);
+            let w = args.get("width").and_then(Value::as_i64).unwrap_or(800);
+            let h = args.get("height").and_then(Value::as_i64).unwrap_or(600);
+            let spec = format!("0,{x},{y},{w},{h}");
+            let hex = hex_window(id);
+            run_cmd("wmctrl", &["-i", "-r", &hex, "-e", &spec]).await?;
+            format!("moved window {hex} to {spec}")
+        }
+        "computer_click" | "computer_double_click" | "computer_right_click" => {
+            let button = match request.tool.as_str() {
+                "computer_right_click" => "3",
+                _ => "1",
+            };
+            let count = if request.tool == "computer_double_click" {
+                2
+            } else {
+                1
+            };
+            let mut argv: Vec<String> = Vec::new();
+            if let (Some(x), Some(y)) = (
+                args.get("x").and_then(Value::as_f64),
+                args.get("y").and_then(Value::as_f64),
+            ) {
+                argv.extend([
+                    "mousemove".into(),
+                    "--".into(),
+                    format!("{}", x as i64),
+                    format!("{}", y as i64),
+                ]);
+            }
+            argv.extend([
+                "click".into(),
+                "--repeat".into(),
+                count.to_string(),
+                button.into(),
+            ]);
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            run_cmd("xdotool", &refs).await?;
+            format!("click button={button} count={count} via X11")
+        }
+        "computer_scroll" => {
+            let dir = args
+                .get("direction")
+                .and_then(Value::as_str)
+                .unwrap_or("down");
+            let button = match dir {
+                "up" => "4",
+                "left" => "6",
+                "right" => "7",
+                _ => "5",
+            };
+            let amount = args.get("amount").and_then(Value::as_i64).unwrap_or(3).max(1);
+            for _ in 0..amount.min(20) {
+                run_cmd("xdotool", &["click", button]).await?;
+            }
+            format!("scroll {dir} x{amount} via X11")
+        }
+        "computer_clipboard_write" => {
+            let text = args.get("text").and_then(Value::as_str).unwrap_or("");
+            let mut child = Command::new("xclip")
+                .args(["-selection", "clipboard"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| ComputerError::Unavailable(format!("xclip: {e}")))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(text.as_bytes()).await;
+            }
+            let _ = tokio::time::timeout(INPUT_TIMEOUT, child.wait()).await;
+            format!("clipboard wrote {} bytes", text.len())
+        }
+        "computer_clipboard_read" => {
+            let text = run_cmd("xclip", &["-selection", "clipboard", "-o"]).await?;
+            return Ok(ActionOutcome {
+                summary: format!("clipboard {} chars", text.chars().count()),
+                details: Some(json!({ "text": text, "source": "x11-xclip" })),
+                observe: None,
+            });
+        }
+        other => {
+            return Err(ComputerError::Unavailable(format!(
+                "x11 cannot handle {other}"
+            )));
+        }
+    };
+    Ok(ActionOutcome {
+        summary,
+        details: Some(json!({ "source": "x11-input", "windowId": window_id })),
+        observe: None,
+    })
 }
 
 #[cfg(test)]
@@ -284,5 +570,25 @@ mod tests {
             .unwrap();
         assert_eq!(mousepad["title"].as_str(), Some("/tmp/a.txt - Mousepad"));
         assert_eq!(mousepad["windowId"], 0x0240_0003_i64);
+    }
+
+    #[test]
+    fn hotkey_chord_is_an_array_not_a_plus_string() {
+        assert_eq!(xdotool_key("ctrl"), "ctrl");
+        assert_eq!(xdotool_key("s"), "s");
+        assert_eq!(xdotool_key("Escape"), "Escape");
+        assert_eq!(xdotool_key("f4"), "F4");
+        assert_eq!(hotkey_chord(&["ctrl".into(), "s".into()]), "ctrl+s");
+        assert_eq!(hotkey_chord(&["escape".into()]), "Escape");
+        assert_eq!(hotkey_chord(&["alt".into(), "F4".into()]), "alt+F4");
+        assert!(can_handle(
+            "computer_hotkey",
+            &json!({"keys": ["ctrl", "s"]})
+        ));
+        assert!(!can_handle(
+            "computer_click",
+            &json!({"elementToken": "s1:2"})
+        ));
+        assert!(can_handle("computer_click", &json!({"x": 10, "y": 10})));
     }
 }
