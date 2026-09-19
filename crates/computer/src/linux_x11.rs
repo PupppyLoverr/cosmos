@@ -206,6 +206,41 @@ pub async fn window_record(pid: i64, window_id: Option<i64>) -> Result<Value, Co
     found.ok_or_else(|| ComputerError::Unavailable(format!("no X11 window for pid {pid}")))
 }
 
+/// Compact observation from a wmctrl window record — no AT-SPI wait.
+pub fn observation_from_record(record: &Value) -> crate::Observation {
+    let title = record
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("window");
+    let app = record
+        .get("app_name")
+        .and_then(Value::as_str)
+        .unwrap_or("app");
+    let pid = record.get("pid").and_then(Value::as_i64);
+    let window_id = record
+        .get("windowId")
+        .or_else(|| record.get("window_id"))
+        .and_then(Value::as_i64);
+    let text = format!(
+        "X11 window app={app} title={title} pid={pid:?} windowId={window_id:?}\n\
+         Semantic AT-SPI tree skipped (GTK/Qt inspect hangs this session). Re-observe with includeScreenshot if you need pixels."
+    );
+    crate::Observation {
+        scope: "window".into(),
+        window: Some(crate::ObservedWindow {
+            app_name: Some(app.into()),
+            window_title: Some(title.into()),
+            bundle_id: None,
+            pid,
+            window_id,
+        }),
+        text,
+        truncated: false,
+        screenshot: None,
+        modality: "semantic".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

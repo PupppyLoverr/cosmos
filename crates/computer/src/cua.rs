@@ -509,6 +509,10 @@ impl CuaBackend {
         window: &Value,
         request: &ObserveRequest,
     ) -> Result<Observation, ComputerError> {
+        #[cfg(target_os = "linux")]
+        if request.semantic && !request.screenshot && !request.full_tree {
+            return Ok(crate::linux_x11::observation_from_record(window));
+        }
         let state = self
             .window_state_inner(
                 window,

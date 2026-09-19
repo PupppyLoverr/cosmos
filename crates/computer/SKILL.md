@@ -18,7 +18,7 @@ Call these MCP tools (prefix may be `cosmos-computer_` / `computer_*`):
 - `computer_pin_window` once you pick a target (required when other agents may run)
 - `computer_observe` / `computer_find` (semantic first; `includeScreenshot` only when needed; pass `maxElements` ≤ 400 and `windowId` from `list_windows`. If you get an X11 fallback observe, continue with pin + hotkey — do not wait on a hung AT-SPI tree.)
 - `computer_click` / `computer_double_click` / `computer_right_click`
-- `computer_type_text` / `computer_set_value` / `computer_press_key` / `computer_hotkey`
+- `computer_type_text` / `computer_set_value` / `computer_press_key` / `computer_hotkey` (`keys` MUST be an array e.g. `["ctrl","s"]` or `["escape"]`, never the string `"ctrl+s"`)
 - `computer_scroll` / `computer_scroll_until`
 - `computer_invoke_menu`
 - `computer_wait` / `computer_verify`

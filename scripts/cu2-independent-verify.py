@@ -82,14 +82,11 @@ def task3() -> bool:
         wid = pad.get("windowId") or pad.get("window_id")
         cc.call("computer_pin_window", {"pid": pad["pid"], "windowId": wid})
         observe(cc, pad)
-        for keys, extra in (
-            ("ctrl+end", {}),
-            ("ctrl+s", {}),
-        ):
+        for keys in (["ctrl", "end"], ["ctrl", "s"]):
             try:
                 cc.call(
                     "computer_hotkey",
-                    {"keys": keys, "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground", **extra},
+                    {"keys": keys, "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
                 )
             except Exception as e:
                 log(f"hotkey {keys}: {e}")
@@ -103,7 +100,7 @@ def task3() -> bool:
         try:
             cc.call(
                 "computer_hotkey",
-                {"keys": "ctrl+s", "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
+                {"keys": ["ctrl", "s"], "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
             )
         except Exception as e:
             log(f"save: {e}")
@@ -130,7 +127,7 @@ def task4() -> bool:
         try:
             cc.call(
                 "computer_hotkey",
-                {"keys": "ctrl+o", "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
+                {"keys": ["ctrl", "o"], "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
             )
         except Exception as e:
             log(f"ctrl+o: {e}")
@@ -145,7 +142,7 @@ def task4() -> bool:
             cc.call(
                 "computer_hotkey",
                 {
-                    "keys": "Escape",
+                    "keys": ["escape"],
                     "pid": target["pid"],
                     "windowId": target.get("windowId") or target.get("window_id"),
                     "deliveryMode": "foreground",
@@ -198,14 +195,20 @@ def task5() -> bool:
         except Exception as e:
             log(f"move: {e}")
         second = observe(cc, pad)
-        cc.call(
-            "computer_type_text",
-            {"text": "\nCOSMOS_CU2_TASK5\n", "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
-        )
-        cc.call(
-            "computer_hotkey",
-            {"keys": "ctrl+s", "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
-        )
+        try:
+            cc.call(
+                "computer_type_text",
+                {"text": "\nCOSMOS_CU2_TASK5\n", "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
+            )
+        except Exception as e:
+            log(f"type5: {e}")
+        try:
+            cc.call(
+                "computer_hotkey",
+                {"keys": ["ctrl", "s"], "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
+            )
+        except Exception as e:
+            log(f"save5: {e}")
         time.sleep(1)
         body = Path("/tmp/cosmos-cu2/task1/report-final.txt").read_text() if Path("/tmp/cosmos-cu2/task1/report-final.txt").exists() else ""
         recovered = "Mousepad" in second or "x11-fallback" in second or "Color" in second or len(second) > 20

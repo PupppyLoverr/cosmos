@@ -23,7 +23,7 @@ use crate::ComputerError;
 pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// `get_window_state` AT-SPI walks on GTK/Qt can hang the Cua stdio child
 /// for the full 60s. Cap observe so OpenCode can re-target instead of wedging.
-pub const OBSERVE_TIMEOUT: Duration = Duration::from_secs(18);
+pub const OBSERVE_TIMEOUT: Duration = Duration::from_secs(8);
 /// Inventory (`list_windows` / `list_apps`) must not sit behind a 60s AT-SPI
 /// hang — Linux X11 fallback kicks in after this.
 pub const INSPECT_TIMEOUT: Duration = Duration::from_secs(12);
