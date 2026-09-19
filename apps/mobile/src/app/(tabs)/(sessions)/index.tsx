@@ -177,7 +177,7 @@ export default function SessionsScreen() {
               onLongPress={() => chatActions(client, chat)}
               style={({ pressed }) => [styles.chatRow, pressed && { backgroundColor: t.surface }]}
             >
-              <HarnessMark harness={chat.config?.harness} size={40} status={ind} />
+              <HarnessMark key={`${chat.id}:${chat.config?.harness ?? 'cosmos'}`} harness={chat.config?.harness} size={40} status={ind} />
               <View style={styles.chatBody}>
                 <View style={styles.chatTop}>
                   <Text style={[type.callout, styles.chatTitle, { color: t.text }]} numberOfLines={1}>{title}</Text>
