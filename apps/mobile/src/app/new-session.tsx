@@ -1,12 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, Alert, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
-import { router } from 'expo-router';
+import { Alert, ScrollView, StyleSheet, TextInput, View } from 'react-native';
+import { router, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { useCosmos, useSnapshot } from '../lib/client';
 import { HarnessId, ReasoningLevel, SandboxLevel } from '../lib/protocol';
 import { useTheme, spacing, radii } from '../lib/theme';
-import { Row, Group, SectionLabel } from '../components/bits';
-import { Pressable } from 'react-native';
+import { Row, Group, SectionLabel, Button } from '../components/bits';
 
 const REASONING: { id: ReasoningLevel; label: string }[] = [
   { id: 'low', label: 'Low' },
@@ -22,6 +21,7 @@ const SANDBOX: { id: SandboxLevel; label: string }[] = [
 
 export default function NewSessionScreen() {
   const t = useTheme();
+  const seed = useLocalSearchParams<{ prompt?: string }>().prompt;
   const client = useCosmos();
   const spaces = useSnapshot(client.spaces);
   const connection = useSnapshot(client.connection);
@@ -32,7 +32,7 @@ export default function NewSessionScreen() {
   const [reasoning, setReasoning] = useState<ReasoningLevel>('medium');
   const [sandbox, setSandbox] = useState<SandboxLevel>('workspace-write');
   const [spaceId, setSpaceId] = useState<string | null>(null);
-  const [prompt, setPrompt] = useState('');
+  const [prompt, setPrompt] = useState(seed ?? '');
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -93,9 +93,10 @@ export default function NewSessionScreen() {
   return (
     <View style={[styles.screen, { backgroundColor: t.background }]}>
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: spacing(4), paddingBottom: spacing(12) }}>
-        <View style={[styles.promptBox, { backgroundColor: t.surface, borderColor: t.separator }]}>
+        <View style={[styles.promptBox, { backgroundColor: t.surface }]}>
           <TextInput
-            style={{ color: t.text, fontSize: 16, minHeight: 80, textAlignVertical: 'top' }}
+            style={{ color: t.text, fontSize: 17, lineHeight: 23, minHeight: 96, textAlignVertical: 'top' }}
+            autoFocus={!seed}
             placeholder="What should Cosmos do?"
             placeholderTextColor={t.textTertiary}
             multiline
@@ -151,13 +152,14 @@ export default function NewSessionScreen() {
           />
         </Group>
 
-        <Pressable
+        <Button
+          title={prompt.trim() ? 'Start session' : 'Create session'}
+          icon="arrow.up"
           onPress={() => void create()}
-          disabled={busy || connection.status !== 'connected'}
-          style={[styles.createBtn, { backgroundColor: t.accent, opacity: busy || connection.status !== 'connected' ? 0.5 : 1 }]}
-        >
-          {busy ? <ActivityIndicator color="#fff" /> : <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }}>Create session</Text>}
-        </Pressable>
+          loading={busy}
+          disabled={connection.status !== 'connected'}
+          style={styles.createBtn}
+        />
       </ScrollView>
     </View>
   );
@@ -166,10 +168,8 @@ export default function NewSessionScreen() {
 const styles = StyleSheet.create({
   screen: { flex: 1 },
   promptBox: {
-    borderWidth: StyleSheet.hairlineWidth, borderRadius: radii.lg,
-    paddingHorizontal: spacing(3.5), paddingVertical: spacing(2.5), marginTop: spacing(2),
+    borderRadius: radii.xl, borderCurve: 'continuous',
+    paddingHorizontal: spacing(4), paddingVertical: spacing(3), marginTop: spacing(2),
   },
-  createBtn: {
-    marginTop: spacing(6), borderRadius: radii.xl, alignItems: 'center', paddingVertical: spacing(3.5),
-  },
+  createBtn: { marginTop: spacing(6) },
 });

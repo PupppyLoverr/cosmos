@@ -2,9 +2,9 @@ import React from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router, Stack } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
-import { useCosmos, useSnapshot, LinkedDesktop } from '../../lib/client';
-import { useTheme, spacing } from '../../lib/theme';
-import { Row, Group, EmptyState, SectionLabel, StatusDot } from '../../components/bits';
+import { useCosmos, useSnapshot, LinkedDesktop } from '../../../lib/client';
+import { useTheme, spacing } from '../../../lib/theme';
+import { Row, Group, EmptyState, SectionLabel, StatusDot } from '../../../components/bits';
 
 function DesktopRow({ d, isActive, online, version }: {
   d: LinkedDesktop; isActive: boolean; online?: boolean; version?: string;

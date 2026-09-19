@@ -62,7 +62,7 @@ function ToolRow({ part, theme }: { part: Extract<MessagePart, { kind: 'tool' }>
           {name.replace(/_/g, ' ')}
           {inputSummary ? <Text style={{ color: theme.textTertiary }}>  {inputSummary}</Text> : null}
         </Text>
-        {!part.resolved ? <Text style={{ color: theme.accent, fontSize: 12 }}>running</Text> : null}
+        {!part.resolved ? <Text style={{ color: theme.link, fontSize: 12 }}>running</Text> : null}
         {part.isError ? <SymbolView name="exclamationmark.triangle" size={12} tintColor={theme.danger} /> : null}
         {detail ? <SymbolView name={open ? 'chevron.up' : 'chevron.down'} size={11} tintColor={theme.textTertiary} /> : null}
       </Pressable>
@@ -133,7 +133,7 @@ export function ApprovalCard({ part, onAnswer }: {
         style={[styles.approveBtn, { backgroundColor: t.accent }]}
         onPress={() => onAnswer(part.requestId, part.questions.map((q) => ({ questionId: q.id, labels: picked[q.id] ?? [] })))}
       >
-        <Text style={{ color: '#fff', fontWeight: '600' }}>Send answer</Text>
+        <Text style={{ color: t.accentContrast, fontWeight: '600' }}>Send answer</Text>
       </Pressable>
     </View>
   );
@@ -155,14 +155,14 @@ export function MessageView({ entry, onAnswer }: {
     <View style={[styles.entry, isUser ? { alignItems: 'flex-end' } : null]}>
       {isUser ? (
         <View style={[styles.userBubble, { backgroundColor: t.userBubble }]}>
-          <Text style={{ color: '#fff', fontSize: 16, lineHeight: 22 }}>{text}</Text>
+          <Text style={{ color: t.userBubbleText, fontSize: 17, lineHeight: 23 }}>{text}</Text>
         </View>
       ) : (
         <View style={styles.assistant}>
           {others.map((part) => {
             switch (part.kind) {
               case 'text':
-                return part.text ? <Text key={part.id} style={{ color: t.text, fontSize: 16, lineHeight: 23 }}>{part.text}</Text> : null;
+                return part.text ? <Text key={part.id} style={{ color: t.text, fontSize: 17, lineHeight: 25 }}>{part.text}</Text> : null;
               case 'reasoning':
                 return <ReasoningRow key={part.id} part={part} theme={t} />;
               case 'tool':
@@ -191,7 +191,7 @@ export function MessageView({ entry, onAnswer }: {
 const styles = StyleSheet.create({
   entry: { paddingHorizontal: spacing(4), marginBottom: spacing(3) },
   userBubble: {
-    maxWidth: '85%', borderRadius: radii.xl, borderBottomRightRadius: radii.sm,
+    maxWidth: '82%', borderRadius: 20, borderCurve: 'continuous',
     paddingHorizontal: spacing(4), paddingVertical: spacing(2.5),
   },
   assistant: { gap: spacing(2) },
@@ -199,7 +199,7 @@ const styles = StyleSheet.create({
   reasoningHead: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
   reasoningBody: { fontSize: 13, lineHeight: 19, marginTop: spacing(1), fontStyle: 'italic' },
   tool: {
-    borderWidth: StyleSheet.hairlineWidth, borderRadius: radii.md, overflow: 'hidden',
+    borderWidth: 0, borderRadius: radii.md, borderCurve: 'continuous', overflow: 'hidden',
   },
   toolHead: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), paddingVertical: spacing(2) },
   toolDetail: {

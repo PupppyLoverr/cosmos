@@ -83,12 +83,18 @@ export function Composer({ placeholder, running, attachments, onAddAttachment, o
           </View>
         ) : null}
         <View style={[styles.bar, { backgroundColor: t.composerBg }]}>
-          <Pressable onPress={openAttachSheet} disabled={busy} style={styles.iconBtn} accessibilityLabel="Attach">
-            <SymbolView name="plus" size={20} tintColor={t.textSecondary} />
+          <Pressable
+            onPress={openAttachSheet}
+            disabled={busy}
+            style={({ pressed }) => [styles.iconBtn, { backgroundColor: t.fill, opacity: pressed ? 0.6 : 1 }]}
+            accessibilityLabel="Attach"
+            accessibilityRole="button"
+          >
+            <SymbolView name="plus" size={17} tintColor={t.text} weight="medium" />
           </Pressable>
           <TextInput
             style={[styles.input, { color: t.text }]}
-            placeholder={placeholder ?? 'Message'}
+            placeholder={placeholder ?? 'Ask Cosmos'}
             placeholderTextColor={t.textTertiary}
             value={text}
             onChangeText={setText}
@@ -97,17 +103,18 @@ export function Composer({ placeholder, running, attachments, onAddAttachment, o
             submitBehavior="blurAndSubmit"
           />
           {running ? (
-            <Pressable onPress={onStop} style={[styles.sendBtn, { backgroundColor: t.danger }]} accessibilityLabel="Stop">
-              <SymbolView name="stop.fill" size={15} tintColor="#fff" />
+            <Pressable onPress={onStop} style={[styles.sendBtn, { backgroundColor: t.accent }]} accessibilityLabel="Stop" accessibilityRole="button">
+              <SymbolView name="stop.fill" size={13} tintColor={t.accentContrast} />
             </Pressable>
           ) : (
             <Pressable
               onPress={send}
               disabled={!text.trim() && attachments.length === 0}
-              style={[styles.sendBtn, { backgroundColor: t.accent, opacity: !text.trim() && attachments.length === 0 ? 0.35 : 1 }]}
+              style={[styles.sendBtn, { backgroundColor: t.accent, opacity: !text.trim() && attachments.length === 0 ? 0.3 : 1 }]}
               accessibilityLabel="Send"
+              accessibilityRole="button"
             >
-              <SymbolView name="arrow.up" size={15} tintColor="#fff" weight="semibold" />
+              <SymbolView name="arrow.up" size={15} tintColor={t.accentContrast} weight="bold" />
             </Pressable>
           )}
         </View>
@@ -117,7 +124,7 @@ export function Composer({ placeholder, running, attachments, onAddAttachment, o
 }
 
 const styles = StyleSheet.create({
-  wrap: { borderTopWidth: StyleSheet.hairlineWidth, paddingBottom: spacing(2) },
+  wrap: { borderTopWidth: 0, paddingBottom: spacing(2) },
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing(2), paddingHorizontal: spacing(3), paddingTop: spacing(2) },
   chip: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(1.5),
@@ -125,13 +132,14 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing(2.5), paddingVertical: spacing(1),
   },
   bar: {
-    flexDirection: 'row', alignItems: 'flex-end', gap: spacing(1),
-    margin: spacing(3), borderRadius: radii.xl,
-    paddingLeft: spacing(1.5), paddingRight: spacing(1.5), paddingVertical: spacing(1.5),
+    flexDirection: 'row', alignItems: 'flex-end', gap: spacing(1.5),
+    marginHorizontal: spacing(3), marginTop: spacing(2), borderRadius: 26, borderCurve: 'continuous',
+    paddingHorizontal: spacing(2), paddingVertical: spacing(2),
+    boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
   },
-  iconBtn: { padding: spacing(1.5), marginBottom: 2 },
-  input: { flex: 1, fontSize: 16, maxHeight: 140, paddingVertical: spacing(2), paddingHorizontal: spacing(1.5) },
+  iconBtn: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center' },
+  input: { flex: 1, fontSize: 17, lineHeight: 22, maxHeight: 140, paddingVertical: spacing(1.5), paddingHorizontal: spacing(1.5) },
   sendBtn: {
-    width: 30, height: 30, borderRadius: 15, alignItems: 'center', justifyContent: 'center', marginBottom: 2,
+    width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center',
   },
 });

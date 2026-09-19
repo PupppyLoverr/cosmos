@@ -2,7 +2,10 @@ import React from 'react';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { CosmosProvider, useCosmos, useSnapshot } from '../lib/client';
-import { useTheme } from '../lib/theme';
+import { loadAppearance, useTheme } from '../lib/theme';
+
+// Restore a pinned Light/Dark before the first frame so the launch doesn't flash.
+void loadAppearance();
 
 function ThemedStack() {
   const t = useTheme();
@@ -16,6 +19,8 @@ function ThemedStack() {
           headerStyle: { backgroundColor: t.background },
           headerTintColor: t.text,
           headerTitleStyle: { fontWeight: '600' },
+          headerLargeTitleStyle: { fontWeight: '700' },
+          headerLargeTitleShadowVisible: false,
           contentStyle: { backgroundColor: t.background },
           headerShadowVisible: false,
         }}
@@ -28,9 +33,9 @@ function ThemedStack() {
             headerBackTitle: 'Back',
           })}
         />
-        <Stack.Screen name="new-session" options={{ presentation: 'modal', title: 'New Session' }} />
-        <Stack.Screen name="sign-in" options={{ presentation: 'modal', title: 'Sign In', headerShown: false }} />
-        <Stack.Screen name="pair" options={{ presentation: 'modal', title: 'Link a Desktop' }} />
+        <Stack.Screen name="new-session" options={{ presentation: 'formSheet', sheetGrabberVisible: true, sheetAllowedDetents: [0.92], title: 'New Session' }} />
+        <Stack.Screen name="sign-in" options={{ presentation: 'fullScreenModal', title: 'Sign In', headerShown: false }} />
+        <Stack.Screen name="pair" options={{ presentation: 'formSheet', sheetGrabberVisible: true, sheetAllowedDetents: [0.92], title: 'Link a Desktop' }} />
         <Stack.Screen
           name="watch/[chatId]"
           options={{ title: 'Watch Live', presentation: 'modal', headerTintColor: t.text }}

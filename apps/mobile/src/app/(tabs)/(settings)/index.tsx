@@ -2,10 +2,10 @@ import React from 'react';
 import { ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 import { router, Stack } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
-import { useCosmos, useSnapshot } from '../../lib/client';
-import { useTheme, spacing } from '../../lib/theme';
-import { Row, Group, SectionLabel, Avatar } from '../../components/bits';
-import { ensureNotificationPermission } from '../../lib/notify';
+import { useCosmos, useSnapshot } from '../../../lib/client';
+import { useTheme, spacing, useAppearance, type } from '../../../lib/theme';
+import { Row, Group, SectionLabel, Avatar, Segmented } from '../../../components/bits';
+import { ensureNotificationPermission } from '../../../lib/notify';
 
 export default function SettingsScreen() {
   const t = useTheme();
@@ -13,6 +13,7 @@ export default function SettingsScreen() {
   const auth = useSnapshot(client.auth);
   const connection = useSnapshot(client.connection);
   const [notifEnabled, setNotifEnabled] = React.useState(false);
+  const [appearance, setAppearance] = useAppearance();
 
   React.useEffect(() => {
     void ensureNotificationPermission().then(setNotifEnabled);
@@ -43,7 +44,7 @@ export default function SettingsScreen() {
             <Row
               title="Sign in with Woozlit"
               subtitle="Required for remote desktops"
-              leading={<SymbolView name="person.crop.circle" size={20} tintColor={t.accent} />}
+              leading={<SymbolView name="person.crop.circle" size={20} tintColor={t.link} />}
               onPress={() => router.push('/sign-in')}
               chevron
             />
@@ -58,14 +59,29 @@ export default function SettingsScreen() {
               ? `${connection.desktop?.kind === 'local' ? 'Local' : 'Remote'} · connected`
               : connection.status}
             leading={<SymbolView name="network" size={18} tintColor={t.textSecondary} />}
-            trailing={<Text style={{ color: t.textTertiary, fontSize: 13 }}>{connection.desktop?.kind === 'local' ? 'Direct' : 'Relay'}</Text>}
+            trailing={<Text style={[type.footnote, { color: t.textTertiary }]}>{connection.desktop?.kind === 'local' ? 'Direct' : 'Relay'}</Text>}
           />
           <Row
             title="Switch desktop"
             leading={<SymbolView name="arrow.triangle.swap" size={18} tintColor={t.textSecondary} />}
-            onPress={() => router.push('/(tabs)/desktops' as never)}
+            onPress={() => router.push('/(tabs)/(desktops)' as never)}
             chevron
           />
+        </Group>
+
+        <SectionLabel>Appearance</SectionLabel>
+        <Group>
+          <View style={{ paddingHorizontal: spacing(4), paddingVertical: spacing(3), gap: spacing(3) }}>
+            <Segmented
+              value={appearance}
+              onChange={setAppearance}
+              options={[
+                { id: 'system', label: 'System' },
+                { id: 'light', label: 'Light' },
+                { id: 'dark', label: 'Dark' },
+              ]}
+            />
+          </View>
         </Group>
 
         <SectionLabel>Notifications</SectionLabel>
@@ -80,7 +96,7 @@ export default function SettingsScreen() {
 
         <SectionLabel>About</SectionLabel>
         <Group>
-          <Row title="Cosmos for iOS" subtitle="Expo · protocol-compatible remote client" />
+          <Row title="Cosmos for iOS" subtitle="Remote client for the Cosmos desktop" leading={<SymbolView name="info.circle" size={18} tintColor={t.textSecondary} />} />
         </Group>
       </ScrollView>
     </View>
