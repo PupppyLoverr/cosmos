@@ -37,7 +37,7 @@
 //! out instead of spinning "Working" forever.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -164,6 +164,89 @@ const REASONING_LEVELS: &[ReasoningLevel] = &[
     ReasoningLevel::XHigh,
     ReasoningLevel::Max,
 ];
+
+/// Seed the *global* opencode config (`~/.config/opencode/opencode.json[c]`)
+/// with the `cosmos-computer` / `cosmos-tools` MCP shims. opencode only
+/// learns MCP servers from its own config files — project `opencode.json`
+/// covers runs rooted in a directory, but project-less chats (the phone app,
+/// the home directory) get nothing. The shim commands expand
+/// `$COSMOS_COMPUTER_MCP` / `$COSMOS_TOOLS_MCP`, which the engine stamps
+/// per-run into the spawned server's environment, so dormant entries are
+/// harmless where the services are off. Best-effort: logs and moves on.
+pub fn seed_global_config() {
+    let Some(home) = crate::executable::home_dir() else {
+        return;
+    };
+    seed_global_config_in(&home.join(".config").join("opencode"));
+}
+
+fn seed_global_config_in(dir: &Path) {
+    let path = ["opencode.json", "opencode.jsonc"]
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| dir.join("opencode.json"));
+    let mut config: serde_json::Map<String, Value> = match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => match deser_hjson::from_str(&text) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => {
+                tracing::warn!(?path, "opencode global config unparseable; not seeding MCP");
+                return;
+            }
+        },
+        _ => serde_json::Map::new(),
+    };
+    let mcp = config.entry("mcp".to_string()).or_insert_with(|| json!({}));
+    let Some(mcp) = mcp.as_object_mut() else {
+        tracing::warn!(?path, "opencode global `mcp` is not an object; not seeding");
+        return;
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(exe) = exe.to_str() else {
+        return;
+    };
+    let mut changed = false;
+    for (name, subcommand, endpoint_env) in [
+        ("cosmos-computer", "computer-stdio", crate::COMPUTER_ENV),
+        ("cosmos-tools", "tools-stdio", crate::TOOLS_ENV),
+    ] {
+        if mcp.contains_key(name) {
+            continue;
+        }
+        // A run without the matching stamp leaves the env var unset: exit
+        // quietly so the entry is inert instead of an erroring MCP server.
+        let command = format!(
+            "test -n \"${endpoint_env}\" && exec \"$COSMOS_MCP_ZERON\" {subcommand} --url \"${endpoint_env}\""
+        );
+        mcp.insert(
+            name.to_string(),
+            json!({
+                "type": "local",
+                "command": ["/bin/bash", "-c", command],
+                "environment": { "COSMOS_MCP_ZERON": exe },
+                "enabled": true,
+                "timeout": 15000,
+            }),
+        );
+        changed = true;
+    }
+    if !changed {
+        return;
+    }
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        tracing::warn!(?dir, %error, "opencode config dir create failed");
+        return;
+    }
+    let body = match serde_json::to_string_pretty(&serde_json::Value::Object(config)) {
+        Ok(body) => body,
+        Err(_) => return,
+    };
+    if let Err(error) = std::fs::write(&path, body) {
+        tracing::warn!(?path, %error, "opencode global config write failed");
+    }
+}
 
 /// Preference-ordered variant ids for a requested effort (opencode's
 /// reasoning variants: models.dev metadata or `variants` in opencode.json).

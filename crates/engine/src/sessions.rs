@@ -425,6 +425,19 @@ impl SessionsEngine {
                 serde_json::json!({ "url": url }),
             );
         }
+        // OpenCode discovers MCP servers only from its own config files —
+        // without a seed, project-less chats (any cwd, e.g. the phone's
+        // "Desktop" sessions landing in ~) get no computer/tools surface at
+        // all. Seed once here, when a service is actually live.
+        if request
+            .model_options
+            .contains_key(zeron_proto::COMPUTER_OPTION)
+            || request
+                .model_options
+                .contains_key(zeron_proto::TOOLS_OPTION)
+        {
+            zeron_harness::opencode::seed_global_config();
+        }
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
