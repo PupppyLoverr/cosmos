@@ -28,7 +28,7 @@ export default function SignInScreen() {
   // throws GO_BACK unhandled and swallows the completed session.
   const leave = () => {
     if (router.canGoBack()) router.back();
-    else router.replace('/(tabs)');
+    else router.replace('/');
   };
 
   const signIn = async () => {
