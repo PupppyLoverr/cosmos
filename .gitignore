@@ -15,3 +15,5 @@ build/
 edge/dist/
 # Machine-specific linker config (absolute toolchain paths differ per box).
 /.cargo/
+__pycache__/
+*.pyc
