@@ -191,6 +191,15 @@ impl CuaBackend {
                 .is_some_and(|note| note.contains("ax_window_unresolved"))
     }
 
+    fn has_sheet_or_dialog(state: &WindowState) -> bool {
+        state.elements.iter().any(|element| {
+            element.role.eq_ignore_ascii_case("AXSheet")
+                || element.role.eq_ignore_ascii_case("AXDialog")
+                || element.role.eq_ignore_ascii_case("sheet")
+                || element.role.eq_ignore_ascii_case("dialog")
+        })
+    }
+
     /// `verify_state`/`window_state`/`act` retarget for sheet windows: when
     /// `window_id` can't resolve on the CG↔AX map, try the app's other
     /// on-screen windows (topmost first). For pixel actions the window-local
@@ -889,6 +898,23 @@ impl CuaBackend {
                 call_args["window_id"] = json!(id);
             }
         }
+        let raised_invoke_menu_window = if tool == "invoke_menu" {
+            let pid = call_args.get("pid").and_then(Value::as_i64);
+            let window_id = call_args.get("window_id").and_then(Value::as_i64);
+            if let (Some(pid), Some(window_id)) = (pid, window_id) {
+                let _ = self
+                    .call(
+                        "bring_to_front",
+                        json!({ "pid": pid, "window_id": window_id }),
+                    )
+                    .await;
+                Some(window_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let result = match self.call(tool, call_args.clone()).await {
             Err(error) if Self::is_ax_window_unresolved(&error) && tool != "launch_app" => {
                 // Sheet windows: retarget to the owning window (window-local
@@ -939,6 +965,11 @@ impl CuaBackend {
                 Some("refused") => summary.push_str(" — refused by the driver"),
                 _ => {}
             }
+        }
+        if let Some(window_id) = raised_invoke_menu_window {
+            summary.push_str(&format!(
+                " (raised window {window_id} first so the menu command targets it)"
+            ));
         }
         #[cfg(target_os = "macos")]
         if tool == "launch_app"
@@ -1004,6 +1035,7 @@ impl CuaBackend {
         alternates.sort_by_key(|w| {
             std::cmp::Reverse(w.get("z_index").and_then(Value::as_i64).unwrap_or(0))
         });
+        let mut resolvable = Vec::new();
         for candidate in alternates {
             let retry = self
                 .window_state_inner(
@@ -1016,23 +1048,40 @@ impl CuaBackend {
                     query,
                 )
                 .await;
-            let Ok(mut state) = retry else { continue };
+            let Ok(state) = retry else { continue };
             if Self::is_ax_unresolved_state(&state) {
                 continue;
             }
-            let note = format!(
+            resolvable.push(state);
+        }
+        let Some(mut state) = resolvable
+            .iter()
+            .position(Self::has_sheet_or_dialog)
+            .map(|index| resolvable.remove(index))
+            .or_else(|| (!resolvable.is_empty()).then(|| resolvable.remove(0)))
+        else {
+            return primary;
+        };
+        let note = if Self::has_sheet_or_dialog(&state) {
+            format!(
                 "sheet/dialog window {} unresolved on the CG↔AX map; showing its owning window {} ({}) — sheet elements are inside this tree",
                 window.get("window_id").and_then(Value::as_i64).unwrap_or(0),
                 state.window_id,
                 state.window_title.as_deref().unwrap_or("untitled")
-            );
-            state.note = Some(match state.note {
-                Some(existing) => format!("{existing}; {note}"),
-                None => note,
-            });
-            return Ok(state);
-        }
-        primary
+            )
+        } else {
+            format!(
+                "sheet/dialog window {} unresolved on the CG↔AX map; showing on-screen sibling window {} ({}) — could not confirm the owning window: no sheet subtree found in it; re-observe the app's other windows",
+                window.get("window_id").and_then(Value::as_i64).unwrap_or(0),
+                state.window_id,
+                state.window_title.as_deref().unwrap_or("untitled")
+            )
+        };
+        state.note = Some(match state.note {
+            Some(existing) => format!("{existing}; {note}"),
+            None => note,
+        });
+        Ok(state)
     }
 }
 

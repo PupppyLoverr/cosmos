@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::backend::{ComputerBackend, ObserveRequest, ObserveScope};
+use crate::backend::{ActionRequest, ComputerBackend, Delivery, ObserveRequest, ObserveScope};
 use crate::cua::{CuaBackend, pid_from_launch_result};
 use crate::mock::MockComputer;
 use crate::service::ComputerService;
@@ -53,6 +53,10 @@ async fn scripted_cua_backend(
     let binary = install_dir.join("cua-driver");
     let windows = serde_json::to_string(&serde_json::to_string(&windows).unwrap()).unwrap();
     let states = serde_json::to_string(&serde_json::to_string(&states).unwrap()).unwrap();
+    let calls = serde_json::to_string(
+        &serde_json::to_string(&data.path().join("calls.jsonl").display().to_string()).unwrap(),
+    )
+    .unwrap();
     let script = format!(
         r#"#!/usr/bin/env python3
 import json
@@ -60,6 +64,7 @@ import sys
 
 windows = json.loads({windows})
 states = json.loads({states})
+calls_path = json.loads({calls})
 
 for line in sys.stdin:
     request = json.loads(line)
@@ -67,14 +72,20 @@ for line in sys.stdin:
     if request_id is None:
         continue
     method = request["method"]
+    name = None
+    args = {{}}
+    if method == "tools/call":
+        name = request["params"]["name"]
+        args = request["params"].get("arguments", {{}})
+    with open(calls_path, "a") as calls_file:
+        calls_file.write(json.dumps({{"method": method, "name": name, "args": args}}) + "\n")
+        calls_file.flush()
     if method == "initialize":
         result = {{"protocolVersion": "2025-06-18", "capabilities": {{}}, "serverInfo": {{"name": "fake-cua", "version": "test"}}}}
     elif method == "tools/list":
         result = {{"tools": [{{"name": "start_session"}}, {{"name": "get_config"}}, {{"name": "list_windows"}}, {{"name": "get_window_state"}}]}}
     elif method == "tools/call":
         params = request["params"]
-        name = params["name"]
-        args = params.get("arguments", {{}})
         if name == "start_session":
             result = {{}}
         elif name == "get_config":
@@ -264,6 +275,251 @@ async fn degraded_window_without_resolvable_sibling_is_returned_as_is() {
             .note
             .as_deref()
             .is_some_and(|note| note.contains("ax_window_unresolved"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sheet_retarget_prefers_candidate_with_sheet_subtree() {
+    let pid = 42;
+    let windows = json!([
+        {
+            "pid": pid,
+            "window_id": 374,
+            "title": "Save",
+            "app_name": "TextEdit",
+            "z_index": 98,
+            "is_on_screen": true,
+            "minimized": false
+        },
+        {
+            "pid": pid,
+            "window_id": 401,
+            "title": "Untitled",
+            "app_name": "TextEdit",
+            "z_index": 95,
+            "is_on_screen": true,
+            "minimized": false
+        },
+        {
+            "pid": pid,
+            "window_id": 409,
+            "title": "Untitled 2",
+            "app_name": "TextEdit",
+            "z_index": 70,
+            "is_on_screen": true,
+            "minimized": false
+        }
+    ]);
+    let states = json!({
+        "374": {
+            "pid": pid,
+            "window_id": 374,
+            "app_name": "TextEdit",
+            "window_title": "Save",
+            "degraded": true,
+            "degraded_reason": "ax_window_unresolved: Save sheet",
+            "elements": []
+        },
+        "401": {
+            "pid": pid,
+            "window_id": 401,
+            "app_name": "TextEdit",
+            "window_title": "Untitled",
+            "elements": [
+                {"element_index": 0, "role": "AXButton", "label": "New"}
+            ]
+        },
+        "409": {
+            "pid": pid,
+            "window_id": 409,
+            "app_name": "TextEdit",
+            "window_title": "Untitled 2",
+            "elements": [
+                {"element_index": 0, "role": "dialog", "label": "Save"},
+                {"element_index": 1, "role": "AXButton", "label": "Save"}
+            ]
+        }
+    });
+    let (backend, _data, screenshots) = scripted_cua_backend(windows, states).await;
+    let state = backend
+        .window_state(
+            pid,
+            Some(374),
+            true,
+            false,
+            100,
+            1200,
+            screenshots.path(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.window_id, 409);
+    assert!(
+        state
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("owning window 409"))
+    );
+    assert!(
+        state
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("sheet elements are inside this tree"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sheet_retarget_fallback_reports_unconfirmed_ownership() {
+    let pid = 42;
+    let windows = json!([
+        {
+            "pid": pid,
+            "window_id": 374,
+            "title": "Save",
+            "app_name": "TextEdit",
+            "z_index": 98,
+            "is_on_screen": true,
+            "minimized": false
+        },
+        {
+            "pid": pid,
+            "window_id": 401,
+            "title": "Untitled",
+            "app_name": "TextEdit",
+            "z_index": 95,
+            "is_on_screen": true,
+            "minimized": false
+        },
+        {
+            "pid": pid,
+            "window_id": 409,
+            "title": "Untitled 2",
+            "app_name": "TextEdit",
+            "z_index": 70,
+            "is_on_screen": true,
+            "minimized": false
+        }
+    ]);
+    let states = json!({
+        "374": {
+            "pid": pid,
+            "window_id": 374,
+            "app_name": "TextEdit",
+            "window_title": "Save",
+            "degraded": true,
+            "degraded_reason": "ax_window_unresolved: Save sheet",
+            "elements": []
+        },
+        "401": {
+            "pid": pid,
+            "window_id": 401,
+            "app_name": "TextEdit",
+            "window_title": "Untitled",
+            "elements": [
+                {"element_index": 0, "role": "AXButton", "label": "New"}
+            ]
+        },
+        "409": {
+            "pid": pid,
+            "window_id": 409,
+            "app_name": "TextEdit",
+            "window_title": "Untitled 2",
+            "elements": [
+                {"element_index": 0, "role": "AXButton", "label": "New"}
+            ]
+        }
+    });
+    let (backend, _data, screenshots) = scripted_cua_backend(windows, states).await;
+    let state = backend
+        .window_state(
+            pid,
+            Some(374),
+            true,
+            false,
+            100,
+            1200,
+            screenshots.path(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.window_id, 401);
+    assert!(
+        state
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("could not confirm the owning window"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_menu_raises_explicit_window_first() {
+    let pid = 42;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 401,
+        "title": "Untitled",
+        "app_name": "TextEdit",
+        "z_index": 95,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({});
+    let (backend, data, screenshots) = scripted_cua_backend(windows, states).await;
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_invoke_menu".into(),
+            args: json!({"pid": pid, "windowId": 401, "path": "File > Save…"}),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(
+        outcome
+            .summary
+            .contains("raised window 401 first so the menu command targets it")
+    );
+    let calls = std::fs::read_to_string(data.path().join("calls.jsonl")).unwrap();
+    let calls: Vec<Value> = calls
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    let tool_calls: Vec<&Value> = calls
+        .iter()
+        .filter(|call| call.get("name").and_then(Value::as_str).is_some())
+        .collect();
+    let names: Vec<&str> = tool_calls
+        .iter()
+        .filter_map(|call| call.get("name").and_then(Value::as_str))
+        .collect();
+    let focus = names
+        .iter()
+        .position(|name| *name == "bring_to_front")
+        .expect("bring_to_front call recorded");
+    let invoke = names
+        .iter()
+        .position(|name| *name == "invoke_menu")
+        .expect("invoke_menu call recorded");
+    assert!(focus < invoke, "focus call must precede invoke_menu");
+    assert_eq!(
+        tool_calls[focus]["args"]["pid"].as_i64(),
+        Some(pid),
+        "focus call must target the requested pid"
+    );
+    assert_eq!(
+        tool_calls[focus]["args"]["window_id"].as_i64(),
+        Some(401),
+        "focus call must target the requested window"
     );
 }
 
