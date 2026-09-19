@@ -1489,7 +1489,20 @@ impl CuaBackend {
                 .await
             {
                 Ok(note) => invoke_menu_recovery_note = note,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if let Some(note) = native_menu_note.as_ref() {
+                        match error {
+                            ComputerError::Refused { code, message } => {
+                                return Err(ComputerError::Refused {
+                                    code,
+                                    message: format!("{message}{note}"),
+                                });
+                            }
+                            other => return Err(other),
+                        }
+                    }
+                    return Err(error);
+                }
             }
         }
         // Surface the driver's effect report inline — a successful tool call

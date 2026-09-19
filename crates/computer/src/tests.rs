@@ -862,6 +862,7 @@ async fn invoke_menu_native_press_still_refuses_when_menu_stays_open() {
             if code == "suspected_noop"
                 && message.contains("menu type-select + Return")
                 && message.contains("menu command not confirmed")
+                && message.contains("dispatched natively via accessibility menu press")
     ));
 }
 

@@ -2,7 +2,8 @@
 # macOS packaging: build the release binary for the host arch and produce
 #   target/package/zeron-<version>-macos-<arch>.dmg          (user download)
 #   target/package/zeron-<version>-macos-<arch>-app.tar.gz   (auto-updater)
-# containing Zeron.app (unsigned unless CODESIGN_IDENTITY is set).
+# containing Zeron.app (signed with the local development identity when
+# available, unless CODESIGN_IDENTITY is set).
 #
 # Usage: scripts/package-macos.sh
 # Env:   CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
@@ -46,12 +47,19 @@ rm -rf "$ICONSET"
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   # Hardened runtime + secure timestamp are both notarization requirements.
-  # (No --deep: Apple deprecated it; the bundle is a single Mach-O anyway.)
-  codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP"
+  codesign --deep --force --options runtime --timestamp \
+    --sign "$CODESIGN_IDENTITY" --identifier sh.zeron.app "$APP"
 else
-  # Ad-hoc signature so the app launches on Apple silicon (Gatekeeper still
-  # requires right-click → Open on first launch without notarization).
-  codesign --deep --force --sign - "$APP"
+  LOCAL_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null |
+    sed -n 's/.*"\(Cosmos Local Signing\)".*/\1/p' | head -1)"
+  if [[ -n "$LOCAL_IDENTITY" ]]; then
+    codesign --deep --force --sign "$LOCAL_IDENTITY" \
+      --identifier sh.zeron.app "$APP"
+  else
+    # Ad-hoc signatures do not retain macOS TCC grants across rebuilds.
+    echo "warning: Cosmos Local Signing is unavailable; using an ad-hoc signature, so TCC grants will not survive rebuilds" >&2
+    codesign --deep --force --sign - --identifier sh.zeron.app "$APP"
+  fi
 fi
 
 # notarize <path>: submit to Apple and wait for the verdict. A rejection may

@@ -39,18 +39,20 @@ if [[ ! -f "$CONTENTS/Resources/zeron.icns" ]]; then
   iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/zeron.icns"
 fi
 
-# A real Apple Development identity gives TCC a stable signing requirement
-# across rebuilds. Set ZERON_DEV_CODESIGN_IDENTITY explicitly when more than
-# one identity is installed; otherwise fall back to an ad-hoc signature.
+# A stable signing identity gives TCC a stable signing requirement across
+# rebuilds. Set ZERON_DEV_CODESIGN_IDENTITY explicitly when more than one
+# identity is installed; otherwise prefer Cosmos Local Signing.
 IDENTITY="${ZERON_DEV_CODESIGN_IDENTITY:-}"
 if [[ -z "$IDENTITY" ]]; then
-  IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' | head -1)"
+  IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null |
+    sed -n 's/.*"\(Cosmos Local Signing\)".*/\1/p' | head -1)"
 fi
 if [[ -n "$IDENTITY" ]]; then
-  codesign --force --sign "$IDENTITY" --identifier sh.zeron.app.dev "$APP"
+  codesign --deep --force --sign "$IDENTITY" \
+    --identifier sh.zeron.app.dev "$APP"
 else
-  codesign --force --sign - --identifier sh.zeron.app.dev "$APP"
-  echo "warning: no Apple Development signing identity found; macOS may ask for permissions again after a rebuild" >&2
+  codesign --deep --force --sign - --identifier sh.zeron.app.dev "$APP"
+  echo "warning: Cosmos Local Signing is unavailable; using an ad-hoc signature, so TCC grants will not survive rebuilds" >&2
 fi
 
 echo "running Cosmos Dev (bundle sh.zeron.app.dev, data $DATA_DIR, IPC $IPC_PORT)" >&2

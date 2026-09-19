@@ -55,10 +55,11 @@ icon with no extra files shipped.
 scripts/package-macos.sh    # → target/package/zeron-<version>-macos-<arch>.dmg
 ```
 
-Builds the release binary, assembles `Zeron.app` (Info.plist + icns), ad-hoc
-signs it (set `CODESIGN_IDENTITY` for a real Developer ID), and wraps it in a
-dmg. The auto-update tarball retains an internal `Zeron.app` path so older
-installed builds can update into Cosmos. CI runs this on tags
+Builds the release binary, assembles `Zeron.app` (Info.plist + icns), signs it
+with `Cosmos Local Signing` when available (run
+`scripts/make-local-signing-identity.sh` once), and wraps it in a dmg. The
+auto-update tarball retains an internal `Zeron.app` path so older installed
+builds can update into Cosmos. CI runs this on tags
 (`.github/workflows/release.yml`). The manual steps it automates, for reference
 (run on a macOS host — gpui needs Metal; no cross-build from Linux):
 
