@@ -626,6 +626,11 @@ pub struct StatusCapabilities {
     pub background: bool,
     /// Foreground escalation exists AND the user enabled Full Control.
     pub foreground: bool,
+    /// Wayland compositors often refuse background input; callers must treat
+    /// `background_unavailable` as expected, not a driver crash, and only
+    /// escalate to foreground under Full Control.
+    #[serde(default)]
+    pub wayland_background_limited: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -190,6 +190,7 @@ impl ComputerService {
                 screenshots: settings.screenshots,
                 background: settings.control.acts(),
                 foreground: settings.control == ControlMode::FullControl,
+                wayland_background_limited: linux_session_label() == Some("wayland"),
             },
             permissions: self.permission_hints(),
             last_error,
@@ -235,10 +236,13 @@ impl ComputerService {
         } else if cfg!(target_os = "linux") {
             match linux_session_label() {
                 Some("wayland") => (
-                    "needs the xdg-desktop-portal ScreenCast grant",
-                    "not required",
+                    "xdg-desktop-portal ScreenCast (user grant); no unique window id for AT-SPI matching",
+                    "AT-SPI bus is optional/best-effort on Wayland — many apps never register; do not treat missing trees as a driver crash",
                 ),
-                _ => ("not required", "not required"),
+                _ => (
+                    "native X11 drawable capture (no portal grant)",
+                    "AT-SPI accessibility bus (at-spi2-core). GTK/Qt apps often need toolkit accessibility enabled (GTK_A11Y=1) before they appear",
+                ),
             }
         } else {
             ("not required", "not required")
@@ -247,7 +251,12 @@ impl ComputerService {
             Some("The driver appears as 'CuaDriver' in macOS permission lists — grant it once, then restart the driver from here.".into())
         } else if cfg!(target_os = "linux") && linux_session_label() == Some("wayland") {
             Some(
-                "Wayland limits background input — some actions may report background_unavailable."
+                "Wayland: screenshots go through the desktop portal; background input is often refused (`background_unavailable`). Semantic (AT-SPI) text is best-effort and is not uniquely matched to a window the way X11 can. Escalate to foreground only with Full Control after an explicit background_unavailable."
+                    .into(),
+            )
+        } else if cfg!(target_os = "linux") {
+            Some(
+                "X11: window capture and AT-SPI semantic text are Ready when the registry is running. Background delivery is generally available; a minimized or obscured window may still refuse."
                     .into(),
             )
         } else {
