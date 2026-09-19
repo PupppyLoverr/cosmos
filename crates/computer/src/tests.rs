@@ -566,8 +566,7 @@ async fn invoke_menu_normalizes_semantic_ellipsis_path() {
         "is_on_screen": true,
         "minimized": false
     }]);
-    let states = json!({
-        "401": {
+    let menu_state = json!({
             "pid": pid,
             "window_id": 401,
             "app_name": "TextEdit",
@@ -576,8 +575,15 @@ async fn invoke_menu_normalizes_semantic_ellipsis_path() {
                 {"element_index": 0, "role": "AXMenuBarItem", "label": "File"},
                 {"element_index": 1, "role": "AXMenuItem", "label": "Save…"}
             ]
-        }
     });
+    let closed_state = json!({
+        "pid": pid,
+        "window_id": 401,
+        "app_name": "TextEdit",
+        "window_title": "Untitled",
+        "elements": []
+    });
+    let states = json!({"401": [menu_state, closed_state]});
     let actions = json!({
         "invoke_menu": [
             {"error": "invoke_menu: path segment 1 was not found (refused)"},
@@ -716,7 +722,8 @@ async fn invoke_menu_recovers_when_driver_leaves_menu_open() {
     let states = json!({"401": [menu_state, closed_state]});
     let actions = json!({
         "invoke_menu": [{"result": {"content": [{"type": "text", "text": "menu invoked"}]}}],
-        "click": [{"result": {"content": [{"type": "text", "text": "clicked"}]}}]
+        "type_text": [{"result": {"content": [{"type": "text", "text": "typed"}]}}],
+        "press_key": [{"result": {"content": [{"type": "text", "text": "pressed"}]}}]
     });
     let (backend, data, screenshots) =
         scripted_cua_backend_with_actions(windows, states, actions).await;
@@ -735,18 +742,26 @@ async fn invoke_menu_recovers_when_driver_leaves_menu_open() {
         .await
         .unwrap();
     assert!(outcome.summary.contains(
-        "driver's menu press left the menu open; completed \"Save\" with a screen-point click at (240,110)"
+        "driver's menu press left the menu open; completed \"Save\" via menu type-select + Return"
     ));
     let calls: Vec<Value> = std::fs::read_to_string(data.path().join("calls.jsonl"))
         .unwrap()
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
-        .filter(|call: &Value| call.get("name").and_then(Value::as_str) == Some("click"))
+        .filter(|call: &Value| {
+            matches!(
+                call.get("name").and_then(Value::as_str),
+                Some("type_text" | "press_key")
+            )
+        })
         .collect();
-    assert_eq!(calls.len(), 1);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["name"], json!("type_text"));
     assert_eq!(calls[0]["args"]["scope"], json!("desktop"));
-    assert_eq!(calls[0]["args"]["x"], json!(240.0));
-    assert_eq!(calls[0]["args"]["y"], json!(110.0));
+    assert_eq!(calls[0]["args"]["text"], json!("Save"));
+    assert_eq!(calls[1]["name"], json!("press_key"));
+    assert_eq!(calls[1]["args"]["scope"], json!("desktop"));
+    assert_eq!(calls[1]["args"]["key"], json!("return"));
 }
 
 #[cfg(unix)]
@@ -794,9 +809,9 @@ async fn invoke_menu_does_not_recover_when_menu_is_closed() {
         })
         .await
         .unwrap();
-    assert!(!outcome.summary.contains("screen-point click"));
+    assert!(!outcome.summary.contains("menu type-select"));
     let calls = std::fs::read_to_string(data.path().join("calls.jsonl")).unwrap();
-    assert!(!calls.contains("\"name\": \"click\""));
+    assert!(!calls.contains("\"name\": \"type_text\""));
 }
 
 #[cfg(unix)]
@@ -828,8 +843,8 @@ async fn invoke_menu_reports_unconfirmed_command_when_menu_stays_open() {
     let states = json!({"401": [menu_state.clone(), menu_state]});
     let actions = json!({
         "invoke_menu": [{"result": {"content": [{"type": "text", "text": "menu invoked"}]}}],
-        "click": [{"result": {"content": [{"type": "text", "text": "clicked"}]}}],
-        "press_key": [{"result": {"content": [{"type": "text", "text": "pressed"}]}}]
+        "press_key": [{"result": {"content": [{"type": "text", "text": "pressed"}]}}],
+        "type_text": [{"result": {"content": [{"type": "text", "text": "typed"}]}}],
     });
     let (backend, data, screenshots) =
         scripted_cua_backend_with_actions(windows, states, actions).await;
@@ -851,17 +866,30 @@ async fn invoke_menu_reports_unconfirmed_command_when_menu_stays_open() {
         error,
         ComputerError::Refused { ref code, ref message }
             if code == "suspected_noop"
+                && message.contains("menu type-select + Return")
                 && message.contains("menu command not confirmed")
     ));
     let calls: Vec<Value> = std::fs::read_to_string(data.path().join("calls.jsonl"))
         .unwrap()
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
-        .filter(|call: &Value| call.get("name").and_then(Value::as_str) == Some("press_key"))
+        .filter(|call: &Value| {
+            matches!(
+                call.get("name").and_then(Value::as_str),
+                Some("type_text" | "press_key")
+            )
+        })
         .collect();
-    assert_eq!(calls.len(), 1);
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0]["name"], json!("type_text"));
     assert_eq!(calls[0]["args"]["scope"], json!("desktop"));
-    assert_eq!(calls[0]["args"]["key"], json!("escape"));
+    assert_eq!(calls[0]["args"]["text"], json!("Save"));
+    assert_eq!(calls[1]["name"], json!("press_key"));
+    assert_eq!(calls[1]["args"]["scope"], json!("desktop"));
+    assert_eq!(calls[1]["args"]["key"], json!("return"));
+    assert_eq!(calls[2]["name"], json!("press_key"));
+    assert_eq!(calls[2]["args"]["scope"], json!("desktop"));
+    assert_eq!(calls[2]["args"]["key"], json!("escape"));
 }
 
 #[cfg(unix)]

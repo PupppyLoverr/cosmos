@@ -238,11 +238,15 @@ impl CuaBackend {
         }
     }
 
-    fn frame_center(state: &WindowState, frame: ElementFrame) -> Option<(f64, f64)> {
-        if Self::screen_absolute_for_state(state) {
+    fn frame_center(
+        frame: ElementFrame,
+        window_bounds: Option<ElementFrame>,
+        screen_absolute: bool,
+    ) -> Option<(f64, f64)> {
+        if screen_absolute {
             Some((frame.x + frame.w / 2.0, frame.y + frame.h / 2.0))
         } else {
-            let bounds = state.window_bounds?;
+            let bounds = window_bounds?;
             Some((
                 bounds.x + frame.x + frame.w / 2.0,
                 bounds.y + frame.y + frame.h / 2.0,
@@ -303,18 +307,8 @@ impl CuaBackend {
         if call_args.get("pid").and_then(Value::as_i64) != Some(cached.pid) {
             return None;
         }
-        let (x, y) = if cached.screen_absolute {
-            (
-                cached.frame.x + cached.frame.w / 2.0,
-                cached.frame.y + cached.frame.h / 2.0,
-            )
-        } else {
-            let bounds = cached.window_bounds?;
-            (
-                bounds.x + cached.frame.x + cached.frame.w / 2.0,
-                bounds.y + cached.frame.y + cached.frame.h / 2.0,
-            )
-        };
+        let (x, y) =
+            Self::frame_center(cached.frame, cached.window_bounds, cached.screen_absolute)?;
         let fallback_note = if cached.role.to_ascii_lowercase().starts_with("axmenu") {
             format!(
                 " (menu item lives in the menu-bar window; fell back to a screen-point click at ({x:.0},{y:.0}))"
@@ -401,6 +395,13 @@ impl CuaBackend {
         segment = segment.strip_suffix('…').unwrap_or(segment).trim_end();
         segment = segment.strip_suffix("...").unwrap_or(segment).trim_end();
         segment.to_lowercase()
+    }
+
+    fn menu_type_select_segment(segment: &str) -> String {
+        let mut segment = segment.trim();
+        segment = segment.strip_suffix('…').unwrap_or(segment).trim_end();
+        segment = segment.strip_suffix("...").unwrap_or(segment).trim_end();
+        segment.to_string()
     }
 
     fn menu_path_from_state(state: &WindowState, requested: &[String]) -> Option<Vec<String>> {
@@ -527,34 +528,35 @@ impl CuaBackend {
             return Ok(None);
         };
         let normalized_segment = Self::normalized_menu_segment(segment);
-        let Some(hit) = digest::find(&state, segment, Some("AXMenuItem"), 5)
+        let has_matching_menu_item = digest::find(&state, segment, Some("AXMenuItem"), 5)
             .into_iter()
-            .find(|hit| {
+            .any(|hit| {
                 hit.label
                     .as_deref()
                     .or(hit.value.as_deref())
                     .is_some_and(|label| Self::normalized_menu_segment(label) == normalized_segment)
-            })
-        else {
+            });
+        if !has_matching_menu_item {
             return Ok(None);
-        };
-        let Some(frame) = hit.frame else {
-            return Ok(None);
-        };
-        let Some((x, y)) = Self::frame_center(&state, frame) else {
-            return Ok(None);
-        };
-        self.call("click", json!({ "scope": "desktop", "x": x, "y": y }))
+        }
+        let type_select_segment = Self::menu_type_select_segment(segment);
+        self.call(
+            "type_text",
+            json!({"scope": "desktop", "text": type_select_segment}),
+        )
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        self.call("press_key", json!({"scope": "desktop", "key": "return"}))
             .await?;
 
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let Ok(state_after_click) = self
+        let Ok(state_after_type_select) = self
             .window_state_inner(&window, true, false, 2000, 1440, screenshot_dir, None)
             .await
         else {
             return Ok(None);
         };
-        let still_open = digest::find(&state_after_click, segment, Some("AXMenuItem"), 5)
+        let still_open = digest::find(&state_after_type_select, segment, Some("AXMenuItem"), 5)
             .into_iter()
             .any(|hit| {
                 hit.label
@@ -564,7 +566,7 @@ impl CuaBackend {
             });
         if !still_open {
             return Ok(Some(format!(
-                " (driver's menu press left the menu open; completed \"{segment}\" with a screen-point click at ({x:.0},{y:.0}))"
+                " (driver's menu press left the menu open; completed \"{segment}\" via menu type-select + Return)"
             )));
         }
 
@@ -573,7 +575,7 @@ impl CuaBackend {
         Err(ComputerError::refused(
             "suspected_noop",
             format!(
-                "invoke_menu: the menu stayed open after dispatch and a screen-point click; menu command not confirmed"
+                "invoke_menu: the menu stayed open after dispatch and menu type-select + Return; menu command not confirmed"
             ),
         ))
     }
