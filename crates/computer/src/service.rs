@@ -12,9 +12,14 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-use crate::backend::{ComputerBackend, Delivery, InspectKind, ObserveRequest, ObserveScope};
+use crate::backend::{
+    ComputerBackend, Delivery, ElementFrame, InspectKind, ObserveRequest, ObserveScope,
+    WindowElement, WindowState,
+};
 use crate::digest;
 use crate::install::{self, InstallProgress};
+use crate::notify::{self, ComputerNotice, NoticeKind};
+use crate::pairing::{PairingStore, TrustPublic};
 use crate::surface;
 use crate::{
     ComputerError, ComputerPaths, ComputerSettings, ComputerSettingsEcho, ComputerStatus,
@@ -50,6 +55,18 @@ struct Inner {
     /// service refuses with `repeated_failure` and a fresh-state hint instead
     /// of letting a harness hammer a dead target forever.
     failures: Mutex<HashMap<String, u32>>,
+    /// Bumped by `computer_stop` / `ComputerStop`. Wait/scroll loops abort
+    /// when the epoch they started under no longer matches.
+    cancel_epoch: std::sync::atomic::AtomicU64,
+    /// Latest Computer notice (task complete, pairing, stop, …).
+    notices: watch::Sender<Option<ComputerNotice>>,
+    pairing: Mutex<PairingStore>,
+    /// Per-session window pin: session label → (pid, window_id). Parallel
+    /// agents each get their own Cua session + this pin so clicks cannot
+    /// leak across windows.
+    pins: Mutex<HashMap<String, (i64, Option<i64>)>>,
+    /// Watch Live subscriber count — screenshots stream only while > 0.
+    live_watchers: std::sync::atomic::AtomicU32,
 }
 
 struct Endpoint {
@@ -83,9 +100,14 @@ impl ComputerService {
     /// attachment-staging jail (the engine passes its uploads root so the UI
     /// can read staged PNGs through the attachment-chunk RPC).
     pub fn new(data_dir: PathBuf, screenshot_dir: PathBuf) -> Self {
+        // The driver writes staged PNGs into `screenshot_dir` per call; it
+        // must exist or every capture fails ENOENT.
+        let _ = std::fs::create_dir_all(&screenshot_dir);
         let settings = load_settings(&data_dir);
         let (install_tx, _) = watch::channel(InstallProgress::Idle);
         let (status_tx, _) = watch::channel(());
+        let (notices, _) = notify::channel();
+        let pairing = PairingStore::load(&data_dir);
         Self {
             inner: Arc::new(Inner {
                 paths: ComputerPaths::new(&data_dir),
@@ -100,6 +122,11 @@ impl ComputerService {
                 status_tx,
                 installing: AtomicBool::new(false),
                 failures: Mutex::new(HashMap::new()),
+                cancel_epoch: std::sync::atomic::AtomicU64::new(0),
+                notices,
+                pairing: Mutex::new(pairing),
+                pins: Mutex::new(HashMap::new()),
+                live_watchers: std::sync::atomic::AtomicU32::new(0),
             }),
         }
     }
@@ -147,6 +174,119 @@ impl ComputerService {
         self.inner.status_tx.subscribe()
     }
 
+    pub fn subscribe_notices(&self) -> watch::Receiver<Option<ComputerNotice>> {
+        self.inner.notices.subscribe()
+    }
+
+    fn emit_notice(&self, kind: NoticeKind, title: &str, body: &str) {
+        let _ = self
+            .inner
+            .notices
+            .send(Some(notify::notice(kind, title, body)));
+        self.bump_status();
+    }
+
+    /// Abort in-flight wait/scroll loops. Does not kill the driver — the next
+    /// action after a fresh observe still works. Remote STOP uses this.
+    pub fn stop(&self, reason: &str) {
+        self.inner.cancel_epoch.fetch_add(1, Ordering::SeqCst);
+        self.emit_notice(NoticeKind::Stopped, "Computer Use stopped", reason);
+    }
+
+    pub fn cancel_epoch(&self) -> u64 {
+        self.inner.cancel_epoch.load(Ordering::SeqCst)
+    }
+
+    fn cancelled(&self, started: u64) -> bool {
+        self.cancel_epoch() != started
+    }
+
+    pub fn request_trust(
+        &self,
+        device_id: &str,
+        device_name: &str,
+        platform: Option<&str>,
+        pairing_token: &str,
+    ) -> Result<TrustPublic, ComputerError> {
+        let public = self.inner.pairing.lock().unwrap().request(
+            device_id,
+            device_name,
+            platform,
+            pairing_token,
+        )?;
+        self.emit_notice(
+            NoticeKind::ApprovalRequired,
+            "Computer Use pairing requested",
+            &format!("{device_name} wants to control this desktop"),
+        );
+        Ok(public)
+    }
+
+    pub fn approve_trust(&self, device_id: &str) -> Result<TrustPublic, ComputerError> {
+        let public = self.inner.pairing.lock().unwrap().approve(device_id)?;
+        self.bump_status();
+        Ok(public)
+    }
+
+    pub fn revoke_trust(&self, device_id: &str) -> Result<TrustPublic, ComputerError> {
+        let public = self.inner.pairing.lock().unwrap().revoke(device_id)?;
+        self.emit_notice(
+            NoticeKind::Stopped,
+            "Computer pairing revoked",
+            &format!("{device_id} can no longer control this desktop"),
+        );
+        Ok(public)
+    }
+
+    pub fn authorize_remote(
+        &self,
+        device_id: &str,
+        pairing_token: &str,
+    ) -> Result<(), ComputerError> {
+        self.inner
+            .pairing
+            .lock()
+            .unwrap()
+            .authorize(device_id, pairing_token)
+    }
+
+    pub fn trust_list(&self) -> Vec<TrustPublic> {
+        self.inner.pairing.lock().unwrap().list()
+    }
+
+    pub fn begin_live_watch(&self) {
+        self.inner.live_watchers.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn end_live_watch(&self) {
+        let _ = self
+            .inner
+            .live_watchers
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+
+    pub fn live_watchers(&self) -> u32 {
+        self.inner.live_watchers.load(Ordering::SeqCst)
+    }
+
+    /// One Watch Live frame — screenshot only when settings allow and at least
+    /// one viewer is subscribed (or `force` for the first snapshot).
+    pub async fn live_frame(&self, force: bool) -> Result<Observation, ComputerError> {
+        if !force && self.live_watchers() == 0 {
+            return Err(ComputerError::refused(
+                "live_idle",
+                "Watch Live is idle — no viewer is subscribed",
+            ));
+        }
+        let mut args = json!({"scope": "frontmost"});
+        if self.settings().screenshots {
+            args["includeScreenshot"] = json!(true);
+        }
+        self.observe(args).await
+    }
+
     // -- status --------------------------------------------------------------
 
     /// The snapshot the Settings page and `computer_status` render. Sync —
@@ -158,6 +298,9 @@ impl ComputerService {
         let backend_running = self.inner.backend.lock().unwrap().is_some();
         let platform_supported = release_asset().is_some();
         let last_error = self.inner.last_error.lock().unwrap().clone();
+        let pending_trust = self.inner.pairing.lock().unwrap().pending();
+        let trusted_devices = self.inner.pairing.lock().unwrap().trusted();
+        let remote_control = !trusted_devices.is_empty();
         let state = self.state_label(
             &settings,
             &install,
@@ -191,10 +334,14 @@ impl ComputerService {
                 background: settings.control.acts(),
                 foreground: settings.control == ControlMode::FullControl,
                 wayland_background_limited: linux_session_label() == Some("wayland"),
+                live_watch: settings.screenshots,
+                remote_control,
             },
             permissions: self.permission_hints(),
             last_error,
             session_id: None,
+            pending_trust,
+            trusted_devices,
             checked_at: chrono::Utc::now(),
         }
     }
@@ -423,7 +570,11 @@ impl ComputerService {
     /// The ONE funnel for `tools/call` — the HTTP endpoint and the engine's
     /// `ComputerToolCall` RPC both come through here, so control-mode policy
     /// is enforced in exactly one place.
-    pub async fn dispatch_tool(&self, name: &str, args: Value) -> Result<ToolReply, ComputerError> {
+    pub async fn dispatch_tool(
+        &self,
+        name: &str,
+        mut args: Value,
+    ) -> Result<ToolReply, ComputerError> {
         // `computer_status` answers even when disabled — it's how a harness
         // learns the computer exists and why it isn't usable.
         if name == "computer_status" {
@@ -431,10 +582,46 @@ impl ComputerService {
                 serde_json::to_string_pretty(&self.status()).unwrap_or_default(),
             ));
         }
+        if name == "computer_stop" {
+            let reason = get_str(&args, "reason").unwrap_or("stopped by caller");
+            self.stop(reason);
+            return Ok(ToolReply::text(format!("stopped: {reason}")));
+        }
+
+        let isolation = take_isolation(&mut args);
+        if name == "computer_pin_window" {
+            let pid = get_i64(&args, "pid").ok_or_else(|| {
+                ComputerError::InvalidArgs("computer_pin_window needs 'pid'".into())
+            })?;
+            let window = get_i64(&args, "windowId");
+            let session = isolation.session.clone().unwrap_or_else(|| "cosmos".into());
+            self.inner
+                .pins
+                .lock()
+                .unwrap()
+                .insert(session.clone(), (pid, window));
+            return Ok(ToolReply::text(format!(
+                "pinned session {session} to pid {pid} window {}",
+                window
+                    .map(|w| w.to_string())
+                    .unwrap_or_else(|| "frontmost".into())
+            )));
+        }
+        if name == "computer_unpin" {
+            let session = isolation.session.clone().unwrap_or_else(|| "cosmos".into());
+            self.inner.pins.lock().unwrap().remove(&session);
+            return Ok(ToolReply::text(format!("unpinned session {session}")));
+        }
 
         let settings = self.settings();
         if !settings.enabled {
             return Err(ComputerError::Disabled);
+        }
+        apply_pin(&mut args, &isolation, &self.inner.pins)?;
+        if let Some(session) = &isolation.session
+            && let Some(obj) = args.as_object_mut()
+        {
+            obj.insert("_session".into(), json!(session));
         }
         let backend = self.ensure_backend().await?;
 
@@ -467,9 +654,15 @@ impl ComputerService {
                 let expect = args.get("expect").cloned().ok_or_else(|| {
                     ComputerError::InvalidArgs("needs 'expect' predicates".into())
                 })?;
-                let outcome = backend
-                    .verify(pid, get_i64(&args, "windowId"), expect)
-                    .await?;
+                let outcome = verify_predicates(
+                    &*backend,
+                    &settings,
+                    &self.inner.screenshot_dir,
+                    pid,
+                    get_i64(&args, "windowId"),
+                    expect,
+                )
+                .await?;
                 Ok(ToolReply::text(
                     serde_json::to_string_pretty(&outcome).unwrap_or_default(),
                 ))
@@ -480,7 +673,7 @@ impl ComputerService {
                     tool: "computer_clipboard_read".into(),
                     args: args.clone(),
                     delivery: Delivery::Background,
-                    session: None,
+                    session: get_str(&args, "_session").map(str::to_string),
                     screenshot_dir: self.inner.screenshot_dir.clone(),
                     observe_screenshot: false,
                     observe_semantic: false,
@@ -537,6 +730,13 @@ impl ComputerService {
             }
             _ => Delivery::Background,
         };
+        if delivery == Delivery::Foreground {
+            self.emit_notice(
+                NoticeKind::ComputerForeground,
+                "Computer Use needs the foreground",
+                "An action could not run in the background and escalated",
+            );
+        }
         if !settings.control.acts() {
             return Err(ComputerError::refused(
                 "control_mode",
@@ -568,7 +768,7 @@ impl ComputerService {
             tool: name.to_string(),
             args: args.clone(),
             delivery,
-            session: None,
+            session: get_str(args, "_session").map(str::to_string),
             screenshot_dir: self.inner.screenshot_dir.clone(),
             observe_screenshot: settings.screenshots,
             observe_semantic: settings.semantic,
@@ -598,17 +798,28 @@ impl ComputerService {
         let window_id = get_i64(args, "windowId");
         if let Some(expect) = args.get("expect") {
             match (pid, window_id) {
-                (Some(pid), _) => match backend.verify(pid, window_id, expect.clone()).await {
-                    Ok(verification) => {
-                        text.push_str("\n--- verification ---\n");
-                        text.push_str(
-                            &serde_json::to_string_pretty(&verification).unwrap_or_default(),
-                        );
+                (Some(pid), _) => {
+                    match verify_predicates(
+                        backend,
+                        settings,
+                        &self.inner.screenshot_dir,
+                        pid,
+                        window_id,
+                        expect.clone(),
+                    )
+                    .await
+                    {
+                        Ok(verification) => {
+                            text.push_str("\n--- verification ---\n");
+                            text.push_str(
+                                &serde_json::to_string_pretty(&verification).unwrap_or_default(),
+                            );
+                        }
+                        Err(error) => {
+                            text.push_str(&format!("\n--- verification failed to run: {error}"));
+                        }
                     }
-                    Err(error) => {
-                        text.push_str(&format!("\n--- verification failed to run: {error}"));
-                    }
-                },
+                }
                 _ => {
                     text.push_str("\n--- 'expect' skipped: needs pid (+windowId) to bind the check")
                 }
@@ -695,9 +906,16 @@ impl ComputerService {
                 .clamp(200, 45_000) as u64,
         );
         let deadline = Instant::now() + timeout;
+        let epoch = self.cancel_epoch();
         let mut last_fingerprint: Option<String> = None;
         let mut last_summary = String::from("unavailable");
         loop {
+            if self.cancelled(epoch) {
+                return Err(ComputerError::refused(
+                    "cancelled",
+                    "Computer Use was stopped before the wait completed",
+                ));
+            }
             match self
                 .wait_check(
                     backend,
@@ -754,7 +972,15 @@ impl ComputerService {
         let semantic_cap = settings.inspect_max_elements.min(600);
         if let Some(selector) = condition.get("element") {
             let expect = json!([{ "element": { "selector": selector, "exists": true } }]);
-            let outcome = backend.verify(pid, window_id, expect).await?;
+            let outcome = verify_predicates(
+                backend,
+                settings,
+                &self.inner.screenshot_dir,
+                pid,
+                window_id,
+                expect,
+            )
+            .await?;
             // verify_state reports `status` = satisfied|unsatisfied|unknown —
             // `unknown` is NOT success.
             let satisfied = outcome.get("status").and_then(Value::as_str) == Some("satisfied");
@@ -762,7 +988,16 @@ impl ComputerService {
         }
         if let Some(selector) = condition.get("elementGone") {
             let expect = json!([{ "element": { "selector": selector, "exists": true } }]);
-            return match backend.verify(pid, window_id, expect).await {
+            return match verify_predicates(
+                backend,
+                settings,
+                &self.inner.screenshot_dir,
+                pid,
+                window_id,
+                expect,
+            )
+            .await
+            {
                 Ok(outcome) => Ok(
                     if outcome.get("status").and_then(Value::as_str) == Some("satisfied") {
                         None
@@ -899,7 +1134,14 @@ impl ComputerService {
         let max_steps = get_i64(args, "maxSteps").unwrap_or(8).clamp(1, 20);
 
         let mut last_fingerprint = String::new();
+        let epoch = self.cancel_epoch();
         for step in 0..max_steps {
+            if self.cancelled(epoch) {
+                return Err(ComputerError::refused(
+                    "cancelled",
+                    "Computer Use was stopped during scroll_until",
+                ));
+            }
             // Full unprojected state — the edge detector compares whole
             // digests, and a `query` projection would change the fingerprint
             // independent of scrolling.
@@ -942,7 +1184,7 @@ impl ComputerService {
                     "amount": 3,
                 }),
                 delivery,
-                session: None,
+                session: get_str(args, "_session").map(str::to_string),
                 screenshot_dir: self.inner.screenshot_dir.clone(),
                 observe_screenshot: false,
                 observe_semantic: false,
@@ -1146,4 +1388,325 @@ fn get_i64(args: &Value, key: &str) -> Option<i64> {
 
 fn get_u32(args: &Value, key: &str) -> Option<u32> {
     args.get(key).and_then(Value::as_u64).map(|v| v as u32)
+}
+
+struct Isolation {
+    session: Option<String>,
+    pin_pid: Option<i64>,
+    pin_window: Option<i64>,
+}
+
+fn take_isolation(args: &mut Value) -> Isolation {
+    Isolation {
+        session: take_str(args, "_cosmosSession").or_else(|| take_str(args, "session")),
+        pin_pid: take_i64(args, "_cosmosPinPid"),
+        pin_window: take_i64(args, "_cosmosPinWindow"),
+    }
+}
+
+fn take_str(args: &mut Value, key: &str) -> Option<String> {
+    args.as_object_mut()
+        .and_then(|o| o.remove(key))
+        .and_then(|v| v.as_str().map(str::to_string))
+}
+
+fn take_i64(args: &mut Value, key: &str) -> Option<i64> {
+    args.as_object_mut()
+        .and_then(|o| o.remove(key))
+        .and_then(|v| v.as_i64())
+}
+
+/// Enforce a session pin: mismatched pid/window is `window_isolation`. A pin
+/// with no pid on the call fills pid/window from the pin (frontmost-in-pin).
+fn apply_pin(
+    args: &mut Value,
+    isolation: &Isolation,
+    pins: &Mutex<HashMap<String, (i64, Option<i64>)>>,
+) -> Result<(), ComputerError> {
+    let mut pin_pid = isolation.pin_pid;
+    let mut pin_window = isolation.pin_window;
+    if pin_pid.is_none()
+        && let Some(session) = &isolation.session
+        && let Some((pid, window)) = pins.lock().unwrap().get(session).copied()
+    {
+        pin_pid = Some(pid);
+        pin_window = window;
+    }
+    let Some(pin_pid) = pin_pid else {
+        return Ok(());
+    };
+    if let Some(pid) = get_i64(args, "pid")
+        && pid != pin_pid
+    {
+        return Err(ComputerError::refused(
+            "window_isolation",
+            format!("this session is pinned to pid {pin_pid}; refusing pid {pid}"),
+        ));
+    }
+    if let Some(pin_window) = pin_window
+        && let Some(window) = get_i64(args, "windowId")
+        && window != pin_window
+    {
+        return Err(ComputerError::refused(
+            "window_isolation",
+            format!("this session is pinned to window {pin_window}; refusing window {window}"),
+        ));
+    }
+    if let Some(obj) = args.as_object_mut() {
+        obj.entry("pid").or_insert(json!(pin_pid));
+        if let Some(window) = pin_window {
+            obj.entry("windowId").or_insert(json!(window));
+        }
+        if obj.get("scope").and_then(Value::as_str) == Some("frontmost") {
+            obj.insert("scope".into(), json!("window"));
+        }
+    }
+    Ok(())
+}
+
+/// `verify_state`-compatible predicates evaluated locally against one
+/// fresh `window_state` snapshot. The driver's own element predicates
+/// return `observation_unavailable` (0.28.2) even when observe works, so
+/// Cosmos evaluates them itself — same vocabulary, same reply shape.
+async fn verify_predicates(
+    backend: &dyn ComputerBackend,
+    settings: &ComputerSettings,
+    screenshot_dir: &std::path::Path,
+    pid: i64,
+    window_id: Option<i64>,
+    expect: Value,
+) -> Result<Value, ComputerError> {
+    let predicates = match normalize_expect(expect) {
+        Value::Array(items) => items,
+        single => vec![single],
+    };
+    let wants_elements = predicates.iter().any(|p| p.get("element").is_some());
+    // get_window_state refuses a bare "nothing to return" call — window-only
+    // predicates still pass semantic:true capped at one element.
+    let state = backend
+        .window_state(
+            pid,
+            window_id,
+            true,
+            false,
+            if wants_elements {
+                settings.inspect_max_elements.min(1_200)
+            } else {
+                1
+            },
+            0,
+            screenshot_dir,
+            None,
+        )
+        .await?;
+    let started = Instant::now();
+    let mut verdicts = Vec::with_capacity(predicates.len());
+    let mut all_satisfied = true;
+    for (index, predicate) in predicates.iter().enumerate() {
+        let (status, observed, unknown_reason) = eval_predicate(predicate, &state);
+        if status != "satisfied" {
+            all_satisfied = false;
+        }
+        verdicts.push(json!({
+            "index": index,
+            "status": status,
+            "observed_json": observed,
+            "unknown_reason": unknown_reason,
+        }));
+    }
+    Ok(json!({
+        "status": if all_satisfied { "satisfied" } else { "unsatisfied" },
+        "predicates": verdicts,
+        "samples": 1,
+        "stable": true,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    }))
+}
+
+/// The surface schema documents verify predicates in camelCase
+/// (`labelContains`, `valueEquals`); the driver's `verify_state` only
+/// accepts snake_case — normalize object keys recursively before
+/// forwarding. Values are untouched.
+fn normalize_expect(expect: Value) -> Value {
+    match expect {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (camel_to_snake_case(&k), normalize_expect(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(normalize_expect).collect()),
+        scalar => scalar,
+    }
+}
+
+fn camel_to_snake_case(key: &str) -> String {
+    if !key.chars().any(|c| c.is_ascii_uppercase()) {
+        return key.to_string();
+    }
+    let mut out = String::with_capacity(key.len() + 4);
+    for ch in key.chars() {
+        if ch.is_ascii_uppercase() {
+            out.push('_');
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// One predicate verdict — mirrors the driver's verify_state entries:
+/// (status, observed_json, unknown_reason).
+fn eval_predicate(
+    predicate: &Value,
+    state: &WindowState,
+) -> (&'static str, String, Option<String>) {
+    if let Some(element) = predicate.get("element") {
+        let selector = element
+            .get("selector")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let matches: Vec<&WindowElement> = state
+            .elements
+            .iter()
+            .filter(|e| selector_matches(e, &selector))
+            .collect();
+        // Asserted flags (enabled/selected/checked/focused/value_equals)
+        // must hold on a matched element.
+        let qualified: Vec<&&WindowElement> = matches
+            .iter()
+            .filter(|e| element_flags_satisfied(element, e))
+            .collect();
+        let want_exists = element
+            .get("exists")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let satisfied = want_exists == !qualified.is_empty();
+        let observed = json!({
+            "matches": qualified.len(),
+            "first": qualified.first().map(|e| json!({
+                "role": e.role,
+                "label": e.label,
+                "value": e.value,
+                "enabled": e.enabled,
+                "selected": e.selected,
+            })),
+            "elements_truncated": state.returned_element_count < state.total_element_count,
+        });
+        return (
+            if satisfied {
+                "satisfied"
+            } else {
+                "unsatisfied"
+            },
+            observed.to_string(),
+            None,
+        );
+    }
+    if let Some(window) = predicate.get("window") {
+        let exists = state.window_id != 0;
+        let mut satisfied = window
+            .get("exists")
+            .and_then(Value::as_bool)
+            .map(|want| want == exists)
+            .unwrap_or(true);
+        if let Some(bounds) = window.get("bounds") {
+            satisfied &= bounds_match(bounds, state.window_bounds);
+        }
+        let observed = json!({
+            "exists": exists,
+            "bounds": state.window_bounds,
+            "title": state.window_title,
+        });
+        return (
+            if satisfied {
+                "satisfied"
+            } else {
+                "unsatisfied"
+            },
+            observed.to_string(),
+            None,
+        );
+    }
+    (
+        "unknown",
+        "{}".to_string(),
+        Some("unsupported predicate".into()),
+    )
+}
+
+/// Selector match — `role` tolerates the driver's `AX` prefixes and common
+/// aliases; `label_contains` is a case-insensitive substring on the label.
+fn selector_matches(e: &WindowElement, selector: &Value) -> bool {
+    if let Some(role) = selector.get("role").and_then(Value::as_str) {
+        if !role_matches(&e.role, role) {
+            return false;
+        }
+    }
+    if let Some(label) = selector.get("label_contains").and_then(Value::as_str) {
+        if !e
+            .label
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains(&label.to_lowercase())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn role_matches(actual: &str, want: &str) -> bool {
+    let strip = |role: &str| role.to_lowercase().trim_start_matches("ax").to_string();
+    let (have, want) = (strip(actual), strip(want));
+    have == want
+        || have.contains(&want)
+        || want.contains(&have)
+        || matches!(
+            (want.as_str(), have.as_str()),
+            ("edit", "textarea")
+                | ("edit", "textfield")
+                | ("input", "textarea")
+                | ("input", "textfield")
+                | ("link", "textlink")
+        )
+}
+
+/// Asserted element flags — absent assertions pass; asserted flags must
+/// hold (an absent driver flag can't satisfy an assertion).
+fn element_flags_satisfied(predicate: &Value, e: &WindowElement) -> bool {
+    let flag = |name: &str, actual: Option<bool>| -> bool {
+        match predicate.get(name).and_then(Value::as_bool) {
+            Some(want) => actual == Some(want),
+            None => true,
+        }
+    };
+    flag("enabled", Some(e.enabled))
+        && flag("selected", e.selected)
+        && flag("checked", e.checked)
+        && flag("focused", e.focused)
+        && match predicate.get("value_equals").and_then(Value::as_str) {
+            Some(want) => {
+                let value = e.value.as_deref().unwrap_or_default();
+                value == want || value.trim() == want || value.contains(want)
+            }
+            None => true,
+        }
+}
+
+fn bounds_match(want: &Value, actual: Option<ElementFrame>) -> bool {
+    let Some(actual) = actual else { return false };
+    let close = |key: &str, got: f64| {
+        want.get(key)
+            .and_then(Value::as_f64)
+            .map(|w| (got - w).abs() <= 1.0)
+            .unwrap_or(true)
+    };
+    close("x", actual.x)
+        && close("y", actual.y)
+        && close("w", actual.w)
+        && close("h", actual.h)
+        && close("width", actual.w)
+        && close("height", actual.h)
 }

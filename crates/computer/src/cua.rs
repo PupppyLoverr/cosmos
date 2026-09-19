@@ -37,13 +37,18 @@ use crate::{
     StagedScreenshot,
 };
 
-/// Session label forwarded on every driver call — groups all Cosmos-driven
-/// calls into one driver-side lifecycle session (idle TTL ~5 min; revived
-/// transparently by [`CuaBackend::call`]).
-const SESSION_LABEL: &str = "cosmos";
+/// Session-label prefix forwarded on every driver call — groups all
+/// Cosmos-driven calls into one driver-side lifecycle session (idle TTL
+/// ~5 min; revived transparently by [`CuaBackend::call`]). The label is
+/// unique per backend spawn (`cosmos-<pid>`): names tombstone daemon-side
+/// when their transport dies, so a shared static label wedges the first
+/// respawn inside the TTL window with `session_unavailable`.
+const SESSION_LABEL_PREFIX: &str = "cosmos";
 
 pub struct CuaBackend {
     client: McpClient,
+    /// This backend's unique driver session label.
+    session: String,
     version: Option<String>,
 }
 
@@ -78,6 +83,7 @@ impl CuaBackend {
         let client = McpClient::spawn(&binary, &env, &[]).await?;
         let backend = Self {
             client,
+            session: format!("{SESSION_LABEL_PREFIX}-{}", std::process::id()),
             version: None,
         };
         // Name the shared session up-front — `start_session` is idempotent and
@@ -96,18 +102,35 @@ impl CuaBackend {
             .or_else(|| Some(install.version.clone()));
         Ok(Self {
             client: backend.client,
+            session: backend.session,
             version,
         })
     }
 
-    /// `start_session` for the shared Cosmos label — creates or revives it.
+    /// `start_session` for this backend's label — creates or revives it.
     async fn start_session(&self) -> Result<(), ComputerError> {
         // Called directly on the client (not `call`) — the revive path calls
         // this, and wrapping it would recurse.
-        self.client
-            .call_tool("start_session", json!({ "session": SESSION_LABEL }))
+        match self
+            .client
+            .call_tool("start_session", json!({ "session": self.session }))
             .await
-            .map(|_| ())
+        {
+            // Defensive: a live lease on the same label (theoretically a
+            // colliding pid reused within the tombstone TTL) is ended and
+            // retried once rather than wedging the spawn.
+            Err(error) if Self::is_session_unavailable(&error) => {
+                let _ = self
+                    .client
+                    .call_tool("end_session", json!({ "session": self.session }))
+                    .await;
+                self.client
+                    .call_tool("start_session", json!({ "session": self.session }))
+                    .await
+                    .map(|_| ())
+            }
+            other => other.map(|_| ()),
+        }
     }
 
     /// Is this error the driver's dead-session refusal?
@@ -115,8 +138,21 @@ impl CuaBackend {
         match error {
             ComputerError::Refused { code, message } => {
                 code == "session_ended"
+                    || Self::is_session_unavailable(error)
                     || message.contains("session has ended")
                     || message.contains("call start_session")
+            }
+            _ => false,
+        }
+    }
+
+    /// Is this error the stale-lease refusal (`session is not available to
+    /// this transport`)? Distinct from `session_ended`: the name survives,
+    /// still bound to a transport that no longer exists.
+    pub(crate) fn is_session_unavailable(error: &ComputerError) -> bool {
+        match error {
+            ComputerError::Refused { code, message } => {
+                code == "session_unavailable" || message.contains("not available to this transport")
             }
             _ => false,
         }
@@ -130,7 +166,12 @@ impl CuaBackend {
         if let Some(obj) = args.as_object_mut()
             && !obj.contains_key("session")
         {
-            obj.insert("session".into(), json!(SESSION_LABEL));
+            obj.insert("session".into(), json!(self.session));
+        }
+        if let Some(label) = args.get("session").and_then(Value::as_str)
+            && label != self.session
+        {
+            self.ensure_named_session(label).await?;
         }
         match self.client.call_tool(tool, args.clone()).await {
             Err(error) if Self::is_session_ended(&error) => {
@@ -138,6 +179,27 @@ impl CuaBackend {
                 self.client.call_tool(tool, args).await
             }
             other => other,
+        }
+    }
+
+    async fn ensure_named_session(&self, label: &str) -> Result<(), ComputerError> {
+        match self
+            .client
+            .call_tool("start_session", json!({ "session": label }))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if Self::is_session_unavailable(&error) => {
+                let _ = self
+                    .client
+                    .call_tool("end_session", json!({ "session": label }))
+                    .await;
+                self.client
+                    .call_tool("start_session", json!({ "session": label }))
+                    .await
+                    .map(|_| ())
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -225,9 +287,22 @@ impl CuaBackend {
                     )
                 });
         }
-        windows
+        // Prefer on-screen windows: macOS reports off-screen remnants (dismissed
+        // sheets, phantom document windows) whose AX tree yields zero elements.
+        let on_screen: Vec<&Value> = windows
             .iter()
             .filter(|w| w.get("minimized").and_then(Value::as_bool) != Some(true))
+            .filter(|w| w.get("is_on_screen").and_then(Value::as_bool) != Some(false))
+            .collect();
+        let fallback: Vec<&Value> = windows.iter().collect();
+        let candidates: &[&Value] = if on_screen.is_empty() {
+            &fallback
+        } else {
+            &on_screen
+        };
+        candidates
+            .iter()
+            .copied()
             .max_by_key(|w| w.get("z_index").and_then(Value::as_i64).unwrap_or(0))
             .or_else(|| windows.first())
             .cloned()
@@ -563,12 +638,17 @@ impl CuaBackend {
                 ),
             ),
             "computer_invoke_menu" => (
+                // invoke_menu resolves the menu item by path — the driver
+                // accepts only pid/window_id/path/session here (no
+                // delivery_mode; menu invocation is already background AX).
+                // The surface's "File > Save" string becomes the driver's
+                // segment array ["File","Save"]. window_id is driver-required;
+                // resolved after this match when absent.
                 "invoke_menu",
                 json!({
                     "pid": int_arg(args, "pid"),
                     "window_id": int_arg(args, "windowId"),
-                    "path": str_arg(args, "path"),
-                    "delivery_mode": delivery,
+                    "path": menu_path(args),
                 }),
             ),
             "computer_set_window_frame" => (
@@ -612,6 +692,23 @@ impl CuaBackend {
             }
         };
         strip_nulls(&mut call_args);
+        if let Some(session) = &request.session
+            && let Some(obj) = call_args.as_object_mut()
+        {
+            obj.insert("session".into(), json!(session));
+        }
+        // invoke_menu requires window_id driver-side; the surface treats it
+        // as "defaults to the pid's frontmost window" — resolve it here.
+        if tool == "invoke_menu" && call_args.get("window_id").is_none() {
+            let pid = call_args
+                .get("pid")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| ComputerError::InvalidArgs("invoke_menu needs 'pid'".into()))?;
+            let window = self.window_for(pid, None).await?;
+            if let Some(id) = window.get("window_id").and_then(Value::as_i64) {
+                call_args["window_id"] = json!(id);
+            }
+        }
         let result = self.call(tool, call_args).await?;
         let details = result.get("structuredContent").cloned();
         let mut summary = result_text(&result).unwrap_or_else(|| format!("{tool} completed"));
@@ -686,6 +783,20 @@ fn target_args(args: &Value, delivery: &str, extra: Value) -> Value {
         }
     }
     out
+}
+
+/// Surface menu path ("File > Save" string, or an already-array path) → the
+/// driver's `path` segment array.
+fn menu_path(args: &Value) -> Value {
+    match args.get("path") {
+        Some(Value::String(path)) => json!(
+            path.split('>')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        ),
+        other => other.cloned().unwrap_or(Value::Null),
+    }
 }
 
 fn strip_nulls(value: &mut Value) {

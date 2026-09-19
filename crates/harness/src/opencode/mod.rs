@@ -269,9 +269,8 @@ impl OpencodeHarness {
 
     /// Boot (or attach to) a server for a run/probe. Probes have no chat cwd:
     /// they boot in the user's home, where global provider config lives.
-    /// `bridge` is the run's embedded-browser endpoint — env-var only;
-    /// opencode's MCP config lives in files we don't touch. `computer` and
-    /// `tools` travel the same env seam.
+    /// Cosmos Computer/Browser/Tools are registered as real OpenCode MCP
+    /// servers (`OPENCODE_CONFIG_CONTENT`) plus the uniform env fallback.
     async fn server(
         &self,
         cwd: Option<&str>,
@@ -513,6 +512,14 @@ impl Server {
         }
         if let Some(url) = tools {
             cmd.env(crate::TOOLS_ENV, url);
+        }
+        if computer.is_some() || bridge.is_some() || tools.is_some() {
+            let exe = std::env::current_exe().unwrap_or_else(|_| exe.to_path_buf());
+            let session = format!("cosmos-run-{}", uuid::Uuid::new_v4().simple());
+            let config = crate::opencode_mcp_config(&exe, computer, bridge, tools, Some(&session));
+            if let Ok(body) = serde_json::to_string(&config) {
+                cmd.env("OPENCODE_CONFIG_CONTENT", body);
+            }
         }
         crate::compose_child_path(&mut cmd, exe);
         if let Some(cwd) = cwd {

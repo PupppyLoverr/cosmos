@@ -27,6 +27,8 @@ pub mod endpoint;
 pub mod install;
 pub mod mcp_client;
 pub mod mock;
+pub mod notify;
+pub mod pairing;
 pub mod service;
 pub mod stdio;
 pub mod surface;
@@ -153,6 +155,13 @@ impl ComputerError {
             "accessibility_denied",
             "timeout",
             "unsupported",
+            "cancelled",
+            "pairing_required",
+            "pairing_pending",
+            "pairing_denied",
+            "window_isolation",
+            "repeated_failure",
+            "session_unavailable",
             "refused",
         ]
         .into_iter()
@@ -693,6 +702,12 @@ pub struct StatusCapabilities {
     /// escalate to foreground under Full Control.
     #[serde(default)]
     pub wayland_background_limited: bool,
+    /// Screenshots are on — Watch Live can stream on-demand frames.
+    #[serde(default)]
+    pub live_watch: bool,
+    /// At least one remote device is paired for Computer Use.
+    #[serde(default)]
+    pub remote_control: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -733,6 +748,12 @@ pub struct ComputerStatus {
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Pending first-time pairing requests (no tokens).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_trust: Vec<crate::pairing::TrustPublic>,
+    /// Devices approved for remote Computer Use (no tokens).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_devices: Vec<crate::pairing::TrustPublic>,
     pub checked_at: chrono::DateTime<chrono::Utc>,
 }
 

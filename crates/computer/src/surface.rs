@@ -325,6 +325,35 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "computer_stop",
+            "description": "Immediately cancel in-flight computer_wait / computer_scroll_until loops and mark Computer Use stopped. Does not uninstall the driver. Call this when the user says STOP. Follow-up actions after a fresh observe still work.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Optional reason recorded on the notice bus."}
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "computer_pin_window",
+            "description": "Pin THIS agent session to one pid (+ optional windowId). Later observe/click/type in this session that name a different pid fail with window_isolation. Use at the start of a parallel-agent task so agents cannot steal each other's windows. Pass the pid/windowId from computer_list_windows.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pid": {"type": "integer"},
+                    "windowId": {"type": "integer"},
+                },
+                "required": ["pid"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "computer_unpin",
+            "description": "Clear the window pin for this agent session so it may target any window again.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+        }),
     ]
 }
 

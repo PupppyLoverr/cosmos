@@ -74,6 +74,15 @@ enum Command {
         /// Loopback MCP endpoint stamped on the run request.
         #[arg(long)]
         url: String,
+        /// Per-agent Cua session label (parallel agents must not share one).
+        #[arg(long)]
+        session: Option<String>,
+        /// Pin every tools/call in this shim to one pid (window isolation).
+        #[arg(long)]
+        pin_pid: Option<i64>,
+        /// Pin every tools/call in this shim to one window id.
+        #[arg(long)]
+        pin_window: Option<i64>,
     },
     /// Stdio MCP front for the Cosmos Tools gateway — the same contract as
     /// `computer-stdio`, pointing at the engine's loopback tools endpoint.
@@ -149,8 +158,19 @@ fn main() -> anyhow::Result<()> {
     if let Some(Command::BrowserBridge { url }) = &cli.command {
         return zeron_ui::browser::bridge::serve_stdio(url);
     }
-    if let Some(Command::ComputerStdio { url }) = &cli.command {
-        return zeron_computer::stdio::serve_stdio(url);
+    if let Some(Command::ComputerStdio {
+        url,
+        session,
+        pin_pid,
+        pin_window,
+    }) = &cli.command
+    {
+        return zeron_computer::stdio::serve_stdio_opts(zeron_computer::stdio::StdioOptions {
+            endpoint: url.clone(),
+            session: session.clone(),
+            pin_pid: *pin_pid,
+            pin_window: *pin_window,
+        });
     }
     if let Some(Command::ToolsStdio { url }) = &cli.command {
         return zeron_tools::stdio::serve_stdio(url);

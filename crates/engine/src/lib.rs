@@ -141,8 +141,9 @@ pub struct EngineCore {
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
-    /// Cosmos Computer — the device-local desktop perception/control service
-    /// (Cua Driver). IPC-only; never relay-forwarded to another device.
+    /// Cosmos Computer — desktop perception/control (Cua Driver). Status,
+    /// observe, tool-call, stop and Watch Live are relay-forwardable to a
+    /// *paired* remote device; install/settings stay host-local.
     pub computer: zeron_computer::ComputerService,
     /// Cosmos Tools — the device-local merged MCP gateway (Composio + user
     /// MCP servers). Management RPCs ARE relay-forwardable so Settings can

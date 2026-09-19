@@ -120,29 +120,49 @@ pub mod methods {
     pub const LOCAL_DEVICE: &str = "LocalDevice";
     /// Renew a desktop viewport's host-local embedded-browser lease.
     pub const REGISTER_BROWSER: &str = "RegisterBrowser";
-    // Cosmos Computer (device-local desktop perception/control). All are
-    // IPC-only and NEVER relay-forwarded: they report or act on whichever
-    // engine you are directly connected to — forwarding a desktop action to
-    // another machine's physical UI must be an explicit decision, not a
-    // relay side-effect.
+    // Cosmos Computer. Management (install/settings) stays host-local.
+    // Status/observe/tool-call/stop/live-watch ARE relay-forwardable so a
+    // paired phone can drive THIS desktop — pairing is checked on the
+    // target, never as a silent side-effect of targetDeviceId alone.
     /// Component/settings/capability snapshot → `zeron_computer::ComputerStatus`.
     pub const COMPUTER_STATUS: &str = "ComputerStatus";
     /// Persist `{enabled, semantic, screenshots, control, telemetry, …}`.
-    /// Returns the resulting `ComputerStatus`.
+    /// Returns the resulting `ComputerStatus`. Host-local (not forwarded).
     pub const COMPUTER_SET_SETTINGS: &str = "ComputerSetSettings";
     /// Download + verify + install the pinned driver component (streams
-    /// `InstallProgress` items).
+    /// `InstallProgress` items). Host-local.
     pub const COMPUTER_INSTALL: &str = "ComputerInstall";
-    /// Remove the installed component.
+    /// Remove the installed component. Host-local.
     pub const COMPUTER_UNINSTALL: &str = "ComputerUninstall";
     /// Live probe — driver ping + health report (OS permission grants).
     pub const COMPUTER_PROBE: &str = "ComputerProbe";
     /// One observe call → `zeron_computer::Observation` (screenshot rides as
     /// a staged uploads-jail path, readable via ReadAttachmentChunk).
     pub const COMPUTER_OBSERVE: &str = "ComputerObserve";
+    /// Dispatch a `computer_*` tool by name. Remote callers must include
+    /// `callerDeviceId` + `pairingToken` (approved pairing).
+    pub const COMPUTER_TOOL_CALL: &str = "ComputerToolCall";
+    /// Cancel in-flight wait/scroll and mark Computer Use stopped.
+    pub const COMPUTER_STOP: &str = "ComputerStop";
+    /// First-time pairing request from a remote device. Forwards to the
+    /// target desktop; the desktop user must Approve.
+    pub const COMPUTER_REQUEST_TRUST: &str = "ComputerRequestTrust";
+    /// Desktop-local approve of a pending pairing request.
+    pub const COMPUTER_APPROVE_TRUST: &str = "ComputerApproveTrust";
+    /// Revoke a pairing (either side).
+    pub const COMPUTER_REVOKE_TRUST: &str = "ComputerRevokeTrust";
+    /// Pairing roster (no tokens).
+    pub const COMPUTER_TRUST_STATUS: &str = "ComputerTrustStatus";
     /// Subscribe to component status changes (install progress, settings,
     /// driver liveness) — stream of `ComputerStatus` snapshots.
     pub const WATCH_COMPUTER: &str = "WatchComputer";
+    /// On-demand Watch Live frames (screenshots only while a viewer is
+    /// subscribed — not a constant stream).
+    pub const WATCH_COMPUTER_LIVE: &str = "WatchComputerLive";
+    /// Notice bus: task complete, approval required, CU foreground, failure,
+    /// offline, reconnect, stopped. Push delivery reports credential_missing
+    /// rather than faking success.
+    pub const WATCH_COMPUTER_EVENTS: &str = "WatchComputerEvents";
     // Cosmos Tools — the device-local merged MCP gateway (Composio Connect +
     // user-configured MCP servers). Unlike computer, ALL of these are
     // relay-forwardable: tool configuration is per-device account state, and

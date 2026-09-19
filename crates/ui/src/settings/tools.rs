@@ -2287,8 +2287,8 @@ impl Render for ToolsPage {
                                 .max_w(px(512.0))
                                 .line_height(px(20.0)),
                             )
-                            .child(body)
-                            .children(error),
+                            .children(error)
+                            .child(body),
                     ),
             )
             .children(scrollbar)

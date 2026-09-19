@@ -638,6 +638,28 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("computer service unavailable".into()))
     }
 
+    /// Local IPC (no callerDeviceId) is the headed host. A remote caller must
+    /// present an approved pairing token — targetDeviceId alone is not trust.
+    fn authorize_computer(&self, params: &serde_json::Value) -> Result<(), RpcError> {
+        let Some(caller) = params
+            .get("callerDeviceId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(());
+        };
+        if caller == self.doc_host.device_id() {
+            return Ok(());
+        }
+        let token = params
+            .get("pairingToken")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        self.computer()?
+            .authorize_remote(caller, token)
+            .map_err(computer_error)
+    }
+
     fn tools(&self) -> Result<&zeron_tools::ToolService, RpcError> {
         self.tools
             .as_ref()
@@ -1010,6 +1032,9 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         methods::RESUME_SESSION => Duration::from_secs(60),
         // ChatContext is a local doc read — interactive, fails fast.
         methods::CHAT_CONTEXT => Duration::from_secs(15),
+        methods::COMPUTER_TOOL_CALL | methods::COMPUTER_OBSERVE | methods::COMPUTER_STOP => {
+            Duration::from_secs(90)
+        }
         _ => Duration::from_secs(30),
     }
 }
@@ -1108,6 +1133,19 @@ fn forwardable(method: &str) -> bool {
             | methods::POLL_APP_CONNECT
             | methods::PROBE_MCP_SERVER
             | methods::WATCH_TOOLS
+            // Cosmos Computer — remote CU after explicit pairing. Install
+            // and settings stay host-local (not in this list).
+            | methods::COMPUTER_STATUS
+            | methods::COMPUTER_PROBE
+            | methods::COMPUTER_OBSERVE
+            | methods::COMPUTER_TOOL_CALL
+            | methods::COMPUTER_STOP
+            | methods::COMPUTER_REQUEST_TRUST
+            | methods::COMPUTER_REVOKE_TRUST
+            | methods::COMPUTER_TRUST_STATUS
+            | methods::WATCH_COMPUTER
+            | methods::WATCH_COMPUTER_LIVE
+            | methods::WATCH_COMPUTER_EVENTS
     )
 }
 
@@ -1123,8 +1161,9 @@ fn is_stream_method(method: &str) -> bool {
             | methods::WATCH_WORKSPACE_FILES
             | methods::UPDATE_STATUS
             | methods::WATCH_TOOLS
-            // Device-local (never reaches `forward`), listed for completeness.
             | methods::WATCH_COMPUTER
+            | methods::WATCH_COMPUTER_LIVE
+            | methods::WATCH_COMPUTER_EVENTS
     )
 }
 
@@ -1182,6 +1221,63 @@ fn computer_stream(
             }))
             .ok()?;
             Some((value, (status_rx, install_rx, service, true)))
+        },
+    )
+    .boxed()
+}
+
+struct LiveWatchGuard(zeron_computer::ComputerService);
+
+impl Drop for LiveWatchGuard {
+    fn drop(&mut self) {
+        self.0.end_live_watch();
+    }
+}
+
+/// Watch Live: one frame immediately, then ~750ms while the subscriber is
+/// alive. Screenshots only flow because `begin_live_watch` raised the count;
+/// dropping the stream stops the capture.
+fn computer_live_stream(
+    service: zeron_computer::ComputerService,
+) -> BoxStream<'static, serde_json::Value> {
+    service.begin_live_watch();
+    let guard = LiveWatchGuard(service.clone());
+    futures::stream::unfold(
+        (service, guard, true),
+        |(service, guard, first)| async move {
+            if !first {
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+            }
+            let value = match service.live_frame(first).await {
+                Ok(observation) => serde_json::to_value(observation).ok()?,
+                Err(error) => serde_json::json!({
+                    "error": error.message(),
+                    "code": error.code(),
+                }),
+            };
+            Some((value, (service, guard, false)))
+        },
+    )
+    .boxed()
+}
+
+fn computer_events_stream(
+    service: zeron_computer::ComputerService,
+) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold(
+        (service.subscribe_notices(), false),
+        |(mut rx, emitted)| async move {
+            if emitted {
+                rx.changed().await.ok()?;
+            }
+            let value = {
+                let borrowed = rx.borrow_and_update();
+                match borrowed.as_ref() {
+                    Some(notice) => serde_json::to_value(notice).ok()?,
+                    None => serde_json::json!({ "kind": "idle" }),
+                }
+            };
+            Some((value, (rx, true)))
         },
     )
     .boxed()
@@ -1451,9 +1547,10 @@ impl RpcService for EngineRpc {
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({"ok": true}))
             }
-            // Cosmos Computer (Settings → Computer). Device-local like
-            // RegisterBrowser: absent from `forwardable`, so a remote device
-            // can never drive THIS machine's physical desktop through relay.
+            // Cosmos Computer. Install/settings stay host-local. Observe /
+            // tool-call / stop / live-watch forward after pairing: a remote
+            // caller MUST send callerDeviceId + pairingToken; local IPC
+            // (headed app) omits them and is trusted as the host.
             methods::COMPUTER_STATUS => RpcReply::value(&self.computer()?.status()),
             methods::COMPUTER_SET_SETTINGS => {
                 let settings: zeron_computer::ComputerSettings = parse_params(params)?;
@@ -1473,6 +1570,7 @@ impl RpcService for EngineRpc {
             }
             methods::COMPUTER_PROBE => RpcReply::value(&self.computer()?.probe().await),
             methods::COMPUTER_OBSERVE => {
+                self.authorize_computer(&params)?;
                 let observation = self
                     .computer()?
                     .observe(params)
@@ -1480,9 +1578,92 @@ impl RpcService for EngineRpc {
                     .map_err(computer_error)?;
                 RpcReply::value(&observation)
             }
+            methods::COMPUTER_TOOL_CALL => {
+                self.authorize_computer(&params)?;
+                let name = params
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RpcError::Failed("Missing computer tool name".into()))?;
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                let reply = self
+                    .computer()?
+                    .dispatch_tool(name, arguments)
+                    .await
+                    .map_err(computer_error)?;
+                RpcReply::value(&serde_json::json!({
+                    "text": reply.text,
+                    "hasImage": reply.image.is_some(),
+                }))
+            }
+            methods::COMPUTER_STOP => {
+                self.authorize_computer(&params)?;
+                let reason = params
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("stopped remotely");
+                self.computer()?.stop(reason);
+                RpcReply::value(&serde_json::json!({ "ok": true, "reason": reason }))
+            }
+            methods::COMPUTER_REQUEST_TRUST => {
+                let device_id = params
+                    .get("callerDeviceId")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RpcError::Failed("Missing callerDeviceId".into()))?;
+                let name = params
+                    .get("callerName")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("device");
+                let platform = params.get("platform").and_then(serde_json::Value::as_str);
+                let token = params
+                    .get("pairingToken")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RpcError::Failed("Missing pairingToken".into()))?;
+                let public = self
+                    .computer()?
+                    .request_trust(device_id, name, platform, token)
+                    .map_err(computer_error)?;
+                RpcReply::value(&public)
+            }
+            methods::COMPUTER_APPROVE_TRUST => {
+                let device_id = params
+                    .get("callerDeviceId")
+                    .or_else(|| params.get("deviceId"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RpcError::Failed("Missing deviceId".into()))?;
+                let public = self
+                    .computer()?
+                    .approve_trust(device_id)
+                    .map_err(computer_error)?;
+                RpcReply::value(&public)
+            }
+            methods::COMPUTER_REVOKE_TRUST => {
+                let device_id = params
+                    .get("callerDeviceId")
+                    .or_else(|| params.get("deviceId"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RpcError::Failed("Missing deviceId".into()))?;
+                let public = self
+                    .computer()?
+                    .revoke_trust(device_id)
+                    .map_err(computer_error)?;
+                RpcReply::value(&public)
+            }
+            methods::COMPUTER_TRUST_STATUS => RpcReply::value(&self.computer()?.trust_list()),
             methods::WATCH_COMPUTER => {
                 let service = self.computer()?.clone();
                 Ok(RpcReply::Stream(computer_stream(service)))
+            }
+            methods::WATCH_COMPUTER_LIVE => {
+                self.authorize_computer(&params)?;
+                let service = self.computer()?.clone();
+                Ok(RpcReply::Stream(computer_live_stream(service)))
+            }
+            methods::WATCH_COMPUTER_EVENTS => {
+                let service = self.computer()?.clone();
+                Ok(RpcReply::Stream(computer_events_stream(service)))
             }
             // Cosmos Tools (Settings → Tools). Relay-forwardable — a
             // `targetDeviceId` param forwards before reaching these arms.
@@ -3008,8 +3189,27 @@ mod tests {
         ] {
             assert!(forwardable(method), "{method}");
         }
-        assert!(is_stream_method(methods::WATCH_TOOLS));
-        assert!(!forwardable(methods::WATCH_COMPUTER));
+        // Cosmos Computer remote surface is pairing-gated, not host-local.
+        for method in [
+            methods::COMPUTER_STATUS,
+            methods::COMPUTER_OBSERVE,
+            methods::COMPUTER_TOOL_CALL,
+            methods::COMPUTER_STOP,
+            methods::COMPUTER_REQUEST_TRUST,
+            methods::COMPUTER_REVOKE_TRUST,
+            methods::COMPUTER_TRUST_STATUS,
+            methods::WATCH_COMPUTER,
+            methods::WATCH_COMPUTER_LIVE,
+            methods::WATCH_COMPUTER_EVENTS,
+        ] {
+            assert!(forwardable(method), "{method}");
+        }
+        assert!(is_stream_method(methods::WATCH_COMPUTER));
+        assert!(is_stream_method(methods::WATCH_COMPUTER_LIVE));
+        assert!(is_stream_method(methods::WATCH_COMPUTER_EVENTS));
+        assert!(!forwardable(methods::COMPUTER_SET_SETTINGS));
+        assert!(!forwardable(methods::COMPUTER_INSTALL));
+        assert!(!forwardable(methods::COMPUTER_APPROVE_TRUST));
     }
 
     /// Every forwardable unary method gets a bounded reply deadline —

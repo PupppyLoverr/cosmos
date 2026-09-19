@@ -609,6 +609,9 @@ fn new_tools_are_advertised_and_gated() {
         "computer_clipboard_read",
         "computer_clipboard_write",
         "computer_hotkey",
+        "computer_stop",
+        "computer_pin_window",
+        "computer_unpin",
     ] {
         assert!(names.contains(&name), "{name} missing from tools/list");
     }
@@ -628,6 +631,9 @@ fn new_tools_are_advertised_and_gated() {
         "computer_wait",
         "computer_verify",
         "computer_clipboard_read",
+        "computer_stop",
+        "computer_pin_window",
+        "computer_unpin",
     ] {
         assert!(
             !crate::surface::is_action_tool(read),
@@ -969,4 +975,93 @@ mod linux_regression {
             .unwrap_err();
         assert_eq!(err.code(), "driver_unavailable");
     }
+}
+
+#[tokio::test]
+async fn pin_refuses_cross_window_actions() {
+    let (service, _data) = service(
+        enabled_settings(ControlMode::FullControl),
+        Arc::new(MockComputer::working()),
+    );
+    service
+        .dispatch_tool(
+            "computer_pin_window",
+            json!({"pid": 11, "windowId": 2, "_cosmosSession": "agent-a"}),
+        )
+        .await
+        .unwrap();
+    let err = service
+        .dispatch_tool(
+            "computer_click",
+            json!({
+                "pid": 99,
+                "windowId": 1,
+                "x": 1, "y": 1,
+                "_cosmosSession": "agent-a"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "window_isolation");
+    // Same pin, matching pid, is allowed.
+    service
+        .dispatch_tool(
+            "computer_click",
+            json!({
+                "pid": 11,
+                "windowId": 2,
+                "x": 1, "y": 1,
+                "_cosmosSession": "agent-a"
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stop_cancels_in_flight_wait() {
+    let (service, _data) = service(
+        enabled_settings(ControlMode::Background),
+        Arc::new(MockComputer::working()),
+    );
+    let waiter = service.clone();
+    let wait = tokio::spawn(async move {
+        waiter
+            .dispatch_tool(
+                "computer_wait",
+                json!({
+                    "pid": 1,
+                    "for": {"text": "this-will-not-appear"},
+                    "timeoutMs": 8000
+                }),
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    service.stop("test stop");
+    let err = wait.await.unwrap().unwrap_err();
+    assert_eq!(err.code(), "cancelled");
+}
+
+#[test]
+fn pairing_is_required_before_authorize() {
+    let dir = tempfile::tempdir().unwrap();
+    let shots = tempfile::tempdir().unwrap();
+    let service = ComputerService::new(dir.path().into(), shots.path().into());
+    service
+        .authorize_remote("phone", "pairing-token-aaaaaaaa")
+        .unwrap_err();
+    service
+        .request_trust("phone", "Pixel", Some("android"), "pairing-token-aaaaaaaa")
+        .unwrap();
+    service
+        .authorize_remote("phone", "pairing-token-aaaaaaaa")
+        .unwrap_err();
+    service.approve_trust("phone").unwrap();
+    service
+        .authorize_remote("phone", "pairing-token-aaaaaaaa")
+        .unwrap();
+    let status = service.status();
+    assert_eq!(status.trusted_devices.len(), 1);
+    assert!(status.capabilities.remote_control);
 }
