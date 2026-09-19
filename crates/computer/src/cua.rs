@@ -220,8 +220,8 @@ impl CuaBackend {
         )
     }
 
-    fn cache_window_state(&self, state: &WindowState) {
-        let screen_absolute = match state.window_bounds {
+    fn screen_absolute_for_state(state: &WindowState) -> bool {
+        match state.window_bounds {
             None => true,
             Some(bounds) => state
                 .elements
@@ -235,7 +235,23 @@ impl CuaBackend {
                 .is_some_and(|frame| {
                     (frame.x - bounds.x).abs() <= 1.0 && (frame.y - bounds.y).abs() <= 1.0
                 }),
-        };
+        }
+    }
+
+    fn frame_center(state: &WindowState, frame: ElementFrame) -> Option<(f64, f64)> {
+        if Self::screen_absolute_for_state(state) {
+            Some((frame.x + frame.w / 2.0, frame.y + frame.h / 2.0))
+        } else {
+            let bounds = state.window_bounds?;
+            Some((
+                bounds.x + frame.x + frame.w / 2.0,
+                bounds.y + frame.y + frame.h / 2.0,
+            ))
+        }
+    }
+
+    fn cache_window_state(&self, state: &WindowState) {
+        let screen_absolute = Self::screen_absolute_for_state(state);
         let mut cache = self
             .element_frames
             .lock()
@@ -476,6 +492,90 @@ impl CuaBackend {
             Ok(result) => Ok((result, path)),
             Err(_) => Err(first_error),
         }
+    }
+
+    async fn recover_invoke_menu(
+        &self,
+        call_args: &Value,
+        screenshot_dir: &Path,
+    ) -> Result<Option<String>, ComputerError> {
+        let Some(path) = call_args.get("path").and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        let Some(segment) = path.last().and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(pid) = call_args.get("pid").and_then(Value::as_i64) else {
+            return Ok(None);
+        };
+        let Some(window_id) = call_args.get("window_id").and_then(Value::as_i64) else {
+            return Ok(None);
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let Some(window) = self.list_windows(Some(pid)).await.ok().and_then(|windows| {
+            windows
+                .into_iter()
+                .find(|window| window.get("window_id").and_then(Value::as_i64) == Some(window_id))
+        }) else {
+            return Ok(None);
+        };
+        let Ok(state) = self
+            .window_state_inner(&window, true, false, 2000, 1440, screenshot_dir, None)
+            .await
+        else {
+            return Ok(None);
+        };
+        let normalized_segment = Self::normalized_menu_segment(segment);
+        let Some(hit) = digest::find(&state, segment, Some("AXMenuItem"), 5)
+            .into_iter()
+            .find(|hit| {
+                hit.label
+                    .as_deref()
+                    .or(hit.value.as_deref())
+                    .is_some_and(|label| Self::normalized_menu_segment(label) == normalized_segment)
+            })
+        else {
+            return Ok(None);
+        };
+        let Some(frame) = hit.frame else {
+            return Ok(None);
+        };
+        let Some((x, y)) = Self::frame_center(&state, frame) else {
+            return Ok(None);
+        };
+        self.call("click", json!({ "scope": "desktop", "x": x, "y": y }))
+            .await?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let Ok(state_after_click) = self
+            .window_state_inner(&window, true, false, 2000, 1440, screenshot_dir, None)
+            .await
+        else {
+            return Ok(None);
+        };
+        let still_open = digest::find(&state_after_click, segment, Some("AXMenuItem"), 5)
+            .into_iter()
+            .any(|hit| {
+                hit.label
+                    .as_deref()
+                    .or(hit.value.as_deref())
+                    .is_some_and(|label| Self::normalized_menu_segment(label) == normalized_segment)
+            });
+        if !still_open {
+            return Ok(Some(format!(
+                " (driver's menu press left the menu open; completed \"{segment}\" with a screen-point click at ({x:.0},{y:.0}))"
+            )));
+        }
+
+        self.call("press_key", json!({ "scope": "desktop", "key": "escape" }))
+            .await?;
+        Err(ComputerError::refused(
+            "suspected_noop",
+            format!(
+                "invoke_menu: the menu stayed open after dispatch and a screen-point click; menu command not confirmed"
+            ),
+        ))
     }
 
     /// `verify_state`/`window_state`/`act` retarget for sheet windows: when
@@ -1277,6 +1377,16 @@ impl CuaBackend {
         };
         let details = result.get("structuredContent").cloned();
         let mut summary = result_text(&result).unwrap_or_else(|| format!("{tool} completed"));
+        let mut invoke_menu_recovery_note = None;
+        if tool == "invoke_menu" {
+            match self
+                .recover_invoke_menu(&call_args, &request.screenshot_dir)
+                .await
+            {
+                Ok(note) => invoke_menu_recovery_note = note,
+                Err(error) => return Err(error),
+            }
+        }
         // Surface the driver's effect report inline — a successful tool call
         // is NOT proof the user's task happened; effect+route+delivery+escalation
         // is. `suspected_noop`/`unverifiable` get an explicit follow-up hint.
@@ -1327,6 +1437,9 @@ impl CuaBackend {
             summary.push_str(&note);
         }
         if let Some(note) = menu_path_note {
+            summary.push_str(&note);
+        }
+        if let Some(note) = invoke_menu_recovery_note {
             summary.push_str(&note);
         }
         if let Some(note) = element_fallback_note {

@@ -77,6 +77,7 @@ states = json.loads({states})
 actions = json.loads({actions})
 calls_path = json.loads({calls})
 action_indexes = {{}}
+state_indexes = {{}}
 
 for line in sys.stdin:
     request = json.loads(line)
@@ -105,7 +106,12 @@ for line in sys.stdin:
         elif name == "list_windows":
             result = {{"structuredContent": {{"windows": windows}}}}
         elif name == "get_window_state":
-            result = {{"structuredContent": states[str(args["window_id"])]}}
+            state = states[str(args["window_id"])]
+            if isinstance(state, list):
+                index = state_indexes.get(str(args["window_id"]), 0)
+                state_indexes[str(args["window_id"])] = index + 1
+                state = state[min(index, len(state) - 1)]
+            result = {{"structuredContent": state}}
         elif name in actions:
             responses = actions[name]
             index = action_indexes.get(name, 0)
@@ -658,6 +664,204 @@ async fn invoke_menu_uses_ellipsis_fallback_without_menu_items() {
         .collect();
     assert_eq!(invokes.len(), 2);
     assert_eq!(invokes[1]["args"]["path"], json!(["File", "Save…"]));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_menu_recovers_when_driver_leaves_menu_open() {
+    let pid = 42;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 401,
+        "title": "Untitled",
+        "app_name": "TextEdit",
+        "z_index": 95,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let menu_state = json!({
+        "pid": pid,
+        "window_id": 401,
+        "app_name": "TextEdit",
+        "window_title": "Untitled",
+        "window_bounds": {"x": 100.0, "y": 80.0, "w": 500.0, "h": 400.0},
+        "elements": [
+            {
+                "element_index": 0,
+                "role": "AXWindow",
+                "depth": 0,
+                "frame": {"x": 100.0, "y": 80.0, "w": 500.0, "h": 400.0}
+            },
+            {
+                "element_index": 1,
+                "role": "AXMenuItem",
+                "label": "Save…",
+                "frame": {"x": 200.0, "y": 100.0, "w": 80.0, "h": 20.0}
+            }
+        ]
+    });
+    let closed_state = json!({
+        "pid": pid,
+        "window_id": 401,
+        "app_name": "TextEdit",
+        "window_title": "Untitled",
+        "window_bounds": {"x": 100.0, "y": 80.0, "w": 500.0, "h": 400.0},
+        "elements": [{
+            "element_index": 0,
+            "role": "AXWindow",
+            "depth": 0,
+            "frame": {"x": 100.0, "y": 80.0, "w": 500.0, "h": 400.0}
+        }]
+    });
+    let states = json!({"401": [menu_state, closed_state]});
+    let actions = json!({
+        "invoke_menu": [{"result": {"content": [{"type": "text", "text": "menu invoked"}]}}],
+        "click": [{"result": {"content": [{"type": "text", "text": "clicked"}]}}]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_invoke_menu".into(),
+            args: json!({"pid": pid, "windowId": 401, "path": "File > Save"}),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.summary.contains(
+        "driver's menu press left the menu open; completed \"Save\" with a screen-point click at (240,110)"
+    ));
+    let calls: Vec<Value> = std::fs::read_to_string(data.path().join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|call: &Value| call.get("name").and_then(Value::as_str) == Some("click"))
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["args"]["scope"], json!("desktop"));
+    assert_eq!(calls[0]["args"]["x"], json!(240.0));
+    assert_eq!(calls[0]["args"]["y"], json!(110.0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_menu_does_not_recover_when_menu_is_closed() {
+    let pid = 42;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 401,
+        "title": "Untitled",
+        "app_name": "TextEdit",
+        "z_index": 95,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({"401": {
+        "pid": pid,
+        "window_id": 401,
+        "app_name": "TextEdit",
+        "window_title": "Untitled",
+        "window_bounds": {"x": 100.0, "y": 80.0, "w": 500.0, "h": 400.0},
+        "elements": [{
+            "element_index": 0,
+            "role": "AXWindow",
+            "depth": 0,
+            "frame": {"x": 100.0, "y": 80.0, "w": 500.0, "h": 400.0}
+        }]
+    }});
+    let actions = json!({
+        "invoke_menu": [{"result": {"content": [{"type": "text", "text": "menu invoked"}]}}]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_invoke_menu".into(),
+            args: json!({"pid": pid, "windowId": 401, "path": "File > Save"}),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(!outcome.summary.contains("screen-point click"));
+    let calls = std::fs::read_to_string(data.path().join("calls.jsonl")).unwrap();
+    assert!(!calls.contains("\"name\": \"click\""));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_menu_reports_unconfirmed_command_when_menu_stays_open() {
+    let pid = 42;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 401,
+        "title": "Untitled",
+        "app_name": "TextEdit",
+        "z_index": 95,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let menu_state = json!({
+        "pid": pid,
+        "window_id": 401,
+        "app_name": "TextEdit",
+        "window_title": "Untitled",
+        "window_bounds": {"x": 100.0, "y": 80.0, "w": 500.0, "h": 400.0},
+        "elements": [{
+            "element_index": 1,
+            "role": "AXMenuItem",
+            "label": "Save…",
+            "frame": {"x": 200.0, "y": 100.0, "w": 80.0, "h": 20.0}
+        }]
+    });
+    let states = json!({"401": [menu_state.clone(), menu_state]});
+    let actions = json!({
+        "invoke_menu": [{"result": {"content": [{"type": "text", "text": "menu invoked"}]}}],
+        "click": [{"result": {"content": [{"type": "text", "text": "clicked"}]}}],
+        "press_key": [{"result": {"content": [{"type": "text", "text": "pressed"}]}}]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    let error = backend
+        .act(&ActionRequest {
+            tool: "computer_invoke_menu".into(),
+            args: json!({"pid": pid, "windowId": 401, "path": "File > Save"}),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .expect_err("persistent menu should not report success");
+    assert!(matches!(
+        error,
+        ComputerError::Refused { ref code, ref message }
+            if code == "suspected_noop"
+                && message.contains("menu command not confirmed")
+    ));
+    let calls: Vec<Value> = std::fs::read_to_string(data.path().join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|call: &Value| call.get("name").and_then(Value::as_str) == Some("press_key"))
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["args"]["scope"], json!("desktop"));
+    assert_eq!(calls[0]["args"]["key"], json!("escape"));
 }
 
 #[cfg(unix)]
