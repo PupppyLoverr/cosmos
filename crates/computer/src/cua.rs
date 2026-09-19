@@ -404,6 +404,93 @@ impl CuaBackend {
             })
     }
 
+    #[cfg(target_os = "macos")]
+    async fn window_is_ax_resolvable(&self, window: &Value) -> bool {
+        let (Some(pid), Some(window_id)) = (
+            window.get("pid").and_then(Value::as_i64),
+            window.get("window_id").and_then(Value::as_i64),
+        ) else {
+            return false;
+        };
+        self.call(
+            "get_window_state",
+            json!({
+                "pid": pid,
+                "window_id": window_id,
+                "include_accessibility_tree": false,
+                "include_screenshot": false,
+                "max_elements": 1,
+                "max_depth": 25,
+            }),
+        )
+        .await
+        .is_ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn ax_window_for_pid(&self, pid: i64) -> Option<Value> {
+        let window = self.window_for(pid, None).await.ok()?;
+        self.window_is_ax_resolvable(&window)
+            .await
+            .then_some(window)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn wait_for_ax_window(&self, pid: i64) -> Option<Value> {
+        for attempt in 0..=16 {
+            if let Ok(windows) = self.list_windows(Some(pid)).await {
+                for window in windows {
+                    if self.window_is_ax_resolvable(&window).await {
+                        return Some(window);
+                    }
+                }
+            }
+            if attempt < 16 {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn reopen_running_app_if_needed(
+        &self,
+        pid: i64,
+        launch_args: &Value,
+        summary: &mut String,
+    ) {
+        if self.ax_window_for_pid(pid).await.is_some() {
+            return;
+        }
+
+        let reopened = if let Some(bundle_id) = launch_args.get("bundle_id").and_then(Value::as_str)
+        {
+            tokio::process::Command::new("open")
+                .args(["-b", bundle_id])
+                .status()
+                .await
+                .is_ok()
+        } else if let Some(name) = launch_args.get("name").and_then(Value::as_str) {
+            tokio::process::Command::new("open")
+                .args(["-a", name])
+                .status()
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+
+        if reopened && self.wait_for_ax_window(pid).await.is_some() {
+            let windows = self.list_windows(Some(pid)).await.unwrap_or_default();
+            *summary = render_launch_summary(summary, pid, &windows);
+            summary.push_str(" [reopened: app was running with no document window]");
+        } else {
+            summary.push_str(
+                " — app is running but exposes no accessibility window; try computer_invoke_menu with the app's menu bar or relaunch",
+            );
+        }
+    }
+
     /// `get_window_state` → typed [`WindowState`]. The structured `elements[]`
     /// (with `element_token` handles) is the grounding surface — the digest
     /// renders from it, never from `tree_markdown`.
@@ -845,6 +932,13 @@ impl CuaBackend {
                 _ => {}
             }
         }
+        #[cfg(target_os = "macos")]
+        if tool == "launch_app"
+            && let Some(pid) = pid_from_launch_result(&result)
+        {
+            self.reopen_running_app_if_needed(pid, &call_args, &mut summary)
+                .await;
+        }
         Ok(ActionOutcome {
             summary,
             details,
@@ -1046,6 +1140,56 @@ fn result_text(result: &Value) -> Option<String> {
                 .find_map(|c| c.get("text").and_then(Value::as_str))
         })
         .map(str::to_string)
+}
+
+pub(crate) fn pid_from_launch_result(result: &Value) -> Option<i64> {
+    result
+        .get("structuredContent")
+        .and_then(|content| content.get("pid"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            result_text(result).and_then(|text| {
+                text.match_indices("pid ").find_map(|(index, _)| {
+                    let rest = text.get(index + "pid ".len()..)?;
+                    let digits: String = rest
+                        .chars()
+                        .take_while(|character| character.is_ascii_digit())
+                        .collect();
+                    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+                })
+            })
+        })
+}
+
+fn render_launch_summary(summary: &str, pid: i64, windows: &[Value]) -> String {
+    let prefix = summary
+        .split_once("\n\nWindows:")
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(summary)
+        .trim_end();
+    let mut rendered = format!("{prefix}\n\nWindows:\n");
+    if windows.is_empty() {
+        rendered.push_str("- (no windows)\n");
+    } else {
+        for window in windows {
+            let title = window
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|title| !title.is_empty())
+                .map(|title| format!("\"{title}\""))
+                .unwrap_or_else(|| "(no title)".into());
+            let window_id = window
+                .get("window_id")
+                .and_then(Value::as_i64)
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "?".into());
+            rendered.push_str(&format!("- {title} [window_id: {window_id}]\n"));
+        }
+    }
+    rendered.push_str(&format!(
+        "→ Call get_window_state(pid: {pid}, window_id) to inspect."
+    ));
+    rendered
 }
 
 /// `list_windows` result → the windows array (structuredContent first, then a

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::cua::pid_from_launch_result;
 use crate::mock::MockComputer;
 use crate::service::ComputerService;
 use crate::{ComputerError, ComputerSettings, ControlMode, save_settings};
@@ -17,6 +18,23 @@ fn enabled_settings(control: ControlMode) -> ComputerSettings {
         control,
         ..ComputerSettings::default()
     }
+}
+
+#[test]
+fn pid_from_launch_result_prefers_structured_content() {
+    let result = json!({
+        "structuredContent": {"pid": 584},
+        "content": [{"text": "Launched TextEdit (pid 999) in background."}]
+    });
+    assert_eq!(pid_from_launch_result(&result), Some(584));
+}
+
+#[test]
+fn pid_from_launch_result_parses_summary_text() {
+    let result = json!({
+        "content": [{"text": "Launched TextEdit (pid 584) in background."}]
+    });
+    assert_eq!(pid_from_launch_result(&result), Some(584));
 }
 
 /// A service with saved settings and an injected mock backend — exercises
