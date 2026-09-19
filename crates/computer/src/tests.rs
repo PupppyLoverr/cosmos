@@ -555,6 +555,147 @@ async fn invoke_menu_raises_explicit_window_first() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn invoke_menu_waits_for_app_activation_before_dispatch() {
+    let pid = 42;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 401,
+        "title": "Untitled",
+        "app_name": "TextEdit",
+        "z_index": 95,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({
+        "401": {
+            "pid": pid,
+            "window_id": 401,
+            "app_name": "TextEdit",
+            "window_title": "Untitled",
+            "elements": []
+        }
+    });
+    let actions = json!({
+        "list_apps": [
+            {"result": {"structuredContent": {"apps": [{"pid": pid, "active": false}]}}},
+            {"result": {"structuredContent": {"apps": [{"pid": pid, "active": true}]}}}
+        ],
+        "invoke_menu": [{"result": {"content": [{"type": "text", "text": "menu invoked"}]}}]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_invoke_menu".into(),
+            args: json!({"pid": pid, "windowId": 401, "path": "File > Save"}),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !outcome
+            .summary
+            .contains("app did not report active before menu dispatch")
+    );
+    let calls: Vec<Value> = std::fs::read_to_string(data.path().join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|call: &Value| call.get("name").and_then(Value::as_str).is_some())
+        .collect();
+    let list_apps: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, call)| {
+            (call.get("name").and_then(Value::as_str) == Some("list_apps")).then_some(index)
+        })
+        .collect();
+    let invoke = calls
+        .iter()
+        .position(|call| call.get("name").and_then(Value::as_str) == Some("invoke_menu"))
+        .expect("invoke_menu call recorded");
+    assert_eq!(list_apps.len(), 2);
+    assert!(
+        list_apps[1] < invoke,
+        "invoke_menu must follow the active list_apps response"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invoke_menu_dispatches_when_app_never_reports_active() {
+    let pid = 42;
+    let windows = json!([{
+        "pid": pid,
+        "window_id": 401,
+        "title": "Untitled",
+        "app_name": "TextEdit",
+        "z_index": 95,
+        "is_on_screen": true,
+        "minimized": false
+    }]);
+    let states = json!({
+        "401": {
+            "pid": pid,
+            "window_id": 401,
+            "app_name": "TextEdit",
+            "window_title": "Untitled",
+            "elements": []
+        }
+    });
+    let actions = json!({
+        "list_apps": [{"result": {"structuredContent": {"apps": [{"pid": pid, "active": false}]}}}],
+        "invoke_menu": [{"result": {"content": [{"type": "text", "text": "menu invoked"}]}}]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_invoke_menu".into(),
+            args: json!({"pid": pid, "windowId": 401, "path": "File > Save"}),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(
+        outcome
+            .summary
+            .contains("app did not report active before menu dispatch")
+    );
+    let calls: Vec<Value> = std::fs::read_to_string(data.path().join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|call: &Value| call.get("name").and_then(Value::as_str).is_some())
+        .collect();
+    let list_apps = calls
+        .iter()
+        .position(|call| call.get("name").and_then(Value::as_str) == Some("list_apps"))
+        .expect("list_apps call recorded");
+    let invoke = calls
+        .iter()
+        .position(|call| call.get("name").and_then(Value::as_str) == Some("invoke_menu"))
+        .expect("invoke_menu call recorded");
+    assert!(
+        list_apps < invoke,
+        "activation polling must precede dispatch"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn invoke_menu_normalizes_semantic_ellipsis_path() {
     let pid = 42;
     let windows = json!([{
@@ -723,11 +864,12 @@ async fn invoke_menu_recovers_when_driver_leaves_menu_open() {
             "label": "Save…"
         }]
     });
-    let states = json!({"401": [menu_state, closed_state]});
+    let states = json!({"401": [menu_state.clone(), menu_state, closed_state]});
     let actions = json!({
         "invoke_menu": [{"result": {"content": [{"type": "text", "text": "menu invoked"}]}}],
         "type_text": [{"result": {"content": [{"type": "text", "text": "typed"}]}}],
-        "press_key": [{"result": {"content": [{"type": "text", "text": "pressed"}]}}]
+        "press_key": [{"result": {"content": [{"type": "text", "text": "pressed"}]}}],
+        "list_apps": [{"result": {"structuredContent": {"apps": [{"pid": pid, "active": true}]}}}]
     });
     let (backend, data, screenshots) =
         scripted_cua_backend_with_actions(windows, states, actions).await;

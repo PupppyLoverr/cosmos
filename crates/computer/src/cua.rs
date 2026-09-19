@@ -547,6 +547,23 @@ impl CuaBackend {
         if !Self::open_menu_item_visible(&state, segment) {
             return Ok(None);
         }
+        let _ = self.wait_for_app_active(pid).await;
+        let Some(window) = self.list_windows(Some(pid)).await.ok().and_then(|windows| {
+            windows
+                .into_iter()
+                .find(|window| window.get("window_id").and_then(Value::as_i64) == Some(window_id))
+        }) else {
+            return Ok(None);
+        };
+        let Ok(state) = self
+            .window_state_inner(&window, true, false, 2000, 1440, screenshot_dir, None)
+            .await
+        else {
+            return Ok(None);
+        };
+        if !Self::open_menu_item_visible(&state, segment) {
+            return Ok(Some(" (menu settled after activation)".into()));
+        }
         let type_select_segment = Self::menu_type_select_segment(segment);
         self.call(
             "type_text",
@@ -720,6 +737,26 @@ impl CuaBackend {
         };
         let result = self.call("list_windows", args).await?;
         Ok(result_windows(&result))
+    }
+
+    async fn app_is_active(&self, pid: i64) -> Option<bool> {
+        let result = self.call("list_apps", json!({})).await.ok()?;
+        result_apps(&result)
+            .into_iter()
+            .find(|app| app.get("pid").and_then(Value::as_i64) == Some(pid))
+            .and_then(|app| app.get("active").and_then(Value::as_bool))
+    }
+
+    /// Poll app activation; an unavailable list_apps response stops polling.
+    async fn wait_for_app_active(&self, pid: i64) -> bool {
+        for _ in 0..15 {
+            match self.app_is_active(pid).await {
+                Some(true) => return true,
+                Some(false) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// Pick the window `computer_observe{scope:"frontmost"}` describes: the
@@ -1304,6 +1341,7 @@ impl CuaBackend {
                 ));
             }
         }
+        let mut app_activation_note: Option<String> = None;
         let raised_invoke_menu_window = if tool == "invoke_menu" {
             let pid = call_args.get("pid").and_then(Value::as_i64);
             let window_id = call_args.get("window_id").and_then(Value::as_i64);
@@ -1314,6 +1352,10 @@ impl CuaBackend {
                         json!({ "pid": pid, "window_id": window_id }),
                     )
                     .await;
+                if !self.wait_for_app_active(pid).await {
+                    app_activation_note =
+                        Some(" (app did not report active before menu dispatch)".into());
+                }
                 Some(window_id)
             } else {
                 None
@@ -1434,6 +1476,9 @@ impl CuaBackend {
             summary.push_str(&format!(
                 " (raised window {window_id} first so the menu command targets it)"
             ));
+        }
+        if let Some(note) = app_activation_note {
+            summary.push_str(&note);
         }
         if let Some(note) = sheet_owner_note {
             summary.push_str(&note);
@@ -1829,6 +1874,27 @@ fn result_windows(result: &Value) -> Vec<Value> {
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|v| {
             v.get("windows")
+                .and_then(Value::as_array)
+                .cloned()
+                .or_else(|| v.as_array().cloned())
+        })
+        .unwrap_or_default()
+}
+
+/// `list_apps` result → the apps array (structuredContent first, then a JSON
+/// parse of the text block).
+fn result_apps(result: &Value) -> Vec<Value> {
+    if let Some(apps) = result
+        .get("structuredContent")
+        .and_then(|s| s.get("apps"))
+        .and_then(Value::as_array)
+    {
+        return apps.clone();
+    }
+    result_text(result)
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|v| {
+            v.get("apps")
                 .and_then(Value::as_array)
                 .cloned()
                 .or_else(|| v.as_array().cloned())
