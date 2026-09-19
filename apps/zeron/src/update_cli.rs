@@ -9,6 +9,9 @@ use zeron_update::{InstallKind, current_version, version_newer};
 /// `--check` prints the verdict and exits (nonzero when an update is available,
 /// so scripts can gate on it).
 pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
+    // Cosmos builds ship no updater: this command can only ever reach the
+    // upstream Zeron feed, which would replace the install with Zeron.
+    zeron_update::ensure_updates_enabled()?;
     let manifest = zeron_update::fetch_latest(edge_url).await?;
     let current = current_version();
     if !version_newer(&manifest.version, current) {

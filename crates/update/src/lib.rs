@@ -36,6 +36,23 @@ pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Cosmos is a forked product line: the inherited Zeron release feed
+/// (`{edge}/releases`) would silently replace this app with an upstream
+/// Zeron build. Cosmos ships no updater until it has a release channel of its
+/// own — every entry point below fails closed: no background check, no update
+/// strip, no `zeron update`.
+pub fn updates_enabled() -> bool {
+    false
+}
+
+pub fn ensure_updates_enabled() -> anyhow::Result<()> {
+    if updates_enabled() {
+        Ok(())
+    } else {
+        bail!("updates are disabled: Cosmos builds do not consume the Zeron release channel")
+    }
+}
+
 /// Background check cadence.
 const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 /// Retry sooner after a failed check (offline boot, transient edge error).
@@ -139,6 +156,7 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
 /// Fetch the newest release metadata: `manifest.json`, falling back to
 /// `latest.txt` (version only, no checksums) for pre-manifest releases.
 pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
+    ensure_updates_enabled()?;
     let base = release_base(edge_url)?;
     let client = http_client()?;
     let manifest_url = format!("{base}/manifest.json");
@@ -273,6 +291,7 @@ impl InstallKind {
         manifest: &Manifest,
         data_dir: &Path,
     ) -> anyhow::Result<PathBuf> {
+        ensure_updates_enabled()?;
         match self {
             Self::MacApp { .. } => stage_mac_app(edge_url, manifest, data_dir).await,
             #[cfg(windows)]
@@ -285,6 +304,7 @@ impl InstallKind {
 
     /// Install and arrange a relaunch. The UI must quit after this succeeds.
     pub fn apply_desktop(&self, staged: &Path) -> anyhow::Result<()> {
+        ensure_updates_enabled()?;
         match self {
             Self::MacApp { bundle } => {
                 apply_mac_app(staged, bundle)?;
@@ -429,6 +449,7 @@ pub async fn stage_headless(
 ) -> anyhow::Result<PathBuf> {
     // Reject unsupported targets before creating a stage or making a request.
     require_managed_update_platform()?;
+    ensure_updates_enabled()?;
     let version = &manifest.version;
     let dest = app_root.join(version);
     let binary = if cfg!(windows) { "zeron.exe" } else { "zeron" };
@@ -562,6 +583,7 @@ pub async fn stage_mac_app(
 ) -> anyhow::Result<PathBuf> {
     // Reject unsupported targets before creating a stage or making a request.
     require_mac_app_update_platform()?;
+    ensure_updates_enabled()?;
     let version = &manifest.version;
     let dir = data_dir.join("updates").join(version);
     let staged = dir.join("Zeron.app");
@@ -594,6 +616,7 @@ pub async fn stage_mac_app(
 /// old bundle is restored if the second rename fails.
 pub fn apply_mac_app(staged: &Path, bundle: &Path) -> anyhow::Result<()> {
     require_mac_app_update_platform()?;
+    ensure_updates_enabled()?;
     let parent = bundle
         .parent()
         .context("app bundle has no parent directory")?;
@@ -891,6 +914,39 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a Cosmos build must never resolve the inherited Zeron
+    /// release feed — every public entry point fails closed, offline.
+    #[tokio::test]
+    async fn upstream_release_channel_is_unreachable() {
+        assert!(!updates_enabled());
+        for url in ["https://edge.zeron.sh", "https://zeron.sh"] {
+            let err = fetch_latest(url).await.unwrap_err();
+            assert!(err.to_string().contains("updates are disabled"), "{err}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let install = InstallKind::MacApp {
+            bundle: tmp.path().join("Cosmos.app"),
+        };
+        let manifest = Manifest::default();
+        let err = install
+            .stage_desktop("https://edge.zeron.sh", &manifest, tmp.path())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("updates are disabled"), "{err}");
+        let err = install.apply_desktop(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("updates are disabled"), "{err}");
+        let err = stage_headless("https://edge.zeron.sh", &manifest, tmp.path())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("updates are disabled"), "{err}");
+        let err = stage_mac_app("https://edge.zeron.sh", &manifest, tmp.path())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("updates are disabled"), "{err}");
+        let err = apply_mac_app(tmp.path(), &tmp.path().join("Cosmos.app")).unwrap_err();
+        assert!(err.to_string().contains("updates are disabled"), "{err}");
+    }
 
     #[tokio::test]
     async fn stalled_update_headers_and_body_time_out_but_progressing_body_survives() {

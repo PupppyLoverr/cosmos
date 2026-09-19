@@ -6771,6 +6771,11 @@ impl Shell {
     /// the staged bundle. Elsewhere (managed/source installs) it is advisory
     /// (`zeron update`); click dismisses it for that version.
     fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Cosmos ships no updater: never present an action that could swap
+        // this build for an upstream Zeron bundle (see zeron_update).
+        if !zeron_update::updates_enabled() {
+            return None;
+        }
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
             return None;

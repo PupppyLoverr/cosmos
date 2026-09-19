@@ -830,15 +830,16 @@ impl Engine {
             tokens: Arc::new(auth.clone()),
         });
         core.previews.start(projects, preview_signaling).await;
-        // Portable Windows packages explicitly configure an update feed; users
-        // should not need to enable workspace sync to receive application updates.
-        let check_updates = edge_enabled;
+        // Cosmos ships no updater: the inherited feed resolves to upstream
+        // Zeron and would replace this build in place (see zeron_update).
+        let check_updates = zeron_update::updates_enabled() && edge_enabled;
         #[cfg(windows)]
         let check_updates = check_updates
-            || matches!(
-                zeron_update::detect_install(),
-                zeron_update::InstallKind::WindowsPortable { .. }
-            );
+            || (zeron_update::updates_enabled()
+                && matches!(
+                    zeron_update::detect_install(),
+                    zeron_update::InstallKind::WindowsPortable { .. }
+                ));
         if check_updates {
             // Release checker: polls {edge}/releases on a 6h cadence; headless
             // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
