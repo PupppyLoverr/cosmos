@@ -174,15 +174,10 @@ fn default_binary() -> Option<std::path::PathBuf> {
 }
 
 /// Best-effort Linux window list. Prefer `wmctrl` (X11 client list, ~ms) so a
-/// wedged `cua-driver mcp` stdio child cannot stall **global** inventory.
-/// Per-pid lookups stay on the Cua driver so transient GTK dialogs that share
-/// an X11 window still appear as distinct accessibility windows.
+/// wedged `cua-driver mcp` stdio child cannot stall inventory — including
+/// per-pid lookups. GTK file choosers that have their own X11 window (e.g.
+/// "Open File") appear here; a11y-only sheets still require the driver.
 pub async fn list_windows(pid: Option<i64>, on_screen_only: bool) -> Result<Value, ComputerError> {
-    if pid.is_some() {
-        return Err(ComputerError::Unavailable(
-            "per-pid window list uses the driver".into(),
-        ));
-    }
     if let Ok(windows) = wmctrl_windows().await {
         let windows = filter_windows(windows, pid, on_screen_only);
         return Ok(json!({ "windows": windows, "source": "x11-wmctrl" }));
