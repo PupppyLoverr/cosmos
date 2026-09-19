@@ -43,7 +43,11 @@ export default function ComputerScreen() {
   async function startTask() {
     setErr(null);
     try {
-      const result = await host?.computerTool("computer_status", {});
+      const result = await host?.computerObserve({
+        scope: "frontmost",
+        includeScreenshot: false,
+        maxElements: 200,
+      });
       setActivity(JSON.stringify(result, null, 2));
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));

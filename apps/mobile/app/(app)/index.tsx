@@ -41,7 +41,7 @@ export default function SessionsScreen() {
       />
       <FlashList
         data={rows}
-        estimatedItemSize={76}
+        drawDistance={400}
         keyExtractor={(s) => s.chatId}
         contentContainerStyle={{ paddingBottom: 100 }}
         ListEmptyComponent={

@@ -162,6 +162,19 @@ export class HostSession {
     return this.call("ComputerDecide", this.paired({ decision, reason }));
   }
 
+  async revokeTrust(): Promise<unknown> {
+    return this.call("ComputerRevokeTrust", {
+      targetDeviceId: this.hostDeviceId,
+      callerDeviceId: this.conn.deviceId,
+      deviceId: this.conn.deviceId,
+      pairingToken: this.pairingToken ?? "",
+    });
+  }
+
+  async computerObserve(args: Record<string, unknown> = {}): Promise<unknown> {
+    return this.call("ComputerObserve", this.paired(args), 90_000);
+  }
+
   async computerTool(name: string, args: Record<string, unknown>): Promise<unknown> {
     return this.call(
       "ComputerToolCall",

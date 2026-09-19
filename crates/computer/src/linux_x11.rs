@@ -198,6 +198,19 @@ pub async fn list_windows(pid: Option<i64>, on_screen_only: bool) -> Result<Valu
     ))
 }
 
+/// Fast observe fallback when Cua `get_window_state` times out. Titles and
+/// bounds only — no AT-SPI tree. Honest about the missing semantic walk.
+pub async fn window_record(pid: i64, window_id: Option<i64>) -> Result<Value, ComputerError> {
+    let windows = wmctrl_windows().await?;
+    let found = windows.into_iter().find(|w| {
+        w.get("pid").and_then(Value::as_i64) == Some(pid)
+            && window_id
+                .map(|id| w.get("window_id").and_then(Value::as_i64) == Some(id))
+                .unwrap_or(true)
+    });
+    found.ok_or_else(|| ComputerError::Unavailable(format!("no X11 window for pid {pid}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +243,16 @@ mod tests {
         let filtered = filter_windows(parse_wmctrl(SAMPLE), Some(30271), false);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["app_name"], "Mousepad");
+    }
+
+    #[test]
+    fn window_record_matches_pid() {
+        let windows = parse_wmctrl(SAMPLE);
+        let mousepad = windows
+            .iter()
+            .find(|w| w.get("pid").and_then(Value::as_i64) == Some(30271))
+            .unwrap();
+        assert_eq!(mousepad["title"].as_str(), Some("/tmp/a.txt - Mousepad"));
+        assert_eq!(mousepad["windowId"], 0x0240_0003_i64);
     }
 }

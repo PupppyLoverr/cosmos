@@ -56,7 +56,7 @@ run_opencode() {
   log "prompt=$prompt"
   set +e
   OPENCODE_CONFIG="$cfg" OPENCODE_CONFIG_CONTENT="$(cat "$cfg")" \
-    timeout 240 "$OPENCODE_BIN" run --print-logs --log-level WARN --auto \
+    timeout 420 "$OPENCODE_BIN" run --print-logs --log-level WARN --auto \
       --model "$MODEL" --title "$name" -- "$prompt" \
       >"$out" 2>"$out.err"
   local rc=$?
@@ -85,7 +85,7 @@ task2() {
     "Use ONLY cosmos-computer MCP tools (computer_*). Never xdotool/wmctrl/cua-driver CLI. Observe XFCE Color Profiles / settings (read-only), then switch to Thunar via pin+observe. Print the window titles and VERIFY_OK. Do not change settings." \
     "$ART/task2-transcript.txt" || true
   stop_rec "$rec"
-  if rg -qi 'VERIFY_OK|Color Profiles|Thunar' "$ART/task2-transcript.txt"; then
+  if rg -qi 'VERIFY_OK' "$ART/task2-transcript.txt" && rg -qi 'Color Profiles' "$ART/task2-transcript.txt" && rg -qi 'Thunar' "$ART/task2-transcript.txt"; then
     log "TASK2=PASS"
   else
     log "TASK2=FAIL"

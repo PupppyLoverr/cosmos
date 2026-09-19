@@ -13,7 +13,9 @@ function decodeB64Url(seg: string): string {
       /* fall through */
     }
   }
-  return Buffer.from(padded, "base64").toString("utf8");
+  const g = globalThis as { Buffer?: { from: (s: string, enc: string) => { toString: (e: string) => string } } };
+  if (g.Buffer) return g.Buffer.from(padded, "base64").toString("utf8");
+  throw new Error("base64 decode unavailable");
 }
 
 export function jwtPayload(token: string): Record<string, unknown> | null {

@@ -371,7 +371,45 @@ impl CuaBackend {
         if let Some(path) = &screenshot_path {
             args["screenshot_out_file"] = json!(path.to_string_lossy());
         }
-        let result = self.call("get_window_state", args).await?;
+        let result = match self
+            .call_with_timeout("get_window_state", args, crate::mcp_client::OBSERVE_TIMEOUT)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                #[cfg(target_os = "linux")]
+                if let Ok(record) = crate::linux_x11::window_record(pid, Some(window_id)).await {
+                    let title = record
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("window");
+                    let app = record
+                        .get("app_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("app");
+                    let text = format!(
+                        "X11 fallback observe (Cua get_window_state: {error}).\n\
+                         app={app} title={title} pid={pid} windowId={window_id}\n\
+                         Semantic AT-SPI tree unavailable this pass — re-observe or use computer_list_windows."
+                    );
+                    return Ok(WindowState {
+                        snapshot_id: "x11-fallback".into(),
+                        pid,
+                        window_id,
+                        app_name: Some(app.into()),
+                        window_title: Some(title.into()),
+                        window_bounds: None,
+                        elements: Vec::new(),
+                        tree_markdown: Some(text.clone()),
+                        returned_element_count: 0,
+                        total_element_count: 0,
+                        note: Some(text),
+                        screenshot: None,
+                    });
+                }
+                return Err(error);
+            }
+        };
         let structured = result
             .get("structuredContent")
             .cloned()
@@ -480,6 +518,13 @@ impl CuaBackend {
         } else {
             String::new()
         };
+        if text.trim().is_empty() {
+            if let Some(md) = &state.tree_markdown {
+                text = md.clone();
+            } else if let Some(note) = &state.note {
+                text = note.clone();
+            }
+        }
         if text.is_empty() && !request.semantic {
             text = format!(
                 "Screenshot of {} captured.",

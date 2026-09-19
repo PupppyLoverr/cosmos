@@ -6,9 +6,16 @@ export const UPLOAD_CHUNK_B64_CHARS = 680_000;
 /** Binary bytes per chunk: b64/4*3 so independent slices concatenate. */
 export const UPLOAD_CHUNK_BYTES = (UPLOAD_CHUNK_B64_CHARS / 4) * 3;
 
+function nodeBuffer():
+  | { from: (input: string | Uint8Array, enc?: string) => { toString: (enc: string) => string } }
+  | undefined {
+  return (globalThis as { Buffer?: { from: (input: string | Uint8Array, enc?: string) => { toString: (enc: string) => string } } }).Buffer;
+}
+
 export function bytesFromBase64(b64: string): Uint8Array {
-  if (typeof Buffer !== "undefined") {
-    return Uint8Array.from(Buffer.from(b64, "base64"));
+  const Buf = nodeBuffer();
+  if (Buf) {
+    return Uint8Array.from(Buf.from(b64, "base64") as unknown as Iterable<number>);
   }
   const binary = atob(b64);
   const out = new Uint8Array(binary.length);
@@ -17,8 +24,9 @@ export function bytesFromBase64(b64: string): Uint8Array {
 }
 
 export function bytesToBase64(bytes: Uint8Array): string {
-  if (typeof Buffer !== "undefined") {
-    return Buffer.from(bytes).toString("base64");
+  const Buf = nodeBuffer();
+  if (Buf) {
+    return Buf.from(bytes).toString("base64");
   }
   let binary = "";
   const chunk = 0x8000;

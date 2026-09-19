@@ -41,6 +41,11 @@ export default function SessionScreen() {
   const [pending, setPending] = useState<StagedAttachment[]>([]);
 
   useEffect(() => {
+    const shared = app.takeShareInbox();
+    if (shared.length) setPending((p) => [...p, ...shared]);
+  }, [app]);
+
+  useEffect(() => {
     if (!id) return;
     let alive = true;
     const tick = async () => {
@@ -133,7 +138,7 @@ export default function SessionScreen() {
       </View>
       <FlashList
         data={items}
-        estimatedItemSize={72}
+        drawDistance={600}
         keyExtractor={(it, i) => it.id || String(i)}
         contentContainerStyle={{ padding: 16, paddingBottom: 24 }}
         ListEmptyComponent={

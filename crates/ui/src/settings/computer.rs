@@ -1,14 +1,14 @@
 //! Settings → Computer: the Cosmos Computer surface — Screen Context
 //! (semantic/screenshot observation) plus the optional local Cua Driver
-//! component, control mode, and OS permission posture.
+//! component, control mode, OS permission posture, and first-time remote
+//! pairing.
 //!
-//! Everything here is DEVICE-LOCAL: the engine's `Computer*` RPCs are
-//! deliberately not relay-forwardable (a remote device can never drive this
-//! machine's physical desktop), so unlike the Agents page there is no device
-//! switcher. Status and install progress arrive on `WatchComputer` — one
-//! stream merging `status()` snapshots with `install` ticks — and every
-//! mutating call replies with the fresh status, so the page always repaints
-//! from the engine's authoritative state.
+//! Install and settings writes stay host-local. Paired phones may forward
+//! observe/tool/stop/live-watch after an explicit Approve on this page.
+//! Status and install progress arrive on `WatchComputer` — one stream
+//! merging `status()` snapshots with `install` ticks — and every mutating
+//! call replies with the fresh status, so the page always repaints from
+//! the engine's authoritative state.
 
 use gpui::{
     AnyElement, Context, Entity, IntoElement, Render, SharedString, Task, Window, div, prelude::*,
@@ -209,6 +209,35 @@ impl ComputerPage {
                         Ok(status) => page.status = Loadable::Ready(status),
                         Err(err) => page.error = Some(err.to_string()),
                     },
+                    Err(err) => page.error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Host-local pairing approve / revoke. Not relay-forwardable from the
+    /// phone that requested trust — the desktop operator clicks here.
+    fn pairing_action(&mut self, method: &'static str, device_id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.error = None;
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(method, serde_json::json!({ "deviceId": device_id }))
+                .await;
+            this.update(cx, |page, cx| {
+                match result {
+                    Ok(value) => {
+                        // Trust RPCs return TrustPublic; reload status so the
+                        // pairing card and WatchComputer stay aligned.
+                        page.load(cx);
+                        let _ = value;
+                    }
                     Err(err) => page.error = Some(err.to_string()),
                 }
                 cx.notify();
@@ -541,6 +570,108 @@ impl ComputerPage {
         card.into_any_element()
     }
 
+    /// First-time remote pairing: phones request trust, this desktop Approves.
+    fn pairing_card(
+        &self,
+        theme: &Theme,
+        status: &ComputerStatus,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pending = status.pending_trust.clone();
+        let trusted = status.trusted_devices.clone();
+        let mut card = widgets::section_card(theme).mt(px(20.0)).child(Self::row(
+            theme,
+            true,
+            "Remote pairing",
+            "Same-account phones can discover this desktop. Computer Use still needs an explicit Approve here. Tokens stay on the phone; this machine stores only a hash.",
+            widgets::badge(
+                theme,
+                if pending.is_empty() && trusted.is_empty() {
+                    "None"
+                } else if pending.is_empty() {
+                    "Paired"
+                } else {
+                    "Pending"
+                },
+            )
+            .into_any_element(),
+        ));
+        if pending.is_empty() && trusted.is_empty() {
+            card = card.child(
+                div()
+                    .px(px(16.0))
+                    .pb(px(12.0))
+                    .text_size(px(12.0))
+                    .line_height(px(18.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(
+                        "No pairing requests. When an Android or iOS client taps Request trust, it appears here.",
+                    )),
+            );
+        }
+        for (ix, req) in pending.into_iter().enumerate() {
+            let id = req.device_id.clone();
+            let id_deny = req.device_id.clone();
+            let platform = req.platform.clone().unwrap_or_else(|| "device".into());
+            let desc = format!("{} · {}", req.device_name, platform);
+            let approve = widgets::ghost_action(theme)
+                .id(("computer-pair-approve", ix))
+                .role(gpui::Role::Button)
+                .aria_label("Approve pairing")
+                .tab_index(0)
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.pairing_action(methods::COMPUTER_APPROVE_TRUST, id.clone(), cx);
+                }))
+                .child("Approve");
+            let deny = widgets::ghost_action(theme)
+                .id(("computer-pair-deny", ix))
+                .role(gpui::Role::Button)
+                .aria_label("Deny pairing")
+                .tab_index(0)
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.pairing_action(methods::COMPUTER_REVOKE_TRUST, id_deny.clone(), cx);
+                }))
+                .child("Deny");
+            card = card.child(Self::row(
+                theme,
+                false,
+                "Waiting for approval",
+                &desc,
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .child(approve)
+                    .child(deny)
+                    .into_any_element(),
+            ));
+        }
+        for (ix, req) in trusted.into_iter().enumerate() {
+            let id = req.device_id.clone();
+            let platform = req.platform.clone().unwrap_or_else(|| "device".into());
+            let desc = format!("{} · {}", req.device_name, platform);
+            let revoke = widgets::ghost_action(theme)
+                .id(("computer-pair-revoke", ix))
+                .role(gpui::Role::Button)
+                .aria_label("Revoke pairing")
+                .tab_index(0)
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.pairing_action(methods::COMPUTER_REVOKE_TRUST, id.clone(), cx);
+                }))
+                .child("Revoke");
+            card = card.child(Self::row(
+                theme,
+                false,
+                "Trusted device",
+                &desc,
+                revoke.into_any_element(),
+            ));
+        }
+        card.into_any_element()
+    }
+
     fn on_scroll_hovered(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
         if self.scroll.set_list_hovered(*hovered) {
             cx.notify();
@@ -690,6 +821,7 @@ impl Render for ComputerPage {
                 if enabled {
                     column = column
                         .child(self.component_card(&theme, &status, cx))
+                        .child(self.pairing_card(&theme, &status, cx))
                         .child(self.permissions_card(&theme, &status, cx));
                 }
                 column.into_any_element()

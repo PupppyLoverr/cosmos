@@ -36,7 +36,7 @@ export const Light = {
   isDark: false,
 } as const;
 
-export type Palette = typeof Dark;
+export type Palette = typeof Dark | typeof Light;
 
 export function palette(scheme: "light" | "dark"): Palette {
   return scheme === "light" ? Light : Dark;

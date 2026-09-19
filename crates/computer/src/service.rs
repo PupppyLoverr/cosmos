@@ -345,7 +345,11 @@ impl ComputerService {
 
     pub fn approve_trust(&self, device_id: &str) -> Result<TrustPublic, ComputerError> {
         let public = self.inner.pairing.lock().unwrap().approve(device_id)?;
-        self.bump_status();
+        self.emit_notice(
+            NoticeKind::Reconnect,
+            "Computer Use pairing approved",
+            &format!("{device_id} may control this desktop"),
+        );
         Ok(public)
     }
 

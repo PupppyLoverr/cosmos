@@ -1,12 +1,42 @@
+import { useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View, useColorScheme } from "react-native";
 import { useApp } from "../../src/state/store";
 import { palette } from "../../src/ui/theme";
-import { computerCapable, deviceOnline } from "../../src/protocol/types";
+import {
+  computerCapable,
+  deviceOnline,
+  formatLastSeen,
+  trustLabel,
+  type TrustPublic,
+} from "../../src/protocol/types";
 
 export default function DevicesScreen() {
   const app = useApp();
   const c = palette(useColorScheme() === "light" ? "light" : "dark");
   const now = Date.now();
+  const [status, setStatus] = useState<{
+    pendingTrust?: TrustPublic[];
+    trustedDevices?: TrustPublic[];
+  } | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => {
+      try {
+        const s = (await app.hostSession()?.computerStatus()) as typeof status;
+        if (alive) setStatus(s ?? null);
+      } catch {
+        if (alive) setStatus(null);
+      }
+    };
+    tick();
+    const t = setInterval(tick, 4000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [app, app.selectedHostId, app.pairing]);
+
   return (
     <ScrollView style={[styles.wrap, { backgroundColor: c.bg }]} contentContainerStyle={{ padding: 20, paddingTop: 56 }}>
       <Text style={[styles.title, { color: c.text }]}>Desktops</Text>
@@ -19,7 +49,19 @@ export default function DevicesScreen() {
       {app.workspace.devices.map((d) => {
         const online = deviceOnline(d, now, app.workspace.presence);
         const selected = app.selectedHostId === d.id;
-        const trusted = Boolean(app.pairing[d.id]);
+        const trustedRemote = Boolean(
+          app.connection &&
+            status?.trustedDevices?.some((row) => row.deviceId === app.connection?.deviceId),
+        );
+        const pendingRemote = Boolean(
+          app.connection &&
+            status?.pendingTrust?.some((row) => row.deviceId === app.connection?.deviceId),
+        );
+        const trust = trustLabel({
+          hasToken: Boolean(app.pairing[d.id]),
+          pending: pendingRemote && selected,
+          trusted: trustedRemote && selected,
+        });
         const sessions = app.workspace.sessions.filter((s) => s.deviceId === d.id).length;
         return (
           <Pressable
@@ -38,10 +80,12 @@ export default function DevicesScreen() {
               <View style={{ flex: 1 }}>
                 <Text style={{ color: c.text, fontWeight: "700", fontSize: 16 }}>{d.name}</Text>
                 <Text style={{ color: c.muted, marginTop: 2 }}>
-                  {d.platform || "unknown"} · {online ? "online" : "offline"} · {sessions} sessions
+                  {d.platform || "unknown"} · {online ? "online" : "offline"} · last seen{" "}
+                  {formatLastSeen(app.workspace.presence[d.id] ?? d.lastSeenAt, now)} · {sessions}{" "}
+                  sessions
                 </Text>
                 <Text style={{ color: c.faint, marginTop: 2 }}>
-                  Computer Use: {computerCapable(d) ? "capable" : "unknown"} · trust: {trusted ? "paired" : "not paired"}
+                  Computer Use: {computerCapable(d) ? "capable" : "unknown"} · trust: {trust}
                 </Text>
               </View>
             </View>
@@ -52,9 +96,11 @@ export default function DevicesScreen() {
               >
                 <Text style={{ color: c.text }}>Request trust</Text>
               </Pressable>
-              {trusted ? (
+              {app.pairing[d.id] ? (
                 <Pressable
-                  onPress={() => app.revokePairing(d.id)}
+                  onPress={() => {
+                    void app.revokePairing(d.id);
+                  }}
                   style={[styles.btn, { borderColor: c.danger }]}
                 >
                   <Text style={{ color: c.danger }}>Revoke</Text>

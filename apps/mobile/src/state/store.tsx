@@ -22,6 +22,8 @@ import { randomPairingToken } from "../protocol/computer";
 import { forgetPairing, rememberPairing, type PairingMap } from "../protocol/notices";
 import { presentComputerNotice } from "../notify";
 import type { NoticeKind } from "../protocol/types";
+import * as Linking from "expo-linking";
+import { attachmentFromShareUrl } from "../share";
 
 const CONN_KEY = "cosmos.connection";
 const PAIR_KEY = "cosmos.pairing";
@@ -47,7 +49,8 @@ interface AppState {
   selectHost: (id: string) => void;
   hostSession: () => HostSession | null;
   requestPairing: () => Promise<void>;
-  revokePairing: (hostId: string) => void;
+  revokePairing: (hostId: string) => Promise<void>;
+  takeShareInbox: () => StagedAttachment[];
   send: (
     chatId: string,
     prompt: string,
@@ -90,6 +93,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [linking, setLinking] = useState(false);
   const [restoring, setRestoring] = useState(true);
+  const [shareInbox, setShareInbox] = useState<StagedAttachment[]>([]);
   const edge = useRef<EdgeClient | null>(null);
   const hosts = useRef<Map<string, HostSession>>(new Map());
   const eventUnsub = useRef<(() => void) | null>(null);
@@ -172,6 +176,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [signIn]);
 
   useEffect(() => {
+    let alive = true;
+    const ingest = async (url: string | null) => {
+      if (!url) return;
+      try {
+        const att = await attachmentFromShareUrl(url);
+        if (alive && att) setShareInbox((prev) => [...prev, att]);
+      } catch {
+        /* share URI unreadable — do not invent a fake attachment */
+      }
+    };
+    void Linking.getInitialURL().then(ingest);
+    const sub = Linking.addEventListener("url", (ev) => {
+      void ingest(ev.url);
+    });
+    return () => {
+      alive = false;
+      sub.remove();
+    };
+  }, []);
+
+  useEffect(() => {
     void writeJson(PAIR_KEY, pairing);
   }, [pairing]);
 
@@ -213,6 +238,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     hosts.current.set(selectedHostId, host);
     await host.requestTrust();
   }, [connection, selectedHostId, pairing]);
+
+  const revokePairing = useCallback(
+    async (hostId: string) => {
+      const token = pairing[hostId];
+      if (connection && token) {
+        try {
+          await new HostSession(connection, hostId, token).revokeTrust();
+        } catch {
+          /* still drop the local token — desktop may already be offline */
+        }
+      }
+      setPairing((m) => forgetPairing(m, hostId));
+    },
+    [connection, pairing],
+  );
+
+  const takeShareInbox = useCallback(() => {
+    const copy = shareInbox;
+    if (copy.length) setShareInbox([]);
+    return copy;
+  }, [shareInbox]);
 
   const send = useCallback(
     async (
@@ -300,7 +346,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       selectHost: setSelectedHostId,
       hostSession,
       requestPairing,
-      revokePairing: (id) => setPairing((m) => forgetPairing(m, id)),
+      revokePairing,
+      takeShareInbox,
       send,
       stop,
       transcript,
@@ -319,6 +366,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       refresh,
       hostSession,
       requestPairing,
+      revokePairing,
+      takeShareInbox,
       send,
       stop,
       transcript,

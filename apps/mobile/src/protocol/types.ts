@@ -143,3 +143,22 @@ export function computerCapable(d: DeviceInfo): boolean {
     ["linux", "macos", "darwin", "windows"].includes(d.platform.toLowerCase())
   );
 }
+
+export function formatLastSeen(ts: number | null, now: number): string {
+  if (ts == null) return "never";
+  const delta = now - ts;
+  if (delta < 45_000) return "just now";
+  if (delta < 3_600_000) return `${Math.max(1, Math.round(delta / 60_000))}m ago`;
+  if (delta < 86_400_000) return `${Math.max(1, Math.round(delta / 3_600_000))}h ago`;
+  return new Date(ts).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+}
+
+export function trustLabel(opts: {
+  hasToken: boolean;
+  pending: boolean;
+  trusted: boolean;
+}): TrustState {
+  if (opts.trusted) return "trusted";
+  if (opts.pending || opts.hasToken) return "pending";
+  return "none";
+}

@@ -25,6 +25,8 @@ import {
 } from "../src/protocol/relay.ts";
 import { randomPairingToken } from "../src/protocol/computer.ts";
 import { deliveryForPush } from "../src/protocol/notices.ts";
+import { parseShareUrl } from "../src/protocol/share.ts";
+import { formatLastSeen, trustLabel } from "../src/protocol/types.ts";
 import { chunkRanges, UPLOAD_CHUNK_BYTES, withAttachmentLines } from "../src/protocol/upload.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -160,5 +162,29 @@ describe("uploads + streams", () => {
     mux.handlePayload(new TextEncoder().encode(JSON.stringify({ id, done: true }) + "\n"));
     await sub.promise;
     assert.deepEqual(items, [{ n: 1 }]);
+  });
+});
+
+describe("share + last seen + trust labels", () => {
+  it("parses cosmos://share without inventing files", () => {
+    assert.equal(parseShareUrl(null), null);
+    assert.equal(parseShareUrl("https://example.com"), null);
+    const file = parseShareUrl("cosmos://share?uri=content%3A%2F%2Fmedia%2F1");
+    assert.equal(file?.uri, "content://media/1");
+    const text = parseShareUrl("cosmos://share?text=hello");
+    assert.equal(text?.text, "hello");
+  });
+
+  it("formats last-seen from registry clocks", () => {
+    const now = 1_700_000_000_000;
+    assert.equal(formatLastSeen(null, now), "never");
+    assert.equal(formatLastSeen(now - 10_000, now), "just now");
+    assert.equal(formatLastSeen(now - 120_000, now), "2m ago");
+  });
+
+  it("does not call a local token trusted until the desktop approves", () => {
+    assert.equal(trustLabel({ hasToken: true, pending: true, trusted: false }), "pending");
+    assert.equal(trustLabel({ hasToken: true, pending: false, trusted: true }), "trusted");
+    assert.equal(trustLabel({ hasToken: false, pending: false, trusted: false }), "none");
   });
 });
