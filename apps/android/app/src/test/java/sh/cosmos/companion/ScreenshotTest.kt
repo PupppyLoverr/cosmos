@@ -8,6 +8,7 @@ import org.junit.Test
 import sh.cosmos.companion.net.RegistryBridge
 import sh.cosmos.companion.net.SessionStatus
 import sh.cosmos.companion.net.SessionSummary
+import sh.cosmos.companion.net.TranscriptItem
 import sh.cosmos.companion.net.SpaceInfo
 import sh.cosmos.companion.net.DeviceInfo
 import sh.cosmos.companion.theme.CosmosTheme
@@ -81,7 +82,16 @@ class ScreenshotTest {
     @Test fun session() {
         paparazzi.snapshot {
             CosmosTheme(ThemeMode.Dark) {
-                SessionScreen(sample()[0], client = null, bridge = RegistryBridge(), onBack = {})
+                SessionScreen(
+                    sample()[0],
+                    client = null,
+                    bridge = RegistryBridge(),
+                    seedItems = listOf(
+                        TranscriptItem("u1", "user", "Stand up a native Android companion for Cosmos sessions.", now - 90_000),
+                        TranscriptItem("a1", "assistant", "Synced to every device through the session room. Mock harness reporting in.", now - 60_000),
+                    ),
+                    onBack = {},
+                )
             }
         }
     }

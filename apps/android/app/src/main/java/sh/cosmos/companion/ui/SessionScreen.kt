@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -80,6 +81,7 @@ fun SessionScreen(
     client: CosmosClient?,
     bridge: ChatBridge,
     link: LinkState = LinkState.Online,
+    seedItems: List<TranscriptItem> = emptyList(),
     onBack: () -> Unit,
     onReconnect: () -> Unit = {},
 ) {
@@ -94,9 +96,13 @@ fun SessionScreen(
     var loading by remember(session.chatId) { mutableStateOf(true) }
     var sending by remember { mutableStateOf(false) }
 
-    LaunchedEffect(session.chatId, client) {
+    LaunchedEffect(session.chatId, client, seedItems) {
         client?.let { runCatching { it.markSeen(session.chatId) } }
-        if (client != null) {
+        if (seedItems.isNotEmpty()) {
+            items.clear()
+            items.addAll(seedItems)
+            loading = false
+        } else if (client != null) {
             loading = true
             val loaded = runCatching { bridge.transcript(client, session) }.getOrDefault(emptyList())
             items.clear()
@@ -208,12 +214,21 @@ fun SessionScreen(
                     }
                 } else if (items.isEmpty()) {
                     item {
-                        Text(
-                            "No transcript published yet. When the desktop host is online it writes a chat2 tail sidecar here.",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontFamily = Geist,
-                            fontSize = 14.sp,
-                        )
+                        Column(Modifier.fillMaxWidth().padding(top = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                "No messages yet",
+                                fontFamily = Geist,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 16.sp,
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                "When the desktop host is online, the transcript appears here.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontFamily = Geist,
+                                fontSize = 14.sp,
+                            )
+                        }
                     }
                 }
                 items(items, key = { it.id }) { MessageBlock(it) }
@@ -298,13 +313,23 @@ private fun MessageBlock(item: TranscriptItem) {
             }
         }
     } else {
-        Text(
-            item.text,
-            color = cosmos.text.copy(alpha = 0.92f),
-            fontFamily = Geist,
-            fontSize = 16.sp,
-            lineHeight = 24.sp,
-        )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+            Box(
+                Modifier
+                    .widthIn(max = 340.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = if (item.streaming) 0.7f else 1f))
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+            ) {
+                Text(
+                    item.text,
+                    color = cosmos.text.copy(alpha = 0.92f),
+                    fontFamily = Geist,
+                    fontSize = 16.sp,
+                    lineHeight = 24.sp,
+                )
+            }
+        }
     }
 }
 

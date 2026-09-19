@@ -59,6 +59,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm755 "$HERE/cosmos" "$HOME/.local/bin/cosmos"
 install -Dm644 "$HERE/cosmos.png" "$HOME/.local/share/icons/hicolor/512x512/apps/cosmos.png"
+mkdir -p "$HOME/.local/share/applications"
 sed "s|^Exec=.*|Exec=$HOME/.local/bin/cosmos %u|; s|^TryExec=.*|TryExec=$HOME/.local/bin/cosmos|" \
   "$HERE/cosmos.desktop" > "$HOME/.local/share/applications/cosmos.desktop"
 command -v update-desktop-database >/dev/null 2>&1 \

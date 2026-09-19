@@ -76,6 +76,32 @@ fn settings_round_trip() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn driver_env_never_exports_autolaunch_session_bus() {
+    let env = enabled_settings(ControlMode::FullControl).driver_env(None);
+    let map: std::collections::BTreeMap<_, _> = env.into_iter().collect();
+    assert_eq!(map.get("GTK_A11Y").map(String::as_str), Some("1"));
+    if let Some(bus) = map.get("DBUS_SESSION_BUS_ADDRESS") {
+        assert!(
+            !bus.starts_with("autolaunch:"),
+            "zbus cannot use autolaunch: {bus}"
+        );
+        assert!(
+            bus.starts_with("unix:") || bus.starts_with("tcp:"),
+            "expected a concrete bus address, got {bus}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_session_bus_resolver_skips_autolaunch() {
+    if let Some(bus) = crate::linux_session_bus_address() {
+        assert!(!bus.starts_with("autolaunch:"), "{bus}");
+    }
+}
+
 #[tokio::test]
 async fn disabled_service_refuses() {
     let (service, _data) = service(

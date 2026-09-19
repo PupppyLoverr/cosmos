@@ -57,7 +57,7 @@ fun ConnectScreen(
         Text("Cosmos", fontFamily = Geist, fontWeight = FontWeight.SemiBold, fontSize = 36.sp)
         Spacer(Modifier.height(8.dp))
         Text(
-            "Companion for your desktop and cloud agent sessions.",
+            "Sign in to the same edge your desktop uses to see sessions, transcripts, and device state.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontFamily = Geist,
             fontSize = 15.sp,
@@ -91,7 +91,7 @@ fun ConnectScreen(
 
         Spacer(Modifier.height(32.dp))
         Text(
-            "Dev pairing: point at an AUTH_MODE=dev edge. The bearer is user@org — the same identity your desktop signs in with. From the emulator use http://10.0.2.2:<port>.",
+            "Use the same user and org as desktop. On the emulator, 10.0.2.2 is this machine.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontFamily = Geist,
             fontSize = 12.sp,
