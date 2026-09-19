@@ -1,42 +1,46 @@
 package sh.cosmos.companion.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material3.Icon
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import sh.cosmos.companion.net.ChatIndicator
-import sh.cosmos.companion.theme.CosmosColors
 import sh.cosmos.companion.theme.Geist
+import sh.cosmos.companion.theme.LocalCosmos
+import sh.cosmos.companion.vm.LinkState
 
-/** shell/spaces.rs status_dot_color — non-done states are muted (running is
- *  routine); only Done keeps its pop. Mirrors apps/ios ChatIndicator.dotColor. */
-fun ChatIndicator.dotColor(): Color = when (this) {
-    ChatIndicator.working -> CosmosColors.statusWorking.copy(alpha = 0.55f)
-    ChatIndicator.awaitingInput -> CosmosColors.accent.copy(alpha = 0.6f)
-    ChatIndicator.errored -> CosmosColors.danger.copy(alpha = 0.65f)
-    ChatIndicator.completed -> CosmosColors.statusCompleted.copy(alpha = 0.9f)
-    ChatIndicator.idle -> Color.White.copy(alpha = 0.14f)
+@Composable
+fun ChatIndicator.liveDot(): Color {
+    val p = LocalCosmos.current
+    return when (this) {
+        ChatIndicator.working -> p.statusWorking.copy(alpha = 0.75f)
+        ChatIndicator.awaitingInput -> p.accent.copy(alpha = 0.75f)
+        ChatIndicator.errored -> p.danger.copy(alpha = 0.8f)
+        ChatIndicator.completed -> p.statusCompleted
+        ChatIndicator.idle -> p.textFaint.copy(alpha = 0.5f)
+    }
 }
 
-/** shell.rs status word; null (idle) renders the time-ago instead. */
 fun ChatIndicator.statusLabel(): String? = when (this) {
     ChatIndicator.working -> "Working"
     ChatIndicator.awaitingInput -> "Input"
@@ -47,37 +51,69 @@ fun ChatIndicator.statusLabel(): String? = when (this) {
 
 @Composable
 fun StatusDot(indicator: ChatIndicator, modifier: Modifier = Modifier) {
-    Box(modifier.size(6.dp).clip(CircleShape).background(indicator.dotColor()))
+    Box(
+        modifier
+            .size(8.dp)
+            .clip(CircleShape)
+            .background(indicator.liveDot())
+            .semantics { contentDescription = indicator.statusLabel() ?: "Idle" },
+    )
 }
 
-/** The row's top-right status glyph: a 6pt dot + word in the same muted color;
- *  Done trades the dot for a check. */
 @Composable
 fun StatusCorner(indicator: ChatIndicator) {
     Row(verticalAlignment = Alignment.CenterVertically) {
-        if (indicator == ChatIndicator.completed) {
-            Icon(Icons.Filled.Check, null, tint = indicator.dotColor(), modifier = Modifier.size(11.dp))
-        } else {
-            StatusDot(indicator)
-        }
+        StatusDot(indicator)
         indicator.statusLabel()?.let {
-            Spacer(Modifier.width(4.dp))
-            Text(it, color = indicator.dotColor(), fontFamily = Geist, fontWeight = FontWeight.Medium, fontSize = 10.sp)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                it,
+                color = indicator.liveDot(),
+                fontFamily = Geist,
+                fontWeight = FontWeight.Medium,
+                fontSize = 12.sp,
+            )
         }
     }
 }
 
-/** A restrained hairline pill — used for meta chips (harness/model/branch). */
 @Composable
-fun Pill(text: String, modifier: Modifier = Modifier, color: Color = CosmosColors.textMuted) {
-    Box(
-        modifier
-            .clip(RoundedCornerShape(6.dp))
-            .background(CosmosColors.elementHover)
-            .border(1.dp, CosmosColors.border, RoundedCornerShape(6.dp))
-            .padding(horizontal = 8.dp, vertical = 3.dp),
+fun Pill(text: String, modifier: Modifier = Modifier, color: Color = LocalCosmos.current.textMuted) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(50),
+        color = LocalCosmos.current.elementHover,
+        tonalElevation = 0.dp,
     ) {
-        Text(text, color = color, fontFamily = Geist, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        Text(
+            text,
+            color = color,
+            fontFamily = Geist,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+        )
+    }
+}
+
+@Composable
+fun ConnectionBanner(link: LinkState, onRetry: () -> Unit) {
+    val p = LocalCosmos.current
+    val (message, color) = when (link) {
+        LinkState.Online -> return
+        LinkState.Reconnecting -> "Reconnecting…" to p.warning
+        LinkState.Offline -> "Offline — tap to retry" to p.danger
+    }
+    Surface(color = color.copy(alpha = 0.12f), modifier = Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(message, color = color, fontFamily = Geist, fontSize = 13.sp, modifier = Modifier.weight(1f))
+            if (link == LinkState.Offline) {
+                TextButton(onClick = onRetry) { Text("Retry", color = color) }
+            }
+        }
     }
 }
 
@@ -102,6 +138,7 @@ fun harnessLabel(id: String): String = when (id) {
     "opencode" -> "OpenCode"
     "antigravity", "agy" -> "Antigravity"
     "amp" -> "Amp"
+    "kimi" -> "Kimi"
     "mock" -> "Mock"
     else -> id.replaceFirstChar { it.uppercase() }
 }

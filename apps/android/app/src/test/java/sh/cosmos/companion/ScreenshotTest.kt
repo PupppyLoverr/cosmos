@@ -5,28 +5,27 @@ import app.cash.paparazzi.Paparazzi
 import com.android.resources.NightMode
 import org.junit.Rule
 import org.junit.Test
+import sh.cosmos.companion.net.RegistryBridge
 import sh.cosmos.companion.net.SessionStatus
 import sh.cosmos.companion.net.SessionSummary
+import sh.cosmos.companion.net.TranscriptItem
 import sh.cosmos.companion.net.SpaceInfo
 import sh.cosmos.companion.net.DeviceInfo
-import sh.cosmos.companion.net.RegistryBridge
 import sh.cosmos.companion.theme.CosmosTheme
+import sh.cosmos.companion.theme.ThemeMode
 import sh.cosmos.companion.ui.ConnectScreen
 import sh.cosmos.companion.ui.SessionScreen
 import sh.cosmos.companion.ui.SessionsScreen
+import sh.cosmos.companion.ui.SettingsScreen
 import sh.cosmos.companion.vm.ConnState
+import sh.cosmos.companion.vm.LinkState
 import sh.cosmos.companion.vm.Workspace
 
-/**
- * Renders the real Compose screens to PNGs on the JVM (no emulator needed).
- * Run `./gradlew :app:recordPaparazziDebug` to write snapshots under
- * app/src/test/snapshots/images/.
- */
 class ScreenshotTest {
     @get:Rule
     val paparazzi = Paparazzi(
         deviceConfig = DeviceConfig.PIXEL_6.copy(nightMode = NightMode.NIGHT),
-        maxPercentDifference = 100.0, // record-only; never fail on diff
+        maxPercentDifference = 100.0,
     )
 
     private val now = System.currentTimeMillis()
@@ -58,7 +57,7 @@ class ScreenshotTest {
 
     @Test fun connect() {
         paparazzi.snapshot {
-            CosmosTheme {
+            CosmosTheme(ThemeMode.Dark) {
                 ConnectScreen(ConnState.Disconnected, "http://10.0.2.2:27640", "alice", "org1") { _, _, _ -> }
             }
         }
@@ -66,14 +65,41 @@ class ScreenshotTest {
 
     @Test fun sessions() {
         paparazzi.snapshot {
-            CosmosTheme { SessionsScreen(workspace(), {}, {}, {}) }
+            CosmosTheme(ThemeMode.Dark) {
+                SessionsScreen(workspace(), LinkState.Online, "", {}, {}, {}, {})
+            }
+        }
+    }
+
+    @Test fun sessionsLight() {
+        paparazzi.snapshot {
+            CosmosTheme(ThemeMode.Light) {
+                SessionsScreen(workspace(), LinkState.Reconnecting, "cosmos", {}, {}, {}, {})
+            }
         }
     }
 
     @Test fun session() {
         paparazzi.snapshot {
-            CosmosTheme {
-                SessionScreen(sample()[0], client = null, bridge = RegistryBridge(), onBack = {})
+            CosmosTheme(ThemeMode.Dark) {
+                SessionScreen(
+                    sample()[0],
+                    client = null,
+                    bridge = RegistryBridge(),
+                    seedItems = listOf(
+                        TranscriptItem("u1", "user", "Stand up a native Android companion for Cosmos sessions.", now - 90_000),
+                        TranscriptItem("a1", "assistant", "Synced to every device through the session room. Mock harness reporting in.", now - 60_000),
+                    ),
+                    onBack = {},
+                )
+            }
+        }
+    }
+
+    @Test fun settings() {
+        paparazzi.snapshot {
+            CosmosTheme(ThemeMode.Dark) {
+                SettingsScreen(null, LinkState.Online, ThemeMode.Dark, {}, {}, {}, {})
             }
         }
     }

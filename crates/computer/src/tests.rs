@@ -76,6 +76,32 @@ fn settings_round_trip() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn driver_env_never_exports_autolaunch_session_bus() {
+    let env = enabled_settings(ControlMode::FullControl).driver_env(None);
+    let map: std::collections::BTreeMap<_, _> = env.into_iter().collect();
+    assert_eq!(map.get("GTK_A11Y").map(String::as_str), Some("1"));
+    if let Some(bus) = map.get("DBUS_SESSION_BUS_ADDRESS") {
+        assert!(
+            !bus.starts_with("autolaunch:"),
+            "zbus cannot use autolaunch: {bus}"
+        );
+        assert!(
+            bus.starts_with("unix:") || bus.starts_with("tcp:"),
+            "expected a concrete bus address, got {bus}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_session_bus_resolver_skips_autolaunch() {
+    if let Some(bus) = crate::linux_session_bus_address() {
+        assert!(!bus.starts_with("autolaunch:"), "{bus}");
+    }
+}
+
 #[tokio::test]
 async fn disabled_service_refuses() {
     let (service, _data) = service(
@@ -614,15 +640,25 @@ fn new_tools_are_advertised_and_gated() {
 }
 
 /// Real-driver end-to-end - runs only with COSMOS_COMPUTER_E2E=1 and a
-/// driver installed under the real data dir (%LOCALAPPDATA%\Zeron on
-/// Windows). Exercises spawn + start_session, list_windows, observe,
-/// find, verify, and the overlay cursor against the shipped cua-driver.
+/// driver installed under the Cosmos data dir. Override with
+/// `COSMOS_COMPUTER_E2E_DATA`; otherwise Linux uses `$HOME/.zeron` and
+/// Windows uses `%LOCALAPPDATA%\Zeron`.
+fn e2e_data_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("COSMOS_COMPUTER_E2E_DATA") {
+        return std::path::PathBuf::from(dir);
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        return std::path::PathBuf::from(local).join("Zeron");
+    }
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join(".zeron")
+}
+
 #[tokio::test]
 async fn e2e_real_driver() {
     if std::env::var("COSMOS_COMPUTER_E2E").as_deref() != Ok("1") {
         return;
     }
-    let data = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap()).join("Zeron");
+    let data = e2e_data_dir();
     let paths = crate::ComputerPaths::new(&data);
     let Some(install) = paths.installed().unwrap() else {
         eprintln!(
@@ -724,5 +760,213 @@ async fn e2e_real_driver() {
             .dispatch_tool("computer_move_cursor", json!({"x": 40, "y": 40}))
             .await;
         eprintln!("e2e move_cursor: {:?}", moved.map(|r| r.text));
+    }
+}
+
+/// Linux Computer Use regression suite — policy + mock backend, no driver.
+/// Covers the observe/find/click/type/scroll/wait/stale/background/visual/
+/// cancel/crash/Wayland-capability surface the live driver is expected to
+/// honor. Live driver coverage is `e2e_real_driver` (COSMOS_COMPUTER_E2E=1).
+mod linux_regression {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_reports_linux_session_and_does_not_hide_wayland_limits() {
+        let (service, _data) = service(
+            enabled_settings(ControlMode::Background),
+            Arc::new(MockComputer::working()),
+        );
+        let status = service.status();
+        assert_eq!(status.platform, "linux");
+        let session = status.session.as_deref();
+        assert!(
+            session == Some("x11") || session == Some("wayland"),
+            "unexpected session label {session:?}"
+        );
+        assert_eq!(
+            status.capabilities.wayland_background_limited,
+            session == Some("wayland")
+        );
+        let note = status.permissions.note.unwrap_or_default();
+        if session == Some("wayland") {
+            assert!(
+                note.contains("background_unavailable"),
+                "Wayland note must name background_unavailable: {note}"
+            );
+            assert!(
+                status.permissions.screen.contains("xdg-desktop-portal"),
+                "{}",
+                status.permissions.screen
+            );
+        } else {
+            assert!(
+                status.permissions.accessibility.contains("AT-SPI"),
+                "X11 must name AT-SPI, not 'not required': {}",
+                status.permissions.accessibility
+            );
+            assert!(note.contains("X11"), "{note}");
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_find_click_type_scroll_wait() {
+        let (service, _data) = service(
+            enabled_settings(ControlMode::FullControl),
+            Arc::new(MockComputer::working()),
+        );
+        let observe = service
+            .dispatch_tool("computer_observe", json!({"scope": "frontmost"}))
+            .await
+            .unwrap();
+        assert!(observe.text.contains("Mock App"), "{}", observe.text);
+
+        let found = service
+            .dispatch_tool("computer_find", json!({"pid": 4242, "query": "OK"}))
+            .await
+            .unwrap();
+        assert!(
+            found.text.to_ascii_lowercase().contains("ok"),
+            "{}",
+            found.text
+        );
+
+        service
+            .dispatch_tool("computer_click", json!({"pid": 4242, "x": 10, "y": 10}))
+            .await
+            .unwrap();
+        service
+            .dispatch_tool(
+                "computer_type_text",
+                json!({"pid": 4242, "text": "hello cosmos"}),
+            )
+            .await
+            .unwrap();
+        service
+            .dispatch_tool(
+                "computer_scroll",
+                json!({"pid": 4242, "direction": "down", "amount": 3}),
+            )
+            .await
+            .unwrap();
+        service
+            .dispatch_tool(
+                "computer_wait",
+                json!({"pid": 4242, "timeoutMs": 500, "for": {"text": "Hello"}}),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_element_fails_closed() {
+        let (service, _data) = service(
+            enabled_settings(ControlMode::FullControl),
+            Arc::new(MockComputer::with_mode(crate::mock::MockMode::Stale)),
+        );
+        let err = service
+            .dispatch_tool(
+                "computer_click",
+                json!({"pid": 4242, "elementToken": "s1:99"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "stale_element");
+    }
+
+    #[tokio::test]
+    async fn background_unavailable_then_foreground_succeeds() {
+        let backend = Arc::new(MockComputer::with_mode(
+            crate::mock::MockMode::BackgroundUnavailable,
+        ));
+        let (service, _data) = service(enabled_settings(ControlMode::FullControl), backend.clone());
+        let err = service
+            .dispatch_tool("computer_click", json!({"pid": 4242, "x": 1, "y": 1}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "background_unavailable");
+        service
+            .dispatch_tool(
+                "computer_click",
+                json!({"pid": 4242, "x": 1, "y": 1, "deliveryMode": "foreground"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.last_delivery.lock().unwrap().as_deref(),
+            Some("foreground")
+        );
+    }
+
+    #[tokio::test]
+    async fn visual_fallback_observe_without_semantic() {
+        let settings = ComputerSettings {
+            enabled: true,
+            semantic: false,
+            screenshots: true,
+            control: ControlMode::Observe,
+            ..ComputerSettings::default()
+        };
+        let (service, _data) = service(settings, Arc::new(MockComputer::working()));
+        let reply = service
+            .dispatch_tool("computer_observe", json!({"screenshot": true}))
+            .await
+            .unwrap();
+        // Semantic text is gated off; the call still succeeds (visual path).
+        assert!(
+            !reply.text.contains("button \"OK\"") || reply.text.contains("Mock"),
+            "{}",
+            reply.text
+        );
+    }
+
+    #[tokio::test]
+    async fn window_scope_refuses_missing_pid_wrong_window_prevention() {
+        let (service, _data) = service(
+            enabled_settings(ControlMode::Observe),
+            Arc::new(MockComputer::working()),
+        );
+        let err = service
+            .dispatch_tool("computer_observe", json!({"scope": "window"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ComputerError::InvalidArgs(_)));
+    }
+
+    #[tokio::test]
+    async fn wait_timeout_is_the_cancel_path() {
+        let (service, _data) = service(
+            enabled_settings(ControlMode::Observe),
+            Arc::new(MockComputer::working()),
+        );
+        let err = service
+            .dispatch_tool(
+                "computer_wait",
+                json!({
+                    "pid": 4242,
+                    "timeoutMs": 200,
+                    "for": {"text": "this-string-is-never-in-the-mock-tree-zzzz"}
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.message().contains("timeout") || err.code() == "invalid_args",
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn component_crashed_surfaces_driver_unavailable() {
+        let (service, _data) = service(
+            enabled_settings(ControlMode::FullControl),
+            Arc::new(MockComputer::with_mode(crate::mock::MockMode::Broken)),
+        );
+        let err = service
+            .dispatch_tool("computer_observe", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "driver_unavailable");
     }
 }

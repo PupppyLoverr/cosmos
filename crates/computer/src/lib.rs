@@ -273,6 +273,13 @@ impl ComputerSettings {
     /// always set explicitly so the user's saved driver prefs can't override
     /// the Cosmos posture; the update check is always off — Cosmos manages
     /// the component itself.
+    ///
+    /// On Linux the driver is also given a *usable* session-bus address.
+    /// XFCE/dbus-launch often exports `DBUS_SESSION_BUS_ADDRESS=autolaunch:`,
+    /// which zbus (and therefore Cua's AT-SPI client) rejects as an
+    /// unsupported transport — semantic trees then degrade to a single
+    /// window node. We resolve the unix socket from dbus-launch's
+    /// `~/.dbus/session-bus/<machine-id>-<display>` file when needed.
     pub fn driver_env(&self, manifest_path: Option<&Path>) -> Vec<(String, String)> {
         let mut env = vec![
             (
@@ -284,6 +291,7 @@ impl ComputerSettings {
                 if self.telemetry { "true" } else { "false" }.into(),
             ),
             ("CUA_DRIVER_RS_UPDATE_CHECK".into(), "false".into()),
+            ("GTK_A11Y".into(), "1".into()),
         ];
         if let Some(manifest) = manifest_path {
             env.push((
@@ -292,8 +300,62 @@ impl ComputerSettings {
             ));
             env.push(("CUA_DRIVER_CAPABILITY_MANIFEST_APPROVED".into(), "1".into()));
         }
+        for key in [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XDG_SESSION_TYPE",
+            "XDG_RUNTIME_DIR",
+            "HOME",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                if !value.is_empty() {
+                    env.push((key.into(), value));
+                }
+            }
+        }
+        if let Some(bus) = linux_session_bus_address() {
+            env.push(("DBUS_SESSION_BUS_ADDRESS".into(), bus));
+        }
         env
     }
+}
+
+/// A zbus-usable session-bus address, or `None` if one cannot be resolved.
+/// Prefers a real `unix:`/`tcp:` env var; never returns `autolaunch:`.
+pub fn linux_session_bus_address() -> Option<String> {
+    if let Ok(addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+        let addr = addr.trim();
+        if !addr.is_empty() && !addr.starts_with("autolaunch:") {
+            return Some(addr.to_string());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let machine = std::fs::read_to_string("/etc/machine-id")
+            .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+            .ok()?;
+        let machine = machine.trim();
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
+        let n = display
+            .rsplit_once(':')
+            .map(|(_, rest)| rest.split('.').next().unwrap_or("0"))
+            .unwrap_or("0");
+        let home = std::env::var("HOME").ok()?;
+        let path = std::path::PathBuf::from(home)
+            .join(".dbus/session-bus")
+            .join(format!("{machine}-{n}"));
+        let body = std::fs::read_to_string(path).ok()?;
+        for line in body.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("DBUS_SESSION_BUS_ADDRESS=") {
+                let value = rest.trim().trim_matches('\'').trim_matches('"');
+                if !value.is_empty() && !value.starts_with("autolaunch:") {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -626,6 +688,11 @@ pub struct StatusCapabilities {
     pub background: bool,
     /// Foreground escalation exists AND the user enabled Full Control.
     pub foreground: bool,
+    /// Wayland compositors often refuse background input; callers must treat
+    /// `background_unavailable` as expected, not a driver crash, and only
+    /// escalate to foreground under Full Control.
+    #[serde(default)]
+    pub wayland_background_limited: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

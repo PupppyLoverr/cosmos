@@ -114,7 +114,27 @@ class CosmosClient(private val connection: Connection) {
         val req = authed(Request.Builder().url(url("/device/$deviceId/nudge")))
             .post(body.toRequestBody("application/json".toMediaType()))
             .build()
-        runCatching { http.newCall(req).execute().use { } }
+        http.newCall(req).execute().use { r ->
+            if (!r.isSuccessful && r.code !in 400..499) {
+                throw CosmosException("nudge ${r.code}")
+            }
+        }
+    }
+
+    /**
+     * GET /chat2/{chatId}/tail — host-published last-N transcript JSON
+     * (crates/engine chat2_maintenance). Same protocol iOS uses for instant-open.
+     * Returns null when the host has not published a sidecar yet (404/empty).
+     */
+    suspend fun chatTail(chatId: String): SessionTail? = withContext(Dispatchers.IO) {
+        val req = authed(Request.Builder().url(url("/chat2/$chatId/tail"))).build()
+        http.newCall(req).execute().use { r ->
+            if (r.code == 404) return@withContext null
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw CosmosException("tail ${r.code}: $body")
+            if (body.isBlank()) return@withContext null
+            json.decodeFromString(SessionTail.serializer(), body)
+        }
     }
 }
 

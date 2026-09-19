@@ -43,6 +43,10 @@ pub enum MockMode {
     ObserveOnly,
     /// Every call fails `driver_unavailable`.
     Broken,
+    /// Actions fail `stale_element` — the harness must re-observe.
+    Stale,
+    /// Background delivery fails `background_unavailable`; foreground works.
+    BackgroundUnavailable,
 }
 
 impl MockComputer {
@@ -79,7 +83,10 @@ impl ComputerBackend for MockComputer {
         self.calls.fetch_add(1, Ordering::Relaxed);
         match self.mode {
             MockMode::Broken => Err(ComputerError::Unavailable("mock driver is down".into())),
-            _ => Ok(()),
+            MockMode::Stale
+            | MockMode::BackgroundUnavailable
+            | MockMode::ObserveOnly
+            | MockMode::Full => Ok(()),
         }
     }
 
@@ -266,7 +273,19 @@ impl ComputerBackend for MockComputer {
                 "observe_only",
                 "the mock driver only observes",
             )),
-            MockMode::Full => Ok(ActionOutcome {
+            MockMode::Stale => Err(ComputerError::refused(
+                "stale_element",
+                "token no longer resolves — re-observe and pick a fresh ref",
+            )),
+            MockMode::BackgroundUnavailable
+                if request.delivery == crate::backend::Delivery::Background =>
+            {
+                Err(ComputerError::refused(
+                    "background_unavailable",
+                    "window is not reachable in the background on this compositor",
+                ))
+            }
+            MockMode::BackgroundUnavailable | MockMode::Full => Ok(ActionOutcome {
                 summary: format!(
                     "mock {} performed ({})",
                     request.tool,
@@ -285,7 +304,7 @@ impl ComputerBackend for MockComputer {
             platform: crate::platform_label(),
             semantic: true,
             screenshots: true,
-            background_control: true,
+            background_control: self.mode != MockMode::BackgroundUnavailable,
             foreground_control: true,
         }
     }

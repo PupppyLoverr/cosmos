@@ -37,6 +37,9 @@ required-features = ["appshots-fixture"]
 name = "new-project-fixture"
 required-features = ["project-palette-fixture"]
 
+[[example]]
+name = "atspi-probe"
+
 [dependencies]
 url = "2"
 zeron-proto.workspace = true
