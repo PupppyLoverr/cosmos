@@ -65,6 +65,7 @@ export default function DesktopsScreen() {
   const devices = useSnapshot(client.devices);
   const sessions = useSnapshot(client.sessions);
   const computer = useSnapshot(client.computer);
+  const auth = useSnapshot(client.auth);
 
   const activeId = connection.desktop?.id;
   const engineDeviceId = connection.localDeviceId;
@@ -129,9 +130,9 @@ export default function DesktopsScreen() {
           />
           <Row
             title="Find remote desktops"
-            subtitle="Sign in with Woozlit to reach your devices anywhere"
+            subtitle={auth ? 'Desktops on your Woozlit account' : 'Sign in with Woozlit to reach your devices anywhere'}
             leading={<SymbolView name="globe" size={18} tintColor={t.textSecondary} />}
-            onPress={() => router.push('/sign-in')}
+            onPress={() => router.push(auth ? '/pair' : '/sign-in')}
             chevron
           />
         </Group>
