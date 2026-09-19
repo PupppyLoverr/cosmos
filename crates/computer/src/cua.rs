@@ -241,11 +241,20 @@ impl CuaBackend {
     /// All top-level windows, thinly normalized (`window_id`, `pid`,
     /// `app_name`, `title`, `z_index`, `minimized`, `is_on_screen`).
     async fn list_windows(&self, pid: Option<i64>) -> Result<Vec<Value>, ComputerError> {
+        #[cfg(target_os = "linux")]
+        if let Ok(value) = crate::linux_x11::list_windows(pid, false).await
+            && let Some(arr) = value.get("windows").and_then(Value::as_array)
+            && (!arr.is_empty() || pid.is_none())
+        {
+            return Ok(arr.clone());
+        }
         let args = match pid {
             Some(pid) => json!({"pid": pid}),
             None => json!({}),
         };
-        let result = self.call("list_windows", args).await?;
+        let result = self
+            .call_with_timeout("list_windows", args, crate::mcp_client::INSPECT_TIMEOUT)
+            .await?;
         Ok(result_windows(&result))
     }
 

@@ -790,10 +790,9 @@ impl ComputerService {
             obj.insert("_session".into(), json!(session));
         }
 
-        // Linux global inventory does not need the Cua stdio child — and must
-        // not wait on it. Per-pid lists go through the driver so GTK dialogs
-        // that share an X11 window still show up. `ensure_backend` stays lazy
-        // for observe/act.
+        // Linux window inventory does not need the Cua stdio child — and must
+        // not wait on it. GTK file choosers that own an X11 window appear in
+        // wmctrl; a11y-only sheets still fall through to the driver.
         if name == "computer_list_windows" && get_i64(&args, "pid").is_none() {
             let on_screen_only = get_bool(&args, "onScreenOnly").unwrap_or(false);
             #[cfg(target_os = "linux")]

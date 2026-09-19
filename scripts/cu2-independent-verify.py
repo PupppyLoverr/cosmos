@@ -82,18 +82,31 @@ def task3() -> bool:
         wid = pad.get("windowId") or pad.get("window_id")
         cc.call("computer_pin_window", {"pid": pad["pid"], "windowId": wid})
         observe(cc, pad)
-        cc.call(
-            "computer_hotkey",
-            {"keys": "ctrl+end", "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
-        )
-        cc.call(
-            "computer_type_text",
-            {"text": "\nCOSMOS_CU2_TASK3\n", "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
-        )
-        cc.call(
-            "computer_hotkey",
-            {"keys": "ctrl+s", "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
-        )
+        for keys, extra in (
+            ("ctrl+end", {}),
+            ("ctrl+s", {}),
+        ):
+            try:
+                cc.call(
+                    "computer_hotkey",
+                    {"keys": keys, "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground", **extra},
+                )
+            except Exception as e:
+                log(f"hotkey {keys}: {e}")
+        try:
+            cc.call(
+                "computer_type_text",
+                {"text": "\nCOSMOS_CU2_TASK3\n", "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
+            )
+        except Exception as e:
+            log(f"type: {e}")
+        try:
+            cc.call(
+                "computer_hotkey",
+                {"keys": "ctrl+s", "pid": pad["pid"], "windowId": wid, "deliveryMode": "foreground"},
+            )
+        except Exception as e:
+            log(f"save: {e}")
         time.sleep(1)
         path = Path("/tmp/cosmos-cu2/task1/report-final.txt")
         body = path.read_text() if path.exists() else ""
