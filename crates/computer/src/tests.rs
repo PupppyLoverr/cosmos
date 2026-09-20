@@ -1334,6 +1334,164 @@ async fn sheet_owner_alias_routes_actions_to_owner_window() {
     assert_eq!(clicks[0]["args"]["scope"], json!("desktop"));
 }
 
+#[test]
+fn sheet_path_values_split_into_folder_and_name() {
+    assert_eq!(
+        CuaBackend::split_sheet_path_value("AXTextField", "/Users/devin/artifacts_raw/note.txt"),
+        Some(("/Users/devin/artifacts_raw/".into(), "note.txt".into()))
+    );
+    assert_eq!(
+        CuaBackend::split_sheet_path_value("AXTextField", "~/Desktop/note.txt"),
+        Some(("~/Desktop/".into(), "note.txt".into()))
+    );
+    assert_eq!(
+        CuaBackend::split_sheet_path_value("AXTextField", "/note.txt"),
+        Some(("/".into(), "note.txt".into()))
+    );
+    assert_eq!(
+        CuaBackend::split_sheet_path_value("AXTextField", "note.txt"),
+        None
+    );
+    assert_eq!(
+        CuaBackend::split_sheet_path_value("AXTextField", "/Users/devin/"),
+        None
+    );
+    assert_eq!(
+        CuaBackend::split_sheet_path_value("AXButton", "/Users/devin/note.txt"),
+        None
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sheet_set_value_with_path_navigates_via_go_to_folder() {
+    let pid = 42;
+    let windows = json!([
+        {
+            "pid": pid,
+            "window_id": 688,
+            "title": "Save",
+            "app_name": "TextEdit",
+            "z_index": 98,
+            "is_on_screen": true,
+            "minimized": false
+        },
+        {
+            "pid": pid,
+            "window_id": 700,
+            "title": "Untitled",
+            "app_name": "TextEdit",
+            "z_index": 78,
+            "is_on_screen": true,
+            "minimized": false
+        }
+    ]);
+    let states = json!({
+        "688": {
+            "pid": pid,
+            "window_id": 688,
+            "app_name": "TextEdit",
+            "window_title": "Save",
+            "degraded": true,
+            "degraded_reason": "ax_window_unresolved: Save sheet",
+            "elements": []
+        },
+        "700": {
+            "pid": pid,
+            "window_id": 700,
+            "app_name": "TextEdit",
+            "window_title": "Untitled",
+            "window_bounds": {"x": 100.0, "y": 200.0, "w": 500.0, "h": 400.0},
+            "elements": [
+                {"element_index": 0, "role": "AXSheet", "label": "Save"},
+                {
+                    "element_index": 1,
+                    "element_token": "s000000d7:121",
+                    "role": "AXTextField",
+                    "label": "Untitled.txt",
+                    "frame": {"x": 20.0, "y": 30.0, "w": 40.0, "h": 20.0}
+                }
+            ]
+        }
+    });
+    let ok = |text: &str| json!({"result": {"content": [{"type": "text", "text": text}]}});
+    let actions = json!({
+        "set_value": [
+            {"error": "set_value: element_outside_target_window (refused)"}
+        ],
+        "click": [ok("clicked"), ok("clicked")],
+        "press_key": [ok("selected"), ok("return"), ok("selected")],
+        "type_text": [ok("lead"), ok("rest"), ok("name")]
+    });
+    let (backend, data, screenshots) =
+        scripted_cua_backend_with_actions(windows, states, actions).await;
+    backend
+        .observe(&ObserveRequest {
+            scope: ObserveScope::Window {
+                pid,
+                window_id: Some(688),
+            },
+            semantic: true,
+            screenshot: false,
+            max_elements: 100,
+            full_tree: false,
+            max_dimension: 1200,
+            screenshot_dir: screenshots.path().into(),
+        })
+        .await
+        .unwrap();
+    let outcome = backend
+        .act(&ActionRequest {
+            tool: "computer_set_value".into(),
+            args: json!({
+                "pid": pid,
+                "windowId": 688,
+                "elementToken": "s000000d7:121",
+                "snapshotId": "s000000d7",
+                "elementIndex": 121,
+                "value": "/Users/devin/artifacts_raw/note.txt"
+            }),
+            delivery: Delivery::Background,
+            session: None,
+            screenshot_dir: screenshots.path().into(),
+            observe_screenshot: false,
+            observe_semantic: false,
+            max_elements: 100,
+            max_dimension: 1200,
+        })
+        .await
+        .unwrap();
+    assert!(outcome.summary.contains("out-of-process sheet"));
+    assert!(
+        outcome
+            .summary
+            .contains("navigated the panel to /Users/devin/artifacts_raw/ via Go to Folder")
+    );
+    assert!(outcome.summary.contains("set the file name note.txt"));
+    let calls: Vec<Value> = std::fs::read_to_string(data.path().join("calls.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    let typed: Vec<&str> = calls
+        .iter()
+        .filter(|call| call.get("name").and_then(Value::as_str) == Some("type_text"))
+        .filter_map(|call| call["args"]["text"].as_str())
+        .collect();
+    assert_eq!(typed, vec!["/", "Users/devin/artifacts_raw/", "note.txt"]);
+    let keys: Vec<&str> = calls
+        .iter()
+        .filter(|call| call.get("name").and_then(Value::as_str) == Some("press_key"))
+        .filter_map(|call| call["args"]["key"].as_str())
+        .collect();
+    assert_eq!(keys, vec!["a", "return", "a"]);
+    let clicks = calls
+        .iter()
+        .filter(|call| call.get("name").and_then(Value::as_str) == Some("click"))
+        .count();
+    assert_eq!(clicks, 2);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn token_conflict_retargets_without_stale_snapshot_fields() {

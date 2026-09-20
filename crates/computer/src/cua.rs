@@ -345,23 +345,49 @@ impl CuaBackend {
             }
             "set_value" => {
                 let value = call_args.get("value").and_then(Value::as_str)?;
-                let click = self
-                    .call("click", json!({ "scope": "desktop", "x": x, "y": y }))
-                    .await;
-                if click.is_err() {
-                    return Some(Err(first_error.clone()));
+                if let Some((folder, name)) = Self::split_sheet_path_value(&cached.role, value) {
+                    // A "/" typed into a save/open panel's name field opens the
+                    // panel's Go to Folder popover, so an absolute path has to be
+                    // delivered as a folder navigation followed by the file name.
+                    if self.select_field_at(x, y).await.is_err() {
+                        return Some(Err(first_error.clone()));
+                    }
+                    let (lead, rest) = folder.split_at(1);
+                    if self
+                        .call("type_text", json!({ "scope": "desktop", "text": lead }))
+                        .await
+                        .is_err()
+                    {
+                        return Some(Err(first_error.clone()));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                    if self
+                        .call("type_text", json!({ "scope": "desktop", "text": rest }))
+                        .await
+                        .is_err()
+                    {
+                        return Some(Err(first_error.clone()));
+                    }
+                    if self
+                        .call("press_key", json!({ "scope": "desktop", "key": "return" }))
+                        .await
+                        .is_err()
+                    {
+                        return Some(Err(first_error.clone()));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                    if self.select_field_at(x, y).await.is_err() {
+                        return Some(Err(first_error.clone()));
+                    }
+                    let typed = self
+                        .call("type_text", json!({ "scope": "desktop", "text": name }))
+                        .await;
+                    let note = format!(
+                        "{fallback_note} (path value: navigated the panel to {folder} via Go to Folder, then set the file name {name})"
+                    );
+                    return Some(typed.map(|result| (result, note)));
                 }
-                let key = self
-                    .call(
-                        "press_key",
-                        json!({
-                            "scope": "desktop",
-                            "key": "a",
-                            "modifiers": ["command"],
-                        }),
-                    )
-                    .await;
-                if key.is_err() {
+                if self.select_field_at(x, y).await.is_err() {
                     return Some(Err(first_error.clone()));
                 }
                 let typed = self
@@ -379,6 +405,40 @@ impl CuaBackend {
             }
             _ => None,
         }
+    }
+
+    /// Click a screen point and select the field's current contents.
+    async fn select_field_at(&self, x: f64, y: f64) -> Result<(), ComputerError> {
+        self.call("click", json!({ "scope": "desktop", "x": x, "y": y }))
+            .await?;
+        self.call(
+            "press_key",
+            json!({ "scope": "desktop", "key": "a", "modifiers": ["command"] }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Split an absolute path typed into a panel's text field into the folder
+    /// to navigate to and the file name to set. `None` when `value` is a plain
+    /// name or the element is not a text field.
+    pub(crate) fn split_sheet_path_value(role: &str, value: &str) -> Option<(String, String)> {
+        let role = role.to_ascii_lowercase();
+        if !(role.ends_with("textfield") || role.ends_with("textarea") || role == "textbox") {
+            return None;
+        }
+        if !(value.starts_with('/') || value.starts_with("~/")) {
+            return None;
+        }
+        let (folder, name) = value.rsplit_once('/')?;
+        if name.is_empty() {
+            return None;
+        }
+        let folder = if folder.is_empty() { "/" } else { folder };
+        Some((
+            format!("{}/", folder.trim_end_matches('/')),
+            name.to_string(),
+        ))
     }
 
     fn is_ax_unresolved_state(state: &WindowState) -> bool {
