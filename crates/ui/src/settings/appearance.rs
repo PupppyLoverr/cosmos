@@ -3398,7 +3398,7 @@ impl Render for AppearancePage {
                             .child(
                                 widgets::page_subtitle(
                                     &theme,
-                                    "Choose how Zeron looks. These settings stay on this device.",
+                                    "Choose how Cosmos looks. These settings stay on this device.",
                                 )
                                 .max_w(px(512.0))
                                 .line_height(px(20.0)),

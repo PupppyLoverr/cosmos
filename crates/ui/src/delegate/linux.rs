@@ -97,7 +97,7 @@ pub fn request_running_delegate(data_dir: &Path) -> Result<(), crate::appshots::
         .map(|_| ())
         .map_err(|error| {
             crate::appshots::CaptureError::CaptureFailed(format!(
-                "Could not reach a running Zeron instance for Delegate: {error}"
+                "Could not reach a running Cosmos instance for Delegate: {error}"
             ))
         })
 }
