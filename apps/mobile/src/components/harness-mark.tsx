@@ -2,7 +2,7 @@ import React from 'react';
 import { Circle, Path, Svg } from 'react-native-svg';
 import { View } from 'react-native';
 import { HarnessId } from '../lib/protocol';
-import { statusColor, tintFor, useTheme } from '../lib/theme';
+import { alpha, statusColor, tintFor, useTheme } from '../lib/theme';
 
 type MarkPath = { d: string; fillRule?: 'evenodd'; fillOpacity?: number };
 type MarkDefinition = { viewBox: string; paths: MarkPath[] };
@@ -128,6 +128,16 @@ const MARKS: Partial<Record<Exclude<HarnessId, 'mock'>, MarkDefinition>> =
   }
 };
 
+const LABELS: Record<HarnessId, string> = {
+  'claude-code': 'Claude Code', codex: 'Codex', cursor: 'Cursor', devin: 'Devin', grok: 'Grok', hermes: 'Hermes', pi: 'Pi',
+  opencode: 'OpenCode', antigravity: 'Antigravity', amp: 'Amp', 'kimi-code': 'Kimi Code', mock: 'Mock',
+};
+
+/** Display name of a harness; undefined when the chat has none configured. */
+export function harnessLabel(harness?: HarnessId | null): string | undefined {
+  return harness ? LABELS[harness] ?? harness : undefined;
+}
+
 function NeutralMark({ color, size }: { color: string; size: number }) {
   return (
     <Svg width={size} height={size} viewBox="0 0 24 24" accessibilityLabel="Cosmos">
@@ -137,24 +147,30 @@ function NeutralMark({ color, size }: { color: string; size: number }) {
   );
 }
 
-export function HarnessMark({ harness, size = 36, status }: { harness?: HarnessId | null; size?: number; status?: string }) {
+/**
+ * Harness glyph. `plain` draws just the SVG in the text colour (list rows);
+ * otherwise it sits on a faint tinted square with tight corners — a mark, not a sticker.
+ */
+export function HarnessMark({ harness, size = 36, status, plain }: { harness?: HarnessId | null; size?: number; status?: string; plain?: boolean }) {
   const t = useTheme();
   const tint = tintFor(harness ?? 'cosmos');
   const mark = harness && harness !== 'mock' ? MARKS[harness] : undefined;
-  const markSize = size * 0.52;
+  const markSize = plain ? size * 0.8 : size * 0.56;
+  const glyph = mark ? (
+    <Svg width={markSize} height={markSize} viewBox={mark.viewBox} accessibilityLabel={harness ?? 'Cosmos'}>
+      {mark.paths.map((path, index) => (
+        <Path key={index} d={path.d} fill={t.text} fillRule={path.fillRule} fillOpacity={path.fillOpacity} />
+      ))}
+    </Svg>
+  ) : <NeutralMark color={t.text} size={markSize} />;
   return (
     <View style={{ width: size, height: size }}>
       <View style={{
-        width: size, height: size, borderRadius: size * 0.34, borderCurve: 'continuous',
-        backgroundColor: tint, alignItems: 'center', justifyContent: 'center',
+        width: size, height: size, alignItems: 'center', justifyContent: 'center',
+        borderRadius: plain ? 0 : Math.min(10, Math.round(size * 0.22)),
+        backgroundColor: plain ? 'transparent' : alpha(tint, t.scheme === 'dark' ? 0.22 : 0.16),
       }}>
-        {mark ? (
-          <Svg width={markSize} height={markSize} viewBox={mark.viewBox} accessibilityLabel={harness ?? 'Cosmos'}>
-            {mark.paths.map((path, index) => (
-              <Path key={index} d={path.d} fill={t.text} fillRule={path.fillRule} fillOpacity={path.fillOpacity} />
-            ))}
-          </Svg>
-        ) : <NeutralMark color={t.text} size={markSize} />}
+        {glyph}
       </View>
       {status && status !== 'idle' ? (
         <View style={{

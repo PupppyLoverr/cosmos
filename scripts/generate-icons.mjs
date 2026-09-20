@@ -13,6 +13,12 @@
 //   dist/macos/icon-1024.png                         macOS icns source: 824 squircle + margins + shadow
 //   dist/windows/zeron.ico                           multi-size ico embedded into zeron.exe (build.rs) + Inno
 //   apps/ios/.../AppIcon1024.png                     iOS app icon (1024, opaque — Apple applies the mask)
+//   apps/mobile/assets/icon.png                      Expo app icon (1024, opaque)
+//   apps/mobile/assets/android-icon-{background,foreground,monochrome}.png
+//                                                    Expo adaptive icon: art as the full-bleed background layer,
+//                                                    empty foreground, luminance-alpha monochrome (432, inner 66%)
+//   apps/mobile/assets/splash-icon.png               Expo splash mark (1024 squircle tile)
+//   apps/mobile/assets/favicon.png                   Expo web favicon (48)
 //   apps/landing/public/assets/zeron-app-icon.png    site logo mark (128)
 //   apps/landing/public/assets/zeron-favicon-v3.png  site favicon (128)
 //   dist/zeron.svg                                   source-art slot, re-rendered with the raster embedded
@@ -210,6 +216,24 @@ function canvas(w, h = w) {
     return { w, h, data: Buffer.alloc(w * h * 4) };
 }
 
+/**
+ * Themed-icon layer: white with alpha = pixel luminance, centred inside a
+ * transparent canvas so the art sits in the adaptive-icon safe zone.
+ */
+function monochrome(img, size) {
+    const out = canvas(size);
+    const ox = Math.round((size - img.w) / 2), oy = Math.round((size - img.h) / 2);
+    for (let y = 0; y < img.h; y++) {
+        for (let x = 0; x < img.w; x++) {
+            const s = (y * img.w + x) * 4, d = ((y + oy) * size + x + ox) * 4;
+            const lum = (0.2126 * img.data[s] + 0.7152 * img.data[s + 1] + 0.0722 * img.data[s + 2]) * (img.data[s + 3] / 255);
+            out.data[d] = out.data[d + 1] = out.data[d + 2] = 255;
+            out.data[d + 3] = Math.round(lum);
+        }
+    }
+    return out;
+}
+
 /** Separable box blur of the alpha channel (3 passes ≈ gaussian). */
 function boxBlurAlpha(img, r, passes = 3) {
     const { w, h, data } = img;
@@ -317,6 +341,16 @@ write(
     "apps/ios/Zeron/Assets.xcassets/AppIcon.appiconset/AppIcon1024.png",
     encodePng(overBlack(resize(src, 1024)), { opaque: true })
 );
+
+// Expo companion app (apps/mobile). Same opaque square as native iOS; Android
+// adaptive icons crop the outer third of the foreground, so the photographic
+// art rides on the background layer instead and the foreground stays empty.
+write("apps/mobile/assets/icon.png", encodePng(overBlack(resize(src, 1024)), { opaque: true }));
+write("apps/mobile/assets/android-icon-background.png", encodePng(overBlack(resize(src, 512)), { opaque: true }));
+write("apps/mobile/assets/android-icon-foreground.png", encodePng(canvas(512)));
+write("apps/mobile/assets/android-icon-monochrome.png", encodePng(monochrome(resize(src, 284), 432)));
+write("apps/mobile/assets/splash-icon.png", encodePng(tile1024));
+write("apps/mobile/assets/favicon.png", encodePng(resize(tile1024, 48)));
 
 // Landing site logo mark + favicon.
 write("apps/landing/public/assets/zeron-app-icon.png", encodePng(resize(tile1024, 128)));

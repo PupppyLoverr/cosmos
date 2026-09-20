@@ -1,16 +1,32 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 import { Image } from 'expo-image';
-import { useLocalSearchParams, router } from 'expo-router';
-import { SymbolView } from 'expo-symbols';
+import { useLocalSearchParams, router, Stack } from 'expo-router';
+import * as Haptics from 'expo-haptics';
+import Animated, { Easing, useAnimatedStyle, useSharedValue, withRepeat, withTiming } from 'react-native-reanimated';
 import { useCosmos, useSnapshot } from '../../lib/client';
-import { useTheme, spacing, radii } from '../../lib/theme';
+import { alpha, radii, spacing, type, useTheme } from '../../lib/theme';
+import { Button, Icon, IconButton } from '../../components/bits';
+import { Glass, Screen } from '../../components/surface';
 
 // Watch Live: near-live screenshots while the viewer is open — polls
-// ComputerObserve on a slow cadence (bandwidth-friendly), plus a big red STOP
-// that interrupts the run remotely.
+// ComputerObserve on a slow cadence (bandwidth-friendly), plus a Stop that
+// interrupts the run remotely.
 
 const POLL_MS = 2_500;
+
+function LivePill({ running }: { running: boolean }) {
+  const t = useTheme();
+  const v = useSharedValue(1);
+  useEffect(() => { v.value = running ? withRepeat(withTiming(0.35, { duration: 700, easing: Easing.inOut(Easing.quad) }), -1, true) : 1; }, [running, v]);
+  const blink = useAnimatedStyle(() => ({ opacity: v.value }));
+  return (
+    <View style={[styles.pill, { backgroundColor: running ? t.danger : alpha('#FFFFFF', 0.14) }]} accessibilityLabel={running ? 'Live' : 'Idle'}>
+      <Animated.View style={[styles.pillDot, { backgroundColor: '#fff' }, blink]} />
+      <Text style={[type.caption2, { color: '#fff', fontWeight: '700', letterSpacing: 0.6 }]}>{running ? 'LIVE' : 'IDLE'}</Text>
+    </View>
+  );
+}
 
 export default function WatchLiveScreen() {
   const { chatId } = useLocalSearchParams<{ chatId: string }>();
@@ -26,6 +42,7 @@ export default function WatchLiveScreen() {
   const [now, setNow] = useState(() => Date.now());
   const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
+  const [paused, setPaused] = useState(false);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const session = sessions.find((s) => s.chatId === chatId);
@@ -33,17 +50,14 @@ export default function WatchLiveScreen() {
   const running = session?.status === 'working' || session?.status === 'awaitingInput';
 
   useEffect(() => {
+    if (paused) return;
     let cancelled = false;
     const tick = async () => {
       try {
         const shot = await client.computerObserve();
-        if (!cancelled && shot) {
-          setFrame(shot);
-          setFrameAt(Date.now());
-          setError(null);
-        } else if (!cancelled && !shot) {
-          setError('No screenshot returned — is Computer running?');
-        }
+        if (cancelled) return;
+        if (shot) { setFrame(shot); setFrameAt(Date.now()); setError(null); }
+        else setError('The desktop returned no screenshot. Computer Use may not be active.');
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       }
@@ -56,19 +70,21 @@ export default function WatchLiveScreen() {
       if (timer.current) clearInterval(timer.current);
       clearInterval(clock);
     };
-  }, [client]);
+  }, [client, paused]);
 
   const stop = () => {
-    Alert.alert('Stop this session?', 'Interrupts the running task on the desktop.', [
-      { text: 'Cancel', style: 'cancel' },
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    Alert.alert('Stop this session?', 'Interrupts the task running on your Mac. Anything half-finished stays as it is.', [
+      { text: 'Keep Running', style: 'cancel' },
       {
         text: 'Stop', style: 'destructive',
         onPress: async () => {
           setStopping(true);
           try {
             await client.interrupt(chatId!);
+            void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
           } catch (e) {
-            Alert.alert('Stop failed', e instanceof Error ? e.message : String(e));
+            Alert.alert("Couldn't stop", e instanceof Error ? e.message : String(e));
           } finally {
             setStopping(false);
           }
@@ -77,75 +93,101 @@ export default function WatchLiveScreen() {
     ]);
   };
 
-  return (
-    <View style={[styles.screen, { backgroundColor: t.background }]}>
-      <View style={styles.meta}>
-        <View style={{ flex: 1 }}>
-          <Text style={{ color: t.text, fontSize: 16, fontWeight: '600' }} numberOfLines={1}>
-            {chat?.title ?? 'Session'}
-          </Text>
-          <Text style={{ color: t.textSecondary, fontSize: 13 }}>
-            {session?.status ?? 'idle'} · {frameAt ? `frame ${Math.max(0, Math.round((now - frameAt) / 1000))}s ago` : 'waiting…'}
-            {computer ? ` · ${computer.control ?? computer.state ?? ''}` : ''}
-          </Text>
-        </View>
-        <View style={[styles.liveChip, { backgroundColor: running ? t.danger : t.surface }]}>
-          <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: running ? '#fff' : t.textTertiary }} />
-          <Text style={{ color: running ? '#fff' : t.textTertiary, fontSize: 11, fontWeight: '700' }}>{running ? 'LIVE' : 'IDLE'}</Text>
-        </View>
-      </View>
+  const age = frameAt ? Math.max(0, Math.round((now - frameAt) / 1000)) : null;
+  const ageLabel = age === null ? 'Waiting for first frame…' : age < 2 ? 'Just now' : `${age}s ago`;
+  const control = computer?.control ?? computer?.state;
 
-      <View style={[styles.stage, { backgroundColor: '#000' }]}>
+  return (
+    <Screen>
+      <Stack.Screen
+        options={{
+          title: chat?.title ?? 'Watch Live',
+          headerRight: () => <IconButton icon="xmark" label="Close" size={30} filled={false} tint={t.textSecondary} onPress={() => { if (router.canGoBack()) router.back(); else router.replace('/'); }} />,
+        }}
+      />
+
+      <View style={styles.stage}>
         {frame ? (
-          <Image source={{ uri: frame }} style={styles.frame} contentFit="contain" transition={120} />
+          <Image source={{ uri: frame }} style={styles.frame} contentFit="contain" transition={160} accessibilityLabel="Live screenshot of the desktop" />
         ) : (
           <View style={styles.center}>
             {error ? (
               <>
-                <SymbolView name="display.trianglebadge.exclamationmark" size={36} tintColor={t.textTertiary} />
-                <Text style={{ color: t.textSecondary, textAlign: 'center', paddingHorizontal: spacing(8) }}>{error}</Text>
+                <Icon name="display.trianglebadge.exclamationmark" size={40} color={alpha('#FFFFFF', 0.5)} weight="regular" />
+                <Text style={[type.subhead, styles.stageText]}>{error}</Text>
               </>
             ) : (
-              <ActivityIndicator color="#fff" />
+              <>
+                <ActivityIndicator color="#fff" />
+                <Text style={[type.footnote, styles.stageText]}>Connecting to the desktop display…</Text>
+              </>
             )}
           </View>
         )}
+
+        <View style={styles.overlayTop} pointerEvents="box-none">
+          <LivePill running={!!running} />
+          <View style={styles.overlayRight}>
+            {control ? (
+              <View style={styles.badge}>
+                <Icon name="display" size={11} color="#fff" weight="semibold" />
+                <Text style={[type.caption2, { color: '#fff', fontWeight: '600' }]} numberOfLines={1}>{control}</Text>
+              </View>
+            ) : null}
+            <View style={styles.badge}>
+              <Text style={[type.caption2, { color: alpha('#FFFFFF', 0.85), fontWeight: '600' }]}>{ageLabel}</Text>
+            </View>
+          </View>
+        </View>
+
+        <Pressable
+          onPress={() => { void Haptics.selectionAsync(); setPaused((p) => !p); }}
+          style={styles.pause}
+          accessibilityRole="button"
+          accessibilityLabel={paused ? 'Resume updates' : 'Pause updates'}
+        >
+          <View style={styles.badge}>
+            <Icon name={paused ? 'play.fill' : 'pause.fill'} size={11} color="#fff" weight="bold" />
+            <Text style={[type.caption2, { color: '#fff', fontWeight: '600' }]}>{paused ? 'Resume' : 'Pause'}</Text>
+          </View>
+        </Pressable>
       </View>
 
-      <View style={styles.controls}>
+      <Glass radius={radii.xl} style={styles.controls}>
         {connection.status !== 'connected' ? (
-          <Text style={{ color: t.warning, flex: 1, textAlign: 'center' }}>Disconnected — reconnecting…</Text>
+          <View style={styles.offline}>
+            <Icon name="wifi.exclamationmark" size={14} color={t.warning} />
+            <Text style={[type.footnote, { color: t.warning }]}>Desktop offline — reconnecting…</Text>
+          </View>
         ) : null}
-        <Pressable onPress={stop} disabled={stopping || !running} style={[styles.stopBtn, { backgroundColor: t.danger, opacity: running ? 1 : 0.4 }]}>
-          {stopping ? <ActivityIndicator color="#fff" /> : (
-            <>
-              <SymbolView name="stop.fill" size={16} tintColor="#fff" />
-              <Text style={{ color: '#fff', fontWeight: '700', fontSize: 16 }}>Stop session</Text>
-            </>
-          )}
-        </Pressable>
-        <Pressable onPress={() => router.back()} style={[styles.doneBtn, { borderColor: t.separator }]}>
-          <Text style={{ color: t.text, fontWeight: '600' }}>Done</Text>
-        </Pressable>
-      </View>
-    </View>
+        <View style={{ flex: 1, minWidth: 0 }}>
+          <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]} numberOfLines={1}>
+            {running ? (session?.status === 'awaitingInput' ? 'Waiting for your answer' : 'Cosmos is controlling your Mac') : 'Nothing running'}
+          </Text>
+          <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>
+            {running ? 'Stop at any time — the desktop keeps its state.' : 'Frames refresh while a task is active.'}
+          </Text>
+        </View>
+        <Button title="Stop" icon="stop.fill" variant="destructive" size="md" onPress={stop} loading={stopping} disabled={!running} />
+      </Glass>
+    </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1 },
-  meta: { flexDirection: 'row', alignItems: 'center', padding: spacing(4), gap: spacing(3) },
-  liveChip: {
-    flexDirection: 'row', alignItems: 'center', gap: 5,
-    borderRadius: radii.pill, paddingHorizontal: spacing(2.5), paddingVertical: spacing(1.25),
-  },
-  stage: { flex: 1, margin: spacing(3), borderRadius: radii.lg, overflow: 'hidden' },
+  stage: { flex: 1, margin: spacing(3), marginBottom: spacing(2), borderRadius: radii.xl, borderCurve: 'continuous', overflow: 'hidden', backgroundColor: '#000' },
   frame: { flex: 1 },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing(3) },
-  controls: { padding: spacing(4), gap: spacing(2.5) },
-  stopBtn: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing(2),
-    borderRadius: radii.xl, paddingVertical: spacing(3.5),
+  center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing(3), padding: spacing(8) },
+  stageText: { color: alpha('#FFFFFF', 0.7), textAlign: 'center' },
+  overlayTop: { position: 'absolute', top: spacing(3), left: spacing(3), right: spacing(3), flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  overlayRight: { flexDirection: 'row', gap: spacing(1.5), maxWidth: '60%' },
+  pill: { flexDirection: 'row', alignItems: 'center', gap: 5, height: 24, paddingHorizontal: spacing(2.5), borderRadius: radii.pill },
+  pillDot: { width: 6, height: 6, borderRadius: 3 },
+  badge: {
+    flexDirection: 'row', alignItems: 'center', gap: 5, height: 24, paddingHorizontal: spacing(2.5),
+    borderRadius: radii.pill, backgroundColor: alpha('#000000', 0.55),
   },
-  doneBtn: { alignItems: 'center', paddingVertical: spacing(3), borderRadius: radii.xl, borderWidth: 1 },
+  pause: { position: 'absolute', bottom: spacing(3), right: spacing(3) },
+  controls: { flexDirection: 'row', alignItems: 'center', gap: spacing(3), marginHorizontal: spacing(3), marginBottom: spacing(3), padding: spacing(3.5), flexWrap: 'wrap' },
+  offline: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), width: '100%' },
 });

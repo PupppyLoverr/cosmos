@@ -1,21 +1,37 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { router } from 'expo-router';
-import { SymbolView } from 'expo-symbols';
+import Animated, { Easing, useAnimatedStyle, useSharedValue, withDelay, withTiming } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCosmos } from '../lib/client';
-import { useTheme, spacing, type, tintFor } from '../lib/theme';
-import { Button } from '../components/bits';
+import { useTheme, spacing, type, radii, alpha } from '../lib/theme';
+import { Button, Icon, Notice } from '../components/bits';
+import { Glass, Screen } from '../components/surface';
+import { HarnessMark } from '../components/harness-mark';
 
-// Scattered tinted marks, echoing the desktop's project badges.
-const MARKS: { x: number; y: number; s: number; r: number; icon: string }[] = [
-  { x: 0.12, y: 0.10, s: 56, r: 22, icon: 'sparkles' },
-  { x: 0.72, y: 0.06, s: 44, r: 22, icon: 'display' },
-  { x: 0.84, y: 0.30, s: 50, r: 16, icon: 'folder' },
-  { x: 0.05, y: 0.42, s: 42, r: 21, icon: 'terminal' },
-  { x: 0.70, y: 0.58, s: 54, r: 18, icon: 'cursorarrow.click.2' },
-  { x: 0.18, y: 0.66, s: 46, r: 23, icon: 'bolt' },
+const PERKS: { icon: string; title: string; body: string }[] = [
+  { icon: 'desktopcomputer', title: 'Every desktop, one list', body: 'Macs signed into your account show up here automatically.' },
+  { icon: 'lock.shield', title: 'You approve each phone', body: 'A desktop only takes control from a phone it has trusted.' },
+  { icon: 'display', title: 'Watch and stop from anywhere', body: 'See what Computer Use is doing and interrupt it instantly.' },
 ];
+
+function Perk({ icon, title, body, index }: (typeof PERKS)[number] & { index: number }) {
+  const t = useTheme();
+  const v = useSharedValue(0);
+  useEffect(() => { v.value = withDelay(120 + index * 90, withTiming(1, { duration: 420, easing: Easing.out(Easing.cubic) })); }, [index, v]);
+  const style = useAnimatedStyle(() => ({ opacity: v.value, transform: [{ translateY: (1 - v.value) * 14 }] }));
+  return (
+    <Animated.View style={[styles.perk, style]}>
+      <View style={[styles.perkIcon, { backgroundColor: alpha(t.accent, 0.14) }]}>
+        <Icon name={icon} size={20} color={t.link} weight="medium" />
+      </View>
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>{title}</Text>
+        <Text style={[type.footnote, { color: t.textSecondary }]}>{body}</Text>
+      </View>
+    </Animated.View>
+  );
+}
 
 export default function SignInScreen() {
   const t = useTheme();
@@ -45,43 +61,37 @@ export default function SignInScreen() {
   };
 
   return (
-    <View style={[styles.screen, { backgroundColor: t.background, paddingTop: insets.top + spacing(2), paddingBottom: insets.bottom + spacing(4) }]}>
+    <Screen style={[styles.screen, { paddingTop: insets.top + spacing(4), paddingBottom: insets.bottom + spacing(4) }]}>
       <View style={styles.hero}>
-        {MARKS.map((m) => (
-          <View
-            key={m.icon}
-            style={{
-              position: 'absolute', left: `${m.x * 100}%`, top: `${m.y * 100}%`,
-              width: m.s, height: m.s, borderRadius: m.r, borderCurve: 'continuous',
-              backgroundColor: tintFor(m.icon), alignItems: 'center', justifyContent: 'center',
-            }}
-          >
-            <SymbolView name={m.icon as never} size={m.s * 0.42} tintColor="#fff" weight="semibold" />
-          </View>
-        ))}
-        <View style={styles.heroText}>
-          <Text style={[type.largeTitle, { color: t.text, textAlign: 'center' }]}>Cosmos</Text>
-          <Text style={[type.subhead, { color: t.textSecondary, textAlign: 'center', maxWidth: 260 }]}>
-            Your Mac, your agents — driven from your pocket.
-          </Text>
-        </View>
-      </View>
-
-      <View style={styles.footer}>
-        {error ? <Text style={[type.footnote, { color: t.danger, textAlign: 'center' }]}>{error}</Text> : null}
-        <Button title="Sign in with Woozlit" onPress={() => void signIn()} loading={busy} />
-        <Button title="Not now" variant="ghost" onPress={leave} />
-        <Text style={[type.caption, { color: t.textTertiary, textAlign: 'center', fontWeight: '400' }]}>
-          Signing in links this phone to your desktops over the encrypted relay. Local links work without an account.
+        <HarnessMark size={64} />
+        <Text style={[type.largeTitle, { color: t.text, textAlign: 'center' }]}>Welcome to Cosmos</Text>
+        <Text style={[type.body, { color: t.textSecondary, textAlign: 'center', maxWidth: 300 }]}>
+          Sign in to reach your Macs and their agents from anywhere.
         </Text>
       </View>
-    </View>
+
+      <Glass radius={radii.xl} style={styles.perks}>
+        {PERKS.map((p, i) => <Perk key={p.icon} {...p} index={i} />)}
+      </Glass>
+
+      <View style={styles.footer}>
+        {error ? <Notice kind="error" title="Sign-in didn't finish" body={error} /> : null}
+        <Button title="Continue with Woozlit" icon="person.crop.circle" onPress={() => void signIn()} loading={busy} />
+        <Button title="Not Now" variant="ghost" onPress={leave} />
+        <Text style={[type.caption, { color: t.textTertiary, textAlign: 'center', fontWeight: '400' }]}>
+          Local links over Wi‑Fi work without an account. Remote reach is roadmap.
+        </Text>
+      </View>
+    </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, paddingHorizontal: spacing(6) },
-  hero: { flex: 1, justifyContent: 'center' },
-  heroText: { alignItems: 'center', gap: spacing(2) },
+  screen: { flex: 1, paddingHorizontal: spacing(5) },
+  hero: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: spacing(3) },
+  mark: { width: 88, height: 88, borderRadius: 26, borderCurve: 'continuous', alignItems: 'center', justifyContent: 'center', marginBottom: spacing(2) },
+  perks: { padding: spacing(4), gap: spacing(4), marginBottom: spacing(6) },
+  perk: { flexDirection: 'row', alignItems: 'center', gap: spacing(3) },
+  perkIcon: { width: 40, height: 40, borderRadius: 12, borderCurve: 'continuous', alignItems: 'center', justifyContent: 'center' },
   footer: { gap: spacing(2) },
 });

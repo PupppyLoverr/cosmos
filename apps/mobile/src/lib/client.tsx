@@ -39,6 +39,9 @@ export interface ConnectionInfo {
   localDeviceId?: string;
 }
 
+/** Name given to a local desktop until the engine's registry reports the real one. */
+export const PLACEHOLDER_NAME = 'This Mac';
+
 const DESKTOPS_KEY = 'cosmos.desktops';
 const ACTIVE_DESKTOP_KEY = 'cosmos.activeDesktop';
 
@@ -249,21 +252,36 @@ export class CosmosClient {
   private startWatches() {
     for (const s of this.streams) s.cancel();
     this.streams = [];
-    const wire = <T,>(method: string, snap: Snapshot<T[]>) => {
+    const wire = <T,>(method: string, snap: Snapshot<T[]>, after?: () => void) => {
       const h = this.rpc!.stream(method, {}, (item) => {
         const rows = (item as { entries?: T[] } | T[]) ?? [];
         snap.set(Array.isArray(rows) ? rows : (rows.entries ?? []));
+        after?.();
       });
       h.done.catch(() => {});
       this.streams.push(h);
     };
     wire<Chat>('WatchChats', this.chats);
-    wire<Device>('WatchDevices', this.devices);
+    wire<Device>('WatchDevices', this.devices, () => this.adoptRegistryName());
     wire<Session>('WatchSessions', this.sessions);
     wire<Space>('WatchSpaces', this.spaces);
   }
 
 
+
+  /** The engine registers itself under the computer's real name; the linked
+   *  desktop keeps whatever the user typed at pairing, so adopt the registry
+   *  name when the stored one is just the address / device-id placeholder. */
+  private adoptRegistryName() {
+    const conn = this.connection.get();
+    const desktop = conn.desktop;
+    if (!desktop || desktop.kind !== 'local' || !conn.localDeviceId) return;
+    const real = this.devices.get().find((d) => d.id === conn.localDeviceId)?.name?.trim();
+    if (!real || real === desktop.name) return;
+    const placeholder = desktop.name === desktop.address || desktop.name === PLACEHOLDER_NAME || conn.localDeviceId.startsWith(desktop.name);
+    if (!placeholder) return;
+    void this.renameDesktop(desktop.id, real);
+  }
 
   /** Direct RPC escape hatch (screens use typed helpers below). */
   raw(): RpcClient | null {
