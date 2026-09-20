@@ -33,9 +33,9 @@ function ThemedStack() {
             headerBackTitle: 'Back',
           })}
         />
-        <Stack.Screen name="new-session" options={{ presentation: 'formSheet', sheetGrabberVisible: true, sheetAllowedDetents: [0.92], title: 'New Session' }} />
+        <Stack.Screen name="new-session" options={{ presentation: 'modal', title: 'New Session' }} />
         <Stack.Screen name="sign-in" options={{ presentation: 'fullScreenModal', title: 'Sign In', headerShown: false }} />
-        <Stack.Screen name="pair" options={{ presentation: 'formSheet', sheetGrabberVisible: true, sheetAllowedDetents: [0.92], title: 'Link a Desktop' }} />
+        <Stack.Screen name="pair" options={{ presentation: 'modal', title: 'Link a Desktop' }} />
         <Stack.Screen
           name="watch/[chatId]"
           options={{ title: 'Watch Live', presentation: 'modal', headerTintColor: t.text }}
