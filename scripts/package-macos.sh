@@ -50,8 +50,10 @@ if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   codesign --deep --force --options runtime --timestamp \
     --sign "$CODESIGN_IDENTITY" --identifier sh.zeron.app "$APP"
 else
+  # Sign by certificate hash: the same identity may be present in more than
+  # one keychain, and codesign rejects a name that matches twice.
   LOCAL_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null |
-    sed -n 's/.*"\(Cosmos Local Signing\)".*/\1/p' | head -1)"
+    sed -n 's/^ *[0-9]*) \([0-9A-F]*\) "Cosmos Local Signing".*/\1/p' | head -1)"
   if [[ -n "$LOCAL_IDENTITY" ]]; then
     codesign --deep --force --sign "$LOCAL_IDENTITY" \
       --identifier sh.zeron.app "$APP"
