@@ -4,7 +4,7 @@ import { FlashList, FlashListRef } from '@shopify/flash-list';
 import { useLocalSearchParams, router, Stack } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { useCosmos, useSnapshot } from '../../lib/client';
-import { SessionMessageEntry, TranscriptUpdate, MessagePart, isComputerCall } from '../../lib/protocol';
+import { SessionMessageEntry, TranscriptUpdate, isComputerCall } from '../../lib/protocol';
 import { applyTranscriptUpdate } from '../../lib/transcript';
 import { PickedFile, ensureDecodable, fileToBase64Chunks } from '../../lib/attachments';
 import { notifySessionEvent } from '../../lib/notify';
@@ -25,7 +25,7 @@ export default function SessionScreen() {
   const computer = useSnapshot(client.computer);
 
   const [entries, setEntries] = useState<SessionMessageEntry[]>([]);
-  const [subscribed, setSubscribed] = useState(false);
+  const [streamLost, setStreamLost] = useState(false);
   const [attachments, setAttachments] = useState<PickedFile[]>([]);
   const [sending, setSending] = useState(false);
   const listRef = useRef<FlashListRef<SessionMessageEntry>>(null);
@@ -35,7 +35,6 @@ export default function SessionScreen() {
   const chat = chats.find((c) => c.id === chatId);
   const session = sessions.find((s) => s.chatId === chatId);
   const status = session?.status ?? 'idle';
-  const running = status === 'working' || status === 'awaitingInput';
   const cuActive = useMemo(
     () => entries.some((e) =>
       e.status === 'streaming' && e.parts.some((p) => p.kind === 'tool' && isComputerCall(p.call)),
@@ -49,8 +48,7 @@ export default function SessionScreen() {
       setEntries((prev) => applyTranscriptUpdate(prev, item as TranscriptUpdate));
     });
     streamRef.current = stream;
-    setSubscribed(true);
-    stream.done.catch(() => setSubscribed(false));
+    stream.done.catch(() => setStreamLost(true));
     return () => stream.cancel();
   }, [chatId, connection.status, client]);
 
@@ -173,7 +171,7 @@ export default function SessionScreen() {
           ),
         }}
       />
-      {!subscribed && connection.status === 'connected' ? (
+      {streamLost && connection.status === 'connected' ? (
         <View style={styles.center}><ActivityIndicator color={t.accent} /></View>
       ) : entries.length === 0 ? (
         <EmptyState

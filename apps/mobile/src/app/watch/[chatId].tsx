@@ -23,6 +23,7 @@ export default function WatchLiveScreen() {
 
   const [frame, setFrame] = useState<string | null>(null);
   const [frameAt, setFrameAt] = useState<number>(0);
+  const [now, setNow] = useState(() => Date.now());
   const [error, setError] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -49,9 +50,11 @@ export default function WatchLiveScreen() {
     };
     void tick();
     timer.current = setInterval(() => void tick(), POLL_MS);
+    const clock = setInterval(() => setNow(Date.now()), 1000);
     return () => {
       cancelled = true;
       if (timer.current) clearInterval(timer.current);
+      clearInterval(clock);
     };
   }, [client]);
 
@@ -82,7 +85,7 @@ export default function WatchLiveScreen() {
             {chat?.title ?? 'Session'}
           </Text>
           <Text style={{ color: t.textSecondary, fontSize: 13 }}>
-            {session?.status ?? 'idle'} · {frameAt ? `frame ${Math.max(0, Math.round((Date.now() - frameAt) / 1000))}s ago` : 'waiting…'}
+            {session?.status ?? 'idle'} · {frameAt ? `frame ${Math.max(0, Math.round((now - frameAt) / 1000))}s ago` : 'waiting…'}
             {computer ? ` · ${computer.control ?? computer.state ?? ''}` : ''}
           </Text>
         </View>
