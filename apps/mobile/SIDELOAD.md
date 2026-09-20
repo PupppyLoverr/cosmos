@@ -6,8 +6,22 @@ The release artifacts under `cosmos-releases/artifacts/v0.2.1-alpha/mobile/` are
 - `Cosmos-0.2.79-ios-unsigned.xcarchive.zip` — the same build as an Xcode archive.
 - `SHA256SUMS`
 
-The build Mac has no Apple Developer certificate, provisioning profile, or Team ID, so
-it cannot produce a signed IPA. Sign locally with one of the two paths below.
+The build Mac has no Apple Developer certificate, provisioning profile, or Team ID
+(verified: zero codesigning identities), so it cannot produce a signed IPA. Sign locally
+with one of the two paths below.
+
+## What you need
+
+- An iPhone (tested target: iPhone 14) with its cable — iPhone 14 is Lightning/USB-A or
+  USB-C depending on the cable — and **Trust This Computer** tapped on the phone.
+- A free Apple ID. No paid Developer Program membership.
+- The phone's **UDID** only for path C (a paid-account ad-hoc profile). Sideloadly and
+  Xcode Personal Team register the device automatically — you never type it.
+  To grab it anyway: connect the phone → Finder → select it in the sidebar → click the
+  line of text under the phone's name until it shows **UDID** → right-click → Copy UDID.
+
+The IPA's icon is the same artwork as the macOS Cosmos.app icon
+(`apps/mobile/assets/icon.png` ↔ `dist/macos/icon-1024.png`).
 
 ## A. Sideloadly / AltStore (fastest, free Apple ID)
 
@@ -49,7 +63,7 @@ xcodebuild -exportArchive -archivePath build/Cosmos.xcarchive \
   -exportOptionsPlist ios/ExportOptions-development.plist -exportPath build/ipa
 ```
 
-## To ship a signed IPA from CI/this repo
+## C. Signed IPA via a paid Apple account (CI / ad hoc)
 
 Provide, via secrets (never committed):
 
