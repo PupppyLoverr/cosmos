@@ -1,86 +1,166 @@
 import React from 'react';
-import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Stack } from 'expo-router';
-import { SymbolView } from 'expo-symbols';
 import * as Haptics from 'expo-haptics';
-import * as ImagePicker from 'expo-image-picker';
-import * as FileSystem from 'expo-file-system/legacy';
-import { Image } from 'expo-image';
-import { LinearGradient } from 'expo-linear-gradient';
-import { Host, Slider } from '@expo/ui';
 import {
   accentOptions,
   accentSwatch,
+  alpha,
   backdropPresets,
+  defaultPrefs,
+  edge,
   families,
   liquidGlassSupported,
   radii,
   spacing,
+  surfaceOptions,
   type,
   useFamilySeeds,
   useTheme,
   useThemePrefs,
+  wallpaperEffects,
   type AccentId,
   type BackdropPresetId,
   type SurfacePref,
   type ThemeFamily,
+  type Backdrop,
 } from '../../../lib/theme';
-import { Group, Row, SectionLabel, Segmented } from '../../../components/bits';
-import { Glass, Screen } from '../../../components/surface';
-
-const PHOTO_DIR = `${FileSystem.documentDirectory ?? ''}backdrop/`;
-
-async function importPhoto(uri: string): Promise<string> {
-  await FileSystem.makeDirectoryAsync(PHOTO_DIR, { intermediates: true }).catch(() => undefined);
-  const dest = `${PHOTO_DIR}${Date.now()}.jpg`;
-  await FileSystem.copyAsync({ from: uri, to: dest });
-  return dest;
-}
+import { pickWallpaper, removeWallpaper, wallpaperPath } from '../../../lib/wallpaper-store';
+import { Group, Icon, Row, SectionLabel, Segmented, Slider } from '../../../components/bits';
+import { Glass, PresetGradient, Screen } from '../../../components/surface';
+import { Wallpaper } from '../../../components/wallpaper';
 
 export default function AppearanceScreen() {
   const t = useTheme();
   const [prefs, setPrefs] = useThemePrefs();
   const seeds = useFamilySeeds();
-  const isPhoto = prefs.backdrop.kind === 'photo';
+  const photo = prefs.backdrop.kind === 'photo' ? prefs.backdrop : null;
+  const photoUri = photo ? wallpaperPath(photo.uri) : null;
   const [picking, setPicking] = React.useState(false);
 
-  const pickPhoto = async () => {
+  const choosePhoto = async () => {
+    if (picking) return;
     setPicking(true);
     try {
-      const res = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.85, allowsEditing: false });
-      const asset = res.assets?.[0];
-      if (res.canceled || !asset) return;
-      const previous = prefs.backdrop.kind === 'photo' ? prefs.backdrop.uri : null;
-      const uri = await importPhoto(asset.uri);
-      setPrefs({ backdrop: { kind: 'photo', uri } });
-      if (previous) void FileSystem.deleteAsync(previous, { idempotent: true });
+      const imported = await pickWallpaper();
+      if (!imported) return;
+      const previous = photo?.uri ?? null;
+      setPrefs({ backdrop: { kind: 'photo', uri: imported.name, width: imported.width, height: imported.height } });
+      if (previous) void removeWallpaper(previous);
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (e) {
+      Alert.alert("Couldn't use that photo", e instanceof Error ? e.message : String(e));
     } finally {
       setPicking(false);
     }
   };
 
-  const materialNote = t.material === 'opaque' && prefs.surface !== 'opaque'
-    ? 'Reduce Transparency is on — using solid surfaces.'
-    : prefs.surface === 'glass' && !liquidGlassSupported
-      ? Platform.OS === 'ios' ? 'Liquid Glass needs iOS 26 — showing frosted glass instead.' : 'Liquid Glass is iOS-only — showing tonal surfaces instead.'
-      : liquidGlassSupported && t.material === 'glass'
-        ? 'Apple Liquid Glass'
-        : undefined;
+  /** Switch away from the photo (deleting the stored copy) to a gradient or nothing. */
+  const setBackdrop = (backdrop: Exclude<Backdrop, { kind: 'photo' }>) => {
+    if (photo) void removeWallpaper(photo.uri);
+    setPrefs({ backdrop, effect: 'none' });
+  };
+  const removePhoto = () => setBackdrop({ kind: 'none' });
+
+  const resetAll = () => {
+    Alert.alert('Reset appearance?', 'Theme, accent, material and wallpaper go back to their defaults.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Reset', style: 'destructive', onPress: () => { if (photo) void removeWallpaper(photo.uri); setPrefs(defaultPrefs); } },
+    ]);
+  };
+
+  const materialNote =
+    t.material === 'opaque' && prefs.surface !== 'opaque'
+      ? 'Reduce Transparency is on, so surfaces are solid.'
+      : prefs.surface === 'glass' && !liquidGlassSupported
+        ? Platform.OS === 'ios' ? 'Liquid Glass needs iOS 26 or later. Showing Acrylic instead.' : 'Liquid Glass is iOS-only. Showing tonal surfaces instead.'
+        : surfaceOptions.find((o) => o.id === prefs.surface)?.description;
 
   return (
     <Screen>
       <Stack.Screen options={{ title: 'Appearance', headerLargeTitle: false }} />
-      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.content}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.content} keyboardDismissMode="on-drag">
         <Preview />
 
-        <SectionLabel>Mode</SectionLabel>
-        <Group>
+        <Group header="Wallpaper" footer={photo ? 'Your photo is stored inside Cosmos; the original in Photos is untouched.' : 'Pick a photo from your library or one of the gradients below.'}>
+          <Row
+            icon="photo.on.rectangle"
+            iconTint={t.link}
+            title={photo ? 'Change Photo' : 'Choose from Photos'}
+            subtitle={photo ? `${photo.width ?? '–'} × ${photo.height ?? '–'}` : undefined}
+            onPress={() => void choosePhoto()}
+            disabled={picking}
+            chevron
+          />
+          {photo ? <Row icon="trash" iconTint={t.danger} title="Remove Photo" danger onPress={removePhoto} /> : null}
+        </Group>
+
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.rail} style={styles.railWrap}>
+          <Tile label="None" selected={prefs.backdrop.kind === 'none'} onPress={() => setBackdrop({ kind: 'none' })}>
+            <View style={[styles.fill, { backgroundColor: t.background }]}>
+              <View style={[styles.miniCard, { backgroundColor: t.surface }]} />
+            </View>
+          </Tile>
+          {photoUri ? (
+            <Tile label="Photo" selected onPress={() => undefined}>
+              <Wallpaper uri={photoUri} effect="none" light={t.scheme === 'light'} width={TILE_W} height={TILE_H} />
+            </Tile>
+          ) : null}
+          {backdropPresets.map((p) => (
+            <Tile key={p.id} label={p.name} selected={prefs.backdrop.kind === 'preset' && prefs.backdrop.id === p.id} onPress={() => setBackdrop({ kind: 'preset', id: p.id as BackdropPresetId })}>
+              <PresetGradient id={p.id} scheme={t.scheme} />
+            </Tile>
+          ))}
+        </ScrollView>
+
+        {photoUri ? (
+          <>
+            <SectionLabel>Image effect</SectionLabel>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.rail} style={styles.railWrap}>
+              {wallpaperEffects.map((e) => (
+                <Tile key={e.id} label={e.label} selected={prefs.effect === e.id} onPress={() => setPrefs({ effect: e.id })} accessibilityHint={e.description}>
+                  <Wallpaper uri={photoUri} effect={e.id} light={t.scheme === 'light'} width={TILE_W} height={TILE_H} cellDp={e.id === 'ascii' ? 1 : 0.9} />
+                </Tile>
+              ))}
+            </ScrollView>
+            <Text style={[type.footnote, styles.footer, { color: t.textSecondary }]}>
+              {wallpaperEffects.find((e) => e.id === prefs.effect)?.description}
+            </Text>
+          </>
+        ) : null}
+
+        {t.hasBackdrop ? (
+          <Group header="Dim" footer="Darkens the wallpaper toward the theme background so text stays readable.">
+            <View style={styles.sliderRow}>
+              <Icon name="sun.min" size={16} color={t.textSecondary} />
+              <View style={{ flex: 1 }}>
+                <Slider label="Wallpaper dim" value={prefs.backdropDim} min={0} max={0.85} step={0.05} onChange={(backdropDim) => setPrefs({ backdropDim })} />
+              </View>
+              <Icon name="sun.max.fill" size={18} color={t.textSecondary} />
+            </View>
+          </Group>
+        ) : null}
+
+        <Group header="Material" footer={materialNote}>
+          <View style={styles.pad}>
+            <Segmented<SurfacePref>
+              value={prefs.surface}
+              onChange={(surface) => setPrefs({ surface })}
+              options={surfaceOptions.map((o) => ({ id: o.id, label: o.label }))}
+            />
+          </View>
+        </Group>
+
+        <Group header="Appearance">
           <View style={styles.pad}>
             <Segmented
               value={prefs.appearance}
               onChange={(appearance) => setPrefs({ appearance })}
-              options={[{ id: 'system', label: 'System' }, { id: 'light', label: 'Light' }, { id: 'dark', label: 'Dark' }]}
+              options={[
+                { id: 'system', label: 'Automatic', icon: 'circle.lefthalf.filled' },
+                { id: 'light', label: 'Light', icon: 'sun.max' },
+                { id: 'dark', label: 'Dark', icon: 'moon' },
+              ]}
             />
           </View>
         </Group>
@@ -92,129 +172,90 @@ export default function AppearanceScreen() {
           ))}
         </ScrollView>
 
-        <SectionLabel>Accent</SectionLabel>
-        <Group>
-          <View style={[styles.pad, styles.wrap]}>
+        <Group header="Accent">
+          <View style={[styles.pad, styles.accents]}>
             {accentOptions.map((a) => (
-              <AccentDot
-                key={a.id}
-                id={a.id}
-                label={a.label}
-                color={accentSwatch(a.id, seeds, t.scheme)}
-                selected={prefs.accent === a.id}
-                onPress={() => setPrefs({ accent: a.id })}
-              />
+              <AccentDot key={a.id} id={a.id} label={a.label} color={accentSwatch(a.id, seeds, t.scheme)} selected={prefs.accent === a.id} onPress={() => setPrefs({ accent: a.id })} />
             ))}
           </View>
         </Group>
 
-        <SectionLabel>Background</SectionLabel>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.rail} style={styles.railWrap}>
-          <BackdropTile
-            label="None"
-            selected={prefs.backdrop.kind === 'none'}
-            onPress={() => setPrefs({ backdrop: { kind: 'none' } })}
-          >
-            <View style={[styles.fill, { backgroundColor: t.background }]} />
-          </BackdropTile>
-          {backdropPresets.map((p) => (
-            <BackdropTile
-              key={p.id}
-              label={p.name}
-              selected={prefs.backdrop.kind === 'preset' && prefs.backdrop.id === p.id}
-              onPress={() => setPrefs({ backdrop: { kind: 'preset', id: p.id as BackdropPresetId } })}
-            >
-              <LinearGradient colors={p[t.scheme] as [string, string, ...string[]]} start={{ x: 0.1, y: 0 }} end={{ x: 0.9, y: 1 }} style={styles.fill} />
-            </BackdropTile>
-          ))}
-          <BackdropTile label={isPhoto ? 'Photo' : 'Choose photo'} selected={isPhoto} onPress={() => void pickPhoto()} busy={picking}>
-            {isPhoto && prefs.backdrop.kind === 'photo' ? (
-              <Image source={{ uri: prefs.backdrop.uri }} style={styles.fill} contentFit="cover" />
-            ) : (
-              <View style={[styles.fill, styles.center, { backgroundColor: t.fill }]}>
-                <SymbolView name="photo.on.rectangle" size={22} tintColor={t.link} />
-              </View>
-            )}
-          </BackdropTile>
-        </ScrollView>
-        {t.hasBackdrop ? (
-          <Group>
-            <Row
-              title="Dim"
-              subtitle="Keeps text readable over the background"
-              leading={<SymbolView name="circle.lefthalf.filled" size={18} tintColor={t.textSecondary} />}
-            />
-            <View style={[styles.pad, { paddingTop: 0 }]}>
-              <Host matchContents style={{ width: '100%' }} colorScheme={t.scheme}>
-                <Slider value={prefs.backdropDim} min={0} max={0.85} step={0.05} onValueChange={(backdropDim) => setPrefs({ backdropDim })} />
-              </Host>
-            </View>
-            {isPhoto ? (
-              <Row
-                title="Remove photo"
-                danger
-                leading={<SymbolView name="trash" size={18} tintColor={t.danger} />}
-                onPress={() => {
-                  if (prefs.backdrop.kind === 'photo') void FileSystem.deleteAsync(prefs.backdrop.uri, { idempotent: true });
-                  setPrefs({ backdrop: { kind: 'none' } });
-                }}
-              />
-            ) : null}
-          </Group>
-        ) : null}
-
-        <SectionLabel>Surfaces</SectionLabel>
-        <Group>
-          <View style={styles.pad}>
-            <Segmented<SurfacePref>
-              value={prefs.surface}
-              onChange={(surface) => setPrefs({ surface })}
-              options={[
-                { id: 'auto', label: 'Auto' },
-                { id: 'glass', label: 'Glass' },
-                { id: 'frosted', label: 'Frosted' },
-                { id: 'opaque', label: 'Solid' },
-              ]}
-            />
-            {materialNote ? (
-              <Text style={[type.footnote, { color: t.textSecondary, marginTop: spacing(2.5) }]}>{materialNote}</Text>
-            ) : null}
-          </View>
+        <Group style={{ marginTop: spacing(6) }}>
+          <Row title="Reset Appearance" danger onPress={resetAll} />
         </Group>
       </ScrollView>
     </Screen>
   );
 }
 
-/** Live sample of the current theme: a mini session card and composer. */
+// ---------------------------------------------------------------------------
+
+/** Live sample of the current theme: a session row, a short exchange and the composer. */
 function Preview() {
   const t = useTheme();
+  const material = surfaceOptions.find((o) => o.id === t.material)?.label ?? 'Solid';
+  const label = `${t.familyName} · ${t.material === 'glass' ? 'Liquid Glass' : material} · ${t.scheme === 'dark' ? 'Dark' : 'Light'}`;
   return (
-    <View style={styles.preview}>
+    <View style={styles.preview} accessibilityLabel={`Preview: ${label}`}>
       <Glass radius={radii.xl} style={styles.previewCard}>
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing(3) }}>
+        <View style={styles.previewRow}>
           <View style={[styles.previewMark, { backgroundColor: t.accentMuted }]}>
-            <SymbolView name="sparkles" size={16} tintColor={t.link} />
+            <Icon name="sparkles" size={15} color={t.link} />
           </View>
-          <View style={{ flex: 1 }}>
-            <Text style={[type.callout, { color: t.text, fontWeight: '600' }]}>{t.familyName}</Text>
-            <Text style={[type.footnote, { color: t.textSecondary }]}>
-              {t.material === 'glass' ? 'Liquid Glass' : t.material === 'frosted' ? 'Frosted' : 'Solid'} · {t.scheme === 'dark' ? 'Dark' : 'Light'}
-            </Text>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]} numberOfLines={1}>Refactor the pairing flow</Text>
+            <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>Working · MacBook Pro</Text>
           </View>
-          <View style={[styles.previewPill, { backgroundColor: t.accentStrong }]}>
-            <Text style={[type.caption, { color: t.accentContrast, fontWeight: '600' }]}>Send</Text>
-          </View>
+          <View style={[styles.previewDot, { backgroundColor: t.success }]} />
         </View>
       </Glass>
+      <View style={[styles.previewBubble, { backgroundColor: t.userBubble }]}>
+        <Text style={[type.subhead, { color: t.userBubbleText }]}>Make the trust step one tap.</Text>
+      </View>
+      <Text style={[type.subhead, styles.previewAssistant, { color: t.text }]}>Done — the Trust & Link button now confirms inline.</Text>
+      <Glass radius={radii.pill} style={styles.previewComposer}>
+        <Text style={[type.subhead, { color: t.textTertiary, flex: 1 }]}>Message</Text>
+        <View style={[styles.previewSend, { backgroundColor: t.accentStrong }]}>
+          <Icon name="arrow.up" size={13} color={t.accentContrast} weight="bold" />
+        </View>
+      </Glass>
+      <Text style={[type.caption, { color: t.textSecondary, textAlign: 'center', marginTop: spacing(2) }]}>{label}</Text>
     </View>
+  );
+}
+
+const TILE_W = 96;
+const TILE_H = 150;
+
+function Tile({ label, selected, onPress, children, accessibilityHint }: {
+  label: string; selected: boolean; onPress: () => void; children: React.ReactNode; accessibilityHint?: string;
+}) {
+  const t = useTheme();
+  return (
+    <Pressable
+      onPress={() => { void Haptics.selectionAsync(); onPress(); }}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      accessibilityHint={accessibilityHint}
+      accessibilityState={{ selected }}
+      style={({ pressed }) => ({ opacity: pressed ? 0.75 : 1, alignItems: 'center', gap: spacing(1.5) })}
+    >
+      <View style={[styles.tile, { borderColor: selected ? t.link : 'transparent', backgroundColor: t.fill }]}>
+        <View style={styles.tileClip}>{children}</View>
+        {selected ? (
+          <View style={[styles.tileCheck, { backgroundColor: t.link }]}>
+            <Icon name="checkmark" size={10} color={t.accentContrast} weight="bold" />
+          </View>
+        ) : null}
+      </View>
+      <Text style={[type.caption, { color: selected ? t.text : t.textSecondary, fontWeight: selected ? '600' : '400' }]}>{label}</Text>
+    </Pressable>
   );
 }
 
 function FamilyCard({ family, selected, onPress }: { family: ThemeFamily; selected: boolean; onPress: () => void }) {
   const t = useTheme();
   const seeds = family[t.scheme] ?? family.dark ?? family.light!;
-  const swatchScheme = family[t.scheme] ? t.scheme : 'dark';
   return (
     <Pressable
       onPress={() => { void Haptics.selectionAsync(); onPress(); }}
@@ -224,24 +265,15 @@ function FamilyCard({ family, selected, onPress }: { family: ThemeFamily; select
       style={({ pressed }) => ({ opacity: pressed ? 0.8 : 1 })}
     >
       <View style={[styles.family, { borderColor: selected ? t.link : 'transparent', backgroundColor: seeds.background }]}>
-        <View style={[styles.familyBar, { backgroundColor: seeds.card, borderColor: seeds.raised }]}>
+        <View style={[styles.familyBar, { backgroundColor: seeds.card }]}>
           <View style={[styles.familyDot, { backgroundColor: seeds.accent }]} />
           <View style={[styles.familyLine, { backgroundColor: seeds.text, opacity: 0.85 }]} />
-          <View style={[styles.familyLine, { backgroundColor: seeds.muted, width: '40%' }]} />
+          <View style={[styles.familyLine, { backgroundColor: seeds.muted, width: '45%' }]} />
         </View>
-        <View style={{ flexDirection: 'row', gap: 4, paddingHorizontal: spacing(2.5) }}>
-          {[seeds.accent, seeds.success, seeds.warning, seeds.danger].map((c, i) => (
-            <View key={i} style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: c }} />
-          ))}
+        <View style={styles.familyFoot}>
+          <Text style={[type.caption, { color: seeds.text, fontWeight: '600', flex: 1 }]} numberOfLines={1}>{family.name}</Text>
+          {!family[t.scheme] ? <Icon name={family.dark ? 'moon.fill' : 'sun.max.fill'} size={10} color={seeds.muted} /> : null}
         </View>
-        <Text style={[type.caption, { color: seeds.text, paddingHorizontal: spacing(2.5), fontWeight: '600' }]} numberOfLines={1}>
-          {family.name}
-        </Text>
-        {!family[t.scheme] ? (
-          <Text style={[type.caption, { color: seeds.muted, paddingHorizontal: spacing(2.5), marginTop: -4, fontSize: 10 }]}>
-            {swatchScheme === 'dark' ? 'Dark only' : 'Light only'}
-          </Text>
-        ) : null}
       </View>
     </Pressable>
   );
@@ -259,8 +291,8 @@ function AccentDot({ id, label, color, selected, onPress }: { id: AccentId; labe
     >
       <View style={[styles.accentRing, { borderColor: selected ? t.text : 'transparent' }]}>
         <View style={[styles.accentDot, { backgroundColor: color }]}>
-          {id === 'theme' ? <SymbolView name="paintpalette.fill" size={13} tintColor={t.accentContrast} /> : null}
-          {id === 'mono' ? <SymbolView name="circle.lefthalf.filled" size={13} tintColor={t.background} /> : null}
+          {id === 'theme' ? <Icon name="paintpalette" size={13} color={t.accentContrast} /> : null}
+          {id === 'mono' ? <View style={{ width: 12, height: 12, borderRadius: 6, backgroundColor: alpha(t.background, 0.9) }} /> : null}
         </View>
       </View>
       <Text style={[type.caption, { color: selected ? t.text : t.textSecondary }]} numberOfLines={1}>{label}</Text>
@@ -268,62 +300,38 @@ function AccentDot({ id, label, color, selected, onPress }: { id: AccentId; labe
   );
 }
 
-function BackdropTile({ label, selected, onPress, busy, children }: {
-  label: string; selected: boolean; onPress: () => void; busy?: boolean; children: React.ReactNode;
-}) {
-  const t = useTheme();
-  return (
-    <Pressable
-      onPress={() => { void Haptics.selectionAsync(); onPress(); }}
-      disabled={busy}
-      accessibilityRole="button"
-      accessibilityLabel={`${label} background`}
-      accessibilityState={{ selected, busy: !!busy }}
-      style={({ pressed }) => ({ opacity: pressed || busy ? 0.7 : 1, alignItems: 'center', gap: spacing(1.5) })}
-    >
-      <View style={[styles.tile, { borderColor: selected ? t.link : t.separator }]}>
-        {children}
-        {selected ? (
-          <View style={[styles.tileCheck, { backgroundColor: t.accentStrong }]}>
-            <SymbolView name="checkmark" size={10} tintColor={t.accentContrast} weight="bold" />
-          </View>
-        ) : null}
-      </View>
-      <Text style={[type.caption, { color: selected ? t.text : t.textSecondary }]}>{label}</Text>
-    </Pressable>
-  );
-}
-
 const styles = StyleSheet.create({
-  content: { paddingHorizontal: spacing(4), paddingBottom: spacing(12) },
-  pad: { paddingHorizontal: spacing(4), paddingVertical: spacing(3) },
-  wrap: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing(3), justifyContent: 'space-between' },
-  railWrap: { marginHorizontal: -spacing(4) },
-  rail: { paddingHorizontal: spacing(4), gap: spacing(3) },
+  content: { paddingHorizontal: edge, paddingBottom: spacing(16) },
+  pad: { paddingHorizontal: edge, paddingVertical: spacing(3) },
+  footer: { marginTop: spacing(2), marginHorizontal: edge },
+  railWrap: { marginHorizontal: -edge, marginTop: spacing(3) },
+  rail: { paddingHorizontal: edge, gap: spacing(3) },
   fill: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
-  center: { alignItems: 'center', justifyContent: 'center' },
-  preview: { marginTop: spacing(4) },
-  previewCard: { padding: spacing(4) },
-  previewMark: { width: 36, height: 36, borderRadius: 12, borderCurve: 'continuous', alignItems: 'center', justifyContent: 'center' },
-  previewPill: { paddingHorizontal: spacing(3), paddingVertical: spacing(1.5), borderRadius: radii.pill },
-  family: {
-    width: 128, borderRadius: radii.lg, borderCurve: 'continuous', borderWidth: 2,
-    paddingTop: spacing(2.5), paddingBottom: spacing(2.5), gap: spacing(2), overflow: 'hidden',
-  },
-  familyBar: {
-    marginHorizontal: spacing(2.5), borderRadius: radii.sm, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth,
-    padding: spacing(2), gap: 5,
-  },
+  miniCard: { position: 'absolute', left: 10, right: 10, top: 24, height: 28, borderRadius: 8, borderCurve: 'continuous' },
+  sliderRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(3), paddingHorizontal: edge, paddingVertical: spacing(2.5) },
+
+  preview: { marginTop: spacing(4), gap: spacing(2.5) },
+  previewCard: { paddingHorizontal: spacing(3.5), paddingVertical: spacing(3) },
+  previewRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(3) },
+  previewMark: { width: 34, height: 34, borderRadius: 11, borderCurve: 'continuous', alignItems: 'center', justifyContent: 'center' },
+  previewDot: { width: 8, height: 8, borderRadius: 4 },
+  previewBubble: { alignSelf: 'flex-end', maxWidth: '78%', paddingHorizontal: spacing(3.5), paddingVertical: spacing(2.25), borderRadius: radii.lg + 2, borderCurve: 'continuous' },
+  previewAssistant: { paddingHorizontal: spacing(1) },
+  previewComposer: { flexDirection: 'row', alignItems: 'center', paddingLeft: spacing(4), paddingRight: spacing(1.25), height: 44, gap: spacing(2) },
+  previewSend: { width: 32, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },
+
+  tile: { width: TILE_W, height: TILE_H, borderRadius: radii.lg, borderCurve: 'continuous', borderWidth: 2.5, padding: 1.5 },
+  tileClip: { flex: 1, borderRadius: radii.lg - 4, borderCurve: 'continuous', overflow: 'hidden' },
+  tileCheck: { position: 'absolute', right: 8, bottom: 8, width: 20, height: 20, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+
+  family: { width: 140, borderRadius: radii.lg, borderCurve: 'continuous', borderWidth: 2.5, padding: spacing(2.5), gap: spacing(2), overflow: 'hidden' },
+  familyBar: { borderRadius: radii.sm + 2, borderCurve: 'continuous', padding: spacing(2), gap: 5 },
   familyDot: { width: 10, height: 10, borderRadius: 5, marginBottom: 2 },
   familyLine: { height: 4, borderRadius: 2, width: '70%' },
+  familyFoot: { flexDirection: 'row', alignItems: 'center', gap: spacing(1) },
+
+  accents: { flexDirection: 'row', flexWrap: 'wrap', rowGap: spacing(3), justifyContent: 'space-between' },
   accent: { width: 56, alignItems: 'center', gap: spacing(1.5) },
   accentRing: { width: 40, height: 40, borderRadius: 20, borderWidth: 2, padding: 3 },
   accentDot: { flex: 1, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },
-  tile: {
-    width: 92, height: 140, borderRadius: radii.lg, borderCurve: 'continuous', borderWidth: 2, overflow: 'hidden',
-  },
-  tileCheck: {
-    position: 'absolute', right: 8, bottom: 8, width: 20, height: 20, borderRadius: 10,
-    alignItems: 'center', justifyContent: 'center',
-  },
 });

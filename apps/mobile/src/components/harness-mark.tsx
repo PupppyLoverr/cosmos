@@ -128,6 +128,16 @@ const MARKS: Partial<Record<Exclude<HarnessId, 'mock'>, MarkDefinition>> =
   }
 };
 
+const LABELS: Record<HarnessId, string> = {
+  'claude-code': 'Claude Code', codex: 'Codex', cursor: 'Cursor', devin: 'Devin', grok: 'Grok', hermes: 'Hermes', pi: 'Pi',
+  opencode: 'OpenCode', antigravity: 'Antigravity', amp: 'Amp', 'kimi-code': 'Kimi Code', mock: 'Mock',
+};
+
+/** Display name of a harness; undefined when the chat has none configured. */
+export function harnessLabel(harness?: HarnessId | null): string | undefined {
+  return harness ? LABELS[harness] ?? harness : undefined;
+}
+
 function NeutralMark({ color, size }: { color: string; size: number }) {
   return (
     <Svg width={size} height={size} viewBox="0 0 24 24" accessibilityLabel="Cosmos">

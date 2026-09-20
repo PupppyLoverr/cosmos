@@ -5,6 +5,7 @@
   "dependencies": {
     "@expo/ui": "~57.0.19",
     "@shopify/flash-list": "2.0.2",
+    "@shopify/react-native-skia": "2.6.2",
     "expo": "~57.0.24",
     "expo-blur": "~57.0.3",
     "expo-clipboard": "~57.0.2",

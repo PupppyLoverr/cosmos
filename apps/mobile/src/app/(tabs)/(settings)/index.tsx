@@ -1,11 +1,10 @@
 import React from 'react';
-import { Platform, ScrollView, Text, View } from 'react-native';
+import { Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router, Stack } from 'expo-router';
-import { SymbolView } from 'expo-symbols';
 import { Host, Switch } from '@expo/ui';
 import { useCosmos, useSnapshot } from '../../../lib/client';
-import { useTheme, spacing, type, familyById, useThemePrefs } from '../../../lib/theme';
-import { Row, Group, SectionLabel, Avatar } from '../../../components/bits';
+import { useTheme, spacing, type, familyById, useThemePrefs, edge, surfaceOptions } from '../../../lib/theme';
+import { Row, Group, Icon, ConnectionBadge } from '../../../components/bits';
 import { Screen } from '../../../components/surface';
 import { ensureNotificationPermission } from '../../../lib/notify';
 
@@ -21,74 +20,64 @@ export default function SettingsScreen() {
     void ensureNotificationPermission().then(setNotifEnabled);
   }, []);
 
+  const appearanceSummary = [
+    familyById(prefs.family).name,
+    surfaceOptions.find((o) => o.id === prefs.surface)?.label,
+    prefs.backdrop.kind === 'photo' ? 'Photo' : prefs.backdrop.kind === 'preset' ? 'Gradient' : null,
+  ].filter(Boolean).join(' · ');
+
   return (
     <Screen>
       <Stack.Screen options={{ title: 'Settings', headerShown: true }} />
-      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: spacing(4), paddingBottom: spacing(10) }}>
-
-        <SectionLabel>Account</SectionLabel>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.content}>
         <Group>
           {auth ? (
-            <>
-              <Row
-                title={auth.user.name || auth.user.email}
-                subtitle={auth.user.email}
-                leading={<Avatar name={auth.user.name || auth.user.email} />}
-              />
-              <Row
-                title="Sign out"
-                danger
-                leading={<SymbolView name="rectangle.portrait.and.arrow.right" size={18} tintColor={t.danger} />}
-                onPress={() => void client.signOut()}
-              />
-            </>
+            <Row
+              tall
+              title={auth.user.name || auth.user.email}
+              subtitle={auth.user.email}
+              leading={<Monogram name={auth.user.name || auth.user.email} />}
+            />
           ) : (
             <Row
+              tall
               title="Sign in with Woozlit"
-              subtitle="Required for remote desktops"
-              leading={<SymbolView name="person.crop.circle" size={20} tintColor={t.link} />}
+              subtitle="Reach your desktops away from home"
+              leading={<Monogram />}
               onPress={() => router.push('/sign-in')}
               chevron
             />
           )}
         </Group>
 
-        <SectionLabel>Connection</SectionLabel>
-        <Group>
+        <Group header="Desktop">
           <Row
-            title={connection.desktop?.name ?? 'No desktop'}
-            subtitle={connection.status === 'connected'
-              ? `${connection.desktop?.kind === 'local' ? 'Local' : 'Remote'} · connected`
-              : connection.status}
-            leading={<SymbolView name="network" size={18} tintColor={t.textSecondary} />}
-            trailing={<Text style={[type.footnote, { color: t.textTertiary }]}>{connection.desktop?.kind === 'local' ? 'Direct' : 'Relay'}</Text>}
-          />
-          <Row
-            title="Switch desktop"
-            leading={<SymbolView name="arrow.triangle.swap" size={18} tintColor={t.textSecondary} />}
+            icon={connection.desktop?.kind === 'local' ? 'laptopcomputer' : 'antenna.radiowaves.left.and.right'}
+            iconTint={connection.status === 'connected' ? t.success : t.textTertiary}
+            title={connection.desktop?.name ?? 'Not linked'}
+            subtitle={connection.desktop ? (connection.desktop.kind === 'local' ? 'Local network' : 'Via Woozlit') : 'Link a Mac to get started'}
+            trailing={<ConnectionBadge status={connection.status} detail={connection.detail} />}
             onPress={() => router.push('/(tabs)/(desktops)' as never)}
             chevron
           />
         </Group>
 
-        <SectionLabel>Appearance</SectionLabel>
-        <Group>
+        <Group header="Personalization">
           <Row
-            title="Theme & background"
-            subtitle={`${familyById(prefs.family).name} · ${prefs.appearance === 'system' ? 'System' : prefs.appearance === 'dark' ? 'Dark' : 'Light'}${prefs.backdrop.kind !== 'none' ? ' · Background' : ''}`}
-            leading={<SymbolView name="paintpalette" size={18} tintColor={t.link} />}
-            trailing={<View style={{ width: 18, height: 18, borderRadius: 9, backgroundColor: t.accent }} />}
+            icon="paintpalette"
+            iconTint={t.accentStrong}
+            title="Appearance"
+            value={appearanceSummary}
             onPress={() => router.push('/(tabs)/(settings)/appearance' as never)}
             chevron
           />
         </Group>
 
-        <SectionLabel>Notifications</SectionLabel>
-        <Group>
+        <Group header="Notifications" footer="Get notified when a session finishes, needs your input, fails, or the desktop connection changes.">
           <Row
-            title="Session events"
-            subtitle="Finished, needs input, failed, connection changes"
-            leading={<SymbolView name="bell" size={18} tintColor={t.textSecondary} />}
+            icon="bell.badge"
+            iconTint="#FF3B30"
+            title="Session Alerts"
             trailing={(
               <Host matchContents colorScheme={t.scheme}>
                 <Switch value={notifEnabled} onValueChange={(v) => { if (v) void ensureNotificationPermission().then(setNotifEnabled); else setNotifEnabled(false); }} />
@@ -97,11 +86,33 @@ export default function SettingsScreen() {
           />
         </Group>
 
-        <SectionLabel>About</SectionLabel>
-        <Group>
-          <Row title={`Cosmos for ${Platform.OS === 'ios' ? 'iOS' : 'Android'}`} subtitle="Remote client for the Cosmos desktop" leading={<SymbolView name="info.circle" size={18} tintColor={t.textSecondary} />} />
-        </Group>
+        {auth ? (
+          <Group header="Account">
+            <Row title="Sign Out" danger onPress={() => void client.signOut()} />
+          </Group>
+        ) : null}
+
+        <View style={styles.about}>
+          <Text style={[type.footnote, { color: t.textTertiary }]}>Cosmos for {Platform.OS === 'ios' ? 'iOS' : 'Android'}</Text>
+          <Text style={[type.caption, { color: t.textTertiary }]}>Local-first companion for the Cosmos desktop.</Text>
+        </View>
       </ScrollView>
     </Screen>
   );
 }
+
+function Monogram({ name }: { name?: string }) {
+  const t = useTheme();
+  const initial = name?.trim().charAt(0).toUpperCase();
+  return (
+    <View style={[styles.monogram, { backgroundColor: initial ? t.accentStrong : t.fill }]}>
+      {initial ? <Text style={[type.title3, { color: t.accentContrast }]}>{initial}</Text> : <Icon name="person.crop.circle.fill" size={26} color={t.textSecondary} />}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  content: { paddingHorizontal: edge, paddingBottom: spacing(12) },
+  monogram: { width: 48, height: 48, borderRadius: 24, alignItems: 'center', justifyContent: 'center' },
+  about: { alignItems: 'center', gap: 2, marginTop: spacing(10) },
+});

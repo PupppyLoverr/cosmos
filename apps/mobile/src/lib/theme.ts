@@ -8,16 +8,26 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useS
 import { AccessibilityInfo, Appearance, Platform, useColorScheme, type TextStyle } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
 import { isGlassEffectAPIAvailable, isLiquidGlassAvailable } from 'expo-glass-effect';
+import { wallpaperPath } from './wallpaper-store';
 
 export type AppearancePref = 'system' | 'light' | 'dark';
 export type Scheme = 'light' | 'dark';
-export type SurfacePref = 'auto' | 'glass' | 'frosted' | 'opaque';
+/**
+ * Surface material. Mirrors the desktop `SurfacePreference`:
+ * glass = Apple Liquid Glass (iOS 26+), acrylic = thick system blur,
+ * frosted = thin system blur, opaque = solid theme surfaces.
+ */
+export type SurfacePref = 'auto' | 'glass' | 'acrylic' | 'frosted' | 'opaque';
+export type Material = 'glass' | 'acrylic' | 'frosted' | 'opaque';
 export type AccentId = 'theme' | 'mono' | 'cosmos' | 'orange' | 'amber' | 'green' | 'cyan' | 'blue' | 'pink';
 export type BackdropPresetId = 'aurora' | 'dusk' | 'ocean' | 'meadow' | 'ember' | 'graphite';
+/** Image treatment applied to a photo wallpaper — same vocabulary as the desktop `NewThreadBackgroundEffect`. */
+export type WallpaperEffect = 'none' | 'dither' | 'halftone' | 'ascii' | 'scanlines';
 export type Backdrop =
   | { kind: 'none' }
   | { kind: 'preset'; id: BackdropPresetId }
-  | { kind: 'photo'; uri: string };
+  /** `uri` is the file name inside the app's wallpaper directory (resolved to a path in `Theme.backdrop`). */
+  | { kind: 'photo'; uri: string; width?: number; height?: number };
 
 export interface ThemePrefs {
   appearance: AppearancePref;
@@ -25,11 +35,29 @@ export interface ThemePrefs {
   accent: AccentId;
   surface: SurfacePref;
   backdrop: Backdrop;
+  effect: WallpaperEffect;
   /** 0–1: how much the backdrop is dimmed toward the theme background. */
   backdropDim: number;
 }
 
-const PREFS_KEY = 'cosmos.theme.v2';
+export const wallpaperEffects: { id: WallpaperEffect; label: string; description: string }[] = [
+  { id: 'none', label: 'Normal', description: 'Shows the original photo.' },
+  { id: 'dither', label: 'Dither', description: 'Rebuilds the photo with a dithered color palette.' },
+  { id: 'halftone', label: 'Halftone', description: 'Recreates the photo with colored print dots.' },
+  { id: 'ascii', label: 'ASCII', description: 'Recreates the photo with colored characters.' },
+  { id: 'scanlines', label: 'Scanlines', description: 'Adds a horizontal display-line texture.' },
+];
+
+export const surfaceOptions: { id: SurfacePref; label: string; description: string }[] = [
+  { id: 'auto', label: 'Auto', description: 'Liquid Glass where available, otherwise acrylic.' },
+  { id: 'glass', label: 'Glass', description: 'Apple Liquid Glass — refracts what is behind it.' },
+  { id: 'acrylic', label: 'Acrylic', description: 'Thick, softly tinted blur.' },
+  { id: 'frosted', label: 'Frosted', description: 'Thin, light blur.' },
+  { id: 'opaque', label: 'Solid', description: 'Flat theme surfaces. No transparency.' },
+];
+
+const PREFS_KEY = 'cosmos.theme.v3';
+const PREV_PREFS_KEY = 'cosmos.theme.v2';
 const LEGACY_APPEARANCE_KEY = 'cosmos.appearance';
 
 export const defaultPrefs: ThemePrefs = {
@@ -38,7 +66,8 @@ export const defaultPrefs: ThemePrefs = {
   accent: 'theme',
   surface: 'auto',
   backdrop: { kind: 'none' },
-  backdropDim: 0.45,
+  effect: 'none',
+  backdropDim: 0.35,
 };
 
 // ---------------------------------------------------------------------------
@@ -237,7 +266,7 @@ export interface Theme {
   familyId: string;
   familyName: string;
   /** Surface treatment actually in effect (auto resolved). */
-  material: 'glass' | 'frosted' | 'opaque';
+  material: Material;
   /** True when surfaces should read as translucent material. */
   translucent: boolean;
   /** iOS 26+ Liquid Glass is available and selected. */
@@ -245,6 +274,7 @@ export interface Theme {
   /** A gradient or photo is painted behind the app. */
   hasBackdrop: boolean;
   backdrop: Backdrop;
+  effect: WallpaperEffect;
   backdropDim: number;
 
   background: string;
@@ -289,10 +319,8 @@ export function resolveTheme(prefs: ThemePrefs, systemScheme: Scheme, reduceTran
       : ACCENTS[prefs.accent][scheme];
 
   const hasBackdrop = prefs.backdrop.kind !== 'none';
-  const wanted = prefs.surface === 'auto'
-    ? (hasBackdrop || base.frosted ? (liquidAvailable ? 'glass' : 'frosted') : 'opaque')
-    : prefs.surface;
-  const material = reduceTransparency ? 'opaque' : wanted === 'glass' && !liquidAvailable ? 'frosted' : wanted;
+  const wanted: Material = prefs.surface === 'auto' ? (liquidAvailable ? 'glass' : 'acrylic') : prefs.surface;
+  const material: Material = reduceTransparency ? 'opaque' : wanted === 'glass' && !liquidAvailable ? 'acrylic' : wanted;
   const translucent = material !== 'opaque';
 
   const surface = base.card !== base.background ? base.card : base.shell;
@@ -306,7 +334,8 @@ export function resolveTheme(prefs: ThemePrefs, systemScheme: Scheme, reduceTran
     translucent,
     liquid: material === 'glass',
     hasBackdrop,
-    backdrop: prefs.backdrop,
+    backdrop: prefs.backdrop.kind === 'photo' ? { ...prefs.backdrop, uri: wallpaperPath(prefs.backdrop.uri) } : prefs.backdrop,
+    effect: prefs.effect,
     backdropDim: prefs.backdropDim,
 
     background: base.background,
@@ -326,8 +355,8 @@ export function resolveTheme(prefs: ThemePrefs, systemScheme: Scheme, reduceTran
     warning: base.warning,
     success: base.success,
     composerBg: translucent ? alpha(surface, dark ? 0.55 : 0.7) : surface,
-    userBubble: mix(base.background, base.text, dark ? 0.16 : 0.07),
-    userBubbleText: base.text,
+    userBubble: accentStrong,
+    userBubbleText: onColor(accentStrong),
     codeBg: mix(surface, base.text, dark ? 0.06 : 0.05),
     glassFallback: alpha(surface, dark ? 0.72 : 0.78),
     glassStroke: alpha(dark ? '#ffffff' : '#000000', dark ? 0.12 : 0.06),
@@ -343,14 +372,16 @@ function normalize(raw: unknown): ThemePrefs {
   const b = p.backdrop;
   const backdrop: Backdrop =
     b?.kind === 'preset' && backdropPresets.some((x) => x.id === b.id) ? b
-      : b?.kind === 'photo' && typeof b.uri === 'string' ? b
+      // Older prefs stored an absolute path; keep only the file name.
+      : b?.kind === 'photo' && typeof b.uri === 'string' ? { ...b, uri: b.uri.slice(b.uri.lastIndexOf('/') + 1) }
       : { kind: 'none' };
   return {
     appearance: p.appearance === 'light' || p.appearance === 'dark' ? p.appearance : 'system',
     family: families.some((f) => f.id === p.family) ? p.family! : 'cosmos',
     accent: accentOptions.some((a) => a.id === p.accent) ? p.accent! : 'theme',
-    surface: p.surface === 'glass' || p.surface === 'frosted' || p.surface === 'opaque' ? p.surface : 'auto',
+    surface: surfaceOptions.some((o) => o.id === p.surface) ? p.surface! : 'auto',
     backdrop,
+    effect: wallpaperEffects.some((e) => e.id === p.effect) ? p.effect! : 'none',
     backdropDim: typeof p.backdropDim === 'number' ? Math.min(0.9, Math.max(0, p.backdropDim)) : defaultPrefs.backdropDim,
   };
 }
@@ -364,7 +395,8 @@ let loaded: Promise<ThemePrefs> | null = null;
 export function loadThemePrefs(): Promise<ThemePrefs> {
   if (!loaded) {
     loaded = (async () => {
-      const stored = await SecureStore.getItemAsync(PREFS_KEY).catch(() => null);
+      const stored = (await SecureStore.getItemAsync(PREFS_KEY).catch(() => null))
+        ?? (await SecureStore.getItemAsync(PREV_PREFS_KEY).catch(() => null));
       let prefs: ThemePrefs;
       if (stored) {
         try { prefs = normalize(JSON.parse(stored)); } catch { prefs = defaultPrefs; }
@@ -440,18 +472,32 @@ export const spacing = (n: number) => n * 4;
 
 export const radii = { sm: 8, md: 12, lg: 16, xl: 22, xxl: 28, pill: 999 };
 
-// Apple text ramp; colors are applied at the call site from the theme.
+/** Screen edge inset — one value, used everywhere content meets the screen edge. */
+export const edge = spacing(4);
+
+// Apple text ramp (SF defaults); colors are applied at the call site from the theme.
 export const type = {
-  largeTitle: { fontSize: 34, fontWeight: '700', letterSpacing: 0.2 },
-  title: { fontSize: 24, fontWeight: '700' },
-  title2: { fontSize: 20, fontWeight: '600' },
-  headline: { fontSize: 17, fontWeight: '600' },
-  body: { fontSize: 17, fontWeight: '400', lineHeight: 24 },
-  callout: { fontSize: 16, fontWeight: '400' },
+  largeTitle: { fontSize: 34, fontWeight: '700', letterSpacing: 0.2, lineHeight: 41 },
+  title: { fontSize: 28, fontWeight: '700', lineHeight: 34 },
+  title2: { fontSize: 22, fontWeight: '700', lineHeight: 28 },
+  title3: { fontSize: 20, fontWeight: '600', lineHeight: 25 },
+  headline: { fontSize: 17, fontWeight: '600', lineHeight: 22 },
+  body: { fontSize: 17, fontWeight: '400', lineHeight: 22 },
+  callout: { fontSize: 16, fontWeight: '400', lineHeight: 21 },
   subhead: { fontSize: 15, fontWeight: '400', lineHeight: 20 },
-  footnote: { fontSize: 13, fontWeight: '400' },
-  caption: { fontSize: 12, fontWeight: '500' },
+  footnote: { fontSize: 13, fontWeight: '400', lineHeight: 18 },
+  caption: { fontSize: 12, fontWeight: '400', lineHeight: 16 },
+  caption2: { fontSize: 11, fontWeight: '500', lineHeight: 13, letterSpacing: 0.3 },
+  mono: { fontSize: 13, fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }), lineHeight: 18 },
 } as const satisfies Record<string, TextStyle>;
+
+export const shadows = {
+  card: '0 1px 2px rgba(0,0,0,0.06)',
+  raised: '0 6px 18px rgba(0,0,0,0.12)',
+  overlay: '0 10px 30px rgba(0,0,0,0.22)',
+} as const;
+
+export const motion = { fast: 150, base: 250, slow: 400 } as const;
 
 export const statusColor = (t: Theme, s?: string): string =>
   s === 'working' ? t.link

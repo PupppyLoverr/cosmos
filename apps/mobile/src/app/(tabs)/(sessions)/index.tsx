@@ -2,14 +2,17 @@ import React, { useMemo, useState } from 'react';
 import { ActionSheetIOS, Alert, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import { router, Stack } from 'expo-router';
+import * as Haptics from 'expo-haptics';
 import { useCosmos, useSnapshot } from '../../../lib/client';
 import { Chat, Session } from '../../../lib/protocol';
-import { useTheme, spacing, radii, statusColor, type } from '../../../lib/theme';
-import { EmptyState, ConnectionBadge, IconButton, Tag, Chip } from '../../../components/bits';
+import { useTheme, spacing, radii, statusColor, type, edge, alpha } from '../../../lib/theme';
+import { EmptyState, IconButton, Icon, StatusDot, Notice, Button } from '../../../components/bits';
 import { HarnessMark } from '../../../components/harness-mark';
 import { Glass, Screen } from '../../../components/surface';
 
-function indicator(chat: Chat, sessions: Session[]): string {
+type Indicator = 'working' | 'awaitingInput' | 'errored' | 'completed' | 'idle';
+
+function indicator(chat: Chat, sessions: Session[]): Indicator {
   const live = sessions.find((s) => s.chatId === chat.id);
   if (live?.status === 'working') return 'working';
   if (live?.status === 'awaitingInput') return 'awaitingInput';
@@ -23,7 +26,7 @@ function relTime(iso?: string | null): string {
   const d = new Date(iso);
   const diff = Date.now() - d.getTime();
   const m = Math.floor(diff / 60000);
-  if (m < 1) return 'now';
+  if (m < 1) return 'Now';
   if (m < 60) return `${m}m`;
   const h = Math.floor(m / 60);
   if (h < 24) return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
@@ -31,11 +34,12 @@ function relTime(iso?: string | null): string {
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-const STATUS_LABEL: Record<string, string> = {
+const STATUS_LABEL: Record<Indicator, string | null> = {
   working: 'Working',
-  awaitingInput: 'Needs input',
+  awaitingInput: 'Needs your input',
   errored: 'Failed',
   completed: 'New reply',
+  idle: null,
 };
 
 const SUGGESTIONS = [
@@ -69,15 +73,20 @@ function chatActions(client: ReturnType<typeof useCosmos>, chat: Chat) {
     },
     { text: 'Cancel', style: 'cancel' },
   ];
+  void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
   if (Platform.OS === 'ios') {
     ActionSheetIOS.showActionSheetWithOptions(
-      { options: buttons.map((b) => b.text), destructiveButtonIndex: 2, cancelButtonIndex: 3 },
+      { title: chat.title ?? 'Session', options: buttons.map((b) => b.text), destructiveButtonIndex: 2, cancelButtonIndex: 3 },
       (i) => buttons[i]?.onPress?.(),
     );
   } else {
     Alert.alert(chat.title ?? 'Session', undefined, buttons);
   }
 }
+
+type ListItem =
+  | { kind: 'section'; key: string; title: string }
+  | { kind: 'chat'; key: string; chat: Chat; ind: Indicator; first: boolean; last: boolean };
 
 export default function SessionsScreen() {
   const t = useTheme();
@@ -88,142 +97,216 @@ export default function SessionsScreen() {
   const connection = useSnapshot(client.connection);
   const [query, setQuery] = useState('');
 
-  const rows = useMemo(() => {
+  const items = useMemo<ListItem[]>(() => {
     const q = query.trim().toLowerCase();
-    return chats
+    const visible = chats
       .filter((c) => !c.archived)
       .filter((c) => !q || (c.title ?? '').toLowerCase().includes(q) || (c.lastMessagePreview ?? '').toLowerCase().includes(q))
-      .sort((a, b) => (b.lastMessageAt ?? b.createdAt).localeCompare(a.lastMessageAt ?? a.createdAt));
-  }, [chats, query]);
+      .sort((a, b) => (b.lastMessageAt ?? b.createdAt).localeCompare(a.lastMessageAt ?? a.createdAt))
+      .map((chat) => ({ chat, ind: indicator(chat, sessions) }));
+
+    const active = visible.filter((v) => v.ind === 'working' || v.ind === 'awaitingInput' || v.ind === 'errored');
+    const rest = visible.filter((v) => !active.includes(v));
+    const out: ListItem[] = [];
+    const push = (title: string, group: typeof visible) => {
+      if (!group.length) return;
+      if (active.length && rest.length) out.push({ kind: 'section', key: `s:${title}`, title });
+      group.forEach((v, i) => out.push({ kind: 'chat', key: v.chat.id, chat: v.chat, ind: v.ind, first: i === 0, last: i === group.length - 1 }));
+    };
+    push('Active', active);
+    push('Recent', rest);
+    return out;
+  }, [chats, sessions, query]);
 
   const spaceName = (chat: Chat) => spaces.find((s) => s.id === chat.spaceId)?.path?.split('/').pop();
   const connected = connection.status === 'connected';
+  const connecting = connection.status === 'connecting' || connection.status === 'reconnecting';
 
   return (
     <Screen>
       <Stack.Screen
         options={{
           headerShown: true,
-          title: 'Cosmos',
+          title: 'Sessions',
           headerLargeTitle: true,
           headerSearchBarOptions: {
-            placeholder: 'Search sessions',
+            placeholder: 'Search',
             onChangeText: (e) => setQuery(e.nativeEvent.text),
             hideWhenScrolling: true,
           },
           headerRight: () => (
-            <IconButton icon="plus" label="New session" onPress={() => router.push('/new-session')} />
+            <IconButton icon="square.and.pencil" label="New session" onPress={() => router.push('/new-session')} filled={false} disabled={!connected} />
           ),
         }}
       />
       <FlashList
-        data={rows}
-        keyExtractor={(c) => c.id}
-        contentContainerStyle={{ paddingBottom: spacing(8) }}
+        data={items}
+        keyExtractor={(i) => i.key}
+        getItemType={(i) => i.kind}
+        contentContainerStyle={styles.list}
         contentInsetAdjustmentBehavior="automatic"
+        keyboardDismissMode="on-drag"
         ListHeaderComponent={
-          <View style={styles.statusBar}>
-            <ConnectionBadge status={connection.status} detail={connection.detail} />
-            <Text style={[type.caption, { color: t.textTertiary, flex: 1 }]} numberOfLines={1}>
-              {connection.desktop ? connection.desktop.name : 'No desktop linked'}
-            </Text>
-            {!connected ? (
-              <Pressable onPress={() => router.push('/pair')} hitSlop={8}>
-                <Text style={[type.caption, { color: t.link }]}>Link</Text>
-              </Pressable>
+          <View style={styles.header}>
+            <Pressable
+              onPress={() => router.push('/(tabs)/(desktops)' as never)}
+              accessibilityRole="button"
+              accessibilityLabel={connection.desktop ? `${connection.desktop.name}, ${connection.status}` : 'No desktop linked'}
+              style={({ pressed }) => [styles.desktopPill, { backgroundColor: alpha(t.fill, pressed ? 1 : 0.7) }]}
+            >
+              <StatusDot status={connected ? 'connected' : connecting ? 'working' : 'errored'} size={7} />
+              <Text style={[type.footnote, { color: t.textSecondary, fontWeight: '500' }]} numberOfLines={1}>
+                {connection.desktop?.name ?? 'No desktop linked'}
+                {connection.desktop ? ` · ${connected ? 'Connected' : connecting ? 'Connecting…' : 'Offline'}` : ''}
+              </Text>
+              <Icon name="chevron.right" size={10} color={t.textTertiary} weight="semibold" />
+            </Pressable>
+            {!connected && connection.detail ? (
+              <Notice kind="warning" title={connecting ? 'Reconnecting' : "Can't reach the desktop"} body={connection.detail} />
             ) : null}
           </View>
         }
         ListEmptyComponent={
           connected ? (
             <EmptyState
-              icon="sparkles"
-              title={query ? 'No matches' : 'Start something'}
-              body={query ? 'Try a different search.' : 'Your desktop is ready. Ask Cosmos to do anything on it.'}
+              icon={query ? 'magnifyingglass' : 'sparkles'}
+              title={query ? 'No Results' : 'Start Something'}
+              body={query ? `Nothing matches “${query}”.` : 'Your Mac is ready. Ask Cosmos to do anything on it.'}
             >
               {!query ? (
                 <View style={styles.suggestions}>
                   {SUGGESTIONS.map((s) => (
-                    <Chip
+                    <Pressable
                       key={s.label}
-                      label={s.label}
-                      sub={s.sub}
-                      icon={s.icon}
+                      accessibilityRole="button"
                       onPress={() => router.push({ pathname: '/new-session', params: { prompt: `${s.label}: ${s.sub}` } })}
-                    />
+                      style={({ pressed }) => [styles.suggestion, { backgroundColor: pressed ? t.fill : t.surface, borderColor: t.separator }]}
+                    >
+                      <View style={[styles.suggestionIcon, { backgroundColor: t.accentMuted }]}>
+                        <Icon name={s.icon} size={16} color={t.link} />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>{s.label}</Text>
+                        <Text style={[type.footnote, { color: t.textSecondary }]}>{s.sub}</Text>
+                      </View>
+                      <Icon name="arrow.up.right" size={12} color={t.textTertiary} />
+                    </Pressable>
                   ))}
                 </View>
               ) : null}
             </EmptyState>
           ) : (
             <EmptyState
-              icon="desktopcomputer"
-              title={connection.status === 'disconnected' ? 'Link a desktop' : 'Connecting…'}
-              body="Cosmos runs on your Mac. Link it once and control it from here."
-              actionLabel="Link a desktop"
-              onAction={() => router.push('/pair')}
-            />
+              icon="laptopcomputer"
+              title={connecting ? 'Connecting…' : 'Link Your Mac'}
+              body="Cosmos runs on your Mac. Link it once on the same network and control it from here."
+            >
+              {!connecting ? <Button title="Link a Desktop" onPress={() => router.push('/pair')} size="md" style={{ marginTop: spacing(4) }} /> : null}
+            </EmptyState>
           )
         }
-        renderItem={({ item: chat }) => {
-          const ind = indicator(chat, sessions);
+        renderItem={({ item }) => {
+          if (item.kind === 'section') {
+            return <Text style={[type.footnote, styles.section, { color: t.textSecondary }]}>{item.title.toUpperCase()}</Text>;
+          }
+          const { chat, ind, first, last } = item;
           const space = spaceName(chat);
           const title = chat.title || 'Untitled session';
-          const body = (
-            <>
-              <HarnessMark key={`${chat.id}:${chat.config?.harness ?? 'cosmos'}`} harness={chat.config?.harness} size={40} status={ind} />
-              <View style={styles.chatBody}>
-                <View style={styles.chatTop}>
-                  <Text style={[type.callout, styles.chatTitle, { color: t.text }]} numberOfLines={1}>{title}</Text>
-                  {STATUS_LABEL[ind] ? <Tag label={STATUS_LABEL[ind]!} color={statusColor(t, ind)} /> : space ? <Tag label={space} /> : null}
-                  <Text style={[type.footnote, { color: t.textTertiary, marginLeft: 'auto' }]}>{relTime(chat.lastMessageAt ?? chat.createdAt)}</Text>
-                </View>
-                <Text style={[type.subhead, { color: t.textSecondary }]} numberOfLines={1}>
-                  {chat.lastMessagePreview || chat.cwd || 'No messages yet'}
-                </Text>
-              </View>
-            </>
-          );
+          const status = STATUS_LABEL[ind];
           const open = () => {
             void client.markChatSeen(chat.id);
             router.push({ pathname: '/session/[id]', params: { id: chat.id, title } });
           };
-          return t.hasBackdrop ? (
-            <Pressable onPress={open} onLongPress={() => chatActions(client, chat)} style={({ pressed }) => [styles.chatCardWrap, { opacity: pressed ? 0.8 : 1 }]}>
-              <Glass radius={radii.xl} interactive style={styles.chatCard}>{body}</Glass>
-            </Pressable>
-          ) : (
+          // Over a wallpaper each row is its own glass cell; otherwise rows form an inset-grouped list.
+          const cells = t.hasBackdrop && t.translucent;
+          const shape = cells
+            ? { borderRadius: radii.xl }
+            : {
+                borderTopLeftRadius: first ? radii.xl : 0,
+                borderTopRightRadius: first ? radii.xl : 0,
+                borderBottomLeftRadius: last ? radii.xl : 0,
+                borderBottomRightRadius: last ? radii.xl : 0,
+              };
+          const content = (
+            <>
+              <HarnessMark key={`${chat.id}:${chat.config?.harness ?? 'cosmos'}`} harness={chat.config?.harness} size={44} status={ind} />
+              <View style={styles.chatBody}>
+                <View style={styles.chatTop}>
+                  <Text style={[type.body, styles.chatTitle, { color: t.text }]} numberOfLines={1}>{title}</Text>
+                  <Text style={[type.footnote, { color: ind === 'completed' ? t.link : t.textTertiary, fontWeight: ind === 'completed' ? '600' : '400' }]}>
+                    {relTime(chat.lastMessageAt ?? chat.createdAt)}
+                  </Text>
+                </View>
+                <View style={styles.chatBottom}>
+                  {status ? (
+                    <View style={styles.status}>
+                      <StatusDot status={ind} size={6} />
+                      <Text style={[type.subhead, { color: statusColor(t, ind), fontWeight: '500' }]}>{status}</Text>
+                      <Text style={[type.subhead, { color: t.textTertiary }]}>·</Text>
+                    </View>
+                  ) : null}
+                  <Text style={[type.subhead, { color: t.textSecondary, flex: 1 }]} numberOfLines={status ? 1 : 2}>
+                    {chat.lastMessagePreview || (space ? `in ${space}` : chat.cwd) || 'No messages yet'}
+                  </Text>
+                </View>
+              </View>
+              {ind === 'completed' ? <View style={[styles.unread, { backgroundColor: t.link }]} /> : null}
+            </>
+          );
+          const pressable = (bg: string | undefined) => (
             <Pressable
               onPress={open}
               onLongPress={() => chatActions(client, chat)}
-              style={({ pressed }) => [styles.chatRow, pressed && { backgroundColor: t.fill }]}
+              delayLongPress={350}
+              accessibilityRole="button"
+              accessibilityLabel={`${title}${status ? `, ${status}` : ''}`}
+              style={({ pressed }) => [styles.chatRow, bg ? { backgroundColor: pressed ? t.fill : bg } : pressed && { backgroundColor: t.fill }, shape]}
             >
-              {body}
+              {content}
             </Pressable>
           );
+          return cells ? (
+            <View style={styles.cellWrap}>
+              <Glass radius={radii.xl} interactive>{pressable(undefined)}</Glass>
+            </View>
+          ) : (
+            <View>
+              {pressable(t.surface)}
+              {!last ? <View style={[styles.sep, { backgroundColor: t.separator }]} /> : null}
+            </View>
+          );
         }}
-        ItemSeparatorComponent={() => t.hasBackdrop ? null : <View style={[styles.sep, { backgroundColor: t.separator }]} />}
       />
     </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1 },
-  statusBar: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing(2),
-    paddingHorizontal: spacing(4), paddingVertical: spacing(2),
+  list: { paddingHorizontal: edge, paddingBottom: spacing(12) },
+  header: { gap: spacing(3), paddingTop: spacing(1), paddingBottom: spacing(2) },
+  desktopPill: {
+    alignSelf: 'flex-start', flexDirection: 'row', alignItems: 'center', gap: spacing(2),
+    paddingLeft: spacing(3), paddingRight: spacing(2.5), height: 30, borderRadius: radii.pill,
   },
-  suggestions: { alignSelf: 'stretch', gap: spacing(2), marginTop: spacing(5) },
+  section: { fontWeight: '500', letterSpacing: 0.3, marginTop: spacing(4), marginBottom: spacing(2), marginLeft: edge },
+  cellWrap: { paddingBottom: spacing(2) },
   chatRow: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(3),
-    paddingHorizontal: spacing(4), paddingVertical: spacing(3),
+    paddingHorizontal: edge, paddingVertical: spacing(3), minHeight: 72,
+    borderCurve: 'continuous',
   },
-  chatCardWrap: { paddingHorizontal: spacing(4), paddingVertical: spacing(1.5) },
-  chatCard: { flexDirection: 'row', alignItems: 'center', gap: spacing(3), paddingHorizontal: spacing(4), paddingVertical: spacing(3.5) },
-  chatBody: { flex: 1, minWidth: 0, gap: 2 },
-  chatTop: { flexDirection: 'row', alignItems: 'center', gap: spacing(2) },
-  chatTitle: { fontWeight: '600', flexShrink: 1 },
-  sep: { height: StyleSheet.hairlineWidth, marginLeft: spacing(4) + 40 + spacing(3) },
-  badge: { borderRadius: radii.pill },
+  chatBody: { flex: 1, minWidth: 0, gap: 3 },
+  chatTop: { flexDirection: 'row', alignItems: 'baseline', gap: spacing(2) },
+  chatTitle: { fontWeight: '600', flex: 1 },
+  chatBottom: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
+  status: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
+  unread: { width: 8, height: 8, borderRadius: 4 },
+  sep: { height: StyleSheet.hairlineWidth, marginLeft: edge + 44 + spacing(3) },
+  suggestions: { alignSelf: 'stretch', gap: spacing(2.5), marginTop: spacing(6) },
+  suggestion: {
+    flexDirection: 'row', alignItems: 'center', gap: spacing(3),
+    paddingHorizontal: spacing(3.5), paddingVertical: spacing(3),
+    borderRadius: radii.lg, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth,
+  },
+  suggestionIcon: { width: 34, height: 34, borderRadius: 10, borderCurve: 'continuous', alignItems: 'center', justifyContent: 'center' },
 });
