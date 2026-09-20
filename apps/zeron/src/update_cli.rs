@@ -16,12 +16,12 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
     let current = current_version();
     if !version_newer(&manifest.version, current) {
         println!(
-            "zeron {current} is up to date (latest: {}).",
+            "Cosmos {current} is up to date (latest: {}).",
             manifest.version
         );
         return Ok(());
     }
-    println!("zeron {current} → {} available", manifest.version);
+    println!("Cosmos {current} → {} available", manifest.version);
     if check_only {
         std::process::exit(1);
     }
@@ -63,7 +63,7 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
             let staged = zeron_update::windows::stage(edge_url, &manifest, &directory).await?;
             zeron_update::windows::apply(&staged, &directory, false)?;
             println!(
-                "updated to {} — relaunch Zeron to finish.",
+                "updated to {} — relaunch Cosmos to finish.",
                 manifest.version
             );
             Ok(())
@@ -71,8 +71,8 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
         InstallKind::Unmanaged => {
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\
-                 Linux: curl -fsSL https://zeron.sh/install.sh | sh\n\
-                 macOS: download the new Cosmos dmg, or rebuild from source.\n\
+                 Linux: download the new Cosmos tarball from https://github.com/PupppyLoverr/cosmos-releases/releases, or rebuild from source.\n\
+                 macOS: download the new Cosmos dmg from https://github.com/PupppyLoverr/cosmos-releases/releases, or rebuild from source.\n\
                  Windows: use an update-enabled portable package, or rebuild from source."
             )
         }

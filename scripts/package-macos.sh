@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # macOS packaging: build the release binary for the host arch and produce
-#   target/package/zeron-<version>-macos-<arch>.dmg          (user download)
-#   target/package/zeron-<version>-macos-<arch>-app.tar.gz   (auto-updater)
-# containing Zeron.app (signed with the local development identity when
+#   target/package/cosmos-<version>-macos-<arch>.dmg          (user download)
+#   target/package/cosmos-<version>-macos-<arch>-app.tar.gz   (bundle archive)
+# containing Cosmos.app (signed with the local development identity when
 # available, unless CODESIGN_IDENTITY is set).
 #
 # Usage: scripts/package-macos.sh
@@ -18,9 +18,9 @@ command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 ARCH="$(uname -m)" # arm64 on Apple silicon runners
 OUT_DIR="$ROOT/target/package"
-APP="$OUT_DIR/Zeron.app"
-DMG="$OUT_DIR/zeron-$VERSION-macos-$ARCH.dmg"
-APP_TARBALL="$OUT_DIR/zeron-$VERSION-macos-$ARCH-app.tar.gz"
+APP="$OUT_DIR/Cosmos.app"
+DMG="$OUT_DIR/cosmos-$VERSION-macos-$ARCH.dmg"
+APP_TARBALL="$OUT_DIR/cosmos-$VERSION-macos-$ARCH-app.tar.gz"
 
 cd "$ROOT"
 cargo build --release -p zeron
@@ -56,8 +56,10 @@ else
     codesign --deep --force --sign "$LOCAL_IDENTITY" \
       --identifier sh.zeron.app "$APP"
   else
-    # Ad-hoc signatures do not retain macOS TCC grants across rebuilds.
-    echo "warning: Cosmos Local Signing is unavailable; using an ad-hoc signature, so TCC grants will not survive rebuilds" >&2
+    # Ad-hoc signatures do not retain macOS TCC grants across rebuilds: TCC
+    # records the code requirement at grant time, so a grant made against an
+    # ad-hoc cdhash stops matching as soon as the binary is rebuilt.
+    echo "warning: Cosmos Local Signing is unavailable; using an ad-hoc signature, so TCC grants will not survive rebuilds (run scripts/make-local-signing-identity.sh and trust the certificate BEFORE packaging)" >&2
     codesign --deep --force --sign - --identifier sh.zeron.app "$APP"
   fi
 fi
@@ -77,15 +79,15 @@ if $NOTARIZE; then
   # Staple the bundle BEFORE tarring it: the auto-updater swaps the .app with
   # no dmg involved, so the tarball copy must carry its own ticket to pass
   # Gatekeeper offline.
-  ZIP="$OUT_DIR/zeron-notarize.zip"
+  ZIP="$OUT_DIR/cosmos-notarize.zip"
   ditto -c -k --keepParent "$APP" "$ZIP"
   notarize "$ZIP"
   rm -f "$ZIP"
   xcrun stapler staple "$APP"
 fi
 
-# The auto-updater artifact.
-tar -czf "$APP_TARBALL" -C "$OUT_DIR" Zeron.app
+# The bare bundle archive (Cosmos ships no self-updater; see crates/update).
+tar -czf "$APP_TARBALL" -C "$OUT_DIR" Cosmos.app
 echo "packaged: $APP_TARBALL"
 
 # The dmg presents the classic drag-into-Applications layout over the
@@ -126,7 +128,7 @@ dmgbuild.build_dmg(
         "window_rect": ((200, 120), (660, 400)),
         "icon_size": 104,
         "text_size": 12,
-        "icon_locations": {"Zeron.app": (165, 195), "Applications": (495, 195)},
+        "icon_locations": {"Cosmos.app": (165, 195), "Applications": (495, 195)},
     },
 )
 PY

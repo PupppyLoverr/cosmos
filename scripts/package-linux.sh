@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Linux packaging: build the release binary and produce
-#   target/package/zeron-<version>-linux-<arch>.tar.gz
+#   target/package/cosmos-<version>-linux-<arch>.tar.gz
 # containing the binary, the .desktop entry, and the icon, plus an install.sh
 # that drops them into ~/.local (XDG) paths.
 #
@@ -15,7 +15,7 @@ PROFILE="${PROFILE:-release}"
 ARCH="$(uname -m)"
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 OUT_DIR="$ROOT/target/package"
-STAGE="$OUT_DIR/zeron-$VERSION-linux-$ARCH"
+STAGE="$OUT_DIR/cosmos-$VERSION-linux-$ARCH"
 TARBALL="$STAGE.tar.gz"
 
 cd "$ROOT"

@@ -118,20 +118,20 @@ fn require_mac_app_update_platform() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `zeron-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball (Linux CI builds).
+/// `cosmos-<ver>-<os>-<arch>.tar.gz` — the headless/CLI tarball (Linux CI builds).
 pub fn headless_artifact(version: &str) -> String {
     let (os, arch) = platform_key();
     if os == "windows" {
-        format!("zeron-{version}-{os}-{arch}.zip")
+        format!("cosmos-{version}-{os}-{arch}.zip")
     } else {
-        format!("zeron-{version}-{os}-{arch}.tar.gz")
+        format!("cosmos-{version}-{os}-{arch}.tar.gz")
     }
 }
 
-/// `zeron-<ver>-macos-<arch>-app.tar.gz` — the macOS app update payload.
+/// `cosmos-<ver>-macos-<arch>-app.tar.gz` — the macOS app bundle archive.
 pub fn mac_app_artifact(version: &str) -> String {
     let (_, arch) = platform_key();
-    format!("zeron-{version}-macos-{arch}-app.tar.gz")
+    format!("cosmos-{version}-macos-{arch}-app.tar.gz")
 }
 
 /// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
@@ -1110,12 +1110,12 @@ mod tests {
     #[test]
     fn artifact_names_match_packaging() {
         let (os, arch) = platform_key();
-        assert!(headless_artifact("0.2.0").starts_with("zeron-0.2.0-"));
+        assert!(headless_artifact("0.2.0").starts_with("cosmos-0.2.0-"));
         // Windows packaging is a zip; unix ships tarballs.
         let ext = if os == "windows" { "zip" } else { "tar.gz" };
         assert_eq!(
             headless_artifact("0.2.0"),
-            format!("zeron-0.2.0-{os}-{arch}.{ext}")
+            format!("cosmos-0.2.0-{os}-{arch}.{ext}")
         );
         assert!(mac_app_artifact("0.2.0").ends_with("-app.tar.gz"));
     }
