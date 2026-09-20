@@ -2178,6 +2178,13 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        if let Some(prompt) = state.update(cx, |state, _| state.take_meridian_prompt()) {
+            self.open_new_session(cx);
+            self.composer.update(cx, |composer, cx| {
+                composer.stage_meridian_prompt(prompt, cx)
+            });
+            self.sidebar_notice = Some("Meridian draft ready. Review it before sending.".into());
+        }
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
             self.sidebar_notice = Some(notice.into());
         }

@@ -3,6 +3,74 @@
 use sha2::{Digest, Sha256};
 use zeron_proto::{AuthState, Chat, HarnessId, WorkspaceScope};
 
+pub fn meridian_prompt(url: &str) -> Result<String, &'static str> {
+    let encoded = url
+        .strip_prefix("zeron://open/meridian?file=")
+        .ok_or("invalid Meridian link")?;
+    let path = std::path::PathBuf::from(decode_component(encoded)?);
+    let home = std::env::var_os("HOME").ok_or("home directory unavailable")?;
+    let root = std::path::PathBuf::from(home).join("Library/Application Support/Meridian");
+    read_meridian_export(&root, &path)
+}
+
+fn read_meridian_export(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<String, &'static str> {
+    let root = root
+        .canonicalize()
+        .map_err(|_| "Meridian vault not found")?;
+    let path = path
+        .canonicalize()
+        .map_err(|_| "Meridian export not found")?;
+    if !path.starts_with(root)
+        || path.extension().is_none_or(|v| v != "md")
+        || path
+            .parent()
+            .and_then(|v| v.file_name())
+            .is_none_or(|v| v != "exports")
+    {
+        return Err("only Markdown exports inside the Meridian vault may be opened");
+    }
+    let metadata = path
+        .metadata()
+        .map_err(|_| "could not inspect Meridian export")?;
+    if !metadata.is_file() || metadata.len() > 65_536 {
+        return Err("Meridian export exceeds 64 KiB");
+    }
+    std::fs::read_to_string(path).map_err(|_| "could not read Meridian export")
+}
+
+#[cfg(test)]
+mod meridian_tests {
+    use super::*;
+
+    #[test]
+    fn imports_only_bounded_markdown_in_vault_exports() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = directory.path().join("Meridian");
+        let exports = vault.join("default/exports");
+        std::fs::create_dir_all(&exports).unwrap();
+        let file = exports.join("prompt.md");
+        std::fs::write(&file, "# A draft\n\nReview this.").unwrap();
+        assert_eq!(
+            read_meridian_export(&vault, &file).unwrap(),
+            "# A draft\n\nReview this."
+        );
+        let outside = directory.path().join("private.md");
+        std::fs::write(&outside, "outside").unwrap();
+        assert!(read_meridian_export(&vault, &outside).is_err());
+        #[cfg(unix)]
+        {
+            let link = exports.join("link.md");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(read_meridian_export(&vault, &link).is_err());
+        }
+        std::fs::write(&file, vec![b'x'; 65_537]).unwrap();
+        assert!(read_meridian_export(&vault, &file).is_err());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationDeepLink {
     pub chat_id: String,

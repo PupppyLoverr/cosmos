@@ -348,7 +348,10 @@ impl EngineHandle {
         // Best-effort — losing the bind race with another engine costs other
         // viewports, not this one.
         let ipc_task = match zeron_engine::serve_ipc(engine_config.ipc_port, service).await {
-            Ok(task) => Some(task),
+            Ok(task) => {
+                zeron_engine::sister_apps::publish_handshake(&engine_config);
+                Some(task)
+            }
             Err(err) => {
                 tracing::warn!(
                     port = engine_config.ipc_port,
@@ -705,6 +708,7 @@ pub struct AppState {
     pub chats_synced: bool,
     pub spaces_synced: bool,
     pending_deep_link: Option<crate::links::ConversationDeepLink>,
+    pending_meridian_prompt: Option<String>,
     deep_link_notice: Option<String>,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
@@ -844,6 +848,7 @@ impl AppState {
             chats_synced: false,
             spaces_synced: false,
             pending_deep_link: None,
+            pending_meridian_prompt: None,
             deep_link_notice: None,
         }
     }
@@ -2051,6 +2056,14 @@ impl AppState {
     }
 
     pub fn open_deep_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        if url.starts_with("zeron://open/meridian?") {
+            match crate::links::meridian_prompt(url) {
+                Ok(prompt) => self.pending_meridian_prompt = Some(prompt),
+                Err(error) => self.deep_link_notice = Some(error.into()),
+            }
+            cx.notify();
+            return;
+        }
         match crate::links::parse_zeron_conversation_link(url) {
             Ok(link) => {
                 self.pending_deep_link = Some(link);
@@ -2059,6 +2072,10 @@ impl AppState {
             Err(error) => self.deep_link_notice = Some(error.to_string()),
         }
         cx.notify();
+    }
+
+    pub fn take_meridian_prompt(&mut self) -> Option<String> {
+        self.pending_meridian_prompt.take()
     }
 
     fn apply_pending_deep_link(&mut self, cx: &mut Context<Self>) {

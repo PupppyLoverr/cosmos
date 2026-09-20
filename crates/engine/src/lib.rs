@@ -32,6 +32,7 @@ pub mod repos;
 pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
+pub mod sister_apps;
 pub mod source_control;
 pub mod spaces;
 pub mod terminals;
@@ -929,6 +930,7 @@ impl Engine {
             stop_tx,
         });
         let server = serve_ipc(config.ipc_port, service).await?;
+        sister_apps::publish_handshake(&config);
 
         tokio::select! {
             result = shutdown_signal() => result?,
