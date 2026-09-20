@@ -135,7 +135,7 @@ export default function PairScreen() {
           disabled={probe.state !== 'ok' || busy}
           style={[styles.linkBtn, { backgroundColor: t.accent, opacity: probe.state === 'ok' && !busy ? 1 : 0.4 }]}
         >
-          {busy ? <ActivityIndicator color="#fff" /> : <Text style={{ color: '#fff', fontWeight: '600', fontSize: 16 }}>Trust & link</Text>}
+          {busy ? <ActivityIndicator color={t.accentContrast} /> : <Text style={{ color: t.accentContrast, fontWeight: '600', fontSize: 16 }}>Trust & link</Text>}
         </Pressable>
         <Text style={{ color: t.textTertiary, fontSize: 12, textAlign: 'center', marginTop: spacing(2) }}>
           Only link desktops on networks you trust. Local pairing speaks the engine protocol directly — no cloud.

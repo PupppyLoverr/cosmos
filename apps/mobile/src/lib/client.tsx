@@ -4,7 +4,7 @@
 // an in-memory snapshot consumed through useSyncExternalStore; no demo data.
 
 import React, {
-  createContext, useContext, useEffect, useMemo, useRef, useSyncExternalStore,
+  createContext, useContext, useMemo, useSyncExternalStore,
 } from 'react';
 import { RpcClient, ConnectionStatus, TransportSpec, localSpec, relaySpec, StreamHandle } from './rpc';
 import {
@@ -12,10 +12,13 @@ import {
   HarnessInfo, EngineInfo, ComputerStatus, UserInputAnswer,
 } from './protocol';
 import {
-  StoredSession, loadSession, saveSession, clearSession, freshAccessToken,
+  StoredSession, loadSession, clearSession, freshAccessToken,
   idTokenExpiry, signInInteractive,
 } from './auth';
 import { Platform } from 'react-native';
+// SecureStore has no sync API at module scope; the store below hydrates async.
+import * as SecureStore from 'expo-secure-store';
+import * as Crypto from 'expo-crypto';
 
 export interface LinkedDesktop {
   /** Engine device id (remote identity) or host:port label (local pairing). */
@@ -38,10 +41,6 @@ export interface ConnectionInfo {
 
 const DESKTOPS_KEY = 'cosmos.desktops';
 const ACTIVE_DESKTOP_KEY = 'cosmos.activeDesktop';
-
-// SecureStore has no sync API at module scope; the store below hydrates async.
-import * as SecureStore from 'expo-secure-store';
-import * as Crypto from 'expo-crypto';
 
 // Hermes has no global `crypto`; expo-crypto's randomUUID is secure RNG-backed.
 const uuid = Crypto.randomUUID;
@@ -217,7 +216,6 @@ export class CosmosClient {
     }
     const rpc = new RpcClient(spec, desktop.kind === 'remote' ? () => this.tokenForDial() : undefined);
     this.rpc = rpc;
-    const conn = this.connection.get();
     this.connection.set({ status: 'connecting', desktop });
     rpc.onStatusChange((s, detail) => {
       this.connection.set({ status: s, detail, desktop });

@@ -26,7 +26,7 @@ export default function NewSessionScreen() {
   const spaces = useSnapshot(client.spaces);
   const connection = useSnapshot(client.connection);
   const [harnesses, setHarnesses] = useState<{ id: HarnessId; name?: string }[]>([]);
-  const [models, setModels] = useState<{ id: string; name?: string }[]>([]);
+  const [modelsFor, setModelsFor] = useState<{ harness: HarnessId; list: { id: string; name?: string }[] }>({ harness: 'opencode', list: [] });
   const [harness, setHarness] = useState<HarnessId>('opencode');
   const [model, setModel] = useState<string | null>(null);
   const [reasoning, setReasoning] = useState<ReasoningLevel>('medium');
@@ -42,9 +42,14 @@ export default function NewSessionScreen() {
 
   useEffect(() => {
     if (connection.status !== 'connected' || !harness) return;
-    setModels([]);
-    void client.listModels(harness).then(setModels).catch(() => {});
+    let cancelled = false;
+    void client
+      .listModels(harness)
+      .then((list) => { if (!cancelled) setModelsFor({ harness, list }); })
+      .catch(() => {});
+    return () => { cancelled = true; };
   }, [client, connection.status, harness]);
+  const models = modelsFor.harness === harness ? modelsFor.list : [];
 
   const spaceChoices = useMemo(
     () => [{ id: null as string | null, label: 'Desktop (no project)' }, ...spaces.map((s) => ({ id: s.id as string | null, label: s.name || s.path.split('/').pop() || s.path }))],
