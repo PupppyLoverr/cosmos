@@ -3,6 +3,7 @@ import { ActivityIndicator, Pressable, StyleProp, StyleSheet, Text, View, ViewSt
 import { SymbolView } from 'expo-symbols';
 import * as Haptics from 'expo-haptics';
 import { Theme, radii, spacing, statusColor, tintFor, type, useTheme } from '../lib/theme';
+import { Glass } from './surface';
 
 export function StatusDot({ status, size = 8 }: { status?: string; size?: number }) {
   const t = useTheme();
@@ -38,8 +39,8 @@ export function Avatar({ name, tintKey, size = 36, status }: { name: string; tin
 }
 
 const buttonVariants = (t: Theme) => ({
-  primary: { bg: t.accent, fg: t.accentContrast },
-  secondary: { bg: t.surface, fg: t.text },
+  primary: { bg: t.accentStrong, fg: t.accentContrast },
+  secondary: { bg: t.translucent ? t.glassFallback : t.surface, fg: t.text },
   ghost: { bg: 'transparent', fg: t.textSecondary },
   destructive: { bg: t.danger, fg: '#fff' },
 });
@@ -86,6 +87,7 @@ export function IconButton({ icon, onPress, label, size = 36, tint, filled = tru
   icon: string; onPress?: () => void; label: string; size?: number; tint?: string; filled?: boolean; disabled?: boolean;
 }) {
   const t = useTheme();
+  const glyph = <SymbolView name={icon as never} size={size * 0.48} tintColor={tint ?? t.text} weight="medium" />;
   return (
     <Pressable
       onPress={onPress}
@@ -93,13 +95,15 @@ export function IconButton({ icon, onPress, label, size = 36, tint, filled = tru
       hitSlop={6}
       accessibilityRole="button"
       accessibilityLabel={label}
-      style={({ pressed }) => ({
-        width: size, height: size, borderRadius: size / 2, alignItems: 'center', justifyContent: 'center',
-        backgroundColor: filled ? t.surface : 'transparent',
-        opacity: disabled ? 0.4 : pressed ? 0.6 : 1,
-      })}
+      style={({ pressed }) => ({ opacity: disabled ? 0.4 : pressed ? 0.6 : 1 })}
     >
-      <SymbolView name={icon as never} size={size * 0.48} tintColor={tint ?? t.text} weight="medium" />
+      {filled ? (
+        <Glass radius={size / 2} interactive thin style={{ width: size, height: size, alignItems: 'center', justifyContent: 'center' }}>
+          {glyph}
+        </Glass>
+      ) : (
+        <View style={{ width: size, height: size, alignItems: 'center', justifyContent: 'center' }}>{glyph}</View>
+      )}
     </Pressable>
   );
 }
@@ -109,20 +113,27 @@ export function Chip({ label, sub, icon, onPress, selected }: {
   label: string; sub?: string; icon?: string; onPress?: () => void; selected?: boolean;
 }) {
   const t = useTheme();
-  return (
-    <Pressable
-      onPress={onPress}
-      accessibilityRole="button"
-      style={({ pressed }) => [
-        styles.chip,
-        { backgroundColor: selected ? t.accent : t.surface, opacity: pressed ? 0.7 : 1 },
-      ]}
-    >
-      {icon ? <SymbolView name={icon as never} size={14} tintColor={selected ? t.accentContrast : t.textSecondary} /> : null}
-      <View style={{ minWidth: 0 }}>
+  const body = (
+    <>
+      {icon ? <SymbolView name={icon as never} size={14} tintColor={selected ? t.accentContrast : t.link} /> : null}
+      <View style={{ minWidth: 0, flexShrink: 1 }}>
         <Text style={[type.subhead, { color: selected ? t.accentContrast : t.text, fontWeight: '600', lineHeight: 18 }]} numberOfLines={1}>{label}</Text>
         {sub ? <Text style={[type.footnote, { color: selected ? t.accentContrast : t.textSecondary }]} numberOfLines={1}>{sub}</Text> : null}
       </View>
+    </>
+  );
+  return (
+    <Pressable
+      onPress={() => { void Haptics.selectionAsync(); onPress?.(); }}
+      accessibilityRole="button"
+      accessibilityState={{ selected: !!selected }}
+      style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
+    >
+      {selected ? (
+        <View style={[styles.chip, { backgroundColor: t.accentStrong }]}>{body}</View>
+      ) : (
+        <Glass radius={radii.lg} interactive style={styles.chip}>{body}</Glass>
+      )}
     </Pressable>
   );
 }
@@ -154,7 +165,7 @@ export function Segmented<T extends string>({ options, value, onChange }: {
 export function Tag({ label, color }: { label: string; color?: string }) {
   const t = useTheme();
   return (
-    <View style={[styles.tag, { backgroundColor: color ? `${color}22` : t.surface }]}>
+    <View style={[styles.tag, { backgroundColor: color ? `${color}22` : t.fill }]}>
       <Text style={[type.caption, { color: color ?? t.textSecondary }]} numberOfLines={1}>{label}</Text>
     </View>
   );
@@ -202,14 +213,16 @@ export function Group({ children }: { children: React.ReactNode }) {
   const t = useTheme();
   const items = React.Children.toArray(children).filter(Boolean);
   return (
-    <View style={[styles.group, { backgroundColor: t.surface }]}>
-      {items.map((child, i) => (
-        <React.Fragment key={i}>
-          {child}
-          {i < items.length - 1 ? <View style={[styles.groupSep, { backgroundColor: t.separator }]} /> : null}
-        </React.Fragment>
-      ))}
-    </View>
+    <Glass radius={radii.xl}>
+      <View style={styles.groupClip}>
+        {items.map((child, i) => (
+          <React.Fragment key={i}>
+            {child}
+            {i < items.length - 1 ? <View style={[styles.groupSep, { backgroundColor: t.separator }]} /> : null}
+          </React.Fragment>
+        ))}
+      </View>
+    </Glass>
   );
 }
 
@@ -219,9 +232,9 @@ export function EmptyState({ icon, title, body, actionLabel, onAction, children 
   const t = useTheme();
   return (
     <View style={styles.empty}>
-      <View style={[styles.emptyGlyph, { backgroundColor: t.surface }]}>
-        <SymbolView name={icon as never} size={30} tintColor={t.textTertiary} weight="light" />
-      </View>
+      <Glass radius={36} style={styles.emptyGlyph}>
+        <SymbolView name={icon as never} size={30} tintColor={t.link} weight="light" />
+      </Glass>
       <Text style={[type.title2, { color: t.text, marginTop: spacing(2) }]}>{title}</Text>
       {body ? <Text style={[type.subhead, { color: t.textSecondary, textAlign: 'center' }]}>{body}</Text> : null}
       {actionLabel && onAction ? (
@@ -243,12 +256,12 @@ export function ConnectionBadge({ status, detail }: { status: string; detail?: s
     : status === 'connecting' || status === 'reconnecting' ? t.warning
     : status === 'disconnected' ? t.textTertiary : t.danger;
   return (
-    <View style={[styles.badge, { backgroundColor: t.surface }]}>
+    <Glass radius={radii.pill} thin style={styles.badge}>
       {status === 'connecting' || status === 'reconnecting'
         ? <ActivityIndicator size={10} color={color} />
         : <View style={[styles.badgeDot, { backgroundColor: color }]} />}
       <Text style={[type.caption, { color: t.textSecondary }]}>{label}</Text>
-    </View>
+    </Glass>
   );
 }
 
@@ -278,7 +291,7 @@ const styles = StyleSheet.create({
   },
   rowLeading: { width: 28, alignItems: 'center' },
   rowText: { flex: 1, minWidth: 0 },
-  group: { borderRadius: radii.lg, borderCurve: 'continuous', overflow: 'hidden' },
+  groupClip: { borderRadius: radii.xl, borderCurve: 'continuous', overflow: 'hidden' },
   groupSep: { height: StyleSheet.hairlineWidth, marginLeft: spacing(4) + 28 + spacing(3) },
   empty: { alignItems: 'center', paddingVertical: spacing(14), gap: spacing(2), paddingHorizontal: spacing(8) },
   emptyGlyph: { width: 72, height: 72, borderRadius: 36, alignItems: 'center', justifyContent: 'center' },
@@ -288,5 +301,5 @@ const styles = StyleSheet.create({
     borderRadius: radii.pill,
   },
   badgeDot: { width: 7, height: 7, borderRadius: 4 },
-  section: { fontSize: 13, fontWeight: '600', marginBottom: spacing(2), marginTop: spacing(6), marginLeft: spacing(1) },
+  section: { fontSize: 13, fontWeight: '600', marginBottom: spacing(2), marginTop: spacing(6), marginLeft: spacing(2), textTransform: 'uppercase', letterSpacing: 0.4 },
 });

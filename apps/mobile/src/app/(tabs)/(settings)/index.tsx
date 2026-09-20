@@ -1,10 +1,12 @@
 import React from 'react';
-import { ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
+import { Platform, ScrollView, Text, View } from 'react-native';
 import { router, Stack } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
+import { Host, Switch } from '@expo/ui';
 import { useCosmos, useSnapshot } from '../../../lib/client';
-import { useTheme, spacing, useAppearance, type } from '../../../lib/theme';
-import { Row, Group, SectionLabel, Avatar, Segmented } from '../../../components/bits';
+import { useTheme, spacing, type, familyById, useThemePrefs } from '../../../lib/theme';
+import { Row, Group, SectionLabel, Avatar } from '../../../components/bits';
+import { Screen } from '../../../components/surface';
 import { ensureNotificationPermission } from '../../../lib/notify';
 
 export default function SettingsScreen() {
@@ -13,15 +15,15 @@ export default function SettingsScreen() {
   const auth = useSnapshot(client.auth);
   const connection = useSnapshot(client.connection);
   const [notifEnabled, setNotifEnabled] = React.useState(false);
-  const [appearance, setAppearance] = useAppearance();
+  const [prefs] = useThemePrefs();
 
   React.useEffect(() => {
     void ensureNotificationPermission().then(setNotifEnabled);
   }, []);
 
   return (
-    <View style={[styles.screen, { backgroundColor: t.background }]}>
-      <Stack.Screen options={{ title: 'Settings', headerLargeTitle: true, headerShown: true }} />
+    <Screen>
+      <Stack.Screen options={{ title: 'Settings', headerShown: true }} />
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: spacing(4), paddingBottom: spacing(10) }}>
 
         <SectionLabel>Account</SectionLabel>
@@ -71,17 +73,14 @@ export default function SettingsScreen() {
 
         <SectionLabel>Appearance</SectionLabel>
         <Group>
-          <View style={{ paddingHorizontal: spacing(4), paddingVertical: spacing(3), gap: spacing(3) }}>
-            <Segmented
-              value={appearance}
-              onChange={setAppearance}
-              options={[
-                { id: 'system', label: 'System' },
-                { id: 'light', label: 'Light' },
-                { id: 'dark', label: 'Dark' },
-              ]}
-            />
-          </View>
+          <Row
+            title="Theme & background"
+            subtitle={`${familyById(prefs.family).name} · ${prefs.appearance === 'system' ? 'System' : prefs.appearance === 'dark' ? 'Dark' : 'Light'}${prefs.backdrop.kind !== 'none' ? ' · Background' : ''}`}
+            leading={<SymbolView name="paintpalette" size={18} tintColor={t.link} />}
+            trailing={<View style={{ width: 18, height: 18, borderRadius: 9, backgroundColor: t.accent }} />}
+            onPress={() => router.push('/(tabs)/(settings)/appearance' as never)}
+            chevron
+          />
         </Group>
 
         <SectionLabel>Notifications</SectionLabel>
@@ -90,17 +89,19 @@ export default function SettingsScreen() {
             title="Session events"
             subtitle="Finished, needs input, failed, connection changes"
             leading={<SymbolView name="bell" size={18} tintColor={t.textSecondary} />}
-            trailing={<Switch value={notifEnabled} onValueChange={(v) => { if (v) void ensureNotificationPermission().then(setNotifEnabled); else setNotifEnabled(false); }} />}
+            trailing={(
+              <Host matchContents colorScheme={t.scheme}>
+                <Switch value={notifEnabled} onValueChange={(v) => { if (v) void ensureNotificationPermission().then(setNotifEnabled); else setNotifEnabled(false); }} />
+              </Host>
+            )}
           />
         </Group>
 
         <SectionLabel>About</SectionLabel>
         <Group>
-          <Row title="Cosmos for iOS" subtitle="Remote client for the Cosmos desktop" leading={<SymbolView name="info.circle" size={18} tintColor={t.textSecondary} />} />
+          <Row title={`Cosmos for ${Platform.OS === 'ios' ? 'iOS' : 'Android'}`} subtitle="Remote client for the Cosmos desktop" leading={<SymbolView name="info.circle" size={18} tintColor={t.textSecondary} />} />
         </Group>
       </ScrollView>
-    </View>
+    </Screen>
   );
 }
-
-const styles = StyleSheet.create({ screen: { flex: 1 } });

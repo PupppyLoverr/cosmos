@@ -6,6 +6,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCosmos } from '../lib/client';
 import { useTheme, spacing, type, tintFor } from '../lib/theme';
 import { Button } from '../components/bits';
+import { Screen } from '../components/surface';
 
 // Scattered tinted marks, echoing the desktop's project badges.
 const MARKS: { x: number; y: number; s: number; r: number; icon: string }[] = [
@@ -45,7 +46,7 @@ export default function SignInScreen() {
   };
 
   return (
-    <View style={[styles.screen, { backgroundColor: t.background, paddingTop: insets.top + spacing(2), paddingBottom: insets.bottom + spacing(4) }]}>
+    <Screen style={[styles.screen, { paddingTop: insets.top + spacing(2), paddingBottom: insets.bottom + spacing(4) }]}>
       <View style={styles.hero}>
         {MARKS.map((m) => (
           <View
@@ -75,7 +76,7 @@ export default function SignInScreen() {
           Signing in links this phone to your desktops over the encrypted relay. Local links work without an account.
         </Text>
       </View>
-    </View>
+    </Screen>
   );
 }
 

@@ -5,6 +5,7 @@ import { useLocalSearchParams, router } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { useCosmos, useSnapshot } from '../../lib/client';
 import { useTheme, spacing, radii } from '../../lib/theme';
+import { Screen } from '../../components/surface';
 
 // Watch Live: near-live screenshots while the viewer is open — polls
 // ComputerObserve on a slow cadence (bandwidth-friendly), plus a big red STOP
@@ -78,7 +79,7 @@ export default function WatchLiveScreen() {
   };
 
   return (
-    <View style={[styles.screen, { backgroundColor: t.background }]}>
+    <Screen>
       <View style={styles.meta}>
         <View style={{ flex: 1 }}>
           <Text style={{ color: t.text, fontSize: 16, fontWeight: '600' }} numberOfLines={1}>
@@ -128,7 +129,7 @@ export default function WatchLiveScreen() {
           <Text style={{ color: t.text, fontWeight: '600' }}>Done</Text>
         </Pressable>
       </View>
-    </View>
+    </Screen>
   );
 }
 

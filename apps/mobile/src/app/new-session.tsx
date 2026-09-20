@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Alert, ScrollView, StyleSheet, TextInput, View } from 'react-native';
+import { Alert, ScrollView, StyleSheet, TextInput } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
 import { SymbolView } from 'expo-symbols';
 import { useCosmos, useSnapshot } from '../lib/client';
 import { HarnessId, ReasoningLevel, SandboxLevel } from '../lib/protocol';
 import { useTheme, spacing, radii } from '../lib/theme';
 import { Row, Group, SectionLabel, Button } from '../components/bits';
+import { Glass, Screen } from '../components/surface';
 
 const REASONING: { id: ReasoningLevel; label: string }[] = [
   { id: 'low', label: 'Low' },
@@ -96,9 +97,9 @@ export default function NewSessionScreen() {
   };
 
   return (
-    <View style={[styles.screen, { backgroundColor: t.background }]}>
+    <Screen>
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: spacing(4), paddingBottom: spacing(12) }}>
-        <View style={[styles.promptBox, { backgroundColor: t.surface }]}>
+        <Glass radius={radii.xl} style={styles.promptBox}>
           <TextInput
             style={{ color: t.text, fontSize: 17, lineHeight: 23, minHeight: 96, textAlignVertical: 'top' }}
             autoFocus={!seed}
@@ -108,7 +109,7 @@ export default function NewSessionScreen() {
             value={prompt}
             onChangeText={setPrompt}
           />
-        </View>
+        </Glass>
 
         <SectionLabel>Project</SectionLabel>
         <Group>
@@ -166,14 +167,13 @@ export default function NewSessionScreen() {
           style={styles.createBtn}
         />
       </ScrollView>
-    </View>
+    </Screen>
   );
 }
 
 const styles = StyleSheet.create({
   screen: { flex: 1 },
   promptBox: {
-    borderRadius: radii.xl, borderCurve: 'continuous',
     paddingHorizontal: spacing(4), paddingVertical: spacing(3), marginTop: spacing(2),
   },
   createBtn: { marginTop: spacing(6) },

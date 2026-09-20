@@ -7,6 +7,7 @@ import { useTheme, spacing, radii } from '../lib/theme';
 import { Row, Group, SectionLabel } from '../components/bits';
 import { localSpec, RpcClient } from '../lib/rpc';
 import { EngineInfo } from '../lib/protocol';
+import { Screen } from '../components/surface';
 
 export default function PairScreen() {
   const t = useTheme();
@@ -87,13 +88,13 @@ export default function PairScreen() {
   };
 
   return (
-    <View style={[styles.screen, { backgroundColor: t.background }]}>
+    <Screen>
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: spacing(4) }}>
         <SectionLabel>Local network</SectionLabel>
         <Group>
           <View style={{ padding: spacing(3), gap: spacing(2.5) }}>
             <TextInput
-              style={[styles.input, { color: t.text, borderColor: t.separator, backgroundColor: t.surfaceRaised }]}
+              style={[styles.input, { color: t.text, borderColor: t.separator, backgroundColor: t.fill }]}
               placeholder="Desktop IP, e.g. 192.168.1.20 or host:port"
               placeholderTextColor={t.textTertiary}
               autoCapitalize="none"
@@ -103,7 +104,7 @@ export default function PairScreen() {
               onChangeText={setHost}
             />
             <TextInput
-              style={[styles.input, { color: t.text, borderColor: t.separator, backgroundColor: t.surfaceRaised }]}
+              style={[styles.input, { color: t.text, borderColor: t.separator, backgroundColor: t.fill }]}
               placeholder="Name (optional)"
               placeholderTextColor={t.textTertiary}
               value={name}
@@ -133,7 +134,7 @@ export default function PairScreen() {
         <Pressable
           onPress={() => void link()}
           disabled={probe.state !== 'ok' || busy}
-          style={[styles.linkBtn, { backgroundColor: t.accent, opacity: probe.state === 'ok' && !busy ? 1 : 0.4 }]}
+          style={[styles.linkBtn, { backgroundColor: t.accentStrong, opacity: probe.state === 'ok' && !busy ? 1 : 0.4 }]}
         >
           {busy ? <ActivityIndicator color={t.accentContrast} /> : <Text style={{ color: t.accentContrast, fontWeight: '600', fontSize: 16 }}>Trust & link</Text>}
         </Pressable>
@@ -174,7 +175,7 @@ export default function PairScreen() {
           </>
         )}
       </ScrollView>
-    </View>
+    </Screen>
   );
 }
 

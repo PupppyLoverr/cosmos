@@ -7,6 +7,7 @@ import { Chat, Session } from '../../../lib/protocol';
 import { useTheme, spacing, radii, statusColor, type } from '../../../lib/theme';
 import { EmptyState, ConnectionBadge, IconButton, Tag, Chip } from '../../../components/bits';
 import { HarnessMark } from '../../../components/harness-mark';
+import { Glass, Screen } from '../../../components/surface';
 
 function indicator(chat: Chat, sessions: Session[]): string {
   const live = sessions.find((s) => s.chatId === chat.id);
@@ -99,7 +100,7 @@ export default function SessionsScreen() {
   const connected = connection.status === 'connected';
 
   return (
-    <View style={[styles.screen, { backgroundColor: t.background }]}>
+    <Screen>
       <Stack.Screen
         options={{
           headerShown: true,
@@ -168,15 +169,8 @@ export default function SessionsScreen() {
           const ind = indicator(chat, sessions);
           const space = spaceName(chat);
           const title = chat.title || 'Untitled session';
-          return (
-            <Pressable
-              onPress={() => {
-                void client.markChatSeen(chat.id);
-                router.push({ pathname: '/session/[id]', params: { id: chat.id, title } });
-              }}
-              onLongPress={() => chatActions(client, chat)}
-              style={({ pressed }) => [styles.chatRow, pressed && { backgroundColor: t.surface }]}
-            >
+          const body = (
+            <>
               <HarnessMark key={`${chat.id}:${chat.config?.harness ?? 'cosmos'}`} harness={chat.config?.harness} size={40} status={ind} />
               <View style={styles.chatBody}>
                 <View style={styles.chatTop}>
@@ -188,12 +182,29 @@ export default function SessionsScreen() {
                   {chat.lastMessagePreview || chat.cwd || 'No messages yet'}
                 </Text>
               </View>
+            </>
+          );
+          const open = () => {
+            void client.markChatSeen(chat.id);
+            router.push({ pathname: '/session/[id]', params: { id: chat.id, title } });
+          };
+          return t.hasBackdrop ? (
+            <Pressable onPress={open} onLongPress={() => chatActions(client, chat)} style={({ pressed }) => [styles.chatCardWrap, { opacity: pressed ? 0.8 : 1 }]}>
+              <Glass radius={radii.xl} interactive style={styles.chatCard}>{body}</Glass>
+            </Pressable>
+          ) : (
+            <Pressable
+              onPress={open}
+              onLongPress={() => chatActions(client, chat)}
+              style={({ pressed }) => [styles.chatRow, pressed && { backgroundColor: t.fill }]}
+            >
+              {body}
             </Pressable>
           );
         }}
-        ItemSeparatorComponent={() => <View style={[styles.sep, { backgroundColor: t.separator }]} />}
+        ItemSeparatorComponent={() => t.hasBackdrop ? null : <View style={[styles.sep, { backgroundColor: t.separator }]} />}
       />
-    </View>
+    </Screen>
   );
 }
 
@@ -208,6 +219,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row', alignItems: 'center', gap: spacing(3),
     paddingHorizontal: spacing(4), paddingVertical: spacing(3),
   },
+  chatCardWrap: { paddingHorizontal: spacing(4), paddingVertical: spacing(1.5) },
+  chatCard: { flexDirection: 'row', alignItems: 'center', gap: spacing(3), paddingHorizontal: spacing(4), paddingVertical: spacing(3.5) },
   chatBody: { flex: 1, minWidth: 0, gap: 2 },
   chatTop: { flexDirection: 'row', alignItems: 'center', gap: spacing(2) },
   chatTitle: { fontWeight: '600', flexShrink: 1 },

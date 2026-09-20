@@ -5,6 +5,7 @@ import { SymbolView } from 'expo-symbols';
 import { useCosmos, useSnapshot, LinkedDesktop } from '../../../lib/client';
 import { useTheme, spacing } from '../../../lib/theme';
 import { Row, Group, EmptyState, SectionLabel, StatusDot } from '../../../components/bits';
+import { Screen } from '../../../components/surface';
 
 function DesktopRow({ d, isActive, online, version }: {
   d: LinkedDesktop; isActive: boolean; online?: boolean; version?: string;
@@ -33,9 +34,9 @@ function DesktopRow({ d, isActive, online, version }: {
           { text: 'Cancel', style: 'cancel' },
         ]);
       }}
-      style={({ pressed }) => [styles.dRow, pressed && { backgroundColor: t.surface }]}
+      style={({ pressed }) => [styles.dRow, pressed && { backgroundColor: t.fill }]}
     >
-      <View style={[styles.dIcon, { backgroundColor: t.surface }]}>
+      <View style={[styles.dIcon, { backgroundColor: t.fill }]}>
         <SymbolView name="desktopcomputer" size={20} tintColor={t.textSecondary} />
       </View>
       <View style={{ flex: 1, minWidth: 0 }}>
@@ -51,7 +52,7 @@ function DesktopRow({ d, isActive, online, version }: {
           <Text style={{ color: online ? t.success : t.textTertiary, fontSize: 12 }}>{online ? 'Online' : 'Offline'}</Text>
         </View>
       ) : (
-        <Text style={{ color: t.accent, fontSize: 13 }}>Connect</Text>
+        <Text style={{ color: t.link, fontSize: 13 }}>Connect</Text>
       )}
     </Pressable>
   );
@@ -73,7 +74,7 @@ export default function DesktopsScreen() {
   const sessionCount = sessions.length;
 
   return (
-    <View style={[styles.screen, { backgroundColor: t.background }]}>
+    <Screen>
       <Stack.Screen options={{ title: 'Desktops', headerLargeTitle: true, headerShown: true }} />
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingHorizontal: spacing(4) }}>
         <SectionLabel>Linked</SectionLabel>
@@ -137,7 +138,7 @@ export default function DesktopsScreen() {
           />
         </Group>
       </ScrollView>
-    </View>
+    </Screen>
   );
 }
 

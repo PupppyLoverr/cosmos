@@ -12,6 +12,7 @@ import { useTheme, spacing } from '../../lib/theme';
 import { MessageView } from '../../components/transcript';
 import { Composer } from '../../components/composer';
 import { EmptyState } from '../../components/bits';
+import { Screen } from '../../components/surface';
 
 export default function SessionScreen() {
   const params = useLocalSearchParams<{ id: string; title?: string }>();
@@ -149,7 +150,7 @@ export default function SessionScreen() {
   };
 
   return (
-    <View style={[styles.screen, { backgroundColor: t.background }]}>
+    <Screen>
       <Stack.Screen
         options={{
           title: chat?.title ?? params.title ?? 'Session',
@@ -199,7 +200,7 @@ export default function SessionScreen() {
         onStop={() => void client.interrupt(chatId)}
         placeholder={status === 'awaitingInput' ? 'Waiting for input…' : undefined}
       />
-    </View>
+    </Screen>
   );
 }
 

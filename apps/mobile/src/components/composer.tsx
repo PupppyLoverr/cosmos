@@ -4,6 +4,7 @@ import { SymbolView } from 'expo-symbols';
 import * as Haptics from 'expo-haptics';
 import { PickedFile, pickPhoto, pickDocument, pickFromClipboard } from '../lib/attachments';
 import { radii, spacing, useTheme } from '../lib/theme';
+import { Glass } from './surface';
 
 interface ComposerProps {
   placeholder?: string;
@@ -68,21 +69,21 @@ export function Composer({ placeholder, running, attachments, onAddAttachment, o
 
   return (
     <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-      <View style={[styles.wrap, { borderTopColor: t.separator, backgroundColor: t.background }]}>
+      <View style={[styles.wrap, { backgroundColor: t.translucent || t.hasBackdrop ? 'transparent' : t.background }]}>
         {attachments.length > 0 ? (
           <View style={styles.chips}>
             {attachments.map((f, i) => (
-              <View key={`${f.uri}-${i}`} style={[styles.chip, { backgroundColor: t.surface, borderColor: t.separator }]}>
+              <Glass key={`${f.uri}-${i}`} radius={radii.pill} thin style={styles.chip}>
                 <SymbolView name="doc" size={11} tintColor={t.textSecondary} />
                 <Text style={{ color: t.textSecondary, fontSize: 12, maxWidth: 140 }} numberOfLines={1}>{f.name}</Text>
                 <Pressable onPress={() => onRemoveAttachment(i)} hitSlop={8}>
                   <SymbolView name="xmark" size={11} tintColor={t.textTertiary} />
                 </Pressable>
-              </View>
+              </Glass>
             ))}
           </View>
         ) : null}
-        <View style={[styles.bar, { backgroundColor: t.composerBg }]}>
+        <Glass radius={26} tint={t.translucent ? undefined : t.composerBg} style={styles.bar}>
           <Pressable
             onPress={openAttachSheet}
             disabled={busy}
@@ -117,7 +118,7 @@ export function Composer({ placeholder, running, attachments, onAddAttachment, o
               <SymbolView name="arrow.up" size={15} tintColor={t.accentContrast} weight="bold" />
             </Pressable>
           )}
-        </View>
+        </Glass>
       </View>
     </KeyboardAvoidingView>
   );
@@ -128,14 +129,12 @@ const styles = StyleSheet.create({
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing(2), paddingHorizontal: spacing(3), paddingTop: spacing(2) },
   chip: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(1.5),
-    borderWidth: StyleSheet.hairlineWidth, borderRadius: radii.pill,
     paddingHorizontal: spacing(2.5), paddingVertical: spacing(1),
   },
   bar: {
     flexDirection: 'row', alignItems: 'flex-end', gap: spacing(1.5),
-    marginHorizontal: spacing(3), marginTop: spacing(2), borderRadius: 26, borderCurve: 'continuous',
+    marginHorizontal: spacing(3), marginTop: spacing(2),
     paddingHorizontal: spacing(2), paddingVertical: spacing(2),
-    boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
   },
   iconBtn: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center' },
   input: { flex: 1, fontSize: 17, lineHeight: 22, maxHeight: 140, paddingVertical: spacing(1.5), paddingHorizontal: spacing(1.5) },
