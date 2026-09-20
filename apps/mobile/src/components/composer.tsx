@@ -9,6 +9,11 @@ import { Glass } from './surface';
 
 interface ComposerProps {
   placeholder?: string;
+  /** Text present when the composer mounts (a suggested prompt). */
+  initialText?: string;
+  onChangeText?: (text: string) => void;
+  /** Extra padding below the bar when it sits at the screen edge. */
+  bottomInset?: number;
   /** A turn is in flight: the primary control becomes Stop and text steers the run. */
   running: boolean;
   /** An upload/send is in progress. */
@@ -52,9 +57,10 @@ function AttachmentChip({ file, onRemove }: { file: PickedFile; onRemove: () => 
   );
 }
 
-export function Composer({ placeholder, running, sending, attachments, onAddAttachment, onRemoveAttachment, onSend, onStop }: ComposerProps) {
+export function Composer({ placeholder, initialText, onChangeText, bottomInset, running, sending, attachments, onAddAttachment, onRemoveAttachment, onSend, onStop }: ComposerProps) {
   const t = useTheme();
-  const [text, setText] = useState('');
+  const [text, setTextState] = useState(initialText ?? '');
+  const setText = (v: string) => { setTextState(v); onChangeText?.(v); };
   const [busy, setBusy] = useState(false);
   const [focused, setFocused] = useState(false);
   const input = useRef<TextInput>(null);
@@ -107,7 +113,7 @@ export function Composer({ placeholder, running, sending, attachments, onAddAtta
   const showStop = running && !text.trim() && attachments.length === 0;
 
   return (
-    <View style={styles.wrap}>
+    <View style={[styles.wrap, bottomInset !== undefined ? { paddingBottom: bottomInset } : null]}>
       {attachments.length > 0 ? (
         <View style={styles.chips}>
           {attachments.map((f, i) => <AttachmentChip key={`${f.uri}-${i}`} file={f} onRemove={() => onRemoveAttachment(i)} />)}
@@ -135,6 +141,7 @@ export function Composer({ placeholder, running, sending, attachments, onAddAtta
           placeholderTextColor={t.textTertiary}
           value={text}
           onChangeText={setText}
+          autoFocus={!!initialText}
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
           multiline

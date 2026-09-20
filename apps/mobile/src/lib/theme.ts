@@ -470,7 +470,8 @@ export const liquidGlassSupported = liquidAvailable;
 
 export const spacing = (n: number) => n * 4;
 
-export const radii = { sm: 8, md: 12, lg: 16, xl: 22, xxl: 28, pill: 999 };
+// Tight corners on purpose: rows and cards are content, not tiles.
+export const radii = { sm: 6, md: 10, lg: 12, xl: 14, xxl: 18, pill: 999 };
 
 /** Screen edge inset — one value, used everywhere content meets the screen edge. */
 export const edge = spacing(4);

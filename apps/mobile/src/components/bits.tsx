@@ -1,5 +1,5 @@
 import React from 'react';
-import { ActivityIndicator, Platform, Pressable, StyleProp, StyleSheet, Text, TextInput, View, ViewStyle, type TextInputProps, type TextStyle } from 'react-native';
+import { ActivityIndicator, Pressable, StyleProp, StyleSheet, Text, TextInput, View, ViewStyle, type TextInputProps, type TextStyle } from 'react-native';
 import { SymbolView, type SymbolViewProps } from 'expo-symbols';
 import { Host, Slider as NativeSlider } from '@expo/ui';
 import * as Haptics from 'expo-haptics';
@@ -253,10 +253,11 @@ export function Field({ label, style, ...input }: { label: string; style?: Style
   );
 }
 
+/** Small tinted glyph on a faint fill — no solid colour blocks. */
 export function IconTile({ name, tint, size = 29 }: { name: string; tint: string; size?: number }) {
   return (
-    <View style={{ width: size, height: size, borderRadius: size * 0.24, borderCurve: 'continuous', backgroundColor: tint, alignItems: 'center', justifyContent: 'center' }}>
-      <Icon name={name} size={size * 0.55} color="#fff" weight="semibold" />
+    <View style={{ width: size, height: size, borderRadius: Math.min(8, Math.round(size * 0.28)), backgroundColor: alpha(tint, 0.14), alignItems: 'center', justifyContent: 'center' }}>
+      <Icon name={name} size={size * 0.55} color={tint} weight="medium" />
     </View>
   );
 }
@@ -270,7 +271,7 @@ export function Group({ children, header, footer, insetSeparators = true, style 
   return (
     <View style={style}>
       {header ? <SectionLabel>{header}</SectionLabel> : null}
-      <Glass radius={Platform.OS === 'ios' ? radii.xl - 2 : radii.md}>
+      <Glass radius={radii.md}>
         <View style={styles.groupClip}>
           {items.map((child, i) => (
             <React.Fragment key={i}>
@@ -389,7 +390,7 @@ const styles = StyleSheet.create({
   // Title keeps its natural width; the value fills the rest and truncates.
   rowTextFixed: { flexShrink: 0 },
   rowValue: { flex: 1, textAlign: 'right' },
-  groupClip: { borderRadius: Platform.OS === 'ios' ? radii.xl - 2 : radii.md, borderCurve: 'continuous', overflow: 'hidden' },
+  groupClip: { borderRadius: radii.md, overflow: 'hidden' },
   groupSep: { height: StyleSheet.hairlineWidth, marginLeft: edge },
   groupSepInset: { marginLeft: edge + 29 + spacing(3) },
   section: { fontWeight: '500', marginBottom: spacing(1.75), marginTop: spacing(5), marginLeft: edge, letterSpacing: 0.2 },

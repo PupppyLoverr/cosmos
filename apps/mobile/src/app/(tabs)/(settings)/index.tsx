@@ -3,8 +3,9 @@ import { Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router, Stack } from 'expo-router';
 import { Host, Switch } from '@expo/ui';
 import { useCosmos, useSnapshot } from '../../../lib/client';
-import { useTheme, spacing, type, familyById, useThemePrefs, edge, surfaceOptions } from '../../../lib/theme';
-import { Row, Group, Icon, ConnectionBadge } from '../../../components/bits';
+import { useTheme, spacing, type, familyById, useThemePrefs, edge, surfaceOptions, backdropPresets } from '../../../lib/theme';
+import { Row, Group, ConnectionBadge } from '../../../components/bits';
+import { HarnessMark } from '../../../components/harness-mark';
 import { Screen } from '../../../components/surface';
 import { ensureNotificationPermission } from '../../../lib/notify';
 
@@ -20,11 +21,14 @@ export default function SettingsScreen() {
     void ensureNotificationPermission().then(setNotifEnabled);
   }, []);
 
-  const appearanceSummary = [
-    familyById(prefs.family).name,
-    surfaceOptions.find((o) => o.id === prefs.surface)?.label,
-    prefs.backdrop.kind === 'photo' ? 'Photo' : prefs.backdrop.kind === 'preset' ? 'Gradient' : null,
-  ].filter(Boolean).join(' · ');
+  const material = surfaceOptions.find((o) => o.id === prefs.surface)?.label ?? 'Auto';
+  const b = prefs.backdrop;
+  const backdrop = b.kind === 'photo'
+    ? (prefs.effect === 'none' ? 'Photo' : `Photo · ${prefs.effect[0]!.toUpperCase()}${prefs.effect.slice(1)}`)
+    : b.kind === 'preset'
+      ? (backdropPresets.find((p) => p.id === b.id)?.name ?? 'Gradient')
+      : 'None';
+  const openAppearance = () => router.push('/(tabs)/(settings)/appearance' as never);
 
   return (
     <Screen>
@@ -36,14 +40,14 @@ export default function SettingsScreen() {
               tall
               title={auth.user.name || auth.user.email}
               subtitle={auth.user.email}
-              leading={<Monogram name={auth.user.name || auth.user.email} />}
+              leading={<HarnessMark size={32} />}
             />
           ) : (
             <Row
               tall
               title="Sign in with Woozlit"
               subtitle="Reach your desktops away from home"
-              leading={<Monogram />}
+              leading={<HarnessMark size={32} />}
               onPress={() => router.push('/sign-in')}
               chevron
             />
@@ -62,15 +66,10 @@ export default function SettingsScreen() {
           />
         </Group>
 
-        <Group header="Personalization">
-          <Row
-            icon="paintpalette"
-            iconTint={t.accentStrong}
-            title="Appearance"
-            value={appearanceSummary}
-            onPress={() => router.push('/(tabs)/(settings)/appearance' as never)}
-            chevron
-          />
+        <Group header="Appearance">
+          <Row title="Theme" value={familyById(prefs.family).name} onPress={openAppearance} chevron />
+          <Row title="Material" value={material} onPress={openAppearance} chevron />
+          <Row title="Backdrop" value={backdrop} onPress={openAppearance} chevron />
         </Group>
 
         <Group header="Notifications" footer="Get notified when a session finishes, needs your input, fails, or the desktop connection changes.">
@@ -101,18 +100,7 @@ export default function SettingsScreen() {
   );
 }
 
-function Monogram({ name }: { name?: string }) {
-  const t = useTheme();
-  const initial = name?.trim().charAt(0).toUpperCase();
-  return (
-    <View style={[styles.monogram, { backgroundColor: initial ? t.accentStrong : t.fill }]}>
-      {initial ? <Text style={[type.title3, { color: t.accentContrast }]}>{initial}</Text> : <Icon name="person.crop.circle.fill" size={26} color={t.textSecondary} />}
-    </View>
-  );
-}
-
 const styles = StyleSheet.create({
   content: { paddingHorizontal: edge, paddingBottom: spacing(12) },
-  monogram: { width: 48, height: 48, borderRadius: 24, alignItems: 'center', justifyContent: 'center' },
   about: { alignItems: 'center', gap: 2, marginTop: spacing(10) },
 });

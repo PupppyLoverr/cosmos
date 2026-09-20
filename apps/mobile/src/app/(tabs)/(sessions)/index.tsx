@@ -6,7 +6,7 @@ import * as Haptics from 'expo-haptics';
 import { useCosmos, useSnapshot } from '../../../lib/client';
 import { Chat, Session } from '../../../lib/protocol';
 import { useTheme, spacing, radii, statusColor, type, edge, alpha } from '../../../lib/theme';
-import { EmptyState, IconButton, Icon, StatusDot, Notice, Button } from '../../../components/bits';
+import { EmptyState, Icon, StatusDot, Notice, Button } from '../../../components/bits';
 import { HarnessMark } from '../../../components/harness-mark';
 import { Glass, Screen } from '../../../components/surface';
 
@@ -134,9 +134,6 @@ export default function SessionsScreen() {
             onChangeText: (e) => setQuery(e.nativeEvent.text),
             hideWhenScrolling: true,
           },
-          headerRight: () => (
-            <IconButton icon="square.and.pencil" label="New session" onPress={() => router.push('/new-session')} filled={false} disabled={!connected} />
-          ),
         }}
       />
       <FlashList
@@ -161,6 +158,17 @@ export default function SessionsScreen() {
               </Text>
               <Icon name="chevron.right" size={10} color={t.textTertiary} weight="semibold" />
             </Pressable>
+            {connected && items.length ? (
+              <Pressable
+                onPress={() => { void Haptics.selectionAsync(); router.push('/new-session'); }}
+                accessibilityRole="button"
+                accessibilityLabel="New session"
+                style={({ pressed }) => [styles.newRow, { backgroundColor: pressed ? t.fill : t.surface, borderColor: t.separator }]}
+              >
+                <Icon name="plus" size={14} color={t.textSecondary} weight="semibold" />
+                <Text style={[type.subhead, { color: t.textSecondary }]}>New session</Text>
+              </Pressable>
+            ) : null}
             {!connected && connection.detail ? (
               <Notice kind="warning" title={connecting ? 'Reconnecting' : "Can't reach the desktop"} body={connection.detail} />
             ) : null}
@@ -220,16 +228,16 @@ export default function SessionsScreen() {
           // Over a wallpaper each row is its own glass cell; otherwise rows form an inset-grouped list.
           const cells = t.hasBackdrop && t.translucent;
           const shape = cells
-            ? { borderRadius: radii.xl }
+            ? { borderRadius: radii.md }
             : {
-                borderTopLeftRadius: first ? radii.xl : 0,
-                borderTopRightRadius: first ? radii.xl : 0,
-                borderBottomLeftRadius: last ? radii.xl : 0,
-                borderBottomRightRadius: last ? radii.xl : 0,
+                borderTopLeftRadius: first ? radii.md : 0,
+                borderTopRightRadius: first ? radii.md : 0,
+                borderBottomLeftRadius: last ? radii.md : 0,
+                borderBottomRightRadius: last ? radii.md : 0,
               };
           const content = (
             <>
-              <HarnessMark key={`${chat.id}:${chat.config?.harness ?? 'cosmos'}`} harness={chat.config?.harness} size={44} status={ind} />
+              <HarnessMark key={`${chat.id}:${chat.config?.harness ?? 'cosmos'}`} harness={chat.config?.harness} size={28} status={ind} plain />
               <View style={styles.chatBody}>
                 <View style={styles.chatTop}>
                   <Text style={[type.body, styles.chatTitle, { color: t.text }]} numberOfLines={1}>{title}</Text>
@@ -267,7 +275,7 @@ export default function SessionsScreen() {
           );
           return cells ? (
             <View style={styles.cellWrap}>
-              <Glass radius={radii.xl} interactive>{pressable(undefined)}</Glass>
+              <Glass radius={radii.md} interactive>{pressable(undefined)}</Glass>
             </View>
           ) : (
             <View>
@@ -292,8 +300,11 @@ const styles = StyleSheet.create({
   cellWrap: { paddingBottom: spacing(2) },
   chatRow: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(3),
-    paddingHorizontal: edge, paddingVertical: spacing(3), minHeight: 72,
-    borderCurve: 'continuous',
+    paddingHorizontal: edge, paddingVertical: spacing(2.5), minHeight: 64,
+  },
+  newRow: {
+    flexDirection: 'row', alignItems: 'center', gap: spacing(2),
+    paddingHorizontal: edge, minHeight: 44, borderRadius: radii.md, borderWidth: StyleSheet.hairlineWidth,
   },
   chatBody: { flex: 1, minWidth: 0, gap: 3 },
   chatTop: { flexDirection: 'row', alignItems: 'baseline', gap: spacing(2) },
@@ -301,12 +312,12 @@ const styles = StyleSheet.create({
   chatBottom: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
   status: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
   unread: { width: 8, height: 8, borderRadius: 4 },
-  sep: { height: StyleSheet.hairlineWidth, marginLeft: edge + 44 + spacing(3) },
+  sep: { height: StyleSheet.hairlineWidth, marginLeft: edge + 28 + spacing(3) },
   suggestions: { alignSelf: 'stretch', gap: spacing(2.5), marginTop: spacing(6) },
   suggestion: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(3),
     paddingHorizontal: spacing(3.5), paddingVertical: spacing(3),
-    borderRadius: radii.lg, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: radii.md, borderWidth: StyleSheet.hairlineWidth,
   },
-  suggestionIcon: { width: 34, height: 34, borderRadius: 10, borderCurve: 'continuous', alignItems: 'center', justifyContent: 'center' },
+  suggestionIcon: { width: 30, height: 30, borderRadius: radii.sm, alignItems: 'center', justifyContent: 'center' },
 });

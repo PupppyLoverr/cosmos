@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router } from 'expo-router';
 import * as Haptics from 'expo-haptics';
-import { useCosmos, useSnapshot } from '../lib/client';
+import { PLACEHOLDER_NAME, useCosmos, useSnapshot } from '../lib/client';
 import { alpha, radii, spacing, type, useTheme } from '../lib/theme';
 import { Button, Field, Group, Icon, IconTile, Row, SectionLabel } from '../components/bits';
 import { localSpec, RpcClient } from '../lib/rpc';
@@ -84,7 +84,7 @@ export default function PairScreen() {
     setBusy(true);
     try {
       const { h, p } = hostParts(host);
-      const desktop = await client.addLocalDesktop(h, p, name.trim() || probe.info?.deviceId?.slice(0, 8));
+      const desktop = await client.addLocalDesktop(h, p, name.trim() || PLACEHOLDER_NAME);
       await client.connect(desktop);
       leave();
     } catch (e) {
@@ -134,7 +134,7 @@ export default function PairScreen() {
               autoFocus
             />
             <View style={[styles.sep, { backgroundColor: t.separator }]} />
-            <Field label="Name" placeholder="Optional" value={name} onChangeText={setName} returnKeyType="done" />
+            <Field label="Name" placeholder="Uses the Mac's name" value={name} onChangeText={setName} returnKeyType="done" />
           </Group>
 
           {probe.state === 'ok' ? (

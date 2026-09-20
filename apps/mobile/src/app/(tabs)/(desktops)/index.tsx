@@ -4,7 +4,7 @@ import { router, Stack } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import { useCosmos, useSnapshot, LinkedDesktop, type ConnectionInfo } from '../../../lib/client';
 import { alpha, radii, spacing, type, useTheme, type Theme } from '../../../lib/theme';
-import { Row, Group, EmptyState, SectionLabel, Icon, IconTile, Tag } from '../../../components/bits';
+import { Row, Group, EmptyState, SectionLabel, Icon, IconTile } from '../../../components/bits';
 import { Glass, Screen } from '../../../components/surface';
 
 function connectionLabel(c: ConnectionInfo, t: Theme): { label: string; color: string } {
@@ -35,7 +35,7 @@ function ActiveDesktop({ desktop, connection, version, platform, sessions, compu
     <Glass radius={radii.xl} style={styles.hero}>
       <View style={styles.heroTop}>
         <View style={[styles.heroIcon, { backgroundColor: alpha(t.accent, 0.16) }]}>
-          <Icon name={platformIcon(platform)} size={30} color={t.link} weight="regular" />
+          <Icon name={platformIcon(platform)} size={26} color={t.link} weight="regular" />
         </View>
         <View style={{ flex: 1, minWidth: 0 }}>
           <Text style={[type.title3, { color: t.text }]} numberOfLines={1}>{desktop.name}</Text>
@@ -151,7 +151,7 @@ export default function DesktopsScreen() {
                   title={d.name}
                   subtitle={d.kind === 'local' ? `Local · ${d.address}` : 'Remote · via Woozlit'}
                   leading={<IconTile name={d.kind === 'local' ? 'laptopcomputer' : 'globe'} tint={t.textTertiary} size={32} />}
-                  trailing={<Tag label="Connect" color={t.link} />}
+                  chevron
                   onPress={() => { void Haptics.selectionAsync(); void client.connect(d); }}
                   onLongPress={() => actions(d)}
                 />
@@ -188,7 +188,7 @@ const styles = StyleSheet.create({
   content: { paddingHorizontal: spacing(4), paddingBottom: spacing(10) },
   hero: { padding: spacing(4), marginTop: spacing(2) },
   heroTop: { flexDirection: 'row', alignItems: 'center', gap: spacing(3.5) },
-  heroIcon: { width: 56, height: 56, borderRadius: 16, borderCurve: 'continuous', alignItems: 'center', justifyContent: 'center' },
+  heroIcon: { width: 48, height: 48, borderRadius: radii.md, alignItems: 'center', justifyContent: 'center' },
   status: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), marginTop: 2 },
   dot: { width: 8, height: 8, borderRadius: 4 },
   facts: { flexDirection: 'row', marginTop: spacing(4), paddingTop: spacing(3.5), borderTopWidth: StyleSheet.hairlineWidth },

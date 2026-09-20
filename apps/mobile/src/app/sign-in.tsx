@@ -7,6 +7,7 @@ import { useCosmos } from '../lib/client';
 import { useTheme, spacing, type, radii, alpha } from '../lib/theme';
 import { Button, Icon, Notice } from '../components/bits';
 import { Glass, Screen } from '../components/surface';
+import { HarnessMark } from '../components/harness-mark';
 
 const PERKS: { icon: string; title: string; body: string }[] = [
   { icon: 'desktopcomputer', title: 'Every desktop, one list', body: 'Macs signed into your account show up here automatically.' },
@@ -62,9 +63,7 @@ export default function SignInScreen() {
   return (
     <Screen style={[styles.screen, { paddingTop: insets.top + spacing(4), paddingBottom: insets.bottom + spacing(4) }]}>
       <View style={styles.hero}>
-        <View style={[styles.mark, { backgroundColor: t.accentStrong, boxShadow: `0 12px 32px ${alpha(t.accentStrong, 0.35)}` }]}>
-          <Icon name="sparkles" size={40} color={t.accentContrast} weight="semibold" />
-        </View>
+        <HarnessMark size={64} />
         <Text style={[type.largeTitle, { color: t.text, textAlign: 'center' }]}>Welcome to Cosmos</Text>
         <Text style={[type.body, { color: t.textSecondary, textAlign: 'center', maxWidth: 300 }]}>
           Sign in to reach your Macs and their agents from anywhere.
