@@ -46,8 +46,10 @@ description: How to run and E2E-test the Cosmos Expo mobile companion app (apps/
 - Mouse-wheel does not scroll RN ScrollViews in the sim; use drags. The Expo Go floating dev
   bubble sits bottom-right and steals taps (e.g. Watch Live "Pause") — drag it elsewhere first.
 - Photo picker: seed the sim library with `xcrun simctl addmedia <udid> file.jpg` (use `sips` to
-  convert if PIL is unavailable). Horizontal drags on in-card sliders can still occasionally
-  trigger the stack back-swipe; slow multi-step `left_mouse_down`/`mouse_move` drags are reliable.
+  convert if PIL is unavailable). Prefer atomic `left_click_drag` for slider tests; low-level
+  `left_mouse_down`/`mouse_move`/`left_mouse_up` sequences can leave the button stuck and fire
+  stray taps (creating sessions / changing prefs). If input misbehaves, send `left_mouse_up` and
+  re-click the Simulator titlebar to refocus (Cosmos.app can steal focus).
 - Compare wallpaper effects at full res: `sips -c 400 400 --cropOffset X Y shot.png --out crop.png`
   on the `simctl` screenshots — the scaled desktop capture hides halftone/scanline detail.
 
