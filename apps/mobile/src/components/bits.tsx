@@ -222,7 +222,7 @@ export function Row({ title, subtitle, value, leading, icon, iconTint, trailing,
       accessibilityState={selected !== undefined ? { selected } : undefined}
     >
       {lead ? <View style={styles.rowLeading}>{lead}</View> : null}
-      <View style={[styles.rowText, value ? styles.rowTextFixed : null]}>
+      <View style={styles.rowText}>
         <Text style={[type.body, { color: danger ? t.danger : t.text }]} numberOfLines={1}>{title}</Text>
         {subtitle ? <Text style={[type.subhead, { color: t.textSecondary, marginTop: 1 }]} numberOfLines={tall ? 2 : 1}>{subtitle}</Text> : null}
       </View>
@@ -386,8 +386,7 @@ const styles = StyleSheet.create({
   rowTall: { paddingVertical: spacing(3.25), minHeight: 60 },
   rowLeading: { alignItems: 'center', justifyContent: 'center' },
   rowText: { flex: 1, minWidth: 0 },
-  rowTextFixed: { flexGrow: 0, flexShrink: 0, flexBasis: 'auto' },
-  rowValue: { flex: 1, textAlign: 'right', minWidth: 0 },
+  rowValue: { flexShrink: 1, textAlign: 'right', maxWidth: '58%' },
   groupClip: { borderRadius: Platform.OS === 'ios' ? radii.xl - 2 : radii.md, borderCurve: 'continuous', overflow: 'hidden' },
   groupSep: { height: StyleSheet.hairlineWidth, marginLeft: edge },
   groupSepInset: { marginLeft: edge + 29 + spacing(3) },

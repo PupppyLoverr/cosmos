@@ -248,7 +248,7 @@ function Tile({ label, selected, onPress, children, accessibilityHint }: {
           </View>
         ) : null}
       </View>
-      <Text style={[type.caption, { color: selected ? t.text : t.textSecondary, fontWeight: selected ? '600' : '400' }]}>{label}</Text>
+      <Caption style={[type.caption, { fontWeight: selected ? '600' : '400', opacity: selected || t.hasBackdrop ? 1 : 0.85 }]}>{label}</Caption>
     </Pressable>
   );
 }
