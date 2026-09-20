@@ -2,7 +2,7 @@
   "expo": {
     "name": "Cosmos",
     "slug": "cosmos-mobile",
-    "version": "0.1.0",
+    "version": "0.2.79",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "scheme": "cosmos",
@@ -10,6 +10,8 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "sh.zeron.mobile",
+      "buildNumber": "1",
+      "icon": "./assets/icon.png",
       "infoPlist": {
         "NSCameraUsageDescription": "Attach photos from the camera to a session.",
         "NSPhotoLibraryUsageDescription": "Attach photos from your library to a session.",
@@ -18,6 +20,7 @@
     },
     "android": {
       "package": "sh.zeron.mobile",
+      "versionCode": 2079,
       "adaptiveIcon": {
         "backgroundColor": "#0B0B0C",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -28,7 +31,18 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 160,
+          "resizeMode": "contain",
+          "backgroundColor": "#F5F5F7",
+          "dark": { "backgroundColor": "#0B0B0C" }
+        }
+      ],
       "expo-secure-store",
+      "./plugins/with-scene-lifecycle.js",
       "expo-notifications"
     ],
     "experiments": {

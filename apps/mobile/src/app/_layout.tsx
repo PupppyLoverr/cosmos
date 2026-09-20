@@ -1,28 +1,28 @@
 import React from 'react';
+import { Platform } from 'react-native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import { CosmosProvider, useCosmos, useSnapshot } from '../lib/client';
-import { loadAppearance, useTheme } from '../lib/theme';
+import { CosmosProvider } from '../lib/client';
+import { ThemeProvider, loadThemePrefs, useTheme } from '../lib/theme';
 
-// Restore a pinned Light/Dark before the first frame so the launch doesn't flash.
-void loadAppearance();
+// Restore the pinned appearance before the first frame so the launch doesn't flash.
+void loadThemePrefs();
 
 function ThemedStack() {
   const t = useTheme();
-  const client = useCosmos();
-  const connection = useSnapshot(client.connection);
+  const dark = t.scheme === 'dark';
   return (
     <>
-      <StatusBar style={t.scheme === 'dark' ? 'light' : 'dark'} />
+      <StatusBar style={dark ? 'light' : 'dark'} />
       <Stack
         screenOptions={{
-          headerStyle: { backgroundColor: t.background },
           headerTintColor: t.text,
           headerTitleStyle: { fontWeight: '600' },
           headerLargeTitleStyle: { fontWeight: '700' },
           headerLargeTitleShadowVisible: false,
-          contentStyle: { backgroundColor: t.background },
           headerShadowVisible: false,
+          headerStyle: { backgroundColor: t.background },
+          contentStyle: { backgroundColor: t.background },
         }}
       >
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
@@ -31,25 +31,26 @@ function ThemedStack() {
           options={({ route }) => ({
             title: (route.params as { title?: string })?.title ?? 'Session',
             headerBackTitle: 'Back',
+            ...(Platform.OS === 'ios' && t.translucent
+              ? { headerTransparent: true, headerBlurEffect: dark ? 'systemChromeMaterialDark' : 'systemChromeMaterial' }
+              : {}),
           })}
         />
         <Stack.Screen name="new-session" options={{ presentation: 'modal', title: 'New Session' }} />
         <Stack.Screen name="sign-in" options={{ presentation: 'fullScreenModal', title: 'Sign In', headerShown: false }} />
         <Stack.Screen name="pair" options={{ presentation: 'modal', title: 'Link a Desktop' }} />
-        <Stack.Screen
-          name="watch/[chatId]"
-          options={{ title: 'Watch Live', presentation: 'modal', headerTintColor: t.text }}
-        />
+        <Stack.Screen name="watch/[chatId]" options={{ title: 'Watch Live', presentation: 'modal' }} />
       </Stack>
-      {connection.status !== 'connected' ? null : null}
     </>
   );
 }
 
 export default function RootLayout() {
   return (
-    <CosmosProvider>
-      <ThemedStack />
-    </CosmosProvider>
+    <ThemeProvider>
+      <CosmosProvider>
+        <ThemedStack />
+      </CosmosProvider>
+    </ThemeProvider>
   );
 }

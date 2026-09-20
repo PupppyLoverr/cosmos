@@ -34,6 +34,24 @@ description: How to run and E2E-test the Cosmos Expo mobile companion app (apps/
   (e.g. "Trust & link") can appear label-less — zoom before assuming the button is missing.
 - Sign-in uses Google via Woozlit; persisted account state lives in Expo Go's SecureStore.
   If signed out and Google asks for password/2FA, document and use LOCAL pairing instead.
+- While an account is persisted, every `/sign-in` entry point is hidden. To render the screen
+  without signing out (you can't sign back in), deep-link it:
+  `xcrun simctl openurl <udid> "exp://127.0.0.1:8081/--/sign-in"`.
+- After killing/restarting Metro, `POST /reload` may return 200 while Expo Go keeps the stale
+  bundle — reopen with `xcrun simctl openurl <udid> exp://127.0.0.1:8081`, or use the Simulator
+  Device → Shake (ctrl+cmd+z) → Reload, which is also visible in recordings. Confirm a reload
+  happened via a fresh "iOS Bundled" line in the Metro log.
+- Reanimated 4 needs `react-native-worklets` as an explicit dependency; a missing lock entry
+  shows up as a red "Unable to resolve module react-native-worklets" screen in Expo Go.
+- Mouse-wheel does not scroll RN ScrollViews in the sim; use drags. The Expo Go floating dev
+  bubble sits bottom-right and steals taps (e.g. Watch Live "Pause") — drag it elsewhere first.
+- Photo picker: seed the sim library with `xcrun simctl addmedia <udid> file.jpg` (use `sips` to
+  convert if PIL is unavailable). Prefer atomic `left_click_drag` for slider tests; low-level
+  `left_mouse_down`/`mouse_move`/`left_mouse_up` sequences can leave the button stuck and fire
+  stray taps (creating sessions / changing prefs). If input misbehaves, send `left_mouse_up` and
+  re-click the Simulator titlebar to refocus (Cosmos.app can steal focus).
+- Compare wallpaper effects at full res: `sips -c 400 400 --cropOffset X Y shot.png --out crop.png`
+  on the `simctl` screenshots — the scaled desktop capture hides halftone/scanline detail.
 
 ## Devin Secrets Needed
 - none for local pairing. Google account credentials only if re-testing Woozlit sign-in.
