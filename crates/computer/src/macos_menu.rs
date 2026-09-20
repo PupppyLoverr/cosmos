@@ -14,6 +14,7 @@ const AX_SUCCESS: AXError = 0;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
+    fn AXIsProcessTrusted() -> bool;
     fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
     fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,
@@ -51,27 +52,26 @@ impl Drop for AxElement {
     }
 }
 
-unsafe fn copy_attribute(element: AXUIElementRef, attribute: &str) -> Option<CFType> {
+unsafe fn copy_attribute(element: AXUIElementRef, attribute: &str) -> Result<CFType, AXError> {
     let attribute = CFString::new(attribute);
     let mut value: CFTypeRef = ptr::null();
-    if unsafe {
+    let code = unsafe {
         AXUIElementCopyAttributeValue(element, attribute.as_concrete_TypeRef(), &mut value)
-    } != AX_SUCCESS
-        || value.is_null()
-    {
-        return None;
+    };
+    if code != AX_SUCCESS || value.is_null() {
+        return Err(code);
     }
-    Some(unsafe { CFType::wrap_under_create_rule(value) })
+    Ok(unsafe { CFType::wrap_under_create_rule(value) })
 }
 
 fn string_attribute(element: AXUIElementRef, attribute: &str) -> Option<String> {
-    unsafe { copy_attribute(element, attribute) }?
+    unsafe { copy_attribute(element, attribute).ok()? }
         .downcast::<CFString>()
         .map(|value| value.to_string())
 }
 
 unsafe fn children(element: AXUIElementRef) -> Vec<AxElement> {
-    let Some(array) = (unsafe { copy_attribute(element, "AXChildren") })
+    let Some(array) = (unsafe { copy_attribute(element, "AXChildren").ok() })
         .and_then(|value| value.downcast::<CFArray>())
     else {
         return Vec::new();
@@ -107,6 +107,12 @@ pub fn press_menu_path(pid: i32, segments: &[String]) -> NativeMenuOutcome {
     if segments.is_empty() {
         return NativeMenuOutcome::Unavailable("menu path is empty".into());
     }
+    if !unsafe { AXIsProcessTrusted() } {
+        return NativeMenuOutcome::Unavailable(
+            "this process is not trusted for accessibility (grant Cosmos in System Settings → Privacy & Security → Accessibility)"
+                .into(),
+        );
+    }
 
     let app = unsafe { AxElement::owned(AXUIElementCreateApplication(pid)) };
     if app.as_ref().is_null() {
@@ -116,8 +122,13 @@ pub fn press_menu_path(pid: i32, segments: &[String]) -> NativeMenuOutcome {
         return NativeMenuOutcome::Unavailable("could not set accessibility timeout".into());
     }
 
-    let Some(menu_bar) = (unsafe { copy_attribute(app.as_ref(), "AXMenuBar") }) else {
-        return NativeMenuOutcome::Unavailable("app has no accessibility menu bar".into());
+    let menu_bar = match unsafe { copy_attribute(app.as_ref(), "AXMenuBar") } {
+        Ok(value) => value,
+        Err(code) => {
+            return NativeMenuOutcome::Unavailable(format!(
+                "app has no accessibility menu bar (AXError {code})"
+            ));
+        }
     };
     let mut current = unsafe { AxElement::retained(menu_bar.as_CFTypeRef() as AXUIElementRef) };
 
