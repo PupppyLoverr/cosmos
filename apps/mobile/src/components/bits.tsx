@@ -1,5 +1,5 @@
 import React from 'react';
-import { ActivityIndicator, Platform, Pressable, StyleProp, StyleSheet, Text, TextInput, View, ViewStyle, type TextInputProps } from 'react-native';
+import { ActivityIndicator, Platform, Pressable, StyleProp, StyleSheet, Text, TextInput, View, ViewStyle, type TextInputProps, type TextStyle } from 'react-native';
 import { SymbolView, type SymbolViewProps } from 'expo-symbols';
 import { Host, Slider as NativeSlider } from '@expo/ui';
 import * as Haptics from 'expo-haptics';
@@ -222,11 +222,11 @@ export function Row({ title, subtitle, value, leading, icon, iconTint, trailing,
       accessibilityState={selected !== undefined ? { selected } : undefined}
     >
       {lead ? <View style={styles.rowLeading}>{lead}</View> : null}
-      <View style={styles.rowText}>
-        <Text style={[type.body, { color: danger ? t.danger : t.text }]} numberOfLines={tall ? 1 : 1}>{title}</Text>
+      <View style={[styles.rowText, value ? styles.rowTextFixed : null]}>
+        <Text style={[type.body, { color: danger ? t.danger : t.text }]} numberOfLines={1}>{title}</Text>
         {subtitle ? <Text style={[type.subhead, { color: t.textSecondary, marginTop: 1 }]} numberOfLines={tall ? 2 : 1}>{subtitle}</Text> : null}
       </View>
-      {value ? <Text style={[type.body, { color: t.textSecondary }]} numberOfLines={1}>{value}</Text> : null}
+      {value ? <Text style={[type.body, styles.rowValue, { color: t.textSecondary }]} numberOfLines={1}>{value}</Text> : null}
       {trailing}
       {selected ? <Icon name="checkmark" size={15} color={t.link} weight="semibold" /> : null}
       {chevron && onPress ? <Icon name="chevron.right" size={13} color={t.textTertiary} weight="semibold" /> : null}
@@ -280,14 +280,31 @@ export function Group({ children, header, footer, insetSeparators = true, style 
           ))}
         </View>
       </Glass>
-      {footer ? <Text style={[type.footnote, styles.footer, { color: t.textSecondary }]}>{footer}</Text> : null}
+      {footer ? <Caption style={styles.footer}>{footer}</Caption> : null}
     </View>
   );
 }
 
 export function SectionLabel({ children }: { children: string }) {
+  return <Caption style={styles.section}>{children.toUpperCase()}</Caption>;
+}
+
+/** Secondary text that stays legible over a photo wallpaper (primary colour + soft shadow). */
+export function Caption({ children, style }: { children: React.ReactNode; style?: StyleProp<TextStyle> }) {
   const t = useTheme();
-  return <Text style={[type.footnote, styles.section, { color: t.textSecondary }]}>{children.toUpperCase()}</Text>;
+  const over = t.hasBackdrop;
+  return (
+    <Text
+      style={[
+        type.footnote,
+        { color: over ? t.text : t.textSecondary },
+        over ? { textShadowColor: alpha(t.scheme === 'dark' ? '#000000' : '#FFFFFF', 0.8), textShadowRadius: 6, textShadowOffset: { width: 0, height: 0 } } : null,
+        style,
+      ]}
+    >
+      {children}
+    </Text>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +386,8 @@ const styles = StyleSheet.create({
   rowTall: { paddingVertical: spacing(3.25), minHeight: 60 },
   rowLeading: { alignItems: 'center', justifyContent: 'center' },
   rowText: { flex: 1, minWidth: 0 },
+  rowTextFixed: { flexGrow: 0, flexShrink: 0, flexBasis: 'auto' },
+  rowValue: { flex: 1, textAlign: 'right', minWidth: 0 },
   groupClip: { borderRadius: Platform.OS === 'ios' ? radii.xl - 2 : radii.md, borderCurve: 'continuous', overflow: 'hidden' },
   groupSep: { height: StyleSheet.hairlineWidth, marginLeft: edge },
   groupSepInset: { marginLeft: edge + 29 + spacing(3) },
