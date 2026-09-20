@@ -2,7 +2,7 @@ import React from 'react';
 import { Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router, Stack } from 'expo-router';
 import { Host, Switch } from '@expo/ui';
-import { useCosmos, useSnapshot } from '../../../lib/client';
+import { desktopDisplayName, useCosmos, useSnapshot } from '../../../lib/client';
 import { useTheme, spacing, type, familyById, useThemePrefs, edge, surfaceOptions, backdropPresets } from '../../../lib/theme';
 import { Row, Group, ConnectionBadge } from '../../../components/bits';
 import { HarnessMark } from '../../../components/harness-mark';
@@ -58,7 +58,7 @@ export default function SettingsScreen() {
           <Row
             icon={connection.desktop?.kind === 'local' ? 'laptopcomputer' : 'antenna.radiowaves.left.and.right'}
             iconTint={connection.status === 'connected' ? t.success : t.textTertiary}
-            title={connection.desktop?.name ?? 'Not linked'}
+            title={connection.desktop ? desktopDisplayName(connection.desktop) : 'Not linked'}
             subtitle={connection.desktop ? (connection.desktop.kind === 'local' ? 'Local network' : 'Via Woozlit') : 'Link a Mac to get started'}
             trailing={<ConnectionBadge status={connection.status} detail={connection.detail} />}
             onPress={() => router.push('/(tabs)/(desktops)' as never)}

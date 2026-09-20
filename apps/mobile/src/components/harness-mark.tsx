@@ -2,7 +2,7 @@ import React from 'react';
 import { Circle, Path, Svg } from 'react-native-svg';
 import { View } from 'react-native';
 import { HarnessId } from '../lib/protocol';
-import { alpha, statusColor, tintFor, useTheme } from '../lib/theme';
+import { statusColor, useTheme } from '../lib/theme';
 
 type MarkPath = { d: string; fillRule?: 'evenodd'; fillOpacity?: number };
 type MarkDefinition = { viewBox: string; paths: MarkPath[] };
@@ -148,12 +148,11 @@ function NeutralMark({ color, size }: { color: string; size: number }) {
 }
 
 /**
- * Harness glyph. `plain` draws just the SVG in the text colour (list rows);
- * otherwise it sits on a faint tinted square with tight corners — a mark, not a sticker.
+ * Harness glyph. `plain` draws just the SVG in the text colour; otherwise it
+ * sits on a neutral fill with tight (8–10pt) corners — a mark, not a sticker.
  */
 export function HarnessMark({ harness, size = 36, status, plain }: { harness?: HarnessId | null; size?: number; status?: string; plain?: boolean }) {
   const t = useTheme();
-  const tint = tintFor(harness ?? 'cosmos');
   const mark = harness && harness !== 'mock' ? MARKS[harness] : undefined;
   const markSize = plain ? size * 0.8 : size * 0.56;
   const glyph = mark ? (
@@ -167,8 +166,9 @@ export function HarnessMark({ harness, size = 36, status, plain }: { harness?: H
     <View style={{ width: size, height: size }}>
       <View style={{
         width: size, height: size, alignItems: 'center', justifyContent: 'center',
-        borderRadius: plain ? 0 : Math.min(10, Math.round(size * 0.22)),
-        backgroundColor: plain ? 'transparent' : alpha(tint, t.scheme === 'dark' ? 0.22 : 0.16),
+        borderRadius: plain ? 0 : Math.min(10, Math.max(8, Math.round(size * 0.22))),
+        borderCurve: 'continuous',
+        backgroundColor: plain ? 'transparent' : t.fill,
       }}>
         {glyph}
       </View>
