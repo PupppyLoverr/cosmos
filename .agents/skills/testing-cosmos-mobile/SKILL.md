@@ -53,5 +53,47 @@ description: How to run and E2E-test the Cosmos Expo mobile companion app (apps/
 - Compare wallpaper effects at full res: `sips -c 400 400 --cropOffset X Y shot.png --out crop.png`
   on the `simctl` screenshots — the scaled desktop capture hides halftone/scanline detail.
 
+## Native dev-client build (recorded runs; preferred over Expo Go)
+- Build + install + Metro in one shot:
+  `cd apps/mobile && LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 npx expo run:ios --device <udid>`
+  (`ios/` is CNG-gitignored; run:ios does prebuild + pods itself). Keep the process alive —
+  it owns Metro.
+- `pod install` crashes on CocoaPods 1.17 + Ruby 4 with a UnicodeNormalize ASCII-8BIT error;
+  always prefix `LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8`.
+- If xcodebuild reports "Unable to find a destination matching …" / "iOS x.y is not installed"
+  and `-showdestinations` lists ZERO eligible destinations, the iOS platform component is
+  missing — run `sudo xcodebuild -downloadPlatform iOS` (≈8.5 GB), NOT Xcode GUI. Check the sim's
+  OS matches the toolchain first: an iOS 27.0 sim is invisible to Xcode 26.x until the platform
+  component lands; pick a same-model device on a supported runtime via `xcrun simctl list`.
+
+## Driving the CuaDriver / Watch Live path
+- The packaged desktop embeds the engine; launch `target/package/Cosmos.app/Contents/MacOS/zeron`
+  directly (env `ZERON_MOCK_QUESTION=1 ZERON_MOCK_DELAY_MS=500` makes MockHarness runs park at
+  `awaitingInput` — ideal for Stop/interrupt testing).
+- Computer page (Settings → Computer): the state badge is display-only; enable via the
+  "Screen Context" row toggle; "Install component" pulls the pinned Cua Driver to
+  `~/.zeron/computer/cua-driver/versions/<ver>-<triple>/`.
+- The driver daemon needs the `com.trycua.driver` TCC identity → it must be started through
+  LaunchServices (`open -a CuaDriver --args serve`), and `open -a` only resolves after the
+  bundle has been registered once (`open <path-to-CuaDriver.app>` by full path).
+- Frames require BOTH Screen Recording AND Accessibility granted to CuaDriver
+  (System Settings → Privacy & Security; each toggle shows an admin password sheet — the
+  account password works). The daemon's permission gate refuses all actions while either is
+  pending; `ComputerObserve` then returns `permissions_pending` and the watch stage shows the
+  error text. Stop/interrupt is independent of frames and still works.
+- Watch out: Cosmos writes `manifest-observe.yaml` with a `schema_version` field that
+  cua-driver 0.28.2 rejects (`expected version`) — manifest-driven daemon launches fail to
+  start entirely.
+
+## Seeding engine state over IPC (for list density / running sessions)
+- `ws://127.0.0.1:27654`, unauthenticated JSON `{id, method, params}` → `{id, ok|err|item}`.
+- `LocalDevice` → `{deviceId}`; `Mutate {op:'createChat', chatId, deviceId, config:{harness,
+  model:null, reasoning:'medium', modelOptions:{}, sandbox:'workspace-write'}}`;
+  `Mutate {op:'renameChat'|'setChatActivity'|'setChatConfig'}`; harness ids are kebab-case
+  ('mock' = built-in MockHarness, never shown in pickers); `QueueCommand {chatId,
+  command:{kind:'run', request:{prompt, harness, cwd, sandbox, autoApprove:false,
+  model:null, reasoning:'medium', modelOptions:{}, resume:null}, messageId}}` starts a run
+  on the local device; `WatchSessions` first frame returns `[{chatId,status,...}]`.
+
 ## Devin Secrets Needed
 - none for local pairing. Google account credentials only if re-testing Woozlit sign-in.
