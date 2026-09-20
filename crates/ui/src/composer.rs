@@ -7340,6 +7340,20 @@ impl Composer {
         }
     }
 
+    pub(crate) fn stage_meridian_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
+        self.on_state_changed(cx);
+        self.input.update(cx, |input, cx| {
+            let existing = input.text();
+            let text = if existing.is_empty() {
+                prompt
+            } else {
+                format!("{existing}\n\n{prompt}")
+            };
+            input.set_text(text, cx);
+        });
+        cx.notify();
+    }
+
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
         {
             let state = self.state.read(cx);
