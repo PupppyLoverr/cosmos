@@ -42,6 +42,13 @@ export interface ConnectionInfo {
 /** Name given to a local desktop until the engine's registry reports the real one. */
 export const PLACEHOLDER_NAME = 'This Mac';
 
+/** Display name for a linked desktop: its real name, or "This Mac" when only
+ *  the address/placeholder was ever stored. */
+export function desktopDisplayName(desktop: LinkedDesktop): string {
+  const name = desktop.name.trim();
+  return !name || name === desktop.address ? PLACEHOLDER_NAME : name;
+}
+
 const DESKTOPS_KEY = 'cosmos.desktops';
 const ACTIVE_DESKTOP_KEY = 'cosmos.activeDesktop';
 

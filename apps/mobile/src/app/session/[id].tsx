@@ -4,7 +4,7 @@ import { FlashList, FlashListRef } from '@shopify/flash-list';
 import { useLocalSearchParams, router, Stack } from 'expo-router';
 import { useHeaderHeight } from 'expo-router/react-navigation';
 import Animated, { Easing, useAnimatedStyle, useSharedValue, withRepeat, withTiming } from 'react-native-reanimated';
-import { useCosmos, useSnapshot } from '../../lib/client';
+import { desktopDisplayName, useCosmos, useSnapshot } from '../../lib/client';
 import { SessionMessageEntry, TranscriptUpdate, isComputerCall, type Chat } from '../../lib/protocol';
 import { applyTranscriptUpdate } from '../../lib/transcript';
 import { PickedFile, ensureDecodable, fileToBase64Chunks } from '../../lib/attachments';
@@ -217,7 +217,7 @@ export default function SessionScreen() {
     ]);
   };
 
-  const desktopName = connection.status === 'connected' ? connection.desktop?.name : undefined;
+  const desktopName = connection.status === 'connected' && connection.desktop ? desktopDisplayName(connection.desktop) : undefined;
   const emptyBody = connection.status === 'connected'
     ? 'Ask for anything — code, files, or a Computer Use task on your Mac.'
     : 'Waiting for the desktop connection…';

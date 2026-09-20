@@ -625,6 +625,11 @@ pub struct UiSettings {
     /// session title.
     pub sidebar_show_project_label: bool,
     pub sidebar_compact: bool,
+    /// First-run chooser dismissed: the app opens locally; this card offers the
+    /// one-time choice between staying local and logging in. Device-local —
+    /// lives in ui-settings.json, never syncs.
+    #[serde(default)]
+    pub first_run_seen: bool,
     pub sidebar_show_project_icon: bool,
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
@@ -775,6 +780,7 @@ impl Default for UiSettings {
             sidebar_sort: SidebarSort::LastUpdated,
             sidebar_show_project_label: true,
             sidebar_compact: true,
+            first_run_seen: false,
             sidebar_show_project_icon: true,
             sidebar_show_harness: true,
             sidebar_show_branch: true,

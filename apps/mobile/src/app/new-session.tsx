@@ -65,7 +65,6 @@ export default function NewSessionScreen() {
   const [typed, setTyped] = useState(false);
 
   const online = connection.status === 'connected';
-  const desktopName = connection.desktop?.name;
 
   useEffect(() => {
     if (!online) return;
@@ -137,11 +136,7 @@ export default function NewSessionScreen() {
             <View style={styles.notice}><Notice kind="warning" title="Desktop offline" body="Link or reconnect a desktop before starting a session." /></View>
           ) : null}
 
-          <View style={styles.canvas}>
-            <HarnessMark harness={harness} size={44} />
-            <Text style={[type.title3, styles.canvasTitle, { color: t.text }]}>{desktopName ? `New session on ${desktopName}` : 'New session'}</Text>
-            <Caption style={styles.canvasBody}>{`${harnessName} does the reasoning. Cosmos runs it on the Mac.`}</Caption>
-          </View>
+          <View style={styles.canvas} />
 
           {!seedText && !typed ? (
             <View style={styles.ideas}>
@@ -168,7 +163,7 @@ export default function NewSessionScreen() {
           accessibilityHint="Agent, model, effort and project"
         >
           <Glass radius={radii.pill} thin style={[styles.setupInner, { borderColor: t.glassStroke }]}>
-            <HarnessMark harness={harness} size={16} />
+            <HarnessMark harness={harness} size={15} plain />
             <Text style={[type.footnote, { color: t.textSecondary, fontWeight: '500' }]} numberOfLines={1}>{summary}</Text>
             <Icon name="chevron.up" size={10} color={t.textTertiary} weight="semibold" />
           </Glass>
@@ -245,9 +240,7 @@ export default function NewSessionScreen() {
 const styles = StyleSheet.create({
   flex: { flex: 1 },
   notice: { paddingHorizontal: spacing(4), paddingTop: spacing(3) },
-  canvas: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: spacing(8), gap: spacing(2) },
-  canvasTitle: { textAlign: 'center', marginTop: spacing(2) },
-  canvasBody: { textAlign: 'center' },
+  canvas: { flex: 1 },
   ideas: { paddingHorizontal: spacing(5), paddingBottom: spacing(3), gap: spacing(1) },
   idea: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), minHeight: 36 },
   ideaText: { flex: 1 },

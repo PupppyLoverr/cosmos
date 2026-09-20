@@ -2,7 +2,7 @@ import React from 'react';
 import { ActionSheetIOS, Alert, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router, Stack } from 'expo-router';
 import * as Haptics from 'expo-haptics';
-import { useCosmos, useSnapshot, LinkedDesktop, type ConnectionInfo } from '../../../lib/client';
+import { desktopDisplayName, useCosmos, useSnapshot, LinkedDesktop, type ConnectionInfo } from '../../../lib/client';
 import { alpha, radii, spacing, type, useTheme, type Theme } from '../../../lib/theme';
 import { Row, Group, EmptyState, SectionLabel, Icon, IconTile } from '../../../components/bits';
 import { Glass, Screen } from '../../../components/surface';
@@ -38,7 +38,7 @@ function ActiveDesktop({ desktop, connection, version, platform, sessions, compu
           <Icon name={platformIcon(platform)} size={26} color={t.link} weight="regular" />
         </View>
         <View style={{ flex: 1, minWidth: 0 }}>
-          <Text style={[type.title3, { color: t.text }]} numberOfLines={1}>{desktop.name}</Text>
+          <Text style={[type.title3, { color: t.text }]} numberOfLines={1}>{desktopDisplayName(desktop)}</Text>
           <View style={styles.status}>
             <View style={[styles.dot, { backgroundColor: c.color }]} />
             <Text style={[type.subhead, { color: c.color, fontWeight: '600' }]}>{c.label}</Text>
@@ -148,7 +148,7 @@ export default function DesktopsScreen() {
                 <Row
                   key={d.id}
                   tall
-                  title={d.name}
+                  title={desktopDisplayName(d)}
                   subtitle={d.kind === 'local' ? `Local · ${d.address}` : 'Remote · via Woozlit'}
                   leading={<IconTile name={d.kind === 'local' ? 'laptopcomputer' : 'globe'} tint={t.textTertiary} size={32} />}
                   chevron

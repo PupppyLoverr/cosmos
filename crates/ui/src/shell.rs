@@ -8750,6 +8750,56 @@ impl Shell {
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
         }
 
+        // First-run chooser: on a local profile with no account, offer the
+        // local-vs-sign-in fork once (persisted in ui-settings.json). Local
+        // mode pairs the phone over the LAN; logging in starts the Woozlit
+        // browser flow and the existing switch wizard migrates local work.
+        let welcome_shown = {
+            let state = self.state.read(cx);
+            state.workspace_scope == Some(WorkspaceScope::Local)
+                && matches!(state.auth, Some(AuthState::SignedOut))
+                && settings::current(cx).first_run_seen
+        };
+        if !welcome_shown {
+            let card = popover::dialog_card(&theme)
+                .child(popover::dialog_title(&theme, "Welcome to Cosmos"))
+                .child(
+                    div().mt(px(6.0)).child(popover::dialog_body(
+                        &theme,
+                        "Use Cosmos locally — no account, everything stays on this Mac, and your phone still pairs on the same network — or log in to sync your workspace across devices.",
+                    )),
+                )
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Use locally", "welcome-local")
+                                .id("welcome-local")
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    settings::update(SavePolicy::Immediate, cx, |settings| {
+                                        settings.first_run_seen = true;
+                                    });
+                                })),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, "Log in")
+                                .id("welcome-login")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    settings::update(SavePolicy::Immediate, cx, |settings| {
+                                        settings.first_run_seen = true;
+                                    });
+                                    this.start_sign_in(cx);
+                                })),
+                        ),
+                )
+                .into_any_element();
+            overlays.push(popover::modal("first-run-welcome", viewport, card));
+        }
+
         if let Some(sync) = self.render_sync_overlay(viewport, cx) {
             overlays.push(sync);
         }

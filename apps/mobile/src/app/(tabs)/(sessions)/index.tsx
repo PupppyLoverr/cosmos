@@ -3,9 +3,9 @@ import { ActionSheetIOS, Alert, Platform, Pressable, StyleSheet, Text, View } fr
 import { FlashList } from '@shopify/flash-list';
 import { router, Stack } from 'expo-router';
 import * as Haptics from 'expo-haptics';
-import { useCosmos, useSnapshot } from '../../../lib/client';
+import { desktopDisplayName, useCosmos, useSnapshot } from '../../../lib/client';
 import { Chat, Session } from '../../../lib/protocol';
-import { useTheme, spacing, radii, statusColor, type, edge, alpha } from '../../../lib/theme';
+import { useTheme, spacing, radii, type, edge, alpha } from '../../../lib/theme';
 import { EmptyState, Icon, StatusDot, Notice, Button } from '../../../components/bits';
 import { HarnessMark } from '../../../components/harness-mark';
 import { Glass, Screen } from '../../../components/surface';
@@ -93,7 +93,6 @@ export default function SessionsScreen() {
   const client = useCosmos();
   const chats = useSnapshot(client.chats);
   const sessions = useSnapshot(client.sessions);
-  const spaces = useSnapshot(client.spaces);
   const connection = useSnapshot(client.connection);
   const [query, setQuery] = useState('');
 
@@ -118,7 +117,6 @@ export default function SessionsScreen() {
     return out;
   }, [chats, sessions, query]);
 
-  const spaceName = (chat: Chat) => spaces.find((s) => s.id === chat.spaceId)?.path?.split('/').pop();
   const connected = connection.status === 'connected';
   const connecting = connection.status === 'connecting' || connection.status === 'reconnecting';
 
@@ -153,7 +151,7 @@ export default function SessionsScreen() {
             >
               <StatusDot status={connected ? 'connected' : connecting ? 'working' : 'errored'} size={7} />
               <Text style={[type.footnote, { color: t.textSecondary, fontWeight: '500' }]} numberOfLines={1}>
-                {connection.desktop?.name ?? 'No desktop linked'}
+                {connection.desktop ? desktopDisplayName(connection.desktop) : 'No desktop linked'}
                 {connection.desktop ? ` · ${connected ? 'Connected' : connecting ? 'Connecting…' : 'Offline'}` : ''}
               </Text>
               <Icon name="chevron.right" size={10} color={t.textTertiary} weight="semibold" />
@@ -218,7 +216,6 @@ export default function SessionsScreen() {
             return <Text style={[type.footnote, styles.section, { color: t.textSecondary }]}>{item.title.toUpperCase()}</Text>;
           }
           const { chat, ind, first, last } = item;
-          const space = spaceName(chat);
           const title = chat.title || 'Untitled session';
           const status = STATUS_LABEL[ind];
           const open = () => {
@@ -237,28 +234,12 @@ export default function SessionsScreen() {
               };
           const content = (
             <>
-              <HarnessMark key={`${chat.id}:${chat.config?.harness ?? 'cosmos'}`} harness={chat.config?.harness} size={28} status={ind} plain />
-              <View style={styles.chatBody}>
-                <View style={styles.chatTop}>
-                  <Text style={[type.body, styles.chatTitle, { color: t.text }]} numberOfLines={1}>{title}</Text>
-                  <Text style={[type.footnote, { color: ind === 'completed' ? t.link : t.textTertiary, fontWeight: ind === 'completed' ? '600' : '400' }]}>
-                    {relTime(chat.lastMessageAt ?? chat.createdAt)}
-                  </Text>
-                </View>
-                <View style={styles.chatBottom}>
-                  {status ? (
-                    <View style={styles.status}>
-                      <StatusDot status={ind} size={6} />
-                      <Text style={[type.subhead, { color: statusColor(t, ind), fontWeight: '500' }]}>{status}</Text>
-                      <Text style={[type.subhead, { color: t.textTertiary }]}>·</Text>
-                    </View>
-                  ) : null}
-                  <Text style={[type.subhead, { color: t.textSecondary, flex: 1 }]} numberOfLines={status ? 1 : 2}>
-                    {chat.lastMessagePreview || (space ? `in ${space}` : chat.cwd) || 'No messages yet'}
-                  </Text>
-                </View>
-              </View>
-              {ind === 'completed' ? <View style={[styles.unread, { backgroundColor: t.link }]} /> : null}
+              <HarnessMark key={`${chat.id}:${chat.config?.harness ?? 'cosmos'}`} harness={chat.config?.harness} size={30} />
+              <Text style={[type.body, styles.chatTitle, { color: t.text }]} numberOfLines={1}>{title}</Text>
+              {ind !== 'idle' ? <StatusDot status={ind} size={7} /> : null}
+              <Text style={[type.footnote, { color: ind === 'completed' ? t.link : t.textTertiary, fontWeight: ind === 'completed' ? '600' : '400' }]}>
+                {relTime(chat.lastMessageAt ?? chat.createdAt)}
+              </Text>
             </>
           );
           const pressable = (bg: string | undefined) => (
@@ -300,19 +281,14 @@ const styles = StyleSheet.create({
   cellWrap: { paddingBottom: spacing(2) },
   chatRow: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(3),
-    paddingHorizontal: edge, paddingVertical: spacing(2.5), minHeight: 64,
+    paddingHorizontal: edge, paddingVertical: spacing(2.5), minHeight: 56,
   },
   newRow: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(2),
     paddingHorizontal: edge, minHeight: 44, borderRadius: radii.md, borderWidth: StyleSheet.hairlineWidth,
   },
-  chatBody: { flex: 1, minWidth: 0, gap: 3 },
-  chatTop: { flexDirection: 'row', alignItems: 'baseline', gap: spacing(2) },
-  chatTitle: { fontWeight: '600', flex: 1 },
-  chatBottom: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
-  status: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
-  unread: { width: 8, height: 8, borderRadius: 4 },
-  sep: { height: StyleSheet.hairlineWidth, marginLeft: edge + 28 + spacing(3) },
+  chatTitle: { fontWeight: '600', flex: 1, minWidth: 0 },
+  sep: { height: StyleSheet.hairlineWidth, marginLeft: edge + 30 + spacing(3) },
   suggestions: { alignSelf: 'stretch', gap: spacing(2.5), marginTop: spacing(6) },
   suggestion: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(3),
