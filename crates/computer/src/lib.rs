@@ -25,6 +25,8 @@ pub mod cua;
 pub mod digest;
 pub mod endpoint;
 pub mod install;
+#[cfg(target_os = "linux")]
+pub mod linux_x11;
 #[cfg(target_os = "macos")]
 mod macos_menu;
 pub mod mcp_client;
