@@ -169,15 +169,31 @@ const REASONING_LEVELS: &[ReasoningLevel] = &[
 /// with the `cosmos-computer` / `cosmos-tools` MCP shims. opencode only
 /// learns MCP servers from its own config files — project `opencode.json`
 /// covers runs rooted in a directory, but project-less chats (the phone app,
-/// the home directory) get nothing. The shim commands expand
+/// the home directory) get nothing. The shims fall back to
 /// `$COSMOS_COMPUTER_MCP` / `$COSMOS_TOOLS_MCP`, which the engine stamps
-/// per-run into the spawned server's environment, so dormant entries are
-/// harmless where the services are off. Best-effort: logs and moves on.
+/// per-run into the spawned server's environment, and serve zero tools when
+/// it is unset — so dormant entries are harmless where the services are off.
+/// Best-effort: logs and moves on.
 pub fn seed_global_config() {
     let Some(home) = crate::executable::home_dir() else {
         return;
     };
     seed_global_config_in(&home.join(".config").join("opencode"));
+}
+
+/// Whether an `mcp` entry came from an older seed build: the retired
+/// `/bin/bash -c 'test -n "$COSMOS_*_MCP" && exec "$COSMOS_MCP_ZERON" …'`
+/// wrapper (unspawnable on Windows). Recognized by the env markers so a
+/// user-owned entry under the same server name is never clobbered.
+fn is_our_opencode_seed(entry: &Value, endpoint_env: &str) -> bool {
+    entry
+        .get("command")
+        .and_then(Value::as_array)
+        .is_some_and(|argv| {
+            argv.iter()
+                .filter_map(Value::as_str)
+                .any(|arg| arg.contains("COSMOS_MCP_ZERON") || arg.contains(endpoint_env))
+        })
 }
 
 fn seed_global_config_in(dir: &Path) {
@@ -212,25 +228,24 @@ fn seed_global_config_in(dir: &Path) {
         ("cosmos-computer", "computer-stdio", crate::COMPUTER_ENV),
         ("cosmos-tools", "tools-stdio", crate::TOOLS_ENV),
     ] {
-        if mcp.contains_key(name) {
-            continue;
+        // Direct spawn, no shell — `/bin/bash` does not exist on Windows,
+        // and the shim's own env fallback + dormant zero-tool mode makes a
+        // wrapper unnecessary.
+        let wanted = json!({
+            "type": "local",
+            "command": [exe, subcommand],
+            "enabled": true,
+            "timeout": 15000,
+        });
+        let replace = match mcp.get(name) {
+            None => true,
+            Some(existing) if existing == &wanted => false,
+            Some(existing) => is_our_opencode_seed(existing, endpoint_env),
+        };
+        if replace {
+            mcp.insert(name.to_string(), wanted);
+            changed = true;
         }
-        // A run without the matching stamp leaves the env var unset: exit
-        // quietly so the entry is inert instead of an erroring MCP server.
-        let command = format!(
-            "test -n \"${endpoint_env}\" && exec \"$COSMOS_MCP_ZERON\" {subcommand} --url \"${endpoint_env}\""
-        );
-        mcp.insert(
-            name.to_string(),
-            json!({
-                "type": "local",
-                "command": ["/bin/bash", "-c", command],
-                "environment": { "COSMOS_MCP_ZERON": exe },
-                "enabled": true,
-                "timeout": 15000,
-            }),
-        );
-        changed = true;
     }
     if !changed {
         return;

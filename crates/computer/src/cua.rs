@@ -1027,13 +1027,21 @@ impl CuaBackend {
             .get("window_id")
             .and_then(Value::as_i64)
             .ok_or_else(|| ComputerError::Internal("window record has no window_id".into()))?;
-        let screenshot_path = screenshot
-            .then(|| screenshot_dir.join(format!("computer-{}.png", uuid::Uuid::new_v4())));
+        let mut screenshot_error: Option<String> = None;
+        let screenshot_path = if screenshot {
+            let path = stage_screenshot_path(screenshot_dir);
+            if path.is_none() {
+                screenshot_error = Some("staging directory could not be created".into());
+            }
+            path
+        } else {
+            None
+        };
         let mut args = json!({
             "pid": pid,
             "window_id": window_id,
             "include_accessibility_tree": semantic,
-            "include_screenshot": screenshot,
+            "include_screenshot": screenshot_path.is_some(),
             "max_elements": max_elements,
             "max_depth": 25,
             "max_dimension": max_dimension,
@@ -1043,7 +1051,21 @@ impl CuaBackend {
         if let Some(path) = &screenshot_path {
             args["screenshot_out_file"] = json!(path.to_string_lossy());
         }
-        let result = self.call("get_window_state", args).await?;
+        let result = match self.call("get_window_state", args.clone()).await {
+            Ok(result) => result,
+            // The PNG write is the usual failure surface (a staging dir the
+            // driver can't reach, a refused capture): retry semantic-only so
+            // the observation still lands, flagging the loss in `note`.
+            Err(error) if screenshot_path.is_some() => {
+                screenshot_error = Some(error.to_string());
+                args["include_screenshot"] = json!(false);
+                if let Some(map) = args.as_object_mut() {
+                    map.remove("screenshot_out_file");
+                }
+                self.call("get_window_state", args).await?
+            }
+            Err(error) => return Err(error),
+        };
         let structured = result
             .get("structuredContent")
             .cloned()
@@ -1055,8 +1077,12 @@ impl CuaBackend {
             .unwrap_or_default();
         let screenshot = finish_screenshot(screenshot_path).await;
         // Caveats worth surfacing to the model — a degraded/projected/Chromium
-        // snapshot changes how much the element set can be trusted.
+        // snapshot changes how much the element set can be trusted. The
+        // screenshot failure leads: it describes what THIS reply is missing.
         let mut notes: Vec<String> = Vec::new();
+        if let Some(error) = &screenshot_error {
+            notes.push(format!("screenshot unavailable: {error}"));
+        }
         if let Some(reason) = structured.get("degraded_reason").and_then(Value::as_str) {
             notes.push(format!("degraded: {reason}"));
         }
@@ -1195,19 +1221,36 @@ impl CuaBackend {
             let windows = self.list_windows(None).await?;
             text = render_desktop_windows(&windows);
         }
-        let screenshot_path = request.screenshot.then(|| {
-            request
-                .screenshot_dir
-                .join(format!("computer-{}.png", uuid::Uuid::new_v4()))
-        });
+        let mut screenshot_error: Option<String> = None;
+        let screenshot_path = if request.screenshot {
+            let path = stage_screenshot_path(&request.screenshot_dir);
+            if path.is_none() {
+                screenshot_error = Some("staging directory could not be created".into());
+            }
+            path
+        } else {
+            None
+        };
         if let Some(path) = &screenshot_path {
-            self.call(
-                "get_desktop_state",
-                json!({ "screenshot_out_file": path.to_string_lossy() }),
-            )
-            .await?;
+            // A failed PNG write must not sink the semantic inventory —
+            // degrade with a note instead of failing the observe.
+            if let Err(error) = self
+                .call(
+                    "get_desktop_state",
+                    json!({ "screenshot_out_file": path.to_string_lossy() }),
+                )
+                .await
+            {
+                screenshot_error = Some(error.to_string());
+            }
         }
         let screenshot = finish_screenshot(screenshot_path).await;
+        if let Some(error) = &screenshot_error {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&format!("screenshot unavailable: {error}"));
+        }
         if text.is_empty() && !request.semantic {
             text = "Desktop screenshot captured.".into();
         }
@@ -1865,6 +1908,18 @@ fn parse_frame(v: &Value) -> Option<ElementFrame> {
         .or_else(|| v.get("height"))
         .and_then(Value::as_f64)?;
     Some(ElementFrame { x, y, w, h })
+}
+
+/// Mint a staging path for a driver-written PNG, creating the directory if
+/// the profile's uploads root materialized after service startup (or a
+/// cleanup removed it mid-session). `None` = screenshot unavailable — the
+/// caller degrades to semantic-only and notes the loss.
+fn stage_screenshot_path(dir: &Path) -> Option<PathBuf> {
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        tracing::warn!(dir = %dir.display(), %error, "computer screenshot dir unavailable");
+        return None;
+    }
+    Some(dir.join(format!("computer-{}.png", uuid::Uuid::new_v4())))
 }
 
 /// Stat a driver-written PNG into a StagedScreenshot (dimension sniffed from

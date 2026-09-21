@@ -64,23 +64,27 @@ enum Command {
     /// harnesses without an HTTP-MCP channel (ACP agents) spawn this as a
     /// server subprocess — stdout is protocol traffic, so it skips logging.
     BrowserBridge {
-        /// Loopback MCP endpoint stamped on the run request.
+        /// Loopback MCP endpoint stamped on the run request. Falls back to
+        /// `$COSMOS_BROWSER_MCP` — harnesses whose MCP config seeds this
+        /// command without a URL inherit the stamped env var per run.
         #[arg(long)]
-        url: String,
+        url: Option<String>,
     },
     /// Stdio MCP front for Cosmos Computer — the same contract as
     /// `browser-bridge`, pointing at the engine's loopback computer endpoint.
     ComputerStdio {
-        /// Loopback MCP endpoint stamped on the run request.
+        /// Loopback MCP endpoint stamped on the run request; falls back to
+        /// `$COSMOS_COMPUTER_MCP`.
         #[arg(long)]
-        url: String,
+        url: Option<String>,
     },
     /// Stdio MCP front for the Cosmos Tools gateway — the same contract as
     /// `computer-stdio`, pointing at the engine's loopback tools endpoint.
     ToolsStdio {
-        /// Loopback MCP endpoint stamped on the run request.
+        /// Loopback MCP endpoint stamped on the run request; falls back to
+        /// `$COSMOS_TOOLS_MCP`.
         #[arg(long)]
-        url: String,
+        url: Option<String>,
     },
 }
 
@@ -140,6 +144,63 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// `--url` first, then the run-stamped env var (harnesses spawn these shims
+/// through their own MCP config, where the endpoint URL can't be baked in).
+fn shim_url(url: &Option<String>, env: &str) -> Option<String> {
+    url.clone()
+        .or_else(|| std::env::var(env).ok())
+        .filter(|u| !u.trim().is_empty())
+}
+
+/// A valid but empty MCP stdio server. Harnesses with a seeded cosmos-*
+/// entry spawn the shim even in runs with no stamped endpoint; answering
+/// initialize + tools/list with zero tools stays inert instead of logging
+/// a connection failure every session.
+fn dormant_mcp_stdio(server_name: &str) -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    let stdin = BufReader::new(std::io::stdin());
+    let mut stdout = std::io::stdout();
+    for line in stdin.lines() {
+        let line = line?;
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(id) = msg.get("id").cloned() else {
+            continue;
+        };
+        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let reply = match method {
+            "initialize" => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": msg
+                        .pointer("/params/protocolVersion")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("2024-11-05"),
+                    "capabilities": {},
+                    "serverInfo": {
+                        "name": server_name,
+                        "version": env!("CARGO_PKG_VERSION"),
+                    }
+                }
+            }),
+            "tools/list" => serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "result": { "tools": [] }
+            }),
+            "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            _ => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": "method not found" }
+            }),
+        };
+        writeln!(stdout, "{reply}")?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     attach_parent_console();
@@ -147,13 +208,22 @@ fn main() -> anyhow::Result<()> {
     // MCP stdio servers speak JSON-RPC on stdout — dispatch before the
     // tracing layer (which writes to stdout) installs.
     if let Some(Command::BrowserBridge { url }) = &cli.command {
-        return zeron_ui::browser::bridge::serve_stdio(url);
+        return match shim_url(url, "COSMOS_BROWSER_MCP") {
+            Some(url) => zeron_ui::browser::bridge::serve_stdio(&url),
+            None => dormant_mcp_stdio("cosmos-browser"),
+        };
     }
     if let Some(Command::ComputerStdio { url }) = &cli.command {
-        return zeron_computer::stdio::serve_stdio(url);
+        return match shim_url(url, "COSMOS_COMPUTER_MCP") {
+            Some(url) => zeron_computer::stdio::serve_stdio(&url),
+            None => dormant_mcp_stdio("cosmos-computer"),
+        };
     }
     if let Some(Command::ToolsStdio { url }) = &cli.command {
-        return zeron_tools::stdio::serve_stdio(url);
+        return match shim_url(url, "COSMOS_TOOLS_MCP") {
+            Some(url) => zeron_tools::stdio::serve_stdio(&url),
+            None => dormant_mcp_stdio("cosmos-tools"),
+        };
     }
     #[cfg(windows)]
     if let Some(pid) = cli.wait_for_exit {

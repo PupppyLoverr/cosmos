@@ -295,6 +295,106 @@ fn grok_spec() -> AcpAgentSpec {
     }
 }
 
+/// Devin ignores `session/new`'s `mcpServers` (verified live on
+/// 3000.10.27 — the field parses but nothing spawns). Its own MCP config is
+/// honored though, so seed the user-scope `mcp_config.json` with stdio
+/// entries for the cosmos shims. The seeded command carries no `--url`:
+/// each shim falls back to `COSMOS_*_MCP` (engine-stamped onto the Devin
+/// process per run, inherited by the MCP child) and goes dormant — a
+/// zero-tool server — when no endpoint exists, so the entries are inert
+/// everywhere else Devin runs. Only cosmos-* keys are touched; user servers
+/// pass through untouched.
+pub fn seed_devin_mcp_config() {
+    let Some(config_dir) = devin_config_dir() else {
+        return;
+    };
+    seed_devin_mcp_config_in(&config_dir);
+}
+
+fn seed_devin_mcp_config_in(config_dir: &Path) {
+    let path = config_dir.join("mcp_config.json");
+    let mut root: serde_json::Map<String, Value> = match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Object(map)) => map,
+            _ => {
+                tracing::warn!(?path, "devin mcp_config.json unparseable; not seeding");
+                return;
+            }
+        },
+        _ => serde_json::Map::new(),
+    };
+    let servers = root
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(servers) = servers.as_object_mut() else {
+        tracing::warn!(
+            ?path,
+            "devin mcp_config `mcpServers` is not an object; not seeding"
+        );
+        return;
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(exe) = exe.to_str() else {
+        return;
+    };
+    let mut changed = false;
+    for (name, subcommand) in [
+        ("cosmos-browser", "browser-bridge"),
+        ("cosmos-computer", "computer-stdio"),
+        ("cosmos-tools", "tools-stdio"),
+    ] {
+        let wanted = json!({
+            "command": exe,
+            "args": [subcommand],
+            "transport": "stdio",
+        });
+        match servers.get(name) {
+            // Ours, still pointing at the same shim — leave it alone.
+            Some(existing) if existing == &wanted => {}
+            // Ours but stale (exe moved after an update): refresh the path.
+            Some(existing) if existing.get("args") == wanted.get("args") => {
+                servers.insert(name.to_string(), wanted);
+                changed = true;
+            }
+            // A user-owned server with the same name — never clobber it.
+            Some(_) => {}
+            None => {
+                servers.insert(name.to_string(), wanted);
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return;
+    }
+    if let Err(error) = std::fs::create_dir_all(&config_dir) {
+        tracing::warn!(?config_dir, %error, "devin config dir create failed");
+        return;
+    }
+    match serde_json::to_string_pretty(&Value::Object(root)) {
+        Ok(body) => {
+            if let Err(error) = std::fs::write(&path, body) {
+                tracing::warn!(?path, %error, "devin mcp_config.json write failed");
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+/// Devin's user-scope config dir: `%APPDATA%/devin` on Windows,
+/// `~/.config/devin` elsewhere (mirrors `devin mcp add --scope user`).
+fn devin_config_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|p| p.join("devin"))
+    } else {
+        crate::executable::home_dir().map(|h| h.join(".config").join("devin"))
+    }
+}
+
 fn devin_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = crate::executable::home_dir() {
@@ -1386,6 +1486,12 @@ impl AcpHarness {
         if self.spec.id == HarnessId::Antigravity {
             cmd.env("GEMINI_HOME", antigravity_paths::home()?);
         }
+        if self.spec.id == HarnessId::Devin {
+            // Devin only honors MCP servers from its own config — seed it
+            // before every spawn so the shims ride the stamped COSMOS_*_MCP
+            // env this process hands the MCP children.
+            seed_devin_mcp_config();
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2230,7 +2336,14 @@ pub(crate) fn initialize_params(harness: HarnessId) -> Value {
         // unlocks lifecycle tags plus every nested message, thought, and tool
         // update, all of which DevinTracker can route. Do not advertise the
         // separate subagentControl extension: Zeron has no matching UI yet.
-        capabilities["_meta"] = json!({ "cognition.ai/subagentSupport": true });
+        // `cognition.ai/mcp` tells Devin this client speaks MCP — verified
+        // live on 3000.10.27 to flip its `mcp` capability gate (it enables
+        // MCP handling/serversChanged notifications; session/new's
+        // `mcpServers` stays ignored — see seed_devin_mcp_config).
+        capabilities["_meta"] = json!({
+            "cognition.ai/subagentSupport": true,
+            "cognition.ai/mcp": true,
+        });
     }
     json!({
         "protocolVersion": 1,
@@ -4550,10 +4663,58 @@ mod tests {
         let devin = initialize_params(HarnessId::Devin);
         let meta = &devin["clientCapabilities"]["_meta"];
         assert_eq!(meta["cognition.ai/subagentSupport"], true);
+        // Devin gates MCP handling on this client capability — without it the
+        // agent never bridges cosmos-* servers into the model's toolset.
+        assert_eq!(meta["cognition.ai/mcp"], true);
         assert!(meta.get("cognition.ai/subagentControl").is_none());
 
         let grok = initialize_params(HarnessId::Grok);
         assert!(grok["clientCapabilities"].get("_meta").is_none());
+    }
+
+    #[test]
+    fn devin_mcp_seed_upserts_cosmos_servers_and_preserves_user_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("devin");
+        let path = config_dir.join("mcp_config.json");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+                "mcpServers": {
+                    "figma": { "serverUrl": "https://mcp.figma.com/mcp" },
+                    "cosmos-computer": { "command": "C:\\old\\cosmos.exe", "args": ["computer-stdio"], "transport": "stdio" }
+                },
+                "otherTopLevel": { "keep": true }
+            }"#,
+        )
+        .unwrap();
+
+        seed_devin_mcp_config_in(&config_dir);
+
+        let root: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let servers = &root["mcpServers"];
+        // User servers and unrelated top-level keys survive.
+        assert_eq!(servers["figma"]["serverUrl"], "https://mcp.figma.com/mcp");
+        assert_eq!(root["otherTopLevel"]["keep"], true);
+        // All three shims seeded; the stale cosmos-computer path refreshed.
+        for (name, sub) in [
+            ("cosmos-browser", "browser-bridge"),
+            ("cosmos-computer", "computer-stdio"),
+            ("cosmos-tools", "tools-stdio"),
+        ] {
+            assert_eq!(servers[name]["args"], json!([sub]), "{name}");
+            assert_eq!(servers[name]["transport"], "stdio");
+            assert!(
+                servers[name]["command"].as_str().unwrap().ends_with(".exe") || !cfg!(windows),
+                "{name} command"
+            );
+        }
+
+        // Idempotent: a second run changes nothing.
+        let before = std::fs::read_to_string(&path).unwrap();
+        seed_devin_mcp_config_in(&config_dir);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]

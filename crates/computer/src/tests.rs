@@ -2839,4 +2839,58 @@ async fn e2e_real_driver() {
             .await;
         eprintln!("e2e move_cursor: {:?}", moved.map(|r| r.text));
     }
+
+    // Screenshot staging: the dir may not exist yet (the profile uploads
+    // root materializes lazily) — the backend must create it on demand and
+    // still land the PNG.
+    let nested = shots.path().join("deep").join("nested");
+    let service2 = ComputerService::with_backend(
+        temp.path().into(),
+        nested.clone(),
+        Arc::new(
+            crate::cua::CuaBackend::spawn(&paths, &settings, &install)
+                .await
+                .expect("driver spawn"),
+        ),
+    );
+    let shot = service2
+        .dispatch_tool(
+            "computer_observe",
+            json!({"scope": "frontmost", "includeScreenshot": true}),
+        )
+        .await
+        .expect("observe+screenshot");
+    eprintln!(
+        "e2e observe+shot: {} / image={}B",
+        shot.text.lines().next().unwrap_or(""),
+        shot.image.as_ref().map(|b| b.len()).unwrap_or(0)
+    );
+    assert!(nested.is_dir(), "staging dir created on demand");
+    assert!(shot.image.is_some(), "PNG reached the reply");
+
+    // Degradation: an unstageable dir (a file blocks the path) must not sink
+    // the observe — semantic text plus an explicit note.
+    let blocker = temp.path().join("blocker");
+    std::fs::write(&blocker, b"file-not-dir").unwrap();
+    let service3 = ComputerService::with_backend(
+        temp.path().into(),
+        blocker.join("sub"),
+        Arc::new(
+            crate::cua::CuaBackend::spawn(&paths, &settings, &install)
+                .await
+                .expect("driver spawn"),
+        ),
+    );
+    let degraded = service3
+        .dispatch_tool(
+            "computer_observe",
+            json!({"scope": "frontmost", "includeScreenshot": true}),
+        )
+        .await
+        .expect("observe survives staging failure");
+    eprintln!("e2e degraded observe: {}", degraded.text);
+    assert!(
+        degraded.text.contains("screenshot unavailable"),
+        "degradation note missing"
+    );
 }

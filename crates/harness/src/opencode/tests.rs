@@ -1383,3 +1383,59 @@ async fn v2_recovered_step_failure_does_not_poison_successful_execution() {
     assert_eq!(status, DoneStatus::Completed);
     assert_eq!(text, "Recovered");
 }
+
+#[test]
+fn seed_writes_direct_spawn_and_repairs_bash_wrapper() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("opencode");
+
+    // Fresh seed: both shims spawn the exe directly (Windows-safe — no
+    // /bin/bash), env fallback lives inside the shim itself.
+    seed_global_config_in(&cfg);
+    let root: Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.join("opencode.json")).unwrap()).unwrap();
+    for (name, sub) in [
+        ("cosmos-computer", "computer-stdio"),
+        ("cosmos-tools", "tools-stdio"),
+    ] {
+        let entry = &root["mcp"][name];
+        assert_eq!(entry["type"], "local");
+        assert_eq!(entry["command"].as_array().unwrap()[1], json!(sub));
+        assert!(
+            entry["command"].as_array().unwrap()[0]
+                .as_str()
+                .unwrap()
+                .contains(if cfg!(windows) { ".exe" } else { "" })
+        );
+        assert!(entry.get("environment").is_none());
+    }
+
+    // A prior build's bash wrapper (unspawnable on Windows) is refreshed;
+    // a foreign entry under another name is untouched.
+    let mut root =
+        serde_json::from_str::<Value>(&std::fs::read_to_string(cfg.join("opencode.json")).unwrap())
+            .unwrap();
+    root["mcp"]["cosmos-computer"] = json!({
+        "type": "local",
+        "command": ["/bin/bash", "-c", "test -n \"$COSMOS_COMPUTER_MCP\" && exec \"$COSMOS_MCP_ZERON\" computer-stdio --url \"${COSMOS_COMPUTER_MCP}\""],
+        "environment": { "COSMOS_MCP_ZERON": "old-cosmos.exe" },
+        "enabled": true,
+    });
+    root["mcp"]["mine"] = json!({ "type": "local", "command": ["my-server"] });
+    std::fs::write(cfg.join("opencode.json"), root.to_string()).unwrap();
+
+    seed_global_config_in(&cfg);
+    let root: Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.join("opencode.json")).unwrap()).unwrap();
+    let fixed = &root["mcp"]["cosmos-computer"]["command"];
+    assert_ne!(fixed[0], json!("/bin/bash"), "bash wrapper not refreshed");
+    assert_eq!(root["mcp"]["mine"]["command"], json!(["my-server"]));
+
+    // Idempotent.
+    let before = std::fs::read_to_string(cfg.join("opencode.json")).unwrap();
+    seed_global_config_in(&cfg);
+    assert_eq!(
+        std::fs::read_to_string(cfg.join("opencode.json")).unwrap(),
+        before
+    );
+}

@@ -8754,19 +8754,19 @@ impl Shell {
         // local-vs-sign-in fork once (persisted in ui-settings.json). Local
         // mode pairs the phone over the LAN; logging in starts the Woozlit
         // browser flow and the existing switch wizard migrates local work.
-        let welcome_shown = {
+        let show_welcome = {
             let state = self.state.read(cx);
             state.workspace_scope == Some(WorkspaceScope::Local)
                 && matches!(state.auth, Some(AuthState::SignedOut))
-                && settings::current(cx).first_run_seen
+                && !settings::current(cx).first_run_seen
         };
-        if !welcome_shown {
+        if show_welcome {
             let card = popover::dialog_card(&theme)
                 .child(popover::dialog_title(&theme, "Welcome to Cosmos"))
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Use Cosmos locally — no account, everything stays on this Mac, and your phone still pairs on the same network — or log in to sync your workspace across devices.",
+                        "Use Cosmos locally — no account, everything stays on this device, and your phone still pairs on the same network — or log in to sync your workspace across devices.",
                     )),
                 )
                 .child(
@@ -8783,6 +8783,10 @@ impl Shell {
                                     settings::update(SavePolicy::Immediate, cx, |settings| {
                                         settings.first_run_seen = true;
                                     });
+                                    // settings::update writes a global — it
+                                    // does not dirty this view; notify so the
+                                    // dialog actually dismisses on click.
+                                    cx.notify();
                                 })),
                         )
                         .child(
