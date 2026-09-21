@@ -105,6 +105,8 @@ export default function PairScreen() {
         return;
       }
       await pairAndConnect(resolved.deviceId, c);
+    } catch (e) {
+      setPairError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }

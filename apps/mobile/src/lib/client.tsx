@@ -142,6 +142,10 @@ export class CosmosClient {
   async signIn(): Promise<void> {
     const session = await signInInteractive();
     this.auth.set(session);
+    // Drop any cached bearer — a still-fresh token from a previous account
+    // would dial the relay as the wrong user and wedge the device room.
+    this.accessTokenCache = null;
+    this.accessToken.set(session.accessToken ?? null);
     await this.refreshTokenNow();
     // After sign-in, remote devices become visible through the desktops watch
     // of whichever transport is live; pairing a remote desktop needs the edge.
@@ -348,8 +352,22 @@ export class CosmosClient {
     // (edge hiccup) still lets the dial try.
     const status = (await this.edgeFetch(
       `/device/${encodeURIComponent(deviceId)}/status`,
-    )) as { hostConnected?: boolean } | null;
-    if (status && status.hostConnected === false) {
+    )) as { hostConnected?: boolean } | { __error: unknown } | null;
+    const probeErr =
+      status && typeof status === 'object' && '__error' in status ? status.__error : undefined;
+    if (probeErr === 404) {
+      throw new Error(
+        "That desktop has never reached the relay — open Cosmos on it, sign in, " +
+          'and show a fresh pairing code.',
+      );
+    }
+    if (probeErr === 401 || probeErr === 403) {
+      throw new Error(
+        'The relay rejected this sign-in — make sure the desktop is signed into ' +
+          'the same Woozlit account as this phone, then retry.',
+      );
+    }
+    if (status && typeof status === 'object' && !('__error' in status) && status.hostConnected === false) {
       throw new Error(
         "That desktop isn't online at the relay — make sure Cosmos is running " +
           'on it and signed into the same Woozlit account, then retry.',
@@ -377,11 +395,18 @@ export class CosmosClient {
           { code: code.trim().toUpperCase(), label: label ?? 'iPhone' },
         )
         .catch((e) => {
-          throw new Error(
-            /timed out/.test(e instanceof Error ? e.message : String(e))
-              ? "The desktop didn't answer — is it still running and signed into Woozlit? Get a fresh code and retry."
-              : e,
-          );
+          const msg = e instanceof Error ? e.message : String(e);
+          if (/timed out/.test(msg)) {
+            throw new Error(
+              "The desktop didn't answer — is it still running and signed into Woozlit? Get a fresh code and retry.",
+            );
+          }
+          if (/offline/.test(msg)) {
+            throw new Error(
+              'The desktop went offline at the relay — make sure Cosmos is running on it, then retry.',
+            );
+          }
+          throw e instanceof Error ? e : new Error(msg);
         });
       const desktop: LinkedDesktop = {
         id: `remote:${reply.deviceId}`,
@@ -433,7 +458,7 @@ export class CosmosClient {
       const [host, portStr] = desktop.address.split(':');
       spec = localSpec(host, Number(portStr) || 27654);
     } else {
-      spec = relaySpec('https://edge.zeron.sh', desktop.address);
+      spec = relaySpec(EDGE_URL, desktop.address);
     }
     const rpc = new RpcClient(spec, desktop.kind === 'remote' ? () => this.tokenForDial() : undefined);
     this.rpc = rpc;
@@ -453,7 +478,19 @@ export class CosmosClient {
       // Remote conns land behind the pairing gate — authorize with the
       // stored grant BEFORE anything else or every call errors.
       if (desktop.kind === 'remote' && desktop.deviceToken) {
-        await this.rpc!.call('AuthorizePhone', { deviceToken: desktop.deviceToken });
+        try {
+          await this.rpc!.call('AuthorizePhone', { deviceToken: desktop.deviceToken });
+        } catch {
+          // Revoked on the desktop (or grant lost) — leave a dead pipe that
+          // reconnect-loops forever. Disconnect and say why instead.
+          this.disconnect();
+          this.connection.set({
+            status: 'error',
+            detail: 'This phone was unpaired on the desktop — pair again with a fresh code.',
+            desktop,
+          });
+          return;
+        }
       }
       const [info, local] = await Promise.all([
         this.rpc!.call<EngineInfo>('EngineInfo').catch(() => null),

@@ -174,7 +174,19 @@ export class RpcClient {
         const frame = typeof ev.data === 'string'
           ? decodeRelayFrame(textEncoder.encode(ev.data).buffer as ArrayBuffer)
           : decodeRelayFrame(ev.data as ArrayBuffer);
-        if (!frame || frame.header.k !== 'rpc') return;
+        if (!frame) return;
+        if (frame.header.k === ' relay') {
+          // Edge-side signal — host_offline (a frame bounced while the host
+          // was away) or host_closed (the host left). Pending calls can never
+          // resolve and the host's per-conn state (auth upgrade, watch subs)
+          // is gone either way, so drop the socket and let onclose redial a
+          // fresh conn that re-authorizes and re-subscribes.
+          const code = (() => { try { return (JSON.parse(frame.payload) as { error?: string }).error; } catch { return undefined; } })();
+          this.failAll(new Error(code === 'host_closed' ? 'the desktop went offline' : 'the desktop is offline'));
+          this.ws?.close();
+          return;
+        }
+        if (frame.header.k !== 'rpc') return;
         this.handleText(frame.payload);
       } else if (typeof ev.data === 'string') {
         this.handleText(ev.data);

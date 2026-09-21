@@ -1478,8 +1478,13 @@ impl RpcService for EngineRpc {
                 // otherwise the grant would be unattributed and the
                 // `phonePair` row could never publish.
                 let signed_in = self.auth.as_ref().is_some_and(|a| a.state().is_signed_in());
-                if !signed_in || self.engine_info.workspace_scope != WorkspaceScope::Synced {
+                if !signed_in {
                     return Err(RpcError::Failed("log in to pair a phone".into()));
+                }
+                if self.engine_info.workspace_scope != WorkspaceScope::Synced {
+                    return Err(RpcError::Failed(
+                        "pairing needs the synced workspace — switch profiles in Settings".into(),
+                    ));
                 }
                 let pairing = self
                     .pairing
