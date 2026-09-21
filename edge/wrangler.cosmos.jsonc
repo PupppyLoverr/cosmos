@@ -6,15 +6,23 @@
   //
   // Deploy:
   //   wrangler login                                    # or CLOUDFLARE_API_TOKEN
-  //   wrangler r2 bucket create cosmos-edge-blobs
+  //   wrangler r2 bucket create cosmos-edge-blobs       # needs R2 enabled in the dashboard once
   //   wrangler r2 bucket create cosmos-edge-releases
   //   wrangler deploy -c wrangler.cosmos.jsonc
-  //   curl https://cosmos-edge.<account>.workers.dev/health   # → auth:"woozlit"
+  //   curl https://cosmos-edge.cosmos-edge.workers.dev/health   # → auth:"woozlit"
   //
-  // Requires a Workers Paid plan (Durable Objects + R2). Then point clients
-  // at it: desktop `ZERON_EDGE_URL`, mobile `EXPO_PUBLIC_EDGE_URL` at build.
+  // R2 must be toggled on once in the dashboard (free tier; bucket commands
+  // fail with code 10042 until then). The worker was first deployed without
+  // r2_buckets so pairing could go live immediately — BLOBS/RELEASES only
+  // serve blob offload, nightly backups, and edge-hosted release assets;
+  // pairing and remote control never touch them. Re-deploy this config after
+  // enabling R2 to restore those paths.
+  //
+  // Clients point here by default (apps/zeron DEFAULT_EDGE_URL, mobile
+  // EDGE_URL); `ZERON_EDGE_URL` / `EXPO_PUBLIC_EDGE_URL` still override.
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "cosmos-edge",
+  "account_id": "9835ec86328796c5bdf1e3f46b9350b4",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
   "workers_dev": true,

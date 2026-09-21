@@ -30,7 +30,7 @@ final class AppModel {
     @ObservationIgnored private var lastPathKey: String?
 
     // Persisted connection settings.
-    @ObservationIgnored @AppStorage("edgeURL") var edgeURLString = "https://edge.zeron.sh"
+    @ObservationIgnored @AppStorage("edgeURL") var edgeURLString = "https://cosmos-edge.cosmos-edge.workers.dev"
     @ObservationIgnored @AppStorage("authMode") var authModeRaw = AppConfig.Mode.woozlit.rawValue
     @ObservationIgnored @AppStorage("userId") var storedUserId = ""
     @ObservationIgnored @AppStorage("orgId") var storedOrgId = ""

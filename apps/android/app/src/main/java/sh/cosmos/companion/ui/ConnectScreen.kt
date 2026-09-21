@@ -66,7 +66,7 @@ fun ConnectScreen(
         Spacer(Modifier.height(36.dp))
 
         FieldLabel("Edge URL")
-        CosmosField(edge, { edge = it }, "https://edge.zeron.sh", KeyboardType.Uri, connecting)
+        CosmosField(edge, { edge = it }, "https://cosmos-edge.cosmos-edge.workers.dev", KeyboardType.Uri, connecting)
         Spacer(Modifier.height(16.dp))
 
         FieldLabel("User ID")

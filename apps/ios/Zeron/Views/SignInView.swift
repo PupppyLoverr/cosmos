@@ -10,7 +10,7 @@ import SwiftUI
 
 /// Production cloud endpoints — Woozlit login, same bounce the desktop uses.
 enum Endpoints {
-    static let edgeURL = URL(string: "https://edge.zeron.sh")!
+    static let edgeURL = URL(string: "https://cosmos-edge.cosmos-edge.workers.dev")!
     static let callbackScheme = "zeron"
 
     static func loginURL() -> URL {

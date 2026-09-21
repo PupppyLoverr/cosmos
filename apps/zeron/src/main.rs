@@ -100,9 +100,9 @@ enum DaemonCommand {
     Status,
 }
 
-/// Production edge (Cloudflare Worker + Durable Objects on the zeron.sh zone).
+/// Production edge (Cosmos-owned Cloudflare Worker + Durable Objects).
 /// `ZERON_EDGE_URL` overrides (local dev / self-hosting).
-const DEFAULT_EDGE_URL: &str = "https://edge.zeron.sh";
+const DEFAULT_EDGE_URL: &str = "https://cosmos-edge.cosmos-edge.workers.dev";
 
 /// Production WorkOS AuthKit client id — public knowledge (it appears in every
 /// authorize URL), so baking it in is safe. Overridden by `ZERON_WORKOS_CLIENT_ID`;
