@@ -2053,6 +2053,7 @@ mod tests {
             delegate_enabled: false,
             keep_running_in_tray: false,
             launch_at_login: true,
+            first_run_seen: true,
             appshots_enabled: false,
             appshot_sound_enabled: true,
             // The destination is only persisted where Appshots exist (macOS and

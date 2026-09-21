@@ -82,6 +82,7 @@ roxmltree = "0.21.1"
 png = "0.18"
 thiserror.workspace = true
 rust-embed = "=8.7.2"
+qrcode = "0.14.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true

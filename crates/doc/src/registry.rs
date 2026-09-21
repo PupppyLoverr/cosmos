@@ -35,6 +35,12 @@ pub const KIND_PREFERENCES: &str = "preferences";
 /// Readiness only; membership and order live on individual pins.
 pub const SIDEBAR_PINS_STATE_ID: &str = "sidebarPins";
 pub const KIND_SIDEBAR_PINS: &str = "sidebarPins";
+
+/// Short-lived phone-pairing offers: `phonePair/<code>` rows carry
+/// `{deviceId, exp}` so a phone that only knows the 6-char code can resolve
+/// the desktop's device id over a plain registry read. The desktop sweeps
+/// stale rows on each rotate and tombstones the row on redeem/expiry.
+pub const KIND_PHONE_PAIR: &str = "phonePair";
 mod sidebar_pins;
 
 /// Snapshot row id in the local `DocsStore` for the persisted registry state.
@@ -771,6 +777,46 @@ impl RegistryDoc {
             .collect();
         devices.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(devices)
+    }
+
+    // ── phone pairing offers (phonePair/<code>) ─────────────────────────────
+
+    /// Publish the current pairing offer. Rotation tombstones every other
+    /// live offer row first — the QR/code surface is single-slot.
+    pub fn upsert_phone_pair(
+        &mut self,
+        code: &str,
+        device_id: &str,
+        expires_at_ms: i64,
+    ) -> Result<(), DocError> {
+        let stale: Vec<(String, String)> = self
+            .overlay_rows(KIND_PHONE_PAIR)
+            .into_iter()
+            .filter(|row| row.id != code)
+            .map(|row| (row.kind.clone(), row.id.clone()))
+            .collect();
+        if !stale.is_empty() {
+            let keys: Vec<(&str, &str)> = stale
+                .iter()
+                .map(|(kind, id)| (kind.as_str(), id.as_str()))
+                .collect();
+            self.delete_row_ops(&keys);
+        }
+        let set = fields([
+            ("deviceId", json!(device_id)),
+            ("exp", json!(expires_at_ms)),
+        ]);
+        self.write(KIND_PHONE_PAIR, code, OpKind::Upsert, set);
+        Ok(())
+    }
+
+    /// Tombstone one offer row (redeemed or rotated out). `false` when absent.
+    pub fn delete_phone_pair(&mut self, code: &str) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_PHONE_PAIR, code) {
+            return Ok(false);
+        }
+        self.delete_row_ops(&[(KIND_PHONE_PAIR, code)]);
+        Ok(true)
     }
 
     // ── spaces ──────────────────────────────────────────────────────────────

@@ -119,10 +119,12 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
           {attachments.map((f, i) => <AttachmentChip key={`${f.uri}-${i}`} file={f} onRemove={() => onRemoveAttachment(i)} />)}
         </View>
       ) : null}
+      {/* The desktop composer is a rounded-rect plate with a hairline rim,
+          not a floating glass pill — keep the same silhouette. */}
       <Glass
-        radius={26}
+        radius={radii.xl}
         tint={t.translucent ? undefined : t.composerBg}
-        style={[styles.bar, { borderColor: focused ? alpha(t.accent, 0.45) : t.glassStroke }]}
+        style={[styles.bar, { borderColor: focused ? alpha(t.accent, 0.45) : t.separator }]}
       >
         <Pressable
           onPress={openAttachSheet}

@@ -65,6 +65,18 @@ description: How to run and E2E-test the Cosmos Expo mobile companion app (apps/
   missing — run `sudo xcodebuild -downloadPlatform iOS` (≈8.5 GB), NOT Xcode GUI. Check the sim's
   OS matches the toolchain first: an iOS 27.0 sim is invisible to Xcode 26.x until the platform
   component lands; pick a same-model device on a supported runtime via `xcrun simctl list`.
+- Release/unsigned builds: check `codesign -d --entitlements - <binary>` — an app built with
+  `CODE_SIGNING_ALLOWED=NO` has NO entitlements blob at all. On iOS 27 sims,
+  `expo-secure-store` then throws `KeyChainException: A required entitlement is not present`
+  on every set/get → pairing (Trust & Link persists `cosmos.desktops`) always fails; iOS ≤26
+  tolerates it. Rebuild with normal `xcodebuild -configuration Release` ("Sign to Run Locally"
+  embeds the DER entitlements blob — empty dict is enough) and pairing works. Re-signing an
+  unsigned bundle ad-hoc cannot fix it: launchd refuses binaries carrying
+  `keychain-access-groups`/`application-identifier` without provisioning, and an XML-slot-only
+  empty entitlements dict does NOT satisfy iOS 27's keychain — the DER-encoded blob is required.
+- `simctl` (install/launch/io screenshot) on a freshly-booted sim can sit silent for 60-90s
+  while installd settles — just wait; don't assume it's hung.
+- In the pair sheet, pressing Return inside the Address field triggers "Check Connection".
 
 ## Driving the CuaDriver / Watch Live path
 - The packaged desktop embeds the engine; launch `target/package/Cosmos.app/Contents/MacOS/zeron`

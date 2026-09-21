@@ -1,27 +1,37 @@
 import React from 'react';
 import { ActivityIndicator, Pressable, StyleProp, StyleSheet, Text, TextInput, View, ViewStyle, type TextInputProps, type TextStyle } from 'react-native';
 import { SymbolView, type SymbolViewProps } from 'expo-symbols';
+import { SvgXml } from 'react-native-svg';
 import { Host, Slider as NativeSlider } from '@expo/ui';
 import * as Haptics from 'expo-haptics';
 import { Theme, alpha, edge, radii, shadows, spacing, statusColor, type, useTheme } from '../lib/theme';
-import { icons } from '../lib/icons';
+import { icons, solarFor } from '../lib/icons';
+import { SOLAR_ICONS } from '../lib/solar-icons';
 import { Glass } from './surface';
 
 // ---------------------------------------------------------------------------
-// Icons
+// Icons — the Solar Linear set the desktop embeds (1.5px strokes, 24px
+// canvas), tinted to the text color exactly like gpui's SVG renderer. Names
+// still arrive as SF Symbol names; `solarFor` aliases them onto the shared
+// asset set. An unmapped name falls back to the SF Symbol / Material glyph so
+// a one-off symbol never renders blank.
 
 type SFName = Extract<SymbolViewProps['name'], string>;
 type SymbolName = Exclude<SymbolViewProps['name'], string>;
 type AndroidName = NonNullable<SymbolName['android']>;
 
-/** SF Symbol on iOS; the mapped Material Symbol on Android. */
 export function Icon({ name, size = 17, color, weight = 'medium' }: { name: string; size?: number; color?: string; weight?: Extract<SymbolViewProps['weight'], string> }) {
   const t = useTheme();
+  const tint = color ?? t.text;
+  const solar = SOLAR_ICONS[solarFor(name) ?? name];
+  if (solar) {
+    return <SvgXml xml={solar} width={size} height={size} color={tint} />;
+  }
   const md = (icons as Record<string, string>)[name];
   const symbol: SymbolViewProps['name'] = md
     ? { ios: name as SFName, android: md as AndroidName, web: md as AndroidName }
     : (name as SFName);
-  return <SymbolView name={symbol} size={size} tintColor={color ?? t.text} weight={weight} resizeMode="scaleAspectFit" />;
+  return <SymbolView name={symbol} size={size} tintColor={tint} weight={weight} resizeMode="scaleAspectFit" />;
 }
 
 export function StatusDot({ status, size = 8 }: { status?: string; size?: number }) {
@@ -206,7 +216,7 @@ interface RowProps {
 
 export function Row({ title, subtitle, value, leading, icon, iconTint, trailing, onPress, onLongPress, danger, disabled, chevron, selected, tall }: RowProps) {
   const t = useTheme();
-  const lead = leading ?? (icon ? <IconTile name={icon} tint={iconTint ?? t.accentStrong} /> : null);
+  const lead = leading ?? (icon ? <IconTile name={icon} tint={iconTint} /> : null);
   return (
     <Pressable
       onPress={onPress}
@@ -234,7 +244,6 @@ export function Row({ title, subtitle, value, leading, icon, iconTint, trailing,
   );
 }
 
-/** iOS Settings-style 29pt rounded icon tile. */
 /** Grouped-form text field: label on the left, value on the right (iOS Settings style). */
 export function Field({ label, style, ...input }: { label: string; style?: StyleProp<ViewStyle> } & Omit<TextInputProps, 'style'>) {
   const t = useTheme();
@@ -253,11 +262,16 @@ export function Field({ label, style, ...input }: { label: string; style?: Style
   );
 }
 
-/** Small tinted glyph on a faint fill — no solid colour blocks. */
-export function IconTile({ name, tint, size = 29 }: { name: string; tint: string; size?: number }) {
+/** Flat mark tile in the desktop idiom: ink glyph on a neutral fill — no
+ *  candy-colored tiles. `tint` stays available for genuinely semantic color
+ *  (destructive rows); everything else reads monochrome. */
+export function IconTile({ name, tint, size = 29 }: { name: string; tint?: string; size?: number }) {
+  const t = useTheme();
+  const fg = tint ?? t.text;
+  const bg = tint ? alpha(tint, 0.14) : t.fill;
   return (
-    <View style={{ width: size, height: size, borderRadius: Math.min(8, Math.round(size * 0.28)), backgroundColor: alpha(tint, 0.14), alignItems: 'center', justifyContent: 'center' }}>
-      <Icon name={name} size={size * 0.55} color={tint} weight="medium" />
+    <View style={{ width: size, height: size, borderRadius: Math.min(8, Math.round(size * 0.28)), backgroundColor: bg, alignItems: 'center', justifyContent: 'center' }}>
+      <Icon name={name} size={size * 0.55} color={fg} weight="medium" />
     </View>
   );
 }
@@ -317,8 +331,8 @@ export function EmptyState({ icon, title, body, actionLabel, onAction, children 
   const t = useTheme();
   return (
     <View style={styles.empty}>
-      <View style={[styles.emptyGlyph, { backgroundColor: t.accentMuted }]}>
-        <Icon name={icon} size={30} color={t.link} weight="regular" />
+      <View style={[styles.emptyGlyph, { backgroundColor: t.fill }]}>
+        <Icon name={icon} size={30} color={t.textSecondary} weight="regular" />
       </View>
       <Text style={[type.title3, { color: t.text, marginTop: spacing(4), textAlign: 'center' }]}>{title}</Text>
       {body ? <Text style={[type.subhead, { color: t.textSecondary, textAlign: 'center', marginTop: spacing(1) }]}>{body}</Text> : null}

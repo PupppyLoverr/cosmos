@@ -31,6 +31,7 @@
             <string>sh.zeron.app.conversation</string>
             <key>CFBundleURLSchemes</key>
             <array>
+                <string>cosmos</string>
                 <string>zeron</string>
             </array>
         </dict>

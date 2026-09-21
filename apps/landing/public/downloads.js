@@ -1,10 +1,18 @@
 (() => {
-  const base = "https://zeron.sh/releases/";
+  // Cosmos release artifacts live in the public cosmos-releases repo. Only
+  // macOS ships a file today; other platforms link to the artifacts folder
+  // until their packages are published.
+  const base = "https://github.com/PupppyLoverr/cosmos-releases/raw/main/artifacts/v0.2.1-alpha/";
+  const folder = "https://github.com/PupppyLoverr/cosmos-releases/tree/main/artifacts/v0.2.1-alpha";
   const releases = {
-    macos: ["macos-arm64.dmg", "Download for macOS", "Apple silicon"],
-    windows: ["windows-x86_64.zip", "Download for Windows", "Windows x64 · Portable ZIP"],
-    linux: ["linux-x86_64.tar.gz", "Download for Linux", "Linux x64"],
-    "linux-arm": ["linux-aarch64.tar.gz", "Download for Linux", "Linux ARM64"],
+    macos: { file: "macos-arm64.dmg", label: "Download for macOS", detail: "Apple silicon" },
+    windows: { label: "Download for Windows", detail: "Windows x64 · Portable ZIP" },
+    linux: { label: "Download for Linux", detail: "Linux x64" },
+    "linux-arm": { label: "Download for Linux", detail: "Linux ARM64" },
+  };
+  const urlFor = (version, key) => {
+    const release = releases[key];
+    return release && release.file ? `${base}cosmos-${version}-${release.file}` : folder;
   };
   const ua = navigator.userAgent || "";
   const platform = navigator.userAgentData?.platform || navigator.platform || "";
@@ -15,14 +23,13 @@
     ? (/aarch64|arm64/i.test(`${platform} ${ua}`) ? "linux-arm" : "linux") : null;
   const apply = (version) => {
     for (const link of document.querySelectorAll("[data-platform-download]")) {
-      const release = releases[link.dataset.platformDownload];
-      if (release) link.href = `${base}zeron-${version}-${release[0]}`;
+      link.href = urlFor(version, link.dataset.platformDownload);
     }
     for (const id of ["nav-download", "hero-download", "closing-download"]) {
       const link = document.getElementById(id);
       if (!link || !os) continue;
-      const [file, label, detail] = releases[os];
-      link.href = `${base}zeron-${version}-${file}`;
+      const { label, detail } = releases[os];
+      link.href = urlFor(version, os);
       link.textContent = id === "nav-download" ? "Download" : label;
       link.setAttribute("aria-label", `${label} (${detail})`);
       link.title = detail;
@@ -30,8 +37,9 @@
     document.getElementById("ver").textContent = `v${version}`;
   };
   // A published fallback keeps downloads usable without the version endpoint.
-  const fallback = "0.2.66";
+  const fallback = "0.2.79";
   apply(fallback);
+  // No latest.txt on the releases repo — keep the fallback until one exists.
   fetch(`${base}latest.txt`, { credentials: "omit" })
     .then((r) => r.ok ? r.text() : Promise.reject())
     .then((text) => {
