@@ -14,7 +14,9 @@ import * as WebBrowser from 'expo-web-browser';
 
 const FIREBASE_API_KEY = 'AIzaSyBbJtkBoJrKM2hjW2H3o9pgtcyiGge9yOo';
 export const WOOZLIT_ORIGIN = 'https://www.woozlit.com';
-export const EDGE_URL = 'https://edge.zeron.sh';
+// The relay edge. `EXPO_PUBLIC_EDGE_URL` is inlined by Expo at bundle time —
+// build the production app against the Cosmos-owned edge deployment.
+export const EDGE_URL = process.env.EXPO_PUBLIC_EDGE_URL?.trim() || 'https://edge.zeron.sh';
 const SESSION_KEY = 'woozlit.session';
 const SIGN_IN_TTL_MS = 10 * 60 * 1000;
 

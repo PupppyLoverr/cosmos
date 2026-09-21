@@ -1,0 +1,55 @@
+{
+  // Cosmos-owned edge deployment — same Worker + Durable Object code as
+  // wrangler.jsonc, but bound to our own Cloudflare account and workers.dev
+  // hostname instead of edge.zeron.sh (which still runs the upstream,
+  // WorkOS-only build and rejects every Woozlit/Firebase token with 401).
+  //
+  // Deploy:
+  //   wrangler login                                    # or CLOUDFLARE_API_TOKEN
+  //   wrangler r2 bucket create cosmos-edge-blobs
+  //   wrangler r2 bucket create cosmos-edge-releases
+  //   wrangler deploy -c wrangler.cosmos.jsonc
+  //   curl https://cosmos-edge.<account>.workers.dev/health   # → auth:"woozlit"
+  //
+  // Requires a Workers Paid plan (Durable Objects + R2). Then point clients
+  // at it: desktop `ZERON_EDGE_URL`, mobile `EXPO_PUBLIC_EDGE_URL` at build.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cosmos-edge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "workers_dev": true,
+  "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
+  // loro-crdt's default entry loads its WASM via URL fetch, which workerd
+  // cannot do at runtime; the base64 entry inlines the module instead.
+  "alias": {
+    "loro-crdt": "loro-crdt/base64"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
+      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+      { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
+      { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
+      { "name": "CHAT_ROOMS", "class_name": "ChatRoom" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SessionRoom", "DeviceRoom"] },
+    { "tag": "v2", "new_sqlite_classes": ["RegistryRoom"] },
+    { "tag": "v3", "new_sqlite_classes": ["ChatRoom"] },
+    { "tag": "v4", "new_sqlite_classes": ["PreviewRoom"] }
+  ],
+  "r2_buckets": [
+    { "binding": "BLOBS", "bucket_name": "cosmos-edge-blobs" },
+    { "binding": "RELEASES", "bucket_name": "cosmos-edge-releases" }
+  ],
+  "vars": {
+    // Anything except "dev" = production token verification (Firebase
+    // Woozlit ID tokens; the /auth/* WorkOS routes answer 501 without
+    // WORKOS_API_KEY, which Cosmos never uses).
+    "AUTH_MODE": "woozlit",
+    "WORKOS_CLIENT_ID": "",
+    "FIREBASE_PROJECT_ID": "nexiloop-c0456"
+  },
+  "observability": { "enabled": true }
+}
