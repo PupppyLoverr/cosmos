@@ -92,14 +92,23 @@ async function signInWithCustomToken(customToken: string): Promise<TokenBundle> 
 }
 
 export async function refreshAccessToken(refreshToken: string): Promise<TokenBundle> {
-  const res = await fetch(
-    `https://securetoken.googleapis.com/v1/token?key=${FIREBASE_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`,
-    },
-  );
+  // Bounded: an unstalled dial should never wait minutes for a token.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 12_000);
+  let res: Response;
+  try {
+    res = await fetch(
+      `https://securetoken.googleapis.com/v1/token?key=${FIREBASE_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`,
+        signal: ctl.signal,
+      },
+    );
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) throw new Error(`token refresh failed (${res.status})`);
   const body = (await res.json()) as {
     id_token?: string; access_token?: string; refresh_token?: string; user_id?: string;

@@ -123,7 +123,18 @@ impl DevicesPage {
     /// "Pair phone": open the offer dialog — mint a fresh code, publish the
     /// `phonePair` registry row, refresh the paired-phones list, and tick the
     /// countdown (auto-rotate at expiry so a dead code is never on screen).
+    ///
+    /// Signed-out desktops must not mint offers: the host relay stays quiet
+    /// without credentials, so the phone would redeem the code into an empty
+    /// device room and sit waiting forever.
     fn open_pair(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).auth_user().is_none() {
+            self.error = Some(
+                "Log in (Woozlit) first — phone pairing rides the account relay.".into(),
+            );
+            cx.notify();
+            return;
+        }
         self.pair_open = true;
         self.fetch_pair_offer(true, cx);
         self.fetch_pair_phones(cx);
@@ -324,7 +335,7 @@ impl DevicesPage {
                 .child(
                     widgets::ghost_action(theme)
                         .id("pair-phone-open")
-                        .opacity(0.7)
+                        .opacity(if signed_in { 0.7 } else { 0.35 })
                         .hover(|s| {
                             s.opacity(1.0)
                                 .bg(crate::theme::ink(0.06))
