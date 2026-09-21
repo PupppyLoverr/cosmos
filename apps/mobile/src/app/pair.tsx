@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router } from 'expo-router';
 import * as Haptics from 'expo-haptics';
-import { PLACEHOLDER_NAME, useCosmos, useSnapshot } from '../lib/client';
+import { CameraView, useCameraPermissions } from 'expo-camera';
+import { AccountDevice, PLACEHOLDER_NAME, useCosmos, useSnapshot } from '../lib/client';
 import { alpha, radii, spacing, type, useTheme } from '../lib/theme';
 import { Button, Field, Group, Icon, IconTile, Row, SectionLabel } from '../components/bits';
 import { localSpec, RpcClient } from '../lib/rpc';
@@ -12,6 +13,7 @@ import { Screen } from '../components/surface';
 type Probe = { state: 'idle' | 'probing' | 'ok' | 'fail'; info?: EngineInfo; error?: string };
 
 const DEFAULT_PORT = 27654;
+const CODE_RE = /^[A-Z2-9]{6}$/;
 
 // Accepts `host` or `host:port`; the engine's IPC port only differs for side-by-side/dev instances.
 function hostParts(raw: string): { h: string; p: number } {
@@ -21,37 +23,84 @@ function hostParts(raw: string): { h: string; p: number } {
   return { h: s, p: DEFAULT_PORT };
 }
 
-function Step({ n, title, body, done }: { n: number; title: string; body: string; done?: boolean }) {
-  const t = useTheme();
-  return (
-    <View style={styles.step}>
-      <View style={[styles.stepBadge, { backgroundColor: done ? t.success : t.accentMuted }]}>
-        {done
-          ? <Icon name="checkmark" size={12} color="#fff" weight="bold" />
-          : <Text style={[type.caption, { color: t.link, fontWeight: '700' }]}>{n}</Text>}
-      </View>
-      <View style={{ flex: 1, minWidth: 0 }}>
-        <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>{title}</Text>
-        <Text style={[type.footnote, { color: t.textSecondary }]}>{body}</Text>
-      </View>
-    </View>
-  );
+/** `cosmos://pair?d=<deviceId>&c=<code>` from the desktop QR. */
+function parseQrPayload(data: string): { deviceId: string; code: string } | null {
+  const d = /[?&]d=([^&\s]+)/.exec(data)?.[1];
+  const c = /[?&]c=([A-Za-z2-9]{6})/.exec(data)?.[1];
+  if (!d || !c) return null;
+  return { deviceId: decodeURIComponent(d), code: c.toUpperCase() };
 }
 
 export default function PairScreen() {
   const t = useTheme();
   const client = useCosmos();
   const auth = useSnapshot(client.auth);
-  const devices = useSnapshot(client.devices);
-  const connection = useSnapshot(client.connection);
+  const desktops = useSnapshot(client.desktops);
 
+  const [code, setCode] = useState('');
   const [host, setHost] = useState('');
   const [name, setName] = useState('');
   const [probe, setProbe] = useState<Probe>({ state: 'idle' });
   const [busy, setBusy] = useState(false);
+  const [pairError, setPairError] = useState<string | null>(null);
+  const [accountDevices, setAccountDevices] = useState<AccountDevice[] | null>(null);
+  const [permission, requestPermission] = useCameraPermissions();
+  const scanning = useRef(true);
 
-  const remoteCandidates = devices.filter((d) => d.id !== connection.localDeviceId);
-  const target = hostParts(host);
+  useEffect(() => {
+    if (!auth) return;
+    void client.fetchAccountDevices().then(setAccountDevices);
+  }, [auth, client]);
+
+  useEffect(() => {
+    if (auth && permission && !permission.granted && permission.canAskAgain) {
+      void requestPermission();
+    }
+  }, [auth, permission, requestPermission]);
+
+  const leave = () => { if (router.canGoBack()) router.back(); else router.replace('/'); };
+
+  const pairAndConnect = async (deviceId: string, codeValue: string) => {
+    setBusy(true);
+    setPairError(null);
+    try {
+      const desktop = await client.pairRemote(deviceId, codeValue, 'iPhone');
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      await client.connect(desktop);
+      leave();
+    } catch (e) {
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      setPairError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+      scanning.current = true;
+    }
+  };
+
+  const onBarcode = ({ data }: { data: string }) => {
+    if (!scanning.current || busy) return;
+    const payload = parseQrPayload(data);
+    if (!payload) return;
+    scanning.current = false;
+    void pairAndConnect(payload.deviceId, payload.code);
+  };
+
+  const submitCode = async () => {
+    const c = code.trim().toUpperCase();
+    if (!CODE_RE.test(c)) return;
+    setBusy(true);
+    setPairError(null);
+    try {
+      const resolved = await client.resolvePairCode(c);
+      if (!resolved) {
+        setPairError("That code isn't live — ask the desktop for a fresh one (they last 5 minutes).");
+        return;
+      }
+      await pairAndConnect(resolved.deviceId, c);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const onHost = (v: string) => { setHost(v); if (probe.state !== 'idle') setProbe({ state: 'idle' }); };
 
@@ -78,8 +127,6 @@ export default function PairScreen() {
     }
   };
 
-  const leave = () => { if (router.canGoBack()) router.back(); else router.replace('/'); };
-
   const link = async () => {
     setBusy(true);
     try {
@@ -94,33 +141,106 @@ export default function PairScreen() {
     }
   };
 
-  const linkRemote = async (deviceId: string, deviceName: string) => {
-    setBusy(true);
-    try {
-      const desktop = await client.addRemoteDesktop({ id: deviceId, name: deviceName, platform: 'remote' });
-      await client.connect(desktop);
-      leave();
-    } catch (e) {
-      Alert.alert("Couldn't link", e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const found = probe.state === 'ok';
+  const codeValid = CODE_RE.test(code.trim().toUpperCase());
+  const knownRemoteIds = new Set(
+    desktops.filter((d) => d.kind === 'remote').map((d) => d.address),
+  );
 
   return (
     <Screen>
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.content} keyboardDismissMode="interactive" keyboardShouldPersistTaps="handled">
-          <View style={styles.steps}>
-            <Step n={1} title="Open Cosmos on your Mac" body="Both devices need to be on the same Wi‑Fi." done={found} />
-            <Step n={2} title="Enter its address" body="Settings › Devices on the Mac shows the IP." done={found} />
-            <Step n={3} title="Approve on the Mac" body="The desktop asks before this phone gets control." />
-          </View>
+          {!auth ? (
+            <Group footer="Remote pairing needs the same account on both devices. Same-Wi-Fi linking is below if you skip this.">
+              <Row title="Sign in to Woozlit" subtitle="Required to pair over any network" icon="person.crop.circle" iconTint={t.success} onPress={() => router.push('/sign-in')} chevron />
+            </Group>
+          ) : (
+            <>
+              <SectionLabel>Pair phone</SectionLabel>
+              {permission?.granted ? (
+                <View style={[styles.cameraCard, { borderColor: t.separator }]}>
+                  <CameraView
+                    style={styles.camera}
+                    facing="back"
+                    barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
+                    onBarcodeScanned={onBarcode}
+                  />
+                  <Text style={[type.caption, { color: t.textSecondary, textAlign: 'center', paddingVertical: spacing(2) }]}>
+                    Point at the QR in Cosmos → Settings → Devices → Pair phone
+                  </Text>
+                </View>
+              ) : (
+                <Group footer={permission?.canAskAgain === false ? 'Camera permission is off — type the code instead.' : undefined}>
+                  <Row
+                    title="Scan the desktop QR"
+                    subtitle="Cosmos → Settings → Devices → Pair phone"
+                    leading={<IconTile name="camera" tint={t.link} />}
+                    trailing={<Text style={[type.body, { color: t.link }]}>Allow</Text>}
+                    onPress={() => void requestPermission()}
+                  />
+                </Group>
+              )}
 
-          <SectionLabel>Local network</SectionLabel>
-          <Group footer={found ? undefined : `Port ${DEFAULT_PORT} is used unless you specify host:port.`}>
+              <Group footer="Single use, good for 5 minutes. A fresh code is on the desktop screen if this one lapsed.">
+                <Field
+                  label="Code"
+                  placeholder="ABC 123"
+                  value={code}
+                  onChangeText={(v) => { setCode(v.toUpperCase()); setPairError(null); }}
+                  autoCapitalize="characters"
+                  autoCorrect={false}
+                  maxLength={7}
+                  returnKeyType="go"
+                  onSubmitEditing={() => void submitCode()}
+                />
+              </Group>
+              {pairError ? (
+                <View style={[styles.result, { backgroundColor: alpha(t.danger, 0.1) }]} accessibilityLiveRegion="polite">
+                  <Icon name="exclamationmark.triangle" size={20} color={t.danger} />
+                  <Text style={[type.footnote, { color: t.textSecondary, flex: 1 }]}>{pairError}</Text>
+                </View>
+              ) : null}
+              <View style={styles.actions}>
+                <Button title="Pair" onPress={() => void submitCode()} disabled={!codeValid} loading={busy} />
+              </View>
+
+              <SectionLabel>On your account</SectionLabel>
+              <Group footer="Already-paired desktops connect here. Others need the code shown on their own screen.">
+                {accountDevices === null ? (
+                  <Row title="Looking for your desktops…" leading={<IconTile name="magnifyingglass" tint={t.textTertiary} />} />
+                ) : accountDevices.length === 0 ? (
+                  <Row title="No desktops on this account" leading={<IconTile name="icloud.slash" tint={t.textTertiary} />} />
+                ) : (
+                  accountDevices.map((d) => {
+                    const paired = knownRemoteIds.has(d.deviceId);
+                    const linked = desktops.find((x) => x.kind === 'remote' && x.address === d.deviceId);
+                    return (
+                      <Row
+                        key={d.deviceId}
+                        tall
+                        title={d.name}
+                        subtitle={`${d.platform ?? 'desktop'} · ${d.online ? 'online' : 'offline'}${paired ? ' · paired' : ''}`}
+                        leading={<IconTile name="desktopcomputer" tint={d.online ? t.link : t.textTertiary} size={32} />}
+                        trailing={
+                          paired && linked ? (
+                            busy ? <ActivityIndicator size="small" /> : <Text style={[type.body, { color: t.link }]}>Connect</Text>
+                          ) : (
+                            <Text style={[type.footnote, { color: t.textTertiary }]}>Needs code</Text>
+                          )
+                        }
+                        onPress={paired && linked ? () => { setBusy(true); void client.connect(linked).then(leave).finally(() => setBusy(false)); } : undefined}
+                        disabled={busy || !paired}
+                      />
+                    );
+                  })
+                )}
+              </Group>
+            </>
+          )}
+
+          <SectionLabel>Same network (advanced)</SectionLabel>
+          <Group footer={found ? undefined : `Direct engine link on port ${DEFAULT_PORT} — both devices on one Wi-Fi.`}>
             <Field
               label="Address"
               placeholder="192.168.1.20"
@@ -131,17 +251,16 @@ export default function PairScreen() {
               keyboardType="numbers-and-punctuation"
               returnKeyType="go"
               onSubmitEditing={() => void probeHost()}
-              autoFocus
             />
             <View style={[styles.sep, { backgroundColor: t.separator }]} />
-            <Field label="Name" placeholder="Uses the Mac's name" value={name} onChangeText={setName} returnKeyType="done" />
+            <Field label="Name" placeholder="Uses the computer's name" value={name} onChangeText={setName} returnKeyType="done" />
           </Group>
 
           {probe.state === 'ok' ? (
             <View style={[styles.result, { backgroundColor: alpha(t.success, 0.12) }]} accessibilityLiveRegion="polite">
               <Icon name="checkmark.seal.fill" size={20} color={t.success} />
               <View style={{ flex: 1 }}>
-                <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>Cosmos found at {target.h}</Text>
+                <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>Cosmos found at {hostParts(host).h}</Text>
                 <Text style={[type.footnote, { color: t.textSecondary }]}>
                   {probe.info?.version ? `Cosmos ${probe.info.version}` : 'Engine reachable'}{probe.info?.deviceId ? ` · ${probe.info.deviceId.slice(0, 8)}` : ''}
                 </Text>
@@ -151,50 +270,21 @@ export default function PairScreen() {
             <View style={[styles.result, { backgroundColor: alpha(t.danger, 0.1) }]} accessibilityLiveRegion="polite">
               <Icon name="wifi.exclamationmark" size={20} color={t.danger} />
               <View style={{ flex: 1 }}>
-                <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>Nothing answered at {target.h}:{target.p}</Text>
-                <Text style={[type.footnote, { color: t.textSecondary }]}>Check that Cosmos is open on the Mac and both devices share a network.</Text>
+                <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>Nothing answered at {hostParts(host).h}:{hostParts(host).p}</Text>
+                <Text style={[type.footnote, { color: t.textSecondary }]}>Check that Cosmos is open on the desktop and both devices share a network.</Text>
               </View>
             </View>
           ) : null}
 
-          <View style={styles.actions}>
-            {found ? (
-              <Button title="Trust & Link" icon="link" onPress={() => void link()} loading={busy} />
-            ) : (
-              <Button title="Check Connection" variant={host.trim() ? 'primary' : 'secondary'} onPress={() => void probeHost()} disabled={!host.trim()} loading={probe.state === 'probing'} />
-            )}
-            <Text style={[type.caption, { color: t.textTertiary, textAlign: 'center' }]}>
-              Pairing speaks the engine protocol directly over your network. No cloud, no relay.
-            </Text>
-          </View>
-
-          <SectionLabel>Remote (Woozlit)</SectionLabel>
-          {auth ? (
-            remoteCandidates.length === 0 ? (
-              <Group footer="Desktops signed into your account appear here when they're reachable.">
-                <Row title="No other devices online" leading={<IconTile name="icloud.slash" tint={t.textTertiary} />} />
-              </Group>
-            ) : (
-              <Group>
-                {remoteCandidates.map((d) => (
-                  <Row
-                    key={d.id}
-                    tall
-                    title={d.name}
-                    subtitle={`${d.platform}${d.version ? ` · Cosmos ${d.version}` : ''}`}
-                    leading={<IconTile name="desktopcomputer" tint={t.link} size={32} />}
-                    trailing={busy ? <ActivityIndicator size="small" /> : <Text style={[type.body, { color: t.link }]}>Link</Text>}
-                    onPress={() => void linkRemote(d.id, d.name)}
-                    disabled={busy}
-                  />
-                ))}
-              </Group>
-            )
-          ) : (
-            <Group footer="Remote reach is roadmap; signing in shows which of your desktops are online.">
-              <Row title="Sign in to Woozlit" subtitle="See your desktops anywhere" icon="person.crop.circle" iconTint={t.success} onPress={() => router.push('/sign-in')} chevron />
-            </Group>
-          )}
+          {host.trim() ? (
+            <View style={styles.actions}>
+              {found ? (
+                <Button title="Trust & Link" icon="link" onPress={() => void link()} loading={busy} />
+              ) : (
+                <Button title="Check Connection" variant="secondary" onPress={() => void probeHost()} loading={probe.state === 'probing'} />
+              )}
+            </View>
+          ) : null}
         </ScrollView>
       </KeyboardAvoidingView>
     </Screen>
@@ -203,13 +293,15 @@ export default function PairScreen() {
 
 const styles = StyleSheet.create({
   content: { paddingHorizontal: spacing(4), paddingTop: spacing(2), paddingBottom: spacing(10) },
-  steps: { gap: spacing(3), paddingHorizontal: spacing(1), paddingBottom: spacing(2) },
-  step: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing(3) },
-  stepBadge: { width: 24, height: 24, borderRadius: 12, alignItems: 'center', justifyContent: 'center', marginTop: 1 },
   sep: { height: StyleSheet.hairlineWidth, marginLeft: spacing(4) },
   result: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(3),
     padding: spacing(3.5), marginTop: spacing(3), borderRadius: radii.lg, borderCurve: 'continuous',
   },
   actions: { marginTop: spacing(4), gap: spacing(3) },
+  cameraCard: {
+    borderRadius: radii.lg, borderCurve: 'continuous', overflow: 'hidden',
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  camera: { height: 240, width: '100%' },
 });

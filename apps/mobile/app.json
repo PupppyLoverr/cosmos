@@ -13,7 +13,7 @@
       "buildNumber": "1",
       "icon": "./assets/icon.png",
       "infoPlist": {
-        "NSCameraUsageDescription": "Attach photos from the camera to a session.",
+        "NSCameraUsageDescription": "Scan the pairing QR shown by Cosmos on your desktop, and attach photos to a session.",
         "NSPhotoLibraryUsageDescription": "Attach photos from your library to a session.",
         "NSLocalNetworkUsageDescription": "Find Cosmos desktops on this network to connect to them directly."
       }
@@ -43,7 +43,13 @@
       ],
       "expo-secure-store",
       "./plugins/with-scene-lifecycle.js",
-      "expo-notifications"
+      "expo-notifications",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Scan the pairing QR shown by Cosmos on your desktop."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true

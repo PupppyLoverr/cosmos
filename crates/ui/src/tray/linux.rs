@@ -44,8 +44,8 @@ impl ksni::Tray for CosmosTray {
     }
 
     fn icon_name(&self) -> String {
-        // Installed theme icon (scripts/package-linux.sh → hicolor/1024x1024).
-        "zeron".into()
+        // Installed theme icon (scripts/package-linux-cosmos.sh → hicolor).
+        "cosmos".into()
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {

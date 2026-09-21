@@ -4283,7 +4283,7 @@ fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
 fn mention_error_message(err: &RpcError) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
-            "The session's device runs an older zeron — update it to search its files".into()
+            "The session's device runs an older Cosmos — update it to search its files".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
         RpcError::BadParams(_) | RpcError::Failed(_) => "File search failed".into(),
@@ -4294,7 +4294,7 @@ fn mention_error_message(err: &RpcError) -> SharedString {
 fn slash_error_message(err: &RpcError) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
-            "The session's device runs an older zeron — update it to list commands".into()
+            "The session's device runs an older Cosmos — update it to list commands".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
         RpcError::BadParams(_) | RpcError::Failed(_) => {
@@ -6606,7 +6606,7 @@ impl Composer {
                     Err(err) => {
                         composer.resume.error = Some(match err {
                             RpcError::UnknownMethod(_) => {
-                                "The session's device runs an older zeron — update it to list sessions".into()
+                                "The session's device runs an older Cosmos — update it to list sessions".into()
                             }
                             _ => "Session list failed".into(),
                         });

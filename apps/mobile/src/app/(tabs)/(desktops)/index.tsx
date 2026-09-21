@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { ActionSheetIOS, Alert, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router, Stack } from 'expo-router';
 import * as Haptics from 'expo-haptics';
@@ -78,6 +78,18 @@ export default function DesktopsScreen() {
   const computer = useSnapshot(client.computer);
   const auth = useSnapshot(client.auth);
 
+  // Remote rows show relay presence (the desktop process checked in), probed
+  // from the edge so the list is truthful even while this phone is offline.
+  const remoteOnline = useSnapshot(client.remotePresence);
+  const remoteAddrs = desktops.filter((d) => d.kind === 'remote').map((d) => d.address).join(',');
+  useEffect(() => {
+    if (!auth) return;
+    void client.refreshRemotePresence();
+    const timer = setInterval(() => void client.refreshRemotePresence(), 20_000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auth, remoteAddrs]);
+
   const active = desktops.find((d) => d.id === connection.desktop?.id);
   const others = desktops.filter((d) => d.id !== active?.id);
   const activeDevice = devices.find((d) => d.id === connection.localDeviceId);
@@ -149,7 +161,11 @@ export default function DesktopsScreen() {
                   key={d.id}
                   tall
                   title={desktopDisplayName(d)}
-                  subtitle={d.kind === 'local' ? `Local · ${d.address}` : 'Remote · via Woozlit'}
+                  subtitle={
+                    d.kind === 'local'
+                      ? `Local · ${d.address}`
+                      : `Remote · ${remoteOnline[d.address] === true ? 'Online' : remoteOnline[d.address] === false ? 'Offline' : 'via Woozlit'}`
+                  }
                   leading={<IconTile name={d.kind === 'local' ? 'laptopcomputer' : 'globe'} tint={t.textTertiary} size={32} />}
                   chevron
                   onPress={() => { void Haptics.selectionAsync(); void client.connect(d); }}

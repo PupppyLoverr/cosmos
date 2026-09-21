@@ -13,7 +13,7 @@ import {
 } from './protocol';
 import {
   StoredSession, loadSession, clearSession, freshAccessToken,
-  idTokenExpiry, signInInteractive,
+  idTokenExpiry, signInInteractive, EDGE_URL,
 } from './auth';
 import { Platform } from 'react-native';
 // SecureStore has no sync API at module scope; the store below hydrates async.
@@ -29,7 +29,21 @@ export interface LinkedDesktop {
   /** Local: `host:port`. Remote: edge device id. */
   address: string;
   trusted: boolean;
+  /** Remote only: the grant token `PairPhone` returned — presented as
+   *  `AuthorizePhone` on every relay conn so the desktop's pairing gate
+   *  unlocks the full RPC surface for this phone. */
+  deviceToken?: string;
   addedAt: number;
+}
+
+/** A device row from the account registry (remote discovery — phones that
+ *  paired show up here once the desktop publishes them). */
+export interface AccountDevice {
+  deviceId: string;
+  name: string;
+  platform?: string;
+  /** `GET /device/:id/status` — the desktop process is checked into the relay. */
+  online?: boolean;
 }
 
 export interface ConnectionInfo {
@@ -90,6 +104,8 @@ export class CosmosClient {
   readonly engine = new Snapshot<EngineInfo | null>(null);
   readonly computer = new Snapshot<ComputerStatus | null>(null);
   readonly accessToken = new Snapshot<string | null>(null);
+  /** deviceId → relay presence for linked remote desktops (edge /status probe). */
+  readonly remotePresence = new Snapshot<Record<string, boolean | null>>({});
 
   private rpc: RpcClient | null = null;
   private streams: StreamHandle[] = [];
@@ -190,6 +206,124 @@ export class CosmosClient {
     return desktop;
   }
 
+  /** Account-scoped fetch against the edge (registry reads, device status).
+   *  The bearer is the Woozlit/Firebase id token — same one the relay
+   *  WebSocket dials with. */
+  private async edgeFetch(path: string): Promise<unknown | null> {
+    const session = this.auth.get();
+    const token = await this.tokenForDial();
+    if (!session || !token) return null;
+    try {
+      const res = await fetch(`${EDGE_URL}${path}`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return { __error: res.status };
+      return await res.json();
+    } catch (e) {
+      return { __error: String(e) };
+    }
+  }
+
+  /** Devices this account's desktops registered — the remote discovery list
+   *  (replaces LAN scanning). Presence comes from `/device/:id/status`. */
+  async fetchAccountDevices(): Promise<AccountDevice[]> {
+    const session = this.auth.get();
+    if (!session) return [];
+    const rows = (await this.edgeFetch(`/registry/${encodeURIComponent(session.user.id)}/rows`)) as
+      | { rows?: { kind: string; id: string; name?: string; platform?: string; lastSeenAt?: number }[] }
+      | null;
+    const devices = (rows?.rows ?? [])
+      .filter((r) => r.kind === 'device')
+      .map((r) => ({
+        deviceId: r.id,
+        name: r.name || r.id,
+        platform: r.platform,
+      }));
+    // Presence probe per device — a handful of GETs, fine for a device list.
+    return Promise.all(
+      devices.map(async (d) => {
+        const status = (await this.edgeFetch(`/device/${encodeURIComponent(d.deviceId)}/status`)) as
+          | { hostConnected?: boolean }
+          | null;
+        return { ...d, online: status?.hostConnected === true };
+      }),
+    );
+  }
+
+  /** Probe relay presence for every linked remote desktop — powers the
+   *  "online whenever the desktop is checked into the relay" list state. */
+  async refreshRemotePresence(): Promise<void> {
+    if (!this.auth.get()) { this.remotePresence.set({}); return; }
+    const map: Record<string, boolean | null> = {};
+    for (const d of this.desktops.get().filter((x) => x.kind === 'remote')) {
+      map[d.address] = await this.deviceOnline(d.address);
+    }
+    this.remotePresence.set(map);
+  }
+
+  /** `GET /device/:id/status` — is the desktop process checked into the
+   *  relay right now. null when signed out or the probe failed. */
+  async deviceOnline(deviceId: string): Promise<boolean | null> {
+    const status = (await this.edgeFetch(`/device/${encodeURIComponent(deviceId)}/status`)) as
+      | { hostConnected?: boolean }
+      | { __error: unknown }
+      | null;
+    if (!status || '__error' in status) return null;
+    return status.hostConnected === true;
+  }
+
+  /** Resolve a typed 6-char pair code → the desktop's device id via the
+   *  `phonePair/<code>` registry row the desktop published. */
+  async resolvePairCode(code: string): Promise<{ deviceId: string } | null> {
+    const session = this.auth.get();
+    if (!session) return null;
+    const rows = (await this.edgeFetch(`/registry/${encodeURIComponent(session.user.id)}/rows`)) as
+      | { rows?: { kind: string; id: string; deviceId?: string; exp?: number }[] }
+      | null;
+    const row = (rows?.rows ?? []).find(
+      (r) => r.kind === 'phonePair' && r.id.toUpperCase() === code.trim().toUpperCase(),
+    );
+    if (!row?.deviceId) return null;
+    if (row.exp && row.exp < Date.now()) return null; // expired offer
+    return { deviceId: row.deviceId };
+  }
+
+  /** The QR/typed-code redemption: dial the device room, `PairPhone` the
+   *  code on this conn, store the returned grant token, then drop — the
+   *  normal `connect()` re-dials and authorizes with the token. */
+  async pairRemote(deviceId: string, code: string, label?: string): Promise<LinkedDesktop> {
+    const rpc = new RpcClient(relaySpec(EDGE_URL, deviceId), () => this.tokenForDial());
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const off = rpc.onStatusChange((s, detail) => {
+          if (s === 'connected') { off(); resolve(); }
+          else if (s === 'error') { off(); reject(new Error(detail ?? 'connection failed')); }
+        });
+        rpc.connect();
+        setTimeout(() => { off(); reject(new Error('pairing timed out')); }, 15_000);
+      });
+      const reply = await rpc.call<{ deviceToken: string; grantId: string; deviceId: string }>(
+        'PairPhone',
+        { code: code.trim().toUpperCase(), label: label ?? 'iPhone' },
+      );
+      const desktop: LinkedDesktop = {
+        id: `remote:${reply.deviceId}`,
+        name: reply.deviceId,
+        kind: 'remote',
+        address: reply.deviceId,
+        trusted: true,
+        deviceToken: reply.deviceToken,
+        addedAt: Date.now(),
+      };
+      const next = [...this.desktops.get().filter((d) => d.id !== desktop.id), desktop];
+      this.desktops.set(next);
+      await this.persistDesktops();
+      return desktop;
+    } finally {
+      rpc.close();
+    }
+  }
+
   async removeDesktop(id: string): Promise<void> {
     const next = this.desktops.get().filter((d) => d.id !== id);
     this.desktops.set(next);
@@ -239,6 +373,11 @@ export class CosmosClient {
 
   private async afterConnect(desktop: LinkedDesktop) {
     try {
+      // Remote conns land behind the pairing gate — authorize with the
+      // stored grant BEFORE anything else or every call errors.
+      if (desktop.kind === 'remote' && desktop.deviceToken) {
+        await this.rpc!.call('AuthorizePhone', { deviceToken: desktop.deviceToken });
+      }
       const [info, local] = await Promise.all([
         this.rpc!.call<EngineInfo>('EngineInfo').catch(() => null),
         this.rpc!.call<{ deviceId: string }>('LocalDevice').catch(() => null),
@@ -282,7 +421,8 @@ export class CosmosClient {
   private adoptRegistryName() {
     const conn = this.connection.get();
     const desktop = conn.desktop;
-    if (!desktop || desktop.kind !== 'local' || !conn.localDeviceId) return;
+    if (!desktop || !conn.localDeviceId) return;
+    if (desktop.kind === 'remote' && conn.localDeviceId !== desktop.address) return;
     const real = this.devices.get().find((d) => d.id === conn.localDeviceId)?.name?.trim();
     if (!real || real === desktop.name) return;
     const placeholder = desktop.name === desktop.address || desktop.name === PLACEHOLDER_NAME || conn.localDeviceId.startsWith(desktop.name);

@@ -546,6 +546,8 @@ pub struct EngineRpc {
     /// unlike computer its methods ARE relay-forwardable.
     tools: Option<zeron_tools::ToolService>,
     auth: Option<Auth>,
+    /// Phone pairing authority (Pair phone offers, grant list, revoke).
+    pairing: Option<std::sync::Arc<crate::pairing::PairingStore>>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
     local_import: Option<crate::local_import::LocalImporter>,
@@ -590,6 +592,7 @@ impl EngineRpc {
             computer: None,
             tools: None,
             auth: None,
+            pairing: None,
             links: None,
             updater: None,
             local_import: None,
@@ -605,6 +608,14 @@ impl EngineRpc {
     /// Attach the auth service (AuthStatus + AuthRpc mutations).
     pub fn with_auth(mut self, auth: Auth) -> Self {
         self.auth = Some(auth);
+        self
+    }
+
+    /// Attach the phone pairing store — PhonePairingOffer / ListPairedPhones /
+    /// RevokePhone (UI/IPC surface; PairPhone itself is conn-scoped, handled by
+    /// the relay gate in [`crate::pairing::RelayGate`]).
+    pub fn with_pairing(mut self, pairing: std::sync::Arc<crate::pairing::PairingStore>) -> Self {
+        self.pairing = Some(pairing);
         self
     }
 
@@ -1026,7 +1037,7 @@ fn forward_deadline(method: &str) -> std::time::Duration {
 /// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
 /// device-addressable — the handlers themselves need no changes.
-fn forwardable(method: &str) -> bool {
+pub(crate) fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_HARNESSES
@@ -1450,6 +1461,61 @@ impl RpcService for EngineRpc {
         }
         match method {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
+            // Phone pairing (Settings → Devices "Pair phone"). The offer mints
+            // a fresh 6-char code on every call with `rotate` (or when none is
+            // live) and publishes the `phonePair/<code>` registry row so a
+            // phone can resolve the code to this device from anywhere.
+            methods::PHONE_PAIRING_OFFER => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct OfferParams {
+                    #[serde(default)]
+                    rotate: bool,
+                }
+                let p: OfferParams = parse_params(params).unwrap_or(OfferParams { rotate: false });
+                let pairing = self
+                    .pairing
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("phone pairing unavailable".into()))?;
+                let (code, expires_at) = match pairing.current_offer() {
+                    Some((code, exp)) if !p.rotate => (code, exp),
+                    _ => pairing.issue(),
+                };
+                // Best-effort publish: the QR path never needs the row (it
+                // carries deviceId); the row only backs typed-code lookup.
+                self.workspace
+                    .publish_phone_pair(&code, &self.engine_info.device_id, expires_at);
+                RpcReply::value(&serde_json::json!({
+                    "deviceId": self.engine_info.device_id,
+                    "code": code,
+                    "qr": format!("cosmos://pair?d={}&c={}", self.engine_info.device_id, code),
+                    "expiresAt": expires_at,
+                }))
+            }
+            methods::LIST_PAIRED_PHONES => {
+                let pairing = self
+                    .pairing
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("phone pairing unavailable".into()))?;
+                RpcReply::value(&serde_json::json!({ "phones": pairing.list() }))
+            }
+            methods::REVOKE_PHONE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct RevokeParams {
+                    id: String,
+                }
+                let p: RevokeParams = parse_params(params)?;
+                let pairing = self
+                    .pairing
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("phone pairing unavailable".into()))?;
+                if pairing.revoke(&p.id) {
+                    RpcReply::value(&serde_json::json!({ "ok": true }))
+                } else {
+                    Err(RpcError::Failed("unknown phone grant".into()))
+                }
+            }
             methods::REGISTER_BROWSER => {
                 let url = params
                     .get("url")

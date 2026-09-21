@@ -26,6 +26,7 @@ pub mod doc_host;
 mod http_error;
 pub mod instance_lock;
 pub mod local_import;
+pub mod pairing;
 pub mod profile;
 pub mod registry;
 pub mod repos;
@@ -151,6 +152,10 @@ pub struct EngineCore {
     pub tools: zeron_tools::ToolService,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
+    /// Phone pairing authority: issues the short-lived pair codes/QR, holds the
+    /// grant store (`paired-phones.json`), and gates relay conns via
+    /// [`pairing::RelayGate`].
+    pub pairing: Arc<pairing::PairingStore>,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
     workspace_scope: WorkspaceScope,
@@ -320,6 +325,15 @@ impl EngineCore {
             )
         });
         let agent_accounts = AgentAccounts::new(agent_accounts_config);
+        // Phone pairing: codes are process-local (restart = rotate), grants
+        // persist in the device dir so phones survive desktop restarts.
+        let pairing = pairing::PairingStore::open(&device_id, &data_dir);
+        {
+            let workspace = workspace.clone();
+            pairing.set_on_redeemed(Arc::new(move |code| {
+                workspace.clear_phone_pair(code);
+            }));
+        }
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -349,6 +363,7 @@ impl EngineCore {
             tools,
             agent_accounts,
             device_id,
+            pairing,
             local_import,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
@@ -447,10 +462,20 @@ impl EngineCore {
     /// Start hosting our device room: serve the full RPC surface to relay clients and
     /// warm-open chat docs on nudges (§7 cold-chat command delivery). The token source
     /// re-reads auth on every (re)dial, so token refreshes take effect at reconnect.
+    ///
+    /// Every client conn is wrapped in [`pairing::RelayGate`]: unpaired conns
+    /// may only call the pairing ceremony plus the `forwardable` peer surface;
+    /// a QR/code redemption or stored grant token unlocks the rest (including
+    /// the computer surface — never silently forwarded to an unpaired conn).
     pub fn start_host_relay(&self, edge_url: &str) -> zeron_rpc::HostRelay {
         let auth = self.auth();
-        let config =
+        let mut config =
             zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
+        let pairing = self.pairing.clone();
+        config.wrap_conn = Some(Arc::new(move |conn_id: &str, inner| {
+            Arc::new(pairing::RelayGate::new(conn_id, inner, pairing.clone()))
+                as Arc<dyn zeron_rpc::RpcService>
+        }));
         let doc_host = self.doc_host.clone();
         let on_nudge: zeron_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
             // Opening the doc joins its room + syncs; drain fires on the change
@@ -481,6 +506,7 @@ impl EngineCore {
             self.workspace_scope,
         )
         .with_auth(self.auth())
+        .with_pairing(self.pairing.clone())
         .with_previews(self.previews.clone())
         .with_computer(self.computer.clone())
         .with_tools(self.tools.clone());

@@ -61,6 +61,23 @@ struct RenameDialog {
     _events: Subscription,
 }
 
+/// The live "Pair phone" offer returned by `PhonePairingOffer` — a 5-minute,
+/// single-use code + QR bound to this account and device.
+struct PairOffer {
+    code: String,
+    qr: String,
+    expires_at_ms: i64,
+}
+
+/// A paired phone grant (ListPairedPhones rows — never carries the token).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairedPhone {
+    id: String,
+    label: Option<String>,
+    created_at: i64,
+}
+
 pub struct DevicesPage {
     state: Entity<AppState>,
     scroll: widgets::PageScroll,
@@ -70,6 +87,11 @@ pub struct DevicesPage {
     error: Option<SharedString>,
     task: Option<Task<()>>,
     copy_task: Option<Task<()>>,
+    pair_open: bool,
+    pair_offer: Option<PairOffer>,
+    pair_phones: Vec<PairedPhone>,
+    pair_phones_authoritative: bool,
+    pair_tick: Option<Task<()>>,
     _observe: Subscription,
 }
 
@@ -84,8 +106,373 @@ impl DevicesPage {
             error: None,
             task: None,
             copy_task: None,
+            pair_open: false,
+            pair_offer: None,
+            pair_phones: Vec::new(),
+            pair_phones_authoritative: false,
+            pair_tick: None,
             _observe: observe,
         }
+    }
+
+    /// "Pair phone": open the offer dialog — mint a fresh code, publish the
+    /// `phonePair` registry row, refresh the paired-phones list, and tick the
+    /// countdown (auto-rotate at expiry so a dead code is never on screen).
+    fn open_pair(&mut self, cx: &mut Context<Self>) {
+        self.pair_open = true;
+        self.fetch_pair_offer(true, cx);
+        self.fetch_pair_phones(cx);
+        if self.pair_tick.is_none() {
+            self.pair_tick = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    let open = this
+                        .update(cx, |page, cx| {
+                            if page.pair_open {
+                                let expired = page
+                                    .pair_offer
+                                    .as_ref()
+                                    .is_some_and(|o| Self::now_ms() >= o.expires_at_ms);
+                                if expired {
+                                    page.fetch_pair_offer(true, cx);
+                                }
+                                cx.notify();
+                            }
+                            page.pair_open
+                        })
+                        .unwrap_or(false);
+                    if !open {
+                        break;
+                    }
+                }
+                this.update(cx, |page, _| page.pair_tick = None).ok();
+            }));
+        }
+        cx.notify();
+    }
+
+    fn fetch_pair_offer(&mut self, rotate: bool, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::PHONE_PAIRING_OFFER,
+                    serde_json::json!({ "rotate": rotate }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                match result {
+                    Ok(v) => {
+                        page.pair_offer = Some(PairOffer {
+                            code: v.get("code").and_then(|c| c.as_str()).unwrap_or("").into(),
+                            qr: v.get("qr").and_then(|c| c.as_str()).unwrap_or("").into(),
+                            expires_at_ms: v.get("expiresAt").and_then(|c| c.as_i64()).unwrap_or(0),
+                        });
+                    }
+                    Err(err) => {
+                        page.error = Some(format!("Couldn't start pairing: {err}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn fetch_pair_phones(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::LIST_PAIRED_PHONES, serde_json::json!({}))
+                .await;
+            this.update(cx, |page, cx| {
+                if let Ok(v) = result {
+                    page.pair_phones = v
+                        .get("phones")
+                        .and_then(|p| serde_json::from_value::<Vec<PairedPhone>>(p.clone()).ok())
+                        .unwrap_or_default();
+                    page.pair_phones_authoritative = true;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn revoke_phone(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.pair_phones.retain(|p| p.id != id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::REVOKE_PHONE, serde_json::json!({ "id": id }))
+                .await;
+            this.update(cx, |page, cx| {
+                if let Err(err) = result {
+                    page.error = Some(format!("Revoke failed: {err}").into());
+                }
+                page.fetch_pair_phones(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn close_pair(&mut self, cx: &mut Context<Self>) {
+        self.pair_open = false;
+        cx.notify();
+    }
+
+    fn now_ms() -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
+
+    /// QR matrix → module grid painted as quads: dark modules on the white
+    /// pad so the scan target survives dark themes.
+    fn render_qr(payload: &str, size: f32) -> AnyElement {
+        let matrix = qrcode::QrCode::new(payload.as_bytes()).ok().map(|code| {
+            let n = code.width();
+            let dark: Vec<bool> = code
+                .to_colors()
+                .iter()
+                .map(|c| *c == qrcode::Color::Dark)
+                .collect();
+            (n, dark)
+        });
+        gpui::canvas(
+            move |_, _, _| matrix.clone(),
+            |bounds, matrix, window, _| {
+                let Some((n, dark)) = matrix else {
+                    return;
+                };
+                let cell = f32::from(bounds.size.width) / n as f32;
+                for (i, filled) in dark.iter().enumerate() {
+                    if !filled {
+                        continue;
+                    }
+                    let col = (i % n) as f32;
+                    let row = (i / n) as f32;
+                    let module = gpui::Bounds {
+                        origin: bounds.origin + gpui::point(px(col * cell), px(row * cell)),
+                        // Half-pixel bleed kills hairline gaps between modules.
+                        size: gpui::size(px(cell + 0.5), px(cell + 0.5)),
+                    };
+                    window.paint_quad(gpui::quad(
+                        module,
+                        px(0.0),
+                        gpui::black(),
+                        px(0.0),
+                        gpui::transparent_black(),
+                        gpui::BorderStyle::default(),
+                    ));
+                }
+            },
+        )
+        .w(px(size))
+        .h(px(size))
+        .into_any_element()
+    }
+
+    /// The "Phone pairing" section above the device list: explainer, the
+    /// "Pair phone" action, and the paired-phones list with per-row revoke.
+    fn render_pair_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let signed_in = self.state.read(cx).auth_user().is_some();
+        let mut card = widgets::section_card(theme).child(
+            widgets::card_row(theme, true)
+                .child(widgets::row_tile(theme, crate::icons::MONITOR))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(widgets::row_title(theme, "Pair phone"))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(if signed_in {
+                                    "Scan the QR with the Cosmos app — your phone can steer this desktop from anywhere, not just this network."
+                                } else {
+                                    "Log in (Woozlit) to pair a phone for remote control from anywhere."
+                                })),
+                        ),
+                )
+                .child(
+                    widgets::ghost_action(theme)
+                        .id("pair-phone-open")
+                        .opacity(0.7)
+                        .hover(|s| {
+                            s.opacity(1.0)
+                                .bg(crate::theme::ink(0.06))
+                                .text_color(theme.text)
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.open_pair(cx)))
+                        .child(SharedString::from("Show code")),
+                ),
+        );
+        for (ix, phone) in self.pair_phones.iter().enumerate() {
+            let id = phone.id.clone();
+            let revoke_id = phone.id.clone();
+            let label = phone
+                .label
+                .clone()
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| format!("Phone {}", short_id(&phone.id)));
+            let when = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(phone.created_at)
+                .map(|t| format!("Paired {}", format_last_seen(Some(t), Utc::now())))
+                .unwrap_or_default();
+            card = card.child(
+                widgets::card_row(theme, false)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::row_title(theme, label))
+                            .child(
+                                div()
+                                    .text_size(crate::typography::ui_rems(10.5))
+                                    .font_family(theme.font_mono.clone())
+                                    .text_color(theme.text_muted.opacity(0.5))
+                                    .child(SharedString::from(format!(
+                                        "{} · {}",
+                                        when,
+                                        short_id(&id)
+                                    ))),
+                            ),
+                    )
+                    .child(
+                        widgets::ghost_action(theme)
+                            .id(("phone-revoke", ix))
+                            .opacity(0.7)
+                            .hover(|s| {
+                                s.opacity(1.0)
+                                    .bg(theme.danger.opacity(0.12))
+                                    .text_color(theme.danger)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.revoke_phone(revoke_id.clone(), cx);
+                            }))
+                            .child(SharedString::from("Revoke")),
+                    ),
+            );
+        }
+        card
+    }
+
+    /// The offer dialog: white QR pad + the same code as text + countdown.
+    /// Single-use; rotates automatically at expiry.
+    fn render_pair_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let offer = self.pair_offer.as_ref();
+        let mut card = popover::dialog_card(theme)
+            .w(px(380.0))
+            .child(popover::dialog_title(theme, "Pair phone"))
+            .child(
+                div()
+                    .mt(px(8.0))
+                    .text_size(crate::typography::ui_rems(12.5))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(
+                        "Open Cosmos on your phone, sign in with the same account, then scan — or type the code.",
+                    )),
+            );
+        if let Some(offer) = offer {
+            let secs_left = ((offer.expires_at_ms - Self::now_ms()) / 1000).max(0);
+            let grouped = offer
+                .code
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == 3 {
+                        format!(" {}", c)
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect::<String>();
+            card = card
+                .child(
+                    div().mt(px(16.0)).flex().justify_center().child(
+                        div()
+                            .p(px(14.0))
+                            .rounded(px(14.0))
+                            .bg(gpui::white())
+                            .child(Self::render_qr(&offer.qr, 184.0)),
+                    ),
+                )
+                .child(
+                    div().mt(px(14.0)).flex().justify_center().child(
+                        div()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(crate::typography::ui_rems(26.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(SharedString::from(grouped)),
+                    ),
+                )
+                .child(
+                    div()
+                        .mt(px(6.0))
+                        .flex()
+                        .justify_center()
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_muted.opacity(0.7))
+                        .child(SharedString::from(format!(
+                            "Single use · expires in {}:{:02}",
+                            secs_left / 60,
+                            secs_left % 60
+                        ))),
+                );
+        } else {
+            card = card.child(
+                div()
+                    .mt(px(16.0))
+                    .py(px(30.0))
+                    .text_center()
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from("Minting a code…")),
+            );
+        }
+        card = card.child(
+            div()
+                .mt(px(18.0))
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(px(8.0))
+                .child(
+                    popover::btn_ghost(theme, "New code", "pair-rotate")
+                        .id("pair-rotate")
+                        .on_click(cx.listener(|this, _, _, cx| this.fetch_pair_offer(true, cx))),
+                )
+                .child(
+                    popover::btn_primary(theme, "Done")
+                        .id("pair-done")
+                        .on_click(cx.listener(|this, _, _, cx| this.close_pair(cx))),
+                ),
+        );
+        popover::modal("pair-phone-dialog", viewport, card.into_any_element())
     }
 
     fn open_rename(&mut self, device_id: String, current: String, cx: &mut Context<Self>) {
@@ -243,6 +630,7 @@ impl Render for DevicesPage {
         };
         let copied = self.copied.clone();
         let dialog = self.render_rename_dialog(window.viewport_size(), cx);
+        let viewport = window.viewport_size();
         let emerald = theme.success; // emerald-400
         let count = devices.len();
 
@@ -423,7 +811,13 @@ impl Render for DevicesPage {
             card.children(rows)
         };
 
+        let pair_section = self.render_pair_section(&theme, cx);
         let scrollbar = popover::rail(self, "devices-page-scrollbar", &theme, cx);
+        let pair_dialog = if self.pair_open {
+            Some(self.render_pair_dialog(viewport, &theme, cx))
+        } else {
+            None
+        };
         div()
             .id("devices-page-host")
             .relative()
@@ -457,11 +851,13 @@ impl Render for DevicesPage {
                                         })),
                                 )
                             })
+                            .child(pair_section)
                             .child(card),
                     ),
             )
             .children(scrollbar)
             .when_some(dialog, |el, dialog| el.child(dialog))
+            .when_some(pair_dialog, |el, dialog| el.child(dialog))
     }
 }
 

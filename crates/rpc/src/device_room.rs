@@ -280,6 +280,10 @@ impl TokenSource for StaticToken {
 /// open it and drain"); the engine warms/opens the chat doc.
 pub type NudgeHandler = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Per-conn service decorator applied to each client conn (conn_id) before it
+/// enters the dispatch loop — the engine's pairing gate hooks in here.
+pub type ConnWrapper = Arc<dyn Fn(&str, Arc<dyn RpcService>) -> Arc<dyn RpcService> + Send + Sync>;
+
 pub struct HostRelayConfig {
     /// Edge base URL (`http(s)://…`; rewritten to `ws(s)` for the socket).
     pub edge_url: String,
@@ -287,6 +291,9 @@ pub struct HostRelayConfig {
     pub token: Arc<dyn TokenSource>,
     /// Reconnect delay after a session ends (a small jitter is added).
     pub retry: Duration,
+    /// Optional per-conn service wrapper (e.g. the phone-pairing gate). When
+    /// set, every client conn's RPC surface passes through it first.
+    pub wrap_conn: Option<ConnWrapper>,
 }
 
 impl HostRelayConfig {
@@ -300,6 +307,7 @@ impl HostRelayConfig {
             device_id: device_id.into(),
             token,
             retry: Duration::from_secs(5),
+            wrap_conn: None,
         }
     }
 }
@@ -342,7 +350,8 @@ impl HostRelay {
                         );
                         let started = tokio::time::Instant::now();
                         let outcome = {
-                            let session = host_session(&url, &service, &on_nudge);
+                            let session =
+                                host_session(&url, &service, &on_nudge, &config.wrap_conn);
                             tokio::pin!(session);
                             loop {
                                 tokio::select! {
@@ -444,7 +453,12 @@ fn make_virtual_conn(
     service: Arc<dyn RpcService>,
     conn_id: String,
     host_out: mpsc::Sender<Vec<u8>>,
+    wrap_conn: &Option<ConnWrapper>,
 ) -> VirtualConn {
+    let service = match wrap_conn {
+        Some(wrap) => wrap(&conn_id, service),
+        None => service,
+    };
     let (in_tx, in_rx) = mpsc::channel::<String>(256);
     let (srv_out_tx, mut srv_out_rx) = mpsc::channel::<String>(256);
     tokio::spawn(serve_connection(service, srv_out_tx, in_rx));
@@ -469,6 +483,7 @@ async fn host_session(
     url: &str,
     service: &Arc<dyn RpcService>,
     on_nudge: &NudgeHandler,
+    wrap_conn: &Option<ConnWrapper>,
 ) -> Result<(), RpcError> {
     let ws = zeron_sync::dial::connect_ws(url)
         .await
@@ -488,7 +503,7 @@ async fn host_session(
     let mut conns: HashMap<String, VirtualConn> = HashMap::new();
     let dispatch = async {
         while let Some(bytes) = in_rx.recv().await {
-            handle_host_frame(&bytes, &mut conns, service, &out_tx, on_nudge).await;
+            handle_host_frame(&bytes, &mut conns, service, &out_tx, on_nudge, wrap_conn).await;
         }
     };
     // Poll the transport even when a virtual RPC connection is backpressured.
@@ -513,6 +528,7 @@ async fn handle_host_frame(
     service: &Arc<dyn RpcService>,
     out_tx: &mpsc::Sender<Vec<u8>>,
     on_nudge: &NudgeHandler,
+    wrap_conn: &Option<ConnWrapper>,
 ) {
     let (header, payload) = match decode_device_frame(bytes) {
         Ok(frame) => frame,
@@ -569,7 +585,7 @@ async fn handle_host_frame(
     };
     let conn = conns
         .entry(from.clone())
-        .or_insert_with(|| make_virtual_conn(service.clone(), from, out_tx.clone()));
+        .or_insert_with(|| make_virtual_conn(service.clone(), from, out_tx.clone(), wrap_conn));
     let text = String::from_utf8_lossy(&payload).into_owned();
     if conn.in_tx.send(text).await.is_err() {
         tracing::warn!("device-room: virtual conn dispatch loop gone");
