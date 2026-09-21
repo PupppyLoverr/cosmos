@@ -163,11 +163,22 @@ export class CosmosClient {
     if (!session) return null;
     const cached = this.accessTokenCache;
     if (cached && cached.expiresAt > Date.now() + 30_000) return cached.token;
+    // The sign-in may have handed us a usable id token with no refresh token
+    // (Woozlit returns either shape) — serve it while it's still fresh.
+    const expiresAt = session.accessTokenExpiresAt ?? 0;
+    if (session.accessToken && expiresAt > Date.now() + 30_000) {
+      this.accessToken.set(session.accessToken);
+      return session.accessToken;
+    }
     if (!session.refreshToken) return null;
     try {
       const token = await freshAccessToken(session);
-      this.accessTokenCache = { token: token!, expiresAt: idTokenExpiry(token!) };
+      if (!token) return null;
+      this.accessTokenCache = { token, expiresAt: idTokenExpiry(token) };
       this.accessToken.set(token);
+      // The refresh rotates both tokens — re-read the persisted session so
+      // this.auth isn't left holding a stale refresh token.
+      this.auth.set((await loadSession()) ?? session);
       return token;
     } catch {
       return null;
@@ -289,7 +300,10 @@ export class CosmosClient {
    *  `phonePair/<code>` registry row the desktop published. */
   async resolvePairCode(code: string): Promise<{ deviceId: string } | null> {
     const session = this.auth.get();
-    if (!session) return null;
+    if (!session) throw new Error('Sign in to Woozlit first.');
+    if (!(await this.tokenForDial())) {
+      throw new Error('Your sign-in session expired — sign out and back in, then retry.');
+    }
     const rows = (await this.edgeFetch(`/registry/${encodeURIComponent(session.user.id)}/rows`)) as
       | { rows?: RegistryRow[] }
       | null;
@@ -310,6 +324,13 @@ export class CosmosClient {
    *  code on this conn, store the returned grant token, then drop — the
    *  normal `connect()` re-dials and authorizes with the token. */
   async pairRemote(deviceId: string, code: string, label?: string): Promise<LinkedDesktop> {
+    if (!(await this.tokenForDial())) {
+      throw new Error(
+        this.auth.get()
+          ? 'Your sign-in session expired — sign out and back in, then retry.'
+          : 'Sign in to Woozlit first.',
+      );
+    }
     const rpc = new RpcClient(relaySpec(EDGE_URL, deviceId), () => this.tokenForDial());
     try {
       await new Promise<void>((resolve, reject) => {

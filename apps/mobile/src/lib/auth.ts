@@ -26,6 +26,11 @@ export interface AuthUser {
 
 export interface StoredSession {
   refreshToken: string;
+  /** The live Firebase id token — Woozlit may return one directly (no custom
+   *  token → no refresh token), so it must be persisted or every relay call
+   *  immediately fails 'signed out'. */
+  accessToken?: string | null;
+  accessTokenExpiresAt?: number | null;
   user: AuthUser;
 }
 
@@ -174,7 +179,12 @@ export async function signInInteractive(): Promise<StoredSession> {
     // remote sockets will need a fresh sign-in when it expires.
     refreshToken = '';
   }
-  const session = { refreshToken, user };
+  const session = {
+    refreshToken,
+    accessToken,
+    accessTokenExpiresAt: idTokenExpiry(accessToken),
+    user,
+  };
   await saveSession(session);
   return session;
 }
@@ -182,6 +192,11 @@ export async function signInInteractive(): Promise<StoredSession> {
 export async function freshAccessToken(session: StoredSession): Promise<string | null> {
   if (!session.refreshToken) return null;
   const bundle = await refreshAccessToken(session.refreshToken);
-  await saveSession({ refreshToken: bundle.refreshToken, user: session.user });
+  await saveSession({
+    refreshToken: bundle.refreshToken,
+    accessToken: bundle.accessToken,
+    accessTokenExpiresAt: idTokenExpiry(bundle.accessToken),
+    user: session.user,
+  });
   return bundle.accessToken;
 }
