@@ -85,7 +85,6 @@ export default function AppearanceScreen() {
         <Group header="Wallpaper" footer={photo ? 'Your photo is stored inside Cosmos; the original in Photos is untouched.' : 'Pick a photo from your library or one of the gradients below.'}>
           <Row
             icon="photo.on.rectangle"
-            iconTint={t.link}
             title={photo ? 'Change Photo' : 'Choose from Photos'}
             subtitle={photo ? `${photo.width ?? '–'} × ${photo.height ?? '–'}` : undefined}
             onPress={() => void choosePhoto()}
@@ -204,7 +203,7 @@ function Preview() {
           </View>
           <View style={{ flex: 1, minWidth: 0 }}>
             <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]} numberOfLines={1}>Refactor the pairing flow</Text>
-            <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>Working · MacBook Pro</Text>
+            <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>Working · Studio Desktop</Text>
           </View>
           <View style={[styles.previewDot, { backgroundColor: t.success }]} />
         </View>

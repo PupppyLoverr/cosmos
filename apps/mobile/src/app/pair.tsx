@@ -164,7 +164,7 @@ export default function PairScreen() {
         <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.content} keyboardDismissMode="interactive" keyboardShouldPersistTaps="handled">
           {!auth ? (
             <Group footer="Remote pairing needs the same account on both devices. Same-Wi-Fi linking is below if you skip this.">
-              <Row title="Sign in to Woozlit" subtitle="Required to pair over any network" icon="person.crop.circle" iconTint={t.success} onPress={() => router.push('/sign-in')} chevron />
+              <Row title="Sign in to Woozlit" subtitle="Required to pair over any network" icon="person.crop.circle" onPress={() => router.push('/sign-in')} chevron />
             </Group>
           ) : (
             <>

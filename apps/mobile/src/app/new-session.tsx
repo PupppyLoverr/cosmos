@@ -21,7 +21,7 @@ const REASONING: { id: ReasoningLevel; label: string }[] = [
 const SANDBOX: { id: SandboxLevel; label: string; icon: string; hint: string }[] = [
   { id: 'read-only', label: 'Read only', icon: 'eye', hint: 'Can inspect files but not change them.' },
   { id: 'workspace-write', label: 'Workspace', icon: 'folder', hint: 'Edits stay inside the project folder.' },
-  { id: 'danger-full-access', label: 'Full access', icon: 'exclamationmark.shield', hint: 'Unrestricted — including Computer Use on the Mac.' },
+  { id: 'danger-full-access', label: 'Full access', icon: 'exclamationmark.shield', hint: 'Unrestricted — including Computer Use on this desktop.' },
 ];
 
 const PROMPTS = [

@@ -74,7 +74,7 @@ export default function WatchLiveScreen() {
 
   const stop = () => {
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    Alert.alert('Stop this session?', 'Interrupts the task running on your Mac. Anything half-finished stays as it is.', [
+    Alert.alert('Stop this session?', 'Interrupts the task running on your desktop. Anything half-finished stays as it is.', [
       { text: 'Keep Running', style: 'cancel' },
       {
         text: 'Stop', style: 'destructive',
@@ -162,7 +162,7 @@ export default function WatchLiveScreen() {
         ) : null}
         <View style={{ flex: 1, minWidth: 0 }}>
           <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]} numberOfLines={1}>
-            {running ? (session?.status === 'awaitingInput' ? 'Waiting for your answer' : 'Cosmos is controlling your Mac') : 'Nothing running'}
+            {running ? (session?.status === 'awaitingInput' ? 'Waiting for your answer' : 'Cosmos is controlling your desktop') : 'Nothing running'}
           </Text>
           <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>
             {running ? 'Stop at any time — the desktop keeps its state.' : 'Frames refresh while a task is active.'}

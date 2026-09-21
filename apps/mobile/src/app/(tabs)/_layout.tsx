@@ -21,7 +21,7 @@ export default function TabsLayout() {
     >
       <NativeTabs.Trigger name="(sessions)">
         <NativeTabs.Trigger.Label>Sessions</NativeTabs.Trigger.Label>
-        <NativeTabs.Trigger.Icon sf="circle.circle" md="radio_button_checked" />
+        <NativeTabs.Trigger.Icon sf="bubble.left.and.bubble.right" md="forum" />
       </NativeTabs.Trigger>
       <NativeTabs.Trigger name="(desktops)">
         <NativeTabs.Trigger.Label>Desktops</NativeTabs.Trigger.Label>
