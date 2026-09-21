@@ -233,14 +233,21 @@ export class CosmosClient {
     const session = this.auth.get();
     const token = await this.tokenForDial();
     if (!session || !token) return null;
+    // Bound the call — an unbounded fetch on a stalled network reads as a
+    // frozen spinner for minutes (observed on cellular).
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 15_000);
     try {
       const res = await fetch(`${EDGE_URL}${path}`, {
         headers: { authorization: `Bearer ${token}` },
+        signal: ctl.signal,
       });
       if (!res.ok) return { __error: res.status };
       return await res.json();
     } catch (e) {
       return { __error: String(e) };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -292,7 +299,7 @@ export class CosmosClient {
       | { hostConnected?: boolean }
       | { __error: unknown }
       | null;
-    if (!status || '__error' in status) return null;
+    if (!status || typeof status !== 'object' || '__error' in status) return null;
     return status.hostConnected === true;
   }
 
@@ -306,8 +313,12 @@ export class CosmosClient {
     }
     const rows = (await this.edgeFetch(`/registry/${encodeURIComponent(session.user.id)}/rows`)) as
       | { rows?: RegistryRow[] }
+      | { __error: unknown }
       | null;
-    const row = (rows?.rows ?? []).find(
+    if (rows !== null && typeof rows === 'object' && '__error' in rows) {
+      throw new Error("Couldn't reach the relay — check your connection and retry.");
+    }
+    const row = ((rows as { rows?: RegistryRow[] } | null)?.rows ?? []).find(
       (r) =>
         r.kind === 'phonePair' &&
         !r.deleted &&
@@ -331,6 +342,19 @@ export class CosmosClient {
           : 'Sign in to Woozlit first.',
       );
     }
+    // Fail fast when the desktop isn't checked into its device room —
+    // otherwise PairPhone sits unanswered for the full call timeout. A
+    // definitively-offline probe errors out now; an inconclusive one
+    // (edge hiccup) still lets the dial try.
+    const status = (await this.edgeFetch(
+      `/device/${encodeURIComponent(deviceId)}/status`,
+    )) as { hostConnected?: boolean } | null;
+    if (status && status.hostConnected === false) {
+      throw new Error(
+        "That desktop isn't online at the relay — make sure Cosmos is running " +
+          'on it and signed into the same Woozlit account, then retry.',
+      );
+    }
     const rpc = new RpcClient(relaySpec(EDGE_URL, deviceId), () => this.tokenForDial());
     try {
       await new Promise<void>((resolve, reject) => {
@@ -340,11 +364,25 @@ export class CosmosClient {
         });
         rpc.connect();
         setTimeout(() => { off(); reject(new Error('pairing timed out')); }, 15_000);
+      }).catch((e) => {
+        throw new Error(
+          /timed out/.test(e instanceof Error ? e.message : String(e))
+            ? 'The desktop relay is unreachable — check that Cosmos is running and signed in on it.'
+            : e,
+        );
       });
-      const reply = await rpc.call<{ deviceToken: string; grantId: string; deviceId: string }>(
-        'PairPhone',
-        { code: code.trim().toUpperCase(), label: label ?? 'iPhone' },
-      );
+      const reply = await rpc
+        .call<{ deviceToken: string; grantId: string; deviceId: string }>(
+          'PairPhone',
+          { code: code.trim().toUpperCase(), label: label ?? 'iPhone' },
+        )
+        .catch((e) => {
+          throw new Error(
+            /timed out/.test(e instanceof Error ? e.message : String(e))
+              ? "The desktop didn't answer — is it still running and signed into Woozlit? Get a fresh code and retry."
+              : e,
+          );
+        });
       const desktop: LinkedDesktop = {
         id: `remote:${reply.deviceId}`,
         name: reply.deviceId,
