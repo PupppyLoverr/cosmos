@@ -495,6 +495,23 @@ impl WorkspaceHost {
         }
     }
 
+    /// Publish the live phone-pairing offer as a `phonePair/<code>` registry
+    /// row — lets a phone that only knows the 6-char code resolve this device
+    /// over a plain registry read. Rotation sweeps older offer rows inside the
+    /// doc; best-effort (the QR carries deviceId anyway).
+    pub fn publish_phone_pair(&self, code: &str, device_id: &str, expires_at_ms: i64) {
+        if let Err(err) = self.mutate(|doc| doc.upsert_phone_pair(code, device_id, expires_at_ms)) {
+            tracing::warn!(error = %err, "phone-pairing row publish failed");
+        }
+    }
+
+    /// Tombstone a pairing offer row (redeemed or expired).
+    pub fn clear_phone_pair(&self, code: &str) {
+        if let Err(err) = self.mutate(|doc| doc.delete_phone_pair(code).map(|_| ())) {
+            tracing::warn!(error = %err, "phone-pairing row clear failed");
+        }
+    }
+
     /// Dial-gate verdict for `LinkCache` (park dials to registry-dark peers).
     /// `Dark` requires positive evidence; every ambiguous state — registry
     /// room down or still in its warm-up window, unknown device, heartbeat in

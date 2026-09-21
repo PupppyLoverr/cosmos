@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { ActionSheetIOS, Alert, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router, Stack } from 'expo-router';
 import * as Haptics from 'expo-haptics';
@@ -78,6 +78,18 @@ export default function DesktopsScreen() {
   const computer = useSnapshot(client.computer);
   const auth = useSnapshot(client.auth);
 
+  // Remote rows show relay presence (the desktop process checked in), probed
+  // from the edge so the list is truthful even while this phone is offline.
+  const remoteOnline = useSnapshot(client.remotePresence);
+  const remoteAddrs = desktops.filter((d) => d.kind === 'remote').map((d) => d.address).join(',');
+  useEffect(() => {
+    if (!auth) return;
+    void client.refreshRemotePresence();
+    const timer = setInterval(() => void client.refreshRemotePresence(), 20_000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auth, remoteAddrs]);
+
   const active = desktops.find((d) => d.id === connection.desktop?.id);
   const others = desktops.filter((d) => d.id !== active?.id);
   const activeDevice = devices.find((d) => d.id === connection.localDeviceId);
@@ -120,7 +132,7 @@ export default function DesktopsScreen() {
             <EmptyState
               icon="desktopcomputer.and.arrow.down"
               title="No desktops yet"
-              body="Link the Cosmos app on your Mac over this network, or sign in to reach your desktops from anywhere."
+              body="Link Cosmos running on your desktop over this network, or sign in to reach it from anywhere."
               actionLabel="Link a Desktop"
               onAction={() => router.push('/pair')}
             />
@@ -149,7 +161,11 @@ export default function DesktopsScreen() {
                   key={d.id}
                   tall
                   title={desktopDisplayName(d)}
-                  subtitle={d.kind === 'local' ? `Local · ${d.address}` : 'Remote · via Woozlit'}
+                  subtitle={
+                    d.kind === 'local'
+                      ? `Local · ${d.address}`
+                      : `Remote · ${remoteOnline[d.address] === true ? 'Online' : remoteOnline[d.address] === false ? 'Offline' : 'via Woozlit'}`
+                  }
                   leading={<IconTile name={d.kind === 'local' ? 'laptopcomputer' : 'globe'} tint={t.textTertiary} size={32} />}
                   chevron
                   onPress={() => { void Haptics.selectionAsync(); void client.connect(d); }}
@@ -161,12 +177,11 @@ export default function DesktopsScreen() {
         ) : null}
 
         <SectionLabel>Add</SectionLabel>
-        <Group footer="A desktop only accepts a phone after you approve it on the Mac. Remote access is roadmap — today Cosmos pairs over your local network.">
+        <Group footer="A desktop only accepts a phone it has trusted. On the same network, link it by address; from anywhere else, sign in and scan the code shown in Cosmos Settings › Desktops.">
           <Row
             title="Link a desktop on this network"
-            subtitle="Enter its address, then trust it on the Mac"
+            subtitle="Enter its address, then trust it on the desktop"
             icon="wifi"
-            iconTint={t.link}
             onPress={() => router.push('/pair')}
             chevron
           />
@@ -174,7 +189,6 @@ export default function DesktopsScreen() {
             title={auth ? 'Find remote desktops' : 'Sign in to Woozlit'}
             subtitle={auth ? 'Desktops signed into your account' : 'Reach your desktops anywhere'}
             icon="globe"
-            iconTint={t.success}
             onPress={() => router.push(auth ? '/pair' : '/sign-in')}
             chevron
           />

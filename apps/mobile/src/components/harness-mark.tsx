@@ -1,8 +1,9 @@
 import React from 'react';
-import { Circle, Path, Svg } from 'react-native-svg';
+import { Path, Svg, SvgXml } from 'react-native-svg';
 import { View } from 'react-native';
 import { HarnessId } from '../lib/protocol';
 import { statusColor, useTheme } from '../lib/theme';
+import { SOLAR_ICONS } from '../lib/solar-icons';
 
 type MarkPath = { d: string; fillRule?: 'evenodd'; fillOpacity?: number };
 type MarkDefinition = { viewBox: string; paths: MarkPath[] };
@@ -138,13 +139,10 @@ export function harnessLabel(harness?: HarnessId | null): string | undefined {
   return harness ? LABELS[harness] ?? harness : undefined;
 }
 
+/** The Cosmos mark — the same pixel-asterisk asset the desktop embeds as
+ *  `zeron-logo.svg`, tinted like gpui's `currentColor` render. */
 function NeutralMark({ color, size }: { color: string; size: number }) {
-  return (
-    <Svg width={size} height={size} viewBox="0 0 24 24" accessibilityLabel="Cosmos">
-      <Circle cx="12" cy="12" r="7" fill="none" stroke={color} strokeWidth="2" />
-      <Circle cx="12" cy="12" r="2" fill={color} />
-    </Svg>
-  );
+  return <SvgXml xml={SOLAR_ICONS['zeron-logo']!} width={size} height={size} color={color} />;
 }
 
 /**

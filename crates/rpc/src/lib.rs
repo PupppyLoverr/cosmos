@@ -24,9 +24,9 @@ mod server;
 
 pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
-    DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenError, TokenSource,
-    decode_device_frame, device_room_ws_url, encode_device_frame,
+    ConnWrapper, DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache,
+    LinkCacheConfig, NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenError,
+    TokenSource, decode_device_frame, device_room_ws_url, encode_device_frame,
 };
 pub use server::{serve_connection, serve_ws_listener};
 
@@ -119,6 +119,23 @@ pub mod methods {
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     pub const LOCAL_DEVICE: &str = "LocalDevice";
+    // Phone pairing (WAN remote control). PhonePairingOffer/ListPairedPhones/
+    // RevokePhone run on the desktop's own IPC/UI surface (IPC-only). PairPhone
+    // and AuthorizePhone are answered by the relay gate on the device-room
+    // conn itself — they never reach EngineRpc.
+    /// `{rotate?}` → `{deviceId, code, qr, expiresAt}` — the current or fresh
+    /// pairing offer for Settings → Devices "Pair phone".
+    pub const PHONE_PAIRING_OFFER: &str = "PhonePairingOffer";
+    /// `{code, label?}` → `{deviceToken, grantId, deviceId}` — redeem the
+    /// on-screen code on THIS relay conn (single-use, short-lived).
+    pub const PAIR_PHONE: &str = "PairPhone";
+    /// `{deviceToken}` → `{ok}` — a stored grant re-authorizing a fresh conn.
+    pub const AUTHORIZE_PHONE: &str = "AuthorizePhone";
+    /// `{}` → `{phones: [{id, label, createdAt, lastUsedAt}]}` (no tokens).
+    pub const LIST_PAIRED_PHONES: &str = "ListPairedPhones";
+    /// `{id}` → `{ok}` — revoke a phone: kills its live conns and deletes the
+    /// stored token so it can never re-authorize.
+    pub const REVOKE_PHONE: &str = "RevokePhone";
     /// Renew a desktop viewport's host-local embedded-browser lease.
     pub const REGISTER_BROWSER: &str = "RegisterBrowser";
     // Cosmos Computer (device-local desktop perception/control). All are

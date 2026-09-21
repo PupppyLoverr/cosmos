@@ -4,13 +4,13 @@ import { router } from 'expo-router';
 import Animated, { Easing, useAnimatedStyle, useSharedValue, withDelay, withTiming } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCosmos } from '../lib/client';
-import { useTheme, spacing, type, radii, alpha } from '../lib/theme';
+import { useTheme, spacing, type, radii } from '../lib/theme';
 import { Button, Icon, Notice } from '../components/bits';
 import { Glass, Screen } from '../components/surface';
 import { HarnessMark } from '../components/harness-mark';
 
 const PERKS: { icon: string; title: string; body: string }[] = [
-  { icon: 'desktopcomputer', title: 'Every desktop, one list', body: 'Macs signed into your account show up here automatically.' },
+  { icon: 'desktopcomputer', title: 'Every desktop, one list', body: 'Desktops signed into your account show up here automatically.' },
   { icon: 'lock.shield', title: 'You approve each phone', body: 'A desktop only takes control from a phone it has trusted.' },
   { icon: 'display', title: 'Watch and stop from anywhere', body: 'See what Computer Use is doing and interrupt it instantly.' },
 ];
@@ -22,8 +22,8 @@ function Perk({ icon, title, body, index }: (typeof PERKS)[number] & { index: nu
   const style = useAnimatedStyle(() => ({ opacity: v.value, transform: [{ translateY: (1 - v.value) * 14 }] }));
   return (
     <Animated.View style={[styles.perk, style]}>
-      <View style={[styles.perkIcon, { backgroundColor: alpha(t.accent, 0.14) }]}>
-        <Icon name={icon} size={20} color={t.link} weight="medium" />
+      <View style={[styles.perkIcon, { backgroundColor: t.fill }]}>
+        <Icon name={icon} size={20} color={t.text} weight="medium" />
       </View>
       <View style={{ flex: 1, minWidth: 0 }}>
         <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>{title}</Text>
@@ -66,7 +66,7 @@ export default function SignInScreen() {
         <HarnessMark size={64} />
         <Text style={[type.largeTitle, { color: t.text, textAlign: 'center' }]}>Welcome to Cosmos</Text>
         <Text style={[type.body, { color: t.textSecondary, textAlign: 'center', maxWidth: 300 }]}>
-          Sign in to reach your Macs and their agents from anywhere.
+          Sign in to reach your desktops and their agents from anywhere.
         </Text>
       </View>
 
@@ -79,7 +79,7 @@ export default function SignInScreen() {
         <Button title="Continue with Woozlit" icon="person.crop.circle" onPress={() => void signIn()} loading={busy} />
         <Button title="Not Now" variant="ghost" onPress={leave} />
         <Text style={[type.caption, { color: t.textTertiary, textAlign: 'center', fontWeight: '400' }]}>
-          Local links over Wi‑Fi work without an account. Remote reach is roadmap.
+          Local links over Wi‑Fi work without an account — sign in to reach your desktops from anywhere.
         </Text>
       </View>
     </Screen>

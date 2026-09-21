@@ -59,7 +59,7 @@ export default function SettingsScreen() {
             icon={connection.desktop?.kind === 'local' ? 'laptopcomputer' : 'antenna.radiowaves.left.and.right'}
             iconTint={connection.status === 'connected' ? t.success : t.textTertiary}
             title={connection.desktop ? desktopDisplayName(connection.desktop) : 'Not linked'}
-            subtitle={connection.desktop ? (connection.desktop.kind === 'local' ? 'Local network' : 'Via Woozlit') : 'Link a Mac to get started'}
+            subtitle={connection.desktop ? (connection.desktop.kind === 'local' ? 'Local network' : 'Via Woozlit') : 'Link a desktop to get started'}
             trailing={<ConnectionBadge status={connection.status} detail={connection.detail} />}
             onPress={() => router.push('/(tabs)/(desktops)' as never)}
             chevron
@@ -75,7 +75,6 @@ export default function SettingsScreen() {
         <Group header="Notifications" footer="Get notified when a session finishes, needs your input, fails, or the desktop connection changes.">
           <Row
             icon="bell.badge"
-            iconTint="#FF3B30"
             title="Session Alerts"
             trailing={(
               <Host matchContents colorScheme={t.scheme}>

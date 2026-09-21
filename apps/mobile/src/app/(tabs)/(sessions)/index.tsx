@@ -177,7 +177,7 @@ export default function SessionsScreen() {
             <EmptyState
               icon={query ? 'magnifyingglass' : 'sparkles'}
               title={query ? 'No Results' : 'Start Something'}
-              body={query ? `Nothing matches “${query}”.` : 'Your Mac is ready. Ask Cosmos to do anything on it.'}
+              body={query ? `Nothing matches “${query}”.` : 'Your desktop is ready. Ask Cosmos to do anything on it.'}
             >
               {!query ? (
                 <View style={styles.suggestions}>
@@ -204,8 +204,8 @@ export default function SessionsScreen() {
           ) : (
             <EmptyState
               icon="laptopcomputer"
-              title={connecting ? 'Connecting…' : 'Link Your Mac'}
-              body="Cosmos runs on your Mac. Link it once on the same network and control it from here."
+              title={connecting ? 'Connecting…' : 'Link Your Desktop'}
+              body="Cosmos runs on your desktop. Pair it once — same network or signed in from anywhere — and control it from here."
             >
               {!connecting ? <Button title="Link a Desktop" onPress={() => router.push('/pair')} size="md" style={{ marginTop: spacing(4) }} /> : null}
             </EmptyState>

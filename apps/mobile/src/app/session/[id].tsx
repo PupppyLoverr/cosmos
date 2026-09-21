@@ -219,7 +219,7 @@ export default function SessionScreen() {
 
   const desktopName = connection.status === 'connected' && connection.desktop ? desktopDisplayName(connection.desktop) : undefined;
   const emptyBody = connection.status === 'connected'
-    ? 'Ask for anything — code, files, or a Computer Use task on your Mac.'
+    ? 'Ask for anything — code, files, or a Computer Use task on your desktop.'
     : 'Waiting for the desktop connection…';
 
   return (
@@ -301,7 +301,7 @@ export default function SessionScreen() {
             ) : (
               <View style={[styles.banner, { backgroundColor: alpha(t.link, 0.12) }]}>
                 <Pulse color={t.link} />
-                <Text style={[type.subhead, { color: t.text, flex: 1, fontWeight: '600' }]}>Controlling your Mac</Text>
+                <Text style={[type.subhead, { color: t.text, flex: 1, fontWeight: '600' }]}>Controlling your desktop</Text>
                 <Button title="Watch" size="sm" variant="tinted" icon="display" onPress={watch} />
                 <Button title="Stop" size="sm" variant="secondary" onPress={stop} />
               </View>
