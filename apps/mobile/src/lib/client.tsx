@@ -36,6 +36,15 @@ export interface LinkedDesktop {
   addedAt: number;
 }
 
+/** Edge `/registry/:orgId/rows` row: metadata lives at the root, domain
+ *  values under `fields`; `deleted` rows are tombstones to skip. */
+interface RegistryRow {
+  kind: string;
+  id: string;
+  deleted?: boolean;
+  fields?: Record<string, unknown>;
+}
+
 /** A device row from the account registry (remote discovery — phones that
  *  paired show up here once the desktop publishes them). */
 export interface AccountDevice {
@@ -230,15 +239,19 @@ export class CosmosClient {
     const session = this.auth.get();
     if (!session) return [];
     const rows = (await this.edgeFetch(`/registry/${encodeURIComponent(session.user.id)}/rows`)) as
-      | { rows?: { kind: string; id: string; name?: string; platform?: string; lastSeenAt?: number }[] }
+      | { rows?: RegistryRow[] }
       | null;
     const devices = (rows?.rows ?? [])
-      .filter((r) => r.kind === 'device')
-      .map((r) => ({
-        deviceId: r.id,
-        name: r.name || r.id,
-        platform: r.platform,
-      }));
+      .filter((r) => r.kind === 'devices' && !r.deleted)
+      .map((r) => {
+        const f = (r.fields ?? {}) as Record<string, unknown>;
+        const deviceId = typeof f.id === 'string' ? f.id : r.id;
+        return {
+          deviceId,
+          name: typeof f.name === 'string' && f.name ? f.name : deviceId,
+          platform: typeof f.platform === 'string' ? f.platform : undefined,
+        };
+      });
     // Presence probe per device — a handful of GETs, fine for a device list.
     return Promise.all(
       devices.map(async (d) => {
@@ -278,14 +291,19 @@ export class CosmosClient {
     const session = this.auth.get();
     if (!session) return null;
     const rows = (await this.edgeFetch(`/registry/${encodeURIComponent(session.user.id)}/rows`)) as
-      | { rows?: { kind: string; id: string; deviceId?: string; exp?: number }[] }
+      | { rows?: RegistryRow[] }
       | null;
     const row = (rows?.rows ?? []).find(
-      (r) => r.kind === 'phonePair' && r.id.toUpperCase() === code.trim().toUpperCase(),
+      (r) =>
+        r.kind === 'phonePair' &&
+        !r.deleted &&
+        r.id.toUpperCase() === code.trim().toUpperCase(),
     );
-    if (!row?.deviceId) return null;
-    if (row.exp && row.exp < Date.now()) return null; // expired offer
-    return { deviceId: row.deviceId };
+    const f = (row?.fields ?? {}) as { deviceId?: unknown; exp?: unknown };
+    const deviceId = typeof f.deviceId === 'string' ? f.deviceId : null;
+    if (!deviceId) return null;
+    if (typeof f.exp === 'number' && f.exp < Date.now()) return null; // expired offer
+    return { deviceId };
   }
 
   /** The QR/typed-code redemption: dial the device room, `PairPhone` the

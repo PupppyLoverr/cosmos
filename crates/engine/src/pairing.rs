@@ -261,17 +261,25 @@ impl PairingStore {
     }
 
     fn persist_locked(&self, state: &State) {
-        match serde_json::to_vec_pretty(&state.grants) {
-            Ok(bytes) => {
-                let tmp = self.path.with_extension("tmp");
-                if std::fs::write(&tmp, &bytes)
-                    .and_then(|_| std::fs::rename(&tmp, &self.path))
-                    .is_err()
-                {
-                    tracing::warn!("phone-pairing: grant persist failed");
-                }
+        let bytes = match serde_json::to_vec_pretty(&state.grants) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(error = %err, "phone-pairing: grant serialize failed");
+                return;
             }
-            Err(err) => tracing::warn!(error = %err, "phone-pairing: grant serialize failed"),
+        };
+        let tmp = self.path.with_extension("tmp");
+        if let Err(err) = std::fs::write(&tmp, &bytes) {
+            tracing::warn!(error = %err, "phone-pairing: grant persist failed");
+            return;
+        }
+        // Windows refuses to rename over an existing destination: remove it
+        // first, then retry. Other platforms keep the atomic replace.
+        if std::fs::rename(&tmp, &self.path).is_err()
+            && (std::fs::remove_file(&self.path).is_err()
+                || std::fs::rename(&tmp, &self.path).is_err())
+        {
+            tracing::warn!("phone-pairing: grant persist failed");
         }
     }
 }
@@ -286,10 +294,15 @@ fn is_bootstrap_method(method: &str) -> bool {
     )
 }
 
-/// Per-conn service wrapper the host relay installs: gates the phone-facing
-/// surface behind phone pairing while leaving the peer-forwardable surface
-/// (desktop↔desktop `targetDeviceId` routing) untouched for same-account
-/// callers — the edge already enforces account ownership on the room.
+/// Per-conn service wrapper the host relay installs: gates the physical
+/// phone-control surface behind phone pairing while leaving the
+/// peer-forwardable surface (desktop↔desktop `targetDeviceId` routing)
+/// untouched for same-account callers — the edge already enforces account
+/// ownership on the room, and a desktop peer carries no phone grant, so
+/// `forwardable` must stay open for multi-device routing to work at all.
+/// `from` is an opaque per-conn id the client picks, so the gate cannot tell
+/// a phone from a peer desktop; account auth is the boundary for that set,
+/// QR pairing is the boundary for everything else.
 pub struct RelayGate {
     conn_id: String,
     inner: Arc<dyn RpcService>,

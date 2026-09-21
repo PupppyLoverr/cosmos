@@ -89,6 +89,10 @@ pub struct DevicesPage {
     copy_task: Option<Task<()>>,
     pair_open: bool,
     pair_offer: Option<PairOffer>,
+    /// A `PhonePairingOffer` call is in flight — the engine only redeems the
+    /// latest issued code, so overlapping fetches could display a stale QR.
+    /// Suppress rotation/clicks until the pending call settles.
+    pair_offer_pending: bool,
     pair_phones: Vec<PairedPhone>,
     pair_phones_authoritative: bool,
     pair_tick: Option<Task<()>>,
@@ -108,6 +112,7 @@ impl DevicesPage {
             copy_task: None,
             pair_open: false,
             pair_offer: None,
+            pair_offer_pending: false,
             pair_phones: Vec::new(),
             pair_phones_authoritative: false,
             pair_tick: None,
@@ -154,9 +159,13 @@ impl DevicesPage {
     }
 
     fn fetch_pair_offer(&mut self, rotate: bool, cx: &mut Context<Self>) {
+        if self.pair_offer_pending {
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        self.pair_offer_pending = true;
         cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -166,6 +175,7 @@ impl DevicesPage {
                 )
                 .await;
             this.update(cx, |page, cx| {
+                page.pair_offer_pending = false;
                 match result {
                     Ok(v) => {
                         page.pair_offer = Some(PairOffer {

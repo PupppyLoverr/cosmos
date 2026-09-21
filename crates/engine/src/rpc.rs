@@ -1473,6 +1473,14 @@ impl RpcService for EngineRpc {
                     rotate: bool,
                 }
                 let p: OfferParams = parse_params(params).unwrap_or(OfferParams { rotate: false });
+                // The pairing promise is "same Woozlit account on both
+                // ends": only a synced, signed-in engine may mint a code —
+                // otherwise the grant would be unattributed and the
+                // `phonePair` row could never publish.
+                let signed_in = self.auth.as_ref().is_some_and(|a| a.state().is_signed_in());
+                if !signed_in || self.engine_info.workspace_scope != WorkspaceScope::Synced {
+                    return Err(RpcError::Failed("log in to pair a phone".into()));
+                }
                 let pairing = self
                     .pairing
                     .as_ref()

@@ -283,7 +283,20 @@ async fn pairing_gate_then_full_surface() {
 #[tokio::test]
 async fn pairing_offer_and_revoke_over_ipc() {
     let dir = tempfile::tempdir().expect("data dir");
-    let core = assemble(dir.path(), "dev-mac");
+    std::fs::create_dir_all(dir.path()).expect("create data dir");
+    std::fs::write(dir.path().join("device-id"), "dev-mac").expect("write device id");
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(InstantHarness));
+    // Offers are minted only for a signed-in synced workspace.
+    let core = EngineCore::assemble_with_identity(
+        dir.path(),
+        Arc::new(registry),
+        HarnessId::Mock,
+        None,
+        "org-test",
+        "user-test",
+    )
+    .expect("engine assembles");
     let service = core.rpc_service();
 
     let offer = service

@@ -23,13 +23,21 @@ function hostParts(raw: string): { h: string; p: number } {
   return { h: s, p: DEFAULT_PORT };
 }
 
-/** `cosmos://pair?d=<deviceId>&c=<code>` from the desktop QR. */
+/** `cosmos://pair?d=<deviceId>&c=<code>` from the desktop QR — scheme and
+ *  path are required so an unrelated QR never initiates pairing. */
 function parseQrPayload(data: string): { deviceId: string; code: string } | null {
-  const d = /[?&]d=([^&\s]+)/.exec(data)?.[1];
-  const c = /[?&]c=([A-Za-z2-9]{6})/.exec(data)?.[1];
+  const m = /^cosmos:\/\/pair\?([?&\S]*)$/i.exec(data.trim());
+  if (!m) return null;
+  const q = m[1];
+  const d = /(?:^|&)d=([^&\s]+)/.exec(q)?.[1];
+  const c = /(?:^|&)c=([A-Za-z2-9]{6})(?:&|$)/.exec(q)?.[1];
   if (!d || !c) return null;
   return { deviceId: decodeURIComponent(d), code: c.toUpperCase() };
 }
+
+/** The desktop groups the code for display (`ABC 123`); typed input may
+ *  carry that separator — strip spaces/dashes before validating. */
+const normalizeCode = (v: string) => v.replace(/[\s-]/g, '').toUpperCase();
 
 export default function PairScreen() {
   const t = useTheme();
@@ -86,7 +94,7 @@ export default function PairScreen() {
   };
 
   const submitCode = async () => {
-    const c = code.trim().toUpperCase();
+    const c = normalizeCode(code);
     if (!CODE_RE.test(c)) return;
     setBusy(true);
     setPairError(null);
@@ -142,9 +150,12 @@ export default function PairScreen() {
   };
 
   const found = probe.state === 'ok';
-  const codeValid = CODE_RE.test(code.trim().toUpperCase());
+  const codeValid = CODE_RE.test(normalizeCode(code));
+  // A remote record only counts as paired when it carries a grant token —
+  // legacy pre-pairing entries can still dial but will be gated, so they
+  // must show "Needs code" instead of "Paired".
   const knownRemoteIds = new Set(
-    desktops.filter((d) => d.kind === 'remote').map((d) => d.address),
+    desktops.filter((d) => d.kind === 'remote' && d.deviceToken).map((d) => d.address),
   );
 
   return (
