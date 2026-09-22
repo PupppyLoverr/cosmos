@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Platform, View } from 'react-native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { CosmosProvider } from '../lib/client';
 import { ThemeProvider, loadThemePrefs, useTheme } from '../lib/theme';
 import { Onboarding } from '../lib/onboarding';
@@ -79,10 +80,12 @@ function ThemedStack() {
 
 export default function RootLayout() {
   return (
-    <ThemeProvider>
-      <CosmosProvider>
-        <ThemedStack />
-      </CosmosProvider>
-    </ThemeProvider>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <ThemeProvider>
+        <CosmosProvider>
+          <ThemedStack />
+        </CosmosProvider>
+      </ThemeProvider>
+    </GestureHandlerRootView>
   );
 }
