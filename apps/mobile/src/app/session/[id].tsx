@@ -313,7 +313,7 @@ export default function SessionScreen() {
           <View style={[styles.fill, styles.center]}>
             <View style={styles.emptyMark}>
               <HarnessMark harness={chat?.config?.harness} size={64} />
-              </View>
+            </View>
             <EmptyState icon="bubble.left.fill" title={harnessLabel(chat?.config?.harness) ?? 'Cosmos'} body={emptyBody} />
             <View style={styles.firstPrompts}>
               {['Summarise what changed in this repo today', 'Open Finder and tidy my Downloads', 'Find and fix the failing test'].map((p) => (
