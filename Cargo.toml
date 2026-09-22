@@ -115,6 +115,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # workloads.
 mimalloc = { version = "0.1", features = ["v2"] }
 anyhow = "1"
+dirs = "6"
 tempfile = "3"
 thiserror = "2"
 tracing = "0.1"

@@ -24,8 +24,8 @@ pub fn publish_handshake(config: &EngineConfig) {
 }
 
 fn publish(config: &EngineConfig) -> Result<()> {
-    let home = std::env::var_os("HOME").context("HOME unavailable")?;
-    let directory = discovery_directory(&PathBuf::from(home));
+    let home = dirs::home_dir().context("home directory unavailable")?;
+    let directory = discovery_directory(&home);
     let binary = std::env::current_exe()?;
     write_handshake(&directory, &config.data_dir, config.ipc_port, &binary)
 }

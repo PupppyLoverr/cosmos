@@ -23,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
 anyhow.workspace = true
+dirs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
