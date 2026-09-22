@@ -5,7 +5,7 @@ import { StatusBar } from 'expo-status-bar';
 import { CosmosProvider } from '../lib/client';
 import { ThemeProvider, loadThemePrefs, useTheme } from '../lib/theme';
 import { Onboarding } from '../lib/onboarding';
-import { hasSeenOnboarding, markOnboardingSeen } from '../lib/onboarding-store';
+import { hasSeenOnboarding, markOnboardingSeen, subscribeOnboardingGate } from '../lib/onboarding-store';
 
 // Restore the pinned appearance before the first frame so the launch doesn't flash.
 void loadThemePrefs();
@@ -21,6 +21,7 @@ function ThemedStack() {
       setShowOnboarding(!seen);
       setBooted(true);
     });
+    return subscribeOnboardingGate(() => setShowOnboarding(true));
   }, []);
 
   if (!booted) {

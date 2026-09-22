@@ -7,6 +7,7 @@ import { Arrive, useReduceMotion } from '../lib/motion';
 import { SessionMessageEntry, MessagePart, ToolCall, toolCallName } from '../lib/protocol';
 import { Theme, alpha, collapseBezier, motion, radii, spacing, type, useTheme } from '../lib/theme';
 import { Button, Icon } from './bits';
+import { Md } from './markdown';
 
 type ToolPart = Extract<MessagePart, { kind: 'tool' }>;
 type InputPart = Extract<MessagePart, { kind: 'input' }>;
@@ -47,7 +48,7 @@ function Disclosure({ open, color }: { open: boolean; color: string }) {
 // ---------------------------------------------------------------------------
 // Tool call presentation
 
-interface ToolFace { icon: string; verb: string; detail: string; computer?: boolean }
+interface ToolFace { icon: string; verb: string; detail: string; computer?: boolean; mono?: boolean }
 
 function humanize(name: string): string {
   return name.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
@@ -55,13 +56,13 @@ function humanize(name: string): string {
 
 function describe(call: ToolCall): ToolFace {
   switch (call.kind) {
-    case 'exec': return { icon: 'terminal', verb: 'Ran', detail: call.command };
-    case 'readFile': return { icon: 'doc.text', verb: 'Read', detail: call.path };
-    case 'writeFile': return { icon: 'doc.badge.plus', verb: 'Wrote', detail: call.path };
-    case 'editFile': return { icon: 'square.and.pencil', verb: 'Edited', detail: call.path };
-    case 'applyPatch': return { icon: 'square.and.pencil', verb: 'Patched', detail: call.path ?? '' };
-    case 'search': return { icon: 'magnifyingglass', verb: 'Searched', detail: call.pattern ?? '' };
-    case 'glob': return { icon: 'folder', verb: 'Listed', detail: call.pattern ?? '' };
+    case 'exec': return { icon: 'terminal', verb: 'Ran', detail: call.command, mono: true };
+    case 'readFile': return { icon: 'doc.text', verb: 'Read', detail: call.path, mono: true };
+    case 'writeFile': return { icon: 'doc.badge.plus', verb: 'Wrote', detail: call.path, mono: true };
+    case 'editFile': return { icon: 'square.and.pencil', verb: 'Edited', detail: call.path, mono: true };
+    case 'applyPatch': return { icon: 'square.and.pencil', verb: 'Patched', detail: call.path ?? '', mono: true };
+    case 'search': return { icon: 'magnifyingglass', verb: 'Searched', detail: call.pattern ?? '', mono: true };
+    case 'glob': return { icon: 'folder', verb: 'Listed', detail: call.pattern ?? '', mono: true };
     case 'webFetch': return { icon: 'safari', verb: 'Fetched', detail: call.url };
     case 'webSearch': return { icon: 'globe', verb: 'Searched the web', detail: call.query };
     case 'todo': return { icon: 'checklist', verb: 'Planned', detail: `${call.items?.length ?? 0} steps` };
@@ -111,7 +112,7 @@ function ToolLine({ part, t, last }: { part: ToolPart; t: Theme; last: boolean }
         </View>
         <Text style={[type.footnote, { color: t.text, flex: 1 }]} numberOfLines={open ? undefined : 1}>
           <Text style={{ fontWeight: '600', color: part.isError ? t.danger : t.text }}>{face.verb}</Text>
-          {face.detail ? <Text style={{ color: t.textSecondary }}>  {face.detail}</Text> : null}
+          {face.detail ? <Text style={[{ color: t.textSecondary }, face.mono && { fontFamily: type.mono.fontFamily, fontSize: 11.5 }]}>  {face.detail}</Text> : null}
         </Text>
         {expandable ? <Disclosure open={open} color={t.textTertiary} /> : null}
       </Pressable>
@@ -144,7 +145,11 @@ function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
   const stateColor = running ? t.link : errors ? t.danger : t.success;
 
   return (
-    <View style={[styles.toolCard, { backgroundColor: t.surface, borderColor: t.separator }]}>
+    <View style={[
+      styles.toolCard,
+      { backgroundColor: t.surface, borderColor: t.separator },
+      (running || errors > 0) && { borderLeftWidth: 2, borderLeftColor: alpha(stateColor, 0.85) },
+    ]}>
       <Pressable
         onPress={() => { animateLayout(reduce); setPinned(!(pinned ?? running)); }}
         accessibilityRole="button"
@@ -154,7 +159,9 @@ function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
       >
         <Disclosure open={open} color={t.textTertiary} />
         <Text style={[type.footnote, { color: t.text, flex: 1, fontWeight: '500' }]} numberOfLines={open ? 2 : 1}>{summary}</Text>
-        <Text style={[type.meta, { color: stateColor, fontWeight: '600' }]}>{state}</Text>
+        <View style={[styles.statePill, { backgroundColor: alpha(stateColor, 0.14) }]}>
+          <Text style={[type.caption2, { color: stateColor, fontWeight: '700' }]}>{state}</Text>
+        </View>
       </Pressable>
       {open ? parts.map((p, i) => <ToolLine key={p.id} part={p} t={t} last={i === parts.length - 1} />) : null}
     </View>
@@ -332,7 +339,7 @@ export function MessageView({ entry, onAnswer, grouped, arrive }: {
         {blocks.map((b) => {
           switch (b.kind) {
             case 'text':
-              return b.text.trim() ? <Text key={b.id} style={[type.transcript, styles.assistantText, { color: t.text }]} selectable>{b.text.trim()}</Text> : null;
+              return b.text.trim() ? <Md key={b.id} streaming={streaming}>{b.text.trim()}</Md> : null;
             case 'reasoning':
               return b.text.trim() ? <ReasoningRow key={b.id} part={b} t={t} /> : null;
             case 'tools':
@@ -392,6 +399,7 @@ const styles = StyleSheet.create({
   reasoningBody: { marginTop: spacing(2), paddingLeft: spacing(3), borderLeftWidth: 2, lineHeight: 19 },
 
   toolCard: { borderRadius: radii.panel, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
+  statePill: { borderRadius: radii.pill, paddingHorizontal: spacing(2), paddingVertical: spacing(0.75) },
   toolHead: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), minHeight: 44 },
   toolLine: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), minHeight: 44 },
   toolIcon: { width: 20, height: 20, alignItems: 'center', justifyContent: 'center' },

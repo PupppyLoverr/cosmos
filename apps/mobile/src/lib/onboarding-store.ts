@@ -7,6 +7,13 @@ const KEY = 'cosmos.onboarding.seen';
 
 let cached: boolean | null = null;
 
+const listeners = new Set<() => void>();
+
+export function subscribeOnboardingGate(fn: () => void): () => void {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
 export async function hasSeenOnboarding(): Promise<boolean> {
   if (cached !== null) return cached;
   try {
@@ -25,6 +32,7 @@ export async function markOnboardingSeen(): Promise<void> {
 
 export async function markOnboardingUnseen(): Promise<void> {
   cached = false;
+  for (const fn of listeners) fn();
   try { await SecureStore.deleteItemAsync(KEY); } catch { /* ignore */ }
 }
 

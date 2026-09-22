@@ -358,7 +358,7 @@ export function EmptyState({ icon, title, body, actionLabel, onAction, children 
   const t = useTheme();
   return (
     <View style={styles.empty}>
-      <View style={[styles.emptyGlyph, { backgroundColor: t.fill }]}>
+      <View style={[styles.emptyGlyph, { backgroundColor: t.fill, borderColor: t.separator }]}>
         <Icon name={icon} size={30} color={t.textSecondary} weight="regular" />
       </View>
       <Text style={[type.title3, { color: t.text, marginTop: spacing(4), textAlign: 'center' }]}>{title}</Text>
@@ -397,7 +397,7 @@ export function Notice({ kind = 'info', title, body, action }: { kind?: 'info' |
   const color = kind === 'error' ? t.danger : kind === 'warning' ? t.warning : t.link;
   const icon = kind === 'error' ? 'exclamationmark.octagon.fill' : kind === 'warning' ? 'exclamationmark.triangle.fill' : 'info.circle.fill';
   return (
-    <View style={[styles.notice, { backgroundColor: alpha(color, 0.12) }]}>
+    <View style={[styles.notice, { backgroundColor: alpha(color, 0.12), borderColor: alpha(color, 0.28) }]}>
       <Icon name={icon} size={17} color={color} />
       <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
         <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>{title}</Text>
@@ -439,8 +439,8 @@ const styles = StyleSheet.create({
   field: { flexDirection: 'row', alignItems: 'center', gap: spacing(3), paddingHorizontal: edge, minHeight: 46 },
   fieldInput: { flex: 1, textAlign: 'right', paddingVertical: spacing(2.5) },
   empty: { alignItems: 'center', paddingVertical: spacing(12), paddingHorizontal: spacing(8) },
-  emptyGlyph: { width: 72, height: 72, borderRadius: 22, borderCurve: 'continuous', alignItems: 'center', justifyContent: 'center' },
+  emptyGlyph: { width: 72, height: 72, borderRadius: 22, borderCurve: 'continuous', alignItems: 'center', justifyContent: 'center', borderWidth: StyleSheet.hairlineWidth },
   badge: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
   badgeDot: { width: 7, height: 7, borderRadius: 4 },
-  notice: { flexDirection: 'row', gap: spacing(2.5), padding: spacing(3), borderRadius: radii.md, borderCurve: 'continuous', alignItems: 'flex-start' },
+  notice: { flexDirection: 'row', gap: spacing(2.5), padding: spacing(3), borderRadius: radii.md, borderCurve: 'continuous', alignItems: 'flex-start', borderWidth: StyleSheet.hairlineWidth },
 });

@@ -4,6 +4,7 @@
   "main": "expo-router/entry",
   "dependencies": {
     "@expo/ui": "~57.0.19",
+    "@ronradtke/react-native-markdown-display": "9.0.3",
     "@shopify/flash-list": "2.0.2",
     "@shopify/react-native-skia": "2.6.2",
     "expo": "~57.0.24",
