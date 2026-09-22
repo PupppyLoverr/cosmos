@@ -69,9 +69,27 @@ function ThemedStack() {
               : {}),
           })}
         />
-        <Stack.Screen name="new-session" options={{ presentation: 'modal', title: 'New Session' }} />
+        <Stack.Screen
+          name="new-session"
+          options={{
+            presentation: 'modal',
+            title: 'New Session',
+            ...(Platform.OS === 'ios'
+              ? { headerTransparent: true, headerBlurEffect: dark ? 'systemChromeMaterialDark' : 'systemChromeMaterial' }
+              : {}),
+          }}
+        />
         <Stack.Screen name="sign-in" options={{ presentation: 'fullScreenModal', title: 'Sign In', headerShown: false }} />
-        <Stack.Screen name="pair" options={{ presentation: 'modal', title: 'Link a Desktop' }} />
+        <Stack.Screen
+          name="pair"
+          options={{
+            presentation: 'formSheet',
+            sheetAllowedDetents: [0.75, 1],
+            sheetGrabberVisible: true,
+            headerShown: false,
+            contentStyle: { backgroundColor: 'transparent' },
+          }}
+        />
         <Stack.Screen name="watch/[chatId]" options={{ title: 'Watch Live', presentation: 'modal' }} />
       </Stack>
     </>

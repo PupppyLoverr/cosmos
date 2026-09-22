@@ -1,14 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, KeyboardAvoidingView, LayoutAnimation, Platform, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { router } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { AccountDevice, PLACEHOLDER_NAME, useCosmos, useSnapshot } from '../lib/client';
-import { alpha, radii, spacing, type, useTheme } from '../lib/theme';
-import { Button, Field, Group, Icon, IconTile, Row, SectionLabel } from '../components/bits';
+import { alpha, motion, radii, spacing, type, useTheme } from '../lib/theme';
+import { Button, Field, Group, Icon, IconButton, IconTile, Notice, Row, SectionLabel } from '../components/bits';
 import { localSpec, RpcClient } from '../lib/rpc';
 import { EngineInfo } from '../lib/protocol';
-import { Screen } from '../components/surface';
+import { Glass, Screen } from '../components/surface';
+import { useReduceMotion } from '../lib/motion';
 
 type Probe = { state: 'idle' | 'probing' | 'ok' | 'fail'; info?: EngineInfo; error?: string };
 
@@ -38,6 +39,99 @@ function parseQrPayload(data: string): { deviceId: string; code: string } | null
 /** The desktop groups the code for display (`ABC 123`); typed input may
  *  carry that separator — strip spaces/dashes before validating. */
 const normalizeCode = (v: string) => v.replace(/[\s-]/g, '').toUpperCase();
+
+function AdvancedNetworkSection({
+  host,
+  onHost,
+  name,
+  setName,
+  probe,
+  probeHost,
+  found,
+  link,
+  busy,
+}: {
+  host: string;
+  onHost: (value: string) => void;
+  name: string;
+  setName: (value: string) => void;
+  probe: Probe;
+  probeHost: () => void;
+  found: boolean;
+  link: () => void;
+  busy: boolean;
+}) {
+  const t = useTheme();
+  const reduce = useReduceMotion();
+  const [advanced, setAdvanced] = useState(!!host);
+  const toggle = () => {
+    if (!reduce) {
+      LayoutAnimation.configureNext({
+        duration: motion.collapse,
+        update: { type: LayoutAnimation.Types.easeInEaseOut },
+        create: { type: LayoutAnimation.Types.easeInEaseOut, property: LayoutAnimation.Properties.opacity },
+        delete: { type: LayoutAnimation.Types.easeInEaseOut, property: LayoutAnimation.Properties.opacity },
+      });
+    }
+    setAdvanced((value) => !value);
+  };
+
+  return (
+    <Group footer={found ? undefined : `Direct engine link on port ${DEFAULT_PORT} — both devices on one Wi-Fi.`}>
+      <Row
+        title="Same network (advanced)"
+        subtitle="Direct link over one Wi-Fi"
+        onPress={toggle}
+        chevron
+      />
+      {advanced ? (
+        <View style={styles.advancedContent}>
+          <Field
+            label="Address"
+            placeholder="192.168.1.20"
+            value={host}
+            onChangeText={onHost}
+            autoCapitalize="none"
+            autoCorrect={false}
+            keyboardType="numbers-and-punctuation"
+            returnKeyType="go"
+            onSubmitEditing={probeHost}
+          />
+          <View style={[styles.sep, { backgroundColor: t.separator }]} />
+          <Field label="Name" placeholder="Uses the computer's name" value={name} onChangeText={setName} returnKeyType="done" />
+
+          {probe.state === 'ok' ? (
+            <View style={[styles.result, { backgroundColor: alpha(t.success, 0.12) }]} accessibilityLiveRegion="polite">
+              <Icon name="checkmark.seal.fill" size={20} color={t.success} />
+              <View style={{ flex: 1 }}>
+                <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>Cosmos found at {hostParts(host).h}</Text>
+                <Text style={[type.footnote, { color: t.textSecondary }]}>
+                  {probe.info?.version ? `Cosmos ${probe.info.version}` : 'Engine reachable'}{probe.info?.deviceId ? ` · ${probe.info.deviceId.slice(0, 8)}` : ''}
+                </Text>
+              </View>
+            </View>
+          ) : probe.state === 'fail' ? (
+            <Notice
+              kind="error"
+              title={`Nothing answered at ${hostParts(host).h}:${hostParts(host).p}`}
+              body="Check that Cosmos is open on the desktop and both devices share a network."
+            />
+          ) : null}
+
+          {host.trim() ? (
+            <View style={styles.actions}>
+              {found ? (
+                <Button title="Trust & Link" icon="link" onPress={link} loading={busy} />
+              ) : (
+                <Button title="Check Connection" variant="secondary" onPress={probeHost} loading={probe.state === 'probing'} />
+              )}
+            </View>
+          ) : null}
+        </View>
+      ) : null}
+    </Group>
+  );
+}
 
 export default function PairScreen() {
   const t = useTheme();
@@ -163,7 +257,23 @@ export default function PairScreen() {
   return (
     <Screen>
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.content} keyboardDismissMode="interactive" keyboardShouldPersistTaps="handled">
+        <ScrollView
+          contentInsetAdjustmentBehavior="automatic"
+          contentContainerStyle={styles.content}
+          keyboardDismissMode="interactive"
+          keyboardShouldPersistTaps="handled"
+          automaticallyAdjustKeyboardInsets
+        >
+          <View style={styles.sheetHeader}>
+            <View style={styles.grabber} />
+            <View style={styles.headerRow}>
+              <View style={styles.headerCopy}>
+                <Text style={[type.title2, { color: t.text }]}>Link a Desktop</Text>
+                <Text style={[type.footnote, { color: t.textSecondary }]}>Pair once over your account. Works from any network.</Text>
+              </View>
+              <IconButton icon="xmark" label="Close" size={32} filled={false} onPress={() => router.back()} />
+            </View>
+          </View>
           {!auth ? (
             <Group footer="Remote pairing needs the same account on both devices. Same-Wi-Fi linking is below if you skip this.">
               <Row title="Sign in to Woozlit" subtitle="Required to pair over any network" icon="person.crop.circle" onPress={() => router.push('/sign-in')} chevron />
@@ -179,9 +289,15 @@ export default function PairScreen() {
                     barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
                     onBarcodeScanned={onBarcode}
                   />
-                  <Text style={[type.caption, { color: t.textSecondary, textAlign: 'center', paddingVertical: spacing(2) }]}>
-                    Point at the QR in Cosmos → Settings → Devices → Pair phone
-                  </Text>
+                  <View pointerEvents="none" style={styles.scanOverlay}>
+                    <View style={[styles.corner, styles.cornerTopLeft, { borderColor: alpha(t.background, 0.9) }]} />
+                    <View style={[styles.corner, styles.cornerTopRight, { borderColor: alpha(t.background, 0.9) }]} />
+                    <View style={[styles.corner, styles.cornerBottomLeft, { borderColor: alpha(t.background, 0.9) }]} />
+                    <View style={[styles.corner, styles.cornerBottomRight, { borderColor: alpha(t.background, 0.9) }]} />
+                    <Glass thin radius={radii.pill} style={styles.scanCaption}>
+                      <Text style={[type.caption, { color: t.text }]}>Point at the QR on the desktop</Text>
+                    </Glass>
+                  </View>
                 </View>
               ) : (
                 <Group footer={permission?.canAskAgain === false ? 'Camera permission is off — type the code instead.' : undefined}>
@@ -195,27 +311,31 @@ export default function PairScreen() {
                 </Group>
               )}
 
-              <Group footer="Single use, good for 5 minutes. A fresh code is on the desktop screen if this one lapsed.">
-                <Field
-                  label="Code"
-                  placeholder="ABC 123"
-                  value={code}
-                  onChangeText={(v) => { setCode(v.toUpperCase()); setPairError(null); }}
-                  autoCapitalize="characters"
-                  autoCorrect={false}
-                  maxLength={7}
-                  returnKeyType="go"
-                  onSubmitEditing={() => void submitCode()}
-                />
-              </Group>
+              <View style={styles.dividerRow}>
+                <View style={[styles.divider, { backgroundColor: t.separator }]} />
+                <Text style={[type.caption, { color: t.textSecondary }]}>or type the code</Text>
+                <View style={[styles.divider, { backgroundColor: t.separator }]} />
+              </View>
+              <TextInput
+                style={[styles.codeInput, type.title2, { color: t.text, backgroundColor: t.fill, borderColor: t.separator }]}
+                value={code}
+                onChangeText={(v) => { setCode(v.toUpperCase()); setPairError(null); }}
+                autoCapitalize="characters"
+                autoCorrect={false}
+                maxLength={7}
+                returnKeyType="go"
+                onSubmitEditing={() => void submitCode()}
+                placeholder="ABC123"
+                placeholderTextColor={t.textTertiary}
+                accessibilityLabel="Pairing code"
+                keyboardAppearance={t.scheme}
+              />
+              <Text style={[type.caption, styles.codeHint, { color: t.textSecondary }]}>Single use, good for 5 minutes. A fresh code is on the desktop screen if this one lapsed.</Text>
               {pairError ? (
-                <View style={[styles.result, { backgroundColor: alpha(t.danger, 0.1) }]} accessibilityLiveRegion="polite">
-                  <Icon name="exclamationmark.triangle" size={20} color={t.danger} />
-                  <Text style={[type.footnote, { color: t.textSecondary, flex: 1 }]}>{pairError}</Text>
-                </View>
+                <Notice kind="error" title="Couldn't pair" body={pairError} />
               ) : null}
               <View style={styles.actions}>
-                <Button title="Pair" onPress={() => void submitCode()} disabled={!codeValid} loading={busy} />
+                <Button title="Pair" style={styles.fullButton} onPress={() => void submitCode()} disabled={!codeValid} loading={busy} />
               </View>
 
               <SectionLabel>On your account</SectionLabel>
@@ -252,52 +372,17 @@ export default function PairScreen() {
             </>
           )}
 
-          <SectionLabel>Same network (advanced)</SectionLabel>
-          <Group footer={found ? undefined : `Direct engine link on port ${DEFAULT_PORT} — both devices on one Wi-Fi.`}>
-            <Field
-              label="Address"
-              placeholder="192.168.1.20"
-              value={host}
-              onChangeText={onHost}
-              autoCapitalize="none"
-              autoCorrect={false}
-              keyboardType="numbers-and-punctuation"
-              returnKeyType="go"
-              onSubmitEditing={() => void probeHost()}
-            />
-            <View style={[styles.sep, { backgroundColor: t.separator }]} />
-            <Field label="Name" placeholder="Uses the computer's name" value={name} onChangeText={setName} returnKeyType="done" />
-          </Group>
-
-          {probe.state === 'ok' ? (
-            <View style={[styles.result, { backgroundColor: alpha(t.success, 0.12) }]} accessibilityLiveRegion="polite">
-              <Icon name="checkmark.seal.fill" size={20} color={t.success} />
-              <View style={{ flex: 1 }}>
-                <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>Cosmos found at {hostParts(host).h}</Text>
-                <Text style={[type.footnote, { color: t.textSecondary }]}>
-                  {probe.info?.version ? `Cosmos ${probe.info.version}` : 'Engine reachable'}{probe.info?.deviceId ? ` · ${probe.info.deviceId.slice(0, 8)}` : ''}
-                </Text>
-              </View>
-            </View>
-          ) : probe.state === 'fail' ? (
-            <View style={[styles.result, { backgroundColor: alpha(t.danger, 0.1) }]} accessibilityLiveRegion="polite">
-              <Icon name="wifi.exclamationmark" size={20} color={t.danger} />
-              <View style={{ flex: 1 }}>
-                <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>Nothing answered at {hostParts(host).h}:{hostParts(host).p}</Text>
-                <Text style={[type.footnote, { color: t.textSecondary }]}>Check that Cosmos is open on the desktop and both devices share a network.</Text>
-              </View>
-            </View>
-          ) : null}
-
-          {host.trim() ? (
-            <View style={styles.actions}>
-              {found ? (
-                <Button title="Trust & Link" icon="link" onPress={() => void link()} loading={busy} />
-              ) : (
-                <Button title="Check Connection" variant="secondary" onPress={() => void probeHost()} loading={probe.state === 'probing'} />
-              )}
-            </View>
-          ) : null}
+          <AdvancedNetworkSection
+            host={host}
+            onHost={onHost}
+            name={name}
+            setName={setName}
+            probe={probe}
+            probeHost={() => void probeHost()}
+            found={found}
+            link={() => void link()}
+            busy={busy}
+          />
         </ScrollView>
       </KeyboardAvoidingView>
     </Screen>
@@ -305,7 +390,11 @@ export default function PairScreen() {
 }
 
 const styles = StyleSheet.create({
-  content: { paddingHorizontal: spacing(4), paddingTop: spacing(2), paddingBottom: spacing(10) },
+  content: { paddingHorizontal: spacing(4), paddingTop: spacing(2), paddingBottom: spacing(10), gap: spacing(3) },
+  sheetHeader: { gap: spacing(3), paddingTop: spacing(1), paddingBottom: spacing(1) },
+  grabber: { width: 36, height: 5, borderRadius: radii.pill, alignSelf: 'center' },
+  headerRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: spacing(3) },
+  headerCopy: { flex: 1, gap: spacing(1) },
   sep: { height: StyleSheet.hairlineWidth, marginLeft: spacing(4) },
   result: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(3),
@@ -313,8 +402,25 @@ const styles = StyleSheet.create({
   },
   actions: { marginTop: spacing(4), gap: spacing(3) },
   cameraCard: {
-    borderRadius: radii.lg, borderCurve: 'continuous', overflow: 'hidden',
-    borderWidth: StyleSheet.hairlineWidth,
+    width: '100%', aspectRatio: 1, borderRadius: radii.xl, borderCurve: 'continuous', overflow: 'hidden',
+    borderWidth: StyleSheet.hairlineWidth, position: 'relative',
   },
-  camera: { height: 240, width: '100%' },
+  camera: StyleSheet.absoluteFill,
+  scanOverlay: StyleSheet.absoluteFill,
+  corner: { position: 'absolute', width: 28, height: 28, borderWidth: 2 },
+  cornerTopLeft: { top: spacing(6), left: spacing(6), borderRightWidth: 0, borderBottomWidth: 0 },
+  cornerTopRight: { top: spacing(6), right: spacing(6), borderLeftWidth: 0, borderBottomWidth: 0 },
+  cornerBottomLeft: { bottom: spacing(6), left: spacing(6), borderRightWidth: 0, borderTopWidth: 0 },
+  cornerBottomRight: { bottom: spacing(6), right: spacing(6), borderLeftWidth: 0, borderTopWidth: 0 },
+  scanCaption: { position: 'absolute', bottom: spacing(4), alignSelf: 'center', paddingHorizontal: spacing(3), paddingVertical: spacing(1.5) },
+  dividerRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), marginTop: spacing(2) },
+  divider: { flex: 1, height: StyleSheet.hairlineWidth },
+  codeInput: {
+    width: '100%', height: 56, borderRadius: radii.lg, borderCurve: 'continuous',
+    borderWidth: StyleSheet.hairlineWidth, textAlign: 'center', fontFamily: type.mono.fontFamily,
+    letterSpacing: 6, paddingHorizontal: spacing(3), marginTop: spacing(1),
+  },
+  codeHint: { textAlign: 'center', marginTop: spacing(1) },
+  fullButton: { width: '100%' },
+  advancedContent: { paddingBottom: spacing(3) },
 });
