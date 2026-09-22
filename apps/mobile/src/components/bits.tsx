@@ -7,6 +7,8 @@ import { Host, Slider as NativeSlider } from '@expo/ui';
 import * as Haptics from 'expo-haptics';
 import { Theme, alpha, edge, motion, radii, shadows, spacing, statusColor, type, useTheme } from '../lib/theme';
 import { useReduceMotion } from '../lib/motion';
+import { HIT_SLOP_44, useLargeText } from '../lib/a11y';
+import { desktopDisplayName, type ConnectionInfo } from '../lib/client';
 import { icons, solarFor } from '../lib/icons';
 import { SOLAR_ICONS } from '../lib/solar-icons';
 import { Glass } from './surface';
@@ -86,7 +88,7 @@ export function Button({ title, onPress, variant = 'primary', size = 'lg', loadi
   const v = buttonVariants(t)[variant];
   const off = disabled || loading;
   const visual = size === 'lg' ? 50 : size === 'md' ? 44 : 32;
-  const pad = Math.max(0, Math.ceil((44 - visual) / 2));
+  const pad = HIT_SLOP_44(visual);
   const label = size === 'lg' ? type.headline : size === 'md' ? { ...type.subhead, fontWeight: '600' as const } : { ...type.footnote, fontWeight: '600' as const };
   return (
     <Pressable
@@ -122,7 +124,7 @@ export function IconButton({ icon, onPress, label, size = 36, tint, filled = tru
   const t = useTheme();
   const glyph = <Icon name={icon} size={Math.min(17, size * 0.46)} color={tint ?? t.text} weight="semibold" />;
   const box: ViewStyle = { width: size, height: size, alignItems: 'center', justifyContent: 'center' };
-  const slop = Math.max(0, Math.ceil((44 - size) / 2));
+  const slop = HIT_SLOP_44(size);
   return (
     <Pressable
       onPress={() => { void Haptics.selectionAsync(); onPress?.(); }}
@@ -150,6 +152,7 @@ export function Chip({ label, icon, onPress, selected }: { label: string; icon?:
   return (
     <Pressable
       onPress={() => { void Haptics.selectionAsync(); onPress?.(); }}
+      accessibilityLabel={label}
       accessibilityRole="button"
       accessibilityState={{ selected: !!selected }}
       hitSlop={{ top: 4, bottom: 4 }}
@@ -239,10 +242,12 @@ interface RowProps {
   selected?: boolean;
   /** Vertically stack title/subtitle with more breathing room (list items vs settings rows). */
   tall?: boolean;
+  accessibilityLabel?: string;
 }
 
-export function Row({ title, subtitle, value, leading, icon, iconTint, trailing, onPress, onLongPress, danger, disabled, chevron, selected, tall }: RowProps) {
+export function Row({ title, subtitle, value, leading, icon, iconTint, trailing, onPress, onLongPress, danger, disabled, chevron, selected, tall, accessibilityLabel }: RowProps) {
   const t = useTheme();
+  const largeText = useLargeText();
   const lead = leading ?? (icon ? <IconTile name={icon} tint={iconTint} /> : null);
   return (
     <Pressable
@@ -256,11 +261,12 @@ export function Row({ title, subtitle, value, leading, icon, iconTint, trailing,
         disabled ? { opacity: 0.5 } : null,
       ]}
       accessibilityRole={onPress ? 'button' : undefined}
+      accessibilityLabel={accessibilityLabel ?? [title, subtitle, value].filter(Boolean).join(', ')}
       accessibilityState={selected !== undefined ? { selected } : undefined}
     >
       {lead ? <View style={styles.rowLeading}>{lead}</View> : null}
       <View style={value ? styles.rowTextFixed : styles.rowText}>
-        <Text style={[type.body, { color: danger ? t.danger : t.text }]} numberOfLines={1}>{title}</Text>
+        <Text style={[type.body, { color: danger ? t.danger : t.text }]} numberOfLines={subtitle && largeText ? 2 : 1}>{title}</Text>
         {subtitle ? <Text style={[type.subhead, { color: t.textSecondary, marginTop: 1 }]} numberOfLines={tall ? 2 : 1}>{subtitle}</Text> : null}
       </View>
       {value ? <Text style={[type.body, styles.rowValue, { color: t.textSecondary }]} numberOfLines={1}>{value}</Text> : null}
@@ -361,7 +367,7 @@ export function EmptyState({ icon, title, body, actionLabel, onAction, children 
       <View style={[styles.emptyGlyph, { backgroundColor: t.fill, borderColor: t.separator }]}>
         <Icon name={icon} size={30} color={t.textSecondary} weight="regular" />
       </View>
-      <Text style={[type.title3, { color: t.text, marginTop: spacing(4), textAlign: 'center' }]}>{title}</Text>
+      <Text accessibilityRole="header" style={[type.title3, { color: t.text, marginTop: spacing(4), textAlign: 'center' }]}>{title}</Text>
       {body ? <Text style={[type.subhead, { color: t.textSecondary, textAlign: 'center', marginTop: spacing(1) }]}>{body}</Text> : null}
       {actionLabel && onAction ? (
         <Button title={actionLabel} onPress={onAction} size="md" variant="tinted" style={{ marginTop: spacing(4), alignSelf: 'center', paddingHorizontal: spacing(5) }} />
@@ -392,18 +398,90 @@ export function ConnectionBadge({ status, detail }: { status: string; detail?: s
 }
 
 /** Inline, non-blocking notice (info/warning/error) that sits in content flow. */
-export function Notice({ kind = 'info', title, body, action }: { kind?: 'info' | 'warning' | 'error'; title: string; body?: string; action?: React.ReactNode }) {
+export function Notice({ kind = 'info', title, body, action, onDismiss }: { kind?: 'info' | 'warning' | 'error'; title: string; body?: string; action?: React.ReactNode; onDismiss?: () => void }) {
   const t = useTheme();
   const color = kind === 'error' ? t.danger : kind === 'warning' ? t.warning : t.link;
   const icon = kind === 'error' ? 'exclamationmark.octagon.fill' : kind === 'warning' ? 'exclamationmark.triangle.fill' : 'info.circle.fill';
   return (
-    <View style={[styles.notice, { backgroundColor: alpha(color, 0.12), borderColor: alpha(color, 0.28) }]}>
+    <View
+      accessible={kind === 'info' ? true : undefined}
+      accessibilityRole={kind !== 'info' ? 'alert' : undefined}
+      accessibilityLabel={`${title}${body ? `. ${body}` : ''}`}
+      style={[styles.notice, { backgroundColor: alpha(color, 0.12), borderColor: alpha(color, 0.28) }]}
+    >
       <Icon name={icon} size={17} color={color} />
       <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
         <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>{title}</Text>
         {body ? <Text style={[type.footnote, { color: t.textSecondary }]}>{body}</Text> : null}
         {action}
       </View>
+      {onDismiss ? <IconButton icon="xmark" label="Dismiss" size={28} filled={false} onPress={onDismiss} /> : null}
+    </View>
+  );
+}
+
+export function StatusPill({ status, label, pulse, size = 'sm' }: {
+  status: string;
+  label: string;
+  pulse?: boolean;
+  size?: 'sm' | 'md';
+}) {
+  const t = useTheme();
+  const color = statusColor(t, status);
+  const textStyle = size === 'md' ? type.footnote : type.meta;
+  return (
+    <View
+      accessibilityRole="text"
+      accessibilityLabel={label}
+      style={[
+        styles.statusPill,
+        { backgroundColor: alpha(color, 0.12), minHeight: size === 'md' ? 24 : 20 },
+      ]}
+    >
+      <StatusDot status={status} size={size === 'md' ? 7 : 6} pulse={pulse} />
+      <Text style={[textStyle, { color, fontWeight: '600' }]}>{label}</Text>
+    </View>
+  );
+}
+
+export function ConnectionBanner({ connection, onPress }: { connection: ConnectionInfo; onPress?: () => void }) {
+  const t = useTheme();
+  const connected = connection.status === 'connected';
+  const connecting = connection.status === 'connecting' || connection.status === 'reconnecting';
+  return (
+    <View style={styles.connectionBanner}>
+      <Pressable
+        onPress={onPress}
+        disabled={!onPress}
+        accessibilityRole={onPress ? 'button' : undefined}
+        accessibilityLabel={connection.desktop ? `${connection.desktop.name}, ${connection.status}` : 'No desktop linked'}
+        style={({ pressed }) => [styles.desktopPill, { backgroundColor: alpha(t.fill, pressed ? 1 : 0.7) }]}
+      >
+        <StatusDot status={connected ? 'connected' : connecting ? 'working' : 'errored'} size={7} pulse={connecting} />
+        <Text style={[type.footnote, { color: t.textSecondary, fontWeight: '500', flex: 1 }]} numberOfLines={1}>
+          {connection.desktop ? desktopDisplayName(connection.desktop) : 'No desktop linked'}
+          {connection.desktop ? ` · ${connected ? 'Connected' : connecting ? 'Connecting…' : 'Offline'}` : ''}
+        </Text>
+        {onPress ? <Icon name="chevron.right" size={10} color={t.textTertiary} weight="semibold" /> : null}
+      </Pressable>
+      {!connected && connection.detail ? (
+        <Notice kind="warning" title={connecting ? 'Connecting to desktop' : "Can't reach the desktop"} body={connection.detail} />
+      ) : null}
+    </View>
+  );
+}
+
+export function SkeletonRows({ count = 5 }: { count?: number }) {
+  const t = useTheme();
+  return (
+    <View style={styles.skeletonList}>
+      {Array.from({ length: count }).map((_, i) => (
+        <View key={i} style={[styles.skeletonRow, { backgroundColor: t.surface }]}>
+          <View style={[styles.skeletonLine, { width: '40%', backgroundColor: t.fill }]} />
+          <View style={[styles.skeletonLine, { width: '70%', backgroundColor: t.fill, marginTop: 6 }]} />
+          <View style={[styles.skeletonLine, { width: '30%', backgroundColor: t.fill, marginTop: 6 }]} />
+        </View>
+      ))}
     </View>
   );
 }
@@ -443,4 +521,10 @@ const styles = StyleSheet.create({
   badge: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
   badgeDot: { width: 7, height: 7, borderRadius: 4 },
   notice: { flexDirection: 'row', gap: spacing(2.5), padding: spacing(3), borderRadius: radii.md, borderCurve: 'continuous', alignItems: 'flex-start', borderWidth: StyleSheet.hairlineWidth },
+  statusPill: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), paddingHorizontal: spacing(2), borderRadius: radii.pill },
+  connectionBanner: { gap: spacing(2) },
+  desktopPill: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), minHeight: 44, paddingHorizontal: spacing(3), borderRadius: radii.pill },
+  skeletonList: { paddingHorizontal: edge, paddingTop: spacing(3), gap: spacing(2) },
+  skeletonRow: { padding: spacing(3), borderRadius: radii.row, borderCurve: 'continuous' },
+  skeletonLine: { height: 10, borderRadius: 5, borderCurve: 'continuous' },
 });

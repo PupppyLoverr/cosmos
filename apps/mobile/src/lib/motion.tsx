@@ -1,7 +1,9 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { AccessibilityInfo } from 'react-native';
 import Animated, { Easing, useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated';
 import { enterBezier, motion } from './theme';
+import { useReduceMotion } from './a11y';
+
+export { useReduceMotion } from './a11y';
 
 /** Desktop `Motion::flavourWords` — rotated every 7s, seeded per chat. */
 const FLAVOUR_WORDS: string[] = [
@@ -28,22 +30,6 @@ export function useFlavourWord(chatId: string, active: boolean): string {
   }, [active]);
   if (!active) return '';
   return FLAVOUR_WORDS[(seed + Math.floor(tick / FLAVOUR_ROTATE_SECS)) % FLAVOUR_WORDS.length]!;
-}
-
-export function useReduceMotion(): boolean {
-  const [reduce, setReduce] = useState(false);
-  useEffect(() => {
-    let live = true;
-    void AccessibilityInfo.isReduceMotionEnabled().then((value) => {
-      if (live) setReduce(value);
-    });
-    const sub = AccessibilityInfo.addEventListener('reduceMotionChanged', setReduce);
-    return () => {
-      live = false;
-      sub.remove();
-    };
-  }, []);
-  return reduce;
 }
 
 export const enterEasing = Easing.bezier(enterBezier[0], enterBezier[1], enterBezier[2], enterBezier[3]);
