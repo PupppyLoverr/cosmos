@@ -152,7 +152,6 @@ export default function NewSessionScreen() {
           {online && !seedText && !typed ? (
             <View style={styles.hero}>
               <HarnessMark harness={harness} size={56} />
-              <Text style={[type.title3, { color: t.text }]}>New Session</Text>
               <Text style={[type.footnote, { color: t.textSecondary }]}>{harnessName} · {space.label}</Text>
             </View>
           ) : null}

@@ -8,7 +8,7 @@ import { alpha, motion, radii, spacing, type, useTheme } from '../lib/theme';
 import { Button, Field, Group, Icon, IconButton, IconTile, Notice, Row, SectionLabel } from '../components/bits';
 import { localSpec, RpcClient } from '../lib/rpc';
 import { EngineInfo } from '../lib/protocol';
-import { Glass, Screen } from '../components/surface';
+import { Glass } from '../components/surface';
 import { useReduceMotion } from '../lib/motion';
 
 type Probe = { state: 'idle' | 'probing' | 'ok' | 'fail'; info?: EngineInfo; error?: string };
@@ -255,7 +255,7 @@ export default function PairScreen() {
   );
 
   return (
-    <Screen>
+    <View style={[styles.sheet, { backgroundColor: t.background }]}>
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView
           contentInsetAdjustmentBehavior="automatic"
@@ -385,11 +385,12 @@ export default function PairScreen() {
           />
         </ScrollView>
       </KeyboardAvoidingView>
-    </Screen>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
+  sheet: { flex: 1 },
   content: { paddingHorizontal: spacing(4), paddingTop: spacing(2), paddingBottom: spacing(10), gap: spacing(3) },
   sheetHeader: { gap: spacing(3), paddingTop: spacing(1), paddingBottom: spacing(1) },
   grabber: { width: 36, height: 5, borderRadius: radii.pill, alignSelf: 'center' },
