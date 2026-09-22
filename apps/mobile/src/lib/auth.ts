@@ -48,9 +48,13 @@ function jwtClaims(token: string): { sub?: string; email?: string } | null {
   }
 }
 
-function isFirebaseIdToken(token: string): boolean {
-  const claims = jwtClaims(token);
-  return !!claims && token.split('.').length === 3;
+export function isFirebaseIdToken(token: string): boolean {
+  // A Firebase *custom* token is also a JWT — its `iss` is the minting service
+  // account (`firebase-adminsdk@….iam.gserviceaccount.com`), not securetoken.
+  // Only a real id token (iss https://securetoken.google.com/<project>) is
+  // acceptable as a relay bearer; anything else must go through the exchange.
+  const claims = jwtClaims(token) as { iss?: string } | null;
+  return !!claims?.iss?.includes('securetoken.google.com');
 }
 
 // Hermes has no global `crypto`; expo-crypto's randomUUID is RFC4122 v4.

@@ -13,7 +13,7 @@ import {
 } from './protocol';
 import {
   StoredSession, loadSession, clearSession, freshAccessToken,
-  idTokenExpiry, signInInteractive, EDGE_URL,
+  idTokenExpiry, isFirebaseIdToken, signInInteractive, EDGE_URL,
 } from './auth';
 import { Platform } from 'react-native';
 // SecureStore has no sync API at module scope; the store below hydrates async.
@@ -168,9 +168,17 @@ export class CosmosClient {
     const cached = this.accessTokenCache;
     if (cached && cached.expiresAt > Date.now() + 30_000) return cached.token;
     // The sign-in may have handed us a usable id token with no refresh token
-    // (Woozlit returns either shape) — serve it while it's still fresh.
+    // (Woozlit returns either shape) — serve it while it's still fresh. A
+    // stored token that isn't a Firebase id token (e.g. a custom token kept
+    // by an older buggy build) must never be dialed — treat it as absent so
+    // the caller surfaces "session expired — sign out and back in" instead
+    // of a relay 401.
     const expiresAt = session.accessTokenExpiresAt ?? 0;
-    if (session.accessToken && expiresAt > Date.now() + 30_000) {
+    if (
+      session.accessToken &&
+      expiresAt > Date.now() + 30_000 &&
+      isFirebaseIdToken(session.accessToken)
+    ) {
       this.accessToken.set(session.accessToken);
       return session.accessToken;
     }
