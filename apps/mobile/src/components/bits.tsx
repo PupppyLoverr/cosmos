@@ -523,7 +523,7 @@ const styles = StyleSheet.create({
   notice: { flexDirection: 'row', gap: spacing(2.5), padding: spacing(3), borderRadius: radii.md, borderCurve: 'continuous', alignItems: 'flex-start', borderWidth: StyleSheet.hairlineWidth },
   statusPill: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), paddingHorizontal: spacing(2), borderRadius: radii.pill },
   connectionBanner: { gap: spacing(2) },
-  desktopPill: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), minHeight: 36, paddingHorizontal: spacing(3), borderRadius: radii.pill },
+  desktopPill: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), minHeight: 44, paddingHorizontal: spacing(3), borderRadius: radii.pill },
   skeletonList: { paddingHorizontal: edge, paddingTop: spacing(3), gap: spacing(2) },
   skeletonRow: { padding: spacing(3), borderRadius: radii.row, borderCurve: 'continuous' },
   skeletonLine: { height: 10, borderRadius: 5, borderCurve: 'continuous' },
