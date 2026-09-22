@@ -170,7 +170,6 @@ export default function DesktopsScreen() {
               <Link.MenuAction title="Rename…" icon="pencil" hidden={Platform.OS !== 'ios'} onPress={() => Alert.prompt('Rename desktop', undefined, (name) => { if (name?.trim()) void client.renameDesktop(active.id, name.trim()); }, 'plain-text', active.name)} />
               <Link.MenuAction title="Unlink" icon="trash" destructive onPress={() => unlink(active)} />
             </Link.Menu>
-            <Link.Preview />
           </Link>
         ) : null}
 
@@ -200,7 +199,6 @@ export default function DesktopsScreen() {
                       <Link.MenuAction title="Rename…" icon="pencil" hidden={Platform.OS !== 'ios'} onPress={() => Alert.prompt('Rename desktop', undefined, (name) => { if (name?.trim()) void client.renameDesktop(d.id, name.trim()); }, 'plain-text', d.name)} />
                       <Link.MenuAction title="Unlink" icon="trash" destructive onPress={() => unlink(d)} />
                     </Link.Menu>
-                    <Link.Preview />
                   </Link>
                 );
               })}
