@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ActionSheetIOS, ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { FlashList, FlashListRef } from '@shopify/flash-list';
 import { useLocalSearchParams, router, Stack } from 'expo-router';
+import * as Haptics from 'expo-haptics';
 import { useHeaderHeight } from 'expo-router/react-navigation';
 import Animated, { Easing, useAnimatedStyle, useSharedValue, withRepeat, withTiming } from 'react-native-reanimated';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../../lib/client';
@@ -9,20 +10,13 @@ import { SessionMessageEntry, TranscriptUpdate, isComputerCall, type Chat } from
 import { applyTranscriptUpdate } from '../../lib/transcript';
 import { PickedFile, ensureDecodable, fileToBase64Chunks } from '../../lib/attachments';
 import { notifySessionEvent } from '../../lib/notify';
-import { useReduceMotion } from '../../lib/motion';
+import { useReduceMotion, useFlavourWord } from '../../lib/motion';
 import { alpha, radii, spacing, type, useTheme, type Theme } from '../../lib/theme';
 import { MessageView } from '../../components/transcript';
 import { Composer, ComposerChip } from '../../components/composer';
 import { Button, EmptyState, Icon, IconButton, Notice } from '../../components/bits';
 import { HarnessMark, harnessLabel } from '../../components/harness-mark';
 import { Glass, Screen } from '../../components/surface';
-
-const STATUS_LABEL: Record<string, string> = {
-  working: 'Working',
-  awaitingInput: 'Needs your input',
-  errored: 'Failed',
-  idle: 'Idle',
-};
 
 function Pulse({ color }: { color: string }) {
   const reduce = useReduceMotion();
@@ -41,16 +35,20 @@ function Pulse({ color }: { color: string }) {
 }
 
 /** Compact header: title with the harness + live status beneath, iMessage-style. */
-function HeaderTitle({ title, chat, status, desktop, t }: { title: string; chat?: Chat; status: string; desktop?: string; t: Theme }) {
+function HeaderTitle({ title, chat, status, desktop, t, chatId }: { title: string; chat?: Chat; status: string; desktop?: string; t: Theme; chatId: string }) {
   const parts = [harnessLabel(chat?.config?.harness), desktop].filter(Boolean);
   const live = status === 'working' || status === 'awaitingInput';
+  const flavour = useFlavourWord(chatId, status === 'working');
+  const sub = live
+    ? (status === 'working' ? (flavour || 'Working') : 'Needs your input')
+    : (parts.join(' · ') || 'Cosmos');
   return (
-    <View style={styles.headerTitle} accessibilityRole="header" accessibilityLabel={`${title}, ${STATUS_LABEL[status] ?? status}`}>
+    <View style={styles.headerTitle} accessibilityRole="header" accessibilityLabel={`${title}, ${sub}`}>
       <Text style={[type.headline, { color: t.text }]} numberOfLines={1}>{title}</Text>
       <View style={styles.headerSub}>
         {live ? <Pulse color={status === 'working' ? t.link : t.warning} /> : null}
         <Text style={[type.caption, { color: live ? (status === 'working' ? t.link : t.warning) : t.textTertiary }]} numberOfLines={1}>
-          {live ? STATUS_LABEL[status] : parts.join(' · ') || 'Cosmos'}
+          {sub}
         </Text>
       </View>
     </View>
@@ -249,7 +247,7 @@ export default function SessionScreen() {
     <Screen>
       <Stack.Screen
         options={{
-          headerTitle: () => <HeaderTitle title={title} chat={chat} status={status} desktop={desktopName} t={t} />,
+          headerTitle: () => <HeaderTitle title={title} chat={chat} status={status} desktop={desktopName} t={t} chatId={chatId} />,
           headerRight: () => (
             <View style={styles.headerRight}>
               {cuActive || computer ? (
@@ -287,6 +285,20 @@ export default function SessionScreen() {
               <HarnessMark harness={chat?.config?.harness} size={64} />
             </View>
             <EmptyState icon="bubble.left.fill" title={harnessLabel(chat?.config?.harness) ?? 'Cosmos'} body={emptyBody} />
+            <View style={styles.firstPrompts}>
+              {['Summarise what changed in this repo today', 'Open Finder and tidy my Downloads', 'Find and fix the failing test'].map((p) => (
+                <Pressable
+                  key={p}
+                  onPress={() => { void Haptics.selectionAsync(); void send(p); }}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Start with: ${p}`}
+                  style={({ pressed }) => [styles.firstPrompt, { backgroundColor: pressed ? t.fill : t.surface, borderColor: t.separator, opacity: pressed ? 0.7 : 1 }]}
+                >
+                  <Icon name="arrow.up" size={12} color={t.textTertiary} weight="bold" />
+                  <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>{p}</Text>
+                </Pressable>
+              ))}
+            </View>
           </View>
         ) : (
           <View style={styles.fill}>
@@ -398,5 +410,11 @@ const styles = StyleSheet.create({
     flexDirection: 'row', alignItems: 'center', gap: spacing(2.5),
     paddingLeft: spacing(3.5), paddingRight: spacing(2), paddingVertical: spacing(2),
     borderRadius: radii.lg, borderCurve: 'continuous',
+  },
+  firstPrompts: { alignSelf: 'stretch', gap: spacing(2), marginTop: spacing(5), paddingHorizontal: spacing(4) },
+  firstPrompt: {
+    flexDirection: 'row', alignItems: 'center', gap: spacing(2.5),
+    paddingHorizontal: spacing(3.5), minHeight: 44,
+    borderRadius: radii.row, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth,
   },
 });

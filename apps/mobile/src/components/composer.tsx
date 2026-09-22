@@ -1,9 +1,11 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ActionSheetIOS, ActivityIndicator, Alert, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { Image } from 'expo-image';
 import * as Haptics from 'expo-haptics';
+import Animated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 import { PickedFile, pickPhoto, pickDocument, pickFromClipboard } from '../lib/attachments';
-import { alpha, radii, spacing, type, useTheme } from '../lib/theme';
+import { useReduceMotion } from '../lib/motion';
+import { radii, spacing, type, useTheme } from '../lib/theme';
 import { Icon } from './bits';
 import { Glass } from './surface';
 
@@ -96,11 +98,19 @@ function AttachmentChip({ file, onRemove }: { file: PickedFile; onRemove: () => 
 
 export function Composer({ placeholder, initialText, onChangeText, bottomInset, running, sending, enabled = true, chips, attachments, onAddAttachment, onRemoveAttachment, onSend, onStop }: ComposerProps) {
   const t = useTheme();
+  const reduce = useReduceMotion();
   const [text, setTextState] = useState(initialText ?? '');
   const setText = (v: string) => { setTextState(v); onChangeText?.(v); };
   const [busy, setBusy] = useState(false);
   const [focused, setFocused] = useState(false);
   const input = useRef<TextInput>(null);
+  const halo = useSharedValue(0);
+  const sendScale = useSharedValue(1);
+
+  useEffect(() => {
+    if (reduce) { halo.set(focused ? 1 : 0); return; }
+    halo.set(withSpring(focused ? 1 : 0, { duration: 280, dampingRatio: 0.9 }));
+  }, [focused, reduce, halo]);
 
   const attach = async (which: Source) => {
     setBusy(true);
@@ -138,6 +148,7 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
   const send = () => {
     if (!canSend) return;
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    if (!reduce) sendScale.set(withSpring(0.86, { duration: 120, dampingRatio: 0.6 }, () => sendScale.set(withSpring(1, { duration: 180, dampingRatio: 0.8 }))));
     onSend(text.trim());
     setText('');
   };
@@ -148,6 +159,10 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
 
   const hint = placeholder ?? (running ? 'Steer while it works…' : 'Do anything…');
   const showStop = running && !text.trim() && attachments.length === 0;
+  const haloStyle = useAnimatedStyle(() => ({
+    borderColor: `rgba(${t.scheme === 'dark' ? '255,255,255' : '0,0,0'},${0.08 + 0.20 * halo.get()})`,
+  }));
+  const sendAnimStyle = useAnimatedStyle(() => ({ transform: [{ scale: sendScale.get() }] }));
 
   return (
     <View style={[styles.wrap, bottomInset !== undefined ? { paddingBottom: bottomInset } : null]}>
@@ -161,8 +176,9 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
       <Glass
         radius={radii.composer}
         tint={t.translucent ? undefined : t.composerBg}
-        style={[styles.bar, { borderColor: focused ? alpha(t.text, t.scheme === 'dark' ? 0.28 : 0.22) : t.separator }]}
+        style={[styles.bar, { borderColor: t.separator }]}
       >
+        <Animated.View style={[styles.haloWrap, haloStyle]} pointerEvents="none" />
         <View style={styles.inputRow}>
           <Pressable
             onPress={openAttachSheet}
@@ -205,13 +221,15 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
               accessibilityRole="button"
               accessibilityState={{ disabled: !canSend }}
             >
-              <View style={[styles.round, { backgroundColor: t.text, opacity: canSend ? 1 : 0.35 }]}>
-                {sending ? (
-                  <ActivityIndicator size="small" color={t.background} />
-                ) : (
-                  <Icon name="arrow.up" size={14} color={t.background} weight="bold" />
-                )}
-              </View>
+              <Animated.View style={sendAnimStyle}>
+                <View style={[styles.round, { backgroundColor: t.text, opacity: canSend ? 1 : 0.35 }]}>
+                  {sending ? (
+                    <ActivityIndicator size="small" color={t.background} />
+                  ) : (
+                    <Icon name="arrow.up" size={14} color={t.background} weight="bold" />
+                  )}
+                </View>
+              </Animated.View>
             </Pressable>
           )}
         </View>
@@ -244,7 +262,9 @@ const styles = StyleSheet.create({
   bar: {
     paddingLeft: spacing(1), paddingRight: spacing(1.5), paddingVertical: spacing(1),
     borderWidth: StyleSheet.hairlineWidth,
+    overflow: 'hidden',
   },
+  haloWrap: { position: 'absolute', top: -1, left: -1, right: -1, bottom: -1, borderRadius: radii.composer + 1, borderWidth: 1.5, borderCurve: 'continuous' },
   inputRow: { flexDirection: 'row', alignItems: 'flex-end' },
   hit: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
   round: { width: 28, height: 28, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },

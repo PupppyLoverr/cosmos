@@ -8,6 +8,7 @@ import { Row, Group, ConnectionBadge } from '../../../components/bits';
 import { HarnessMark } from '../../../components/harness-mark';
 import { Screen } from '../../../components/surface';
 import { ensureNotificationPermission } from '../../../lib/notify';
+import { markOnboardingUnseen } from '../../../lib/onboarding-store';
 
 export default function SettingsScreen() {
   const t = useTheme();
@@ -89,6 +90,16 @@ export default function SettingsScreen() {
             <Row title="Sign Out" danger onPress={() => void client.signOut()} />
           </Group>
         ) : null}
+
+        <Group header="Help">
+          <Row
+            title="Show the welcome again"
+            subtitle="Replay the first-run tour"
+            icon="sparkles"
+            onPress={() => { void markOnboardingUnseen().then(() => router.replace('/')); }}
+            chevron
+          />
+        </Group>
 
         <View style={styles.about}>
           <Text style={[type.footnote, { color: t.textTertiary }]}>Cosmos for {Platform.OS === 'ios' ? 'iOS' : 'Android'}</Text>

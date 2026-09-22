@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { ActionSheetIOS, Alert, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActionSheetIOS, Alert, Platform, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import { router, Stack } from 'expo-router';
 import * as Haptics from 'expo-haptics';
@@ -117,6 +117,10 @@ export default function SessionsScreen() {
   const connection = useSnapshot(client.connection);
   const [query, setQuery] = useState('');
   const [archiveOpen, setArchiveOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  // Skeleton only while the transport is still handshaking. Once connected,
+  // an empty list is a real empty state, not a loading state.
+  const loading = connection.status === 'connecting';
 
   const items = useMemo<ListItem[]>(() => {
     const q = query.trim().toLowerCase();
@@ -154,6 +158,11 @@ export default function SessionsScreen() {
   const connected = connection.status === 'connected';
   const connecting = connection.status === 'connecting' || connection.status === 'reconnecting';
   const startNew = () => { void Haptics.selectionAsync(); router.push('/new-session'); };
+  const refresh = async () => {
+    setRefreshing(true);
+    try { await client.refreshRemotePresence(); } catch { /* ignore */ }
+    setTimeout(() => setRefreshing(false), 600);
+  };
 
   return (
     <Screen>
@@ -186,6 +195,9 @@ export default function SessionsScreen() {
         contentContainerStyle={styles.list}
         contentInsetAdjustmentBehavior="automatic"
         keyboardDismissMode="on-drag"
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} tintColor={t.textTertiary} />
+        }
         ListHeaderComponent={
           <View style={styles.header}>
             <Pressable
@@ -207,7 +219,17 @@ export default function SessionsScreen() {
           </View>
         }
         ListEmptyComponent={
-          connected ? (
+          loading ? (
+            <View style={styles.skeletonList}>
+              {Array.from({ length: 5 }).map((_, i) => (
+                <View key={i} style={[styles.skeletonRow, { backgroundColor: t.surface }]}>
+                  <View style={[styles.skeletonLine, { width: '40%', backgroundColor: t.fill }]} />
+                  <View style={[styles.skeletonLine, { width: '70%', backgroundColor: t.fill, marginTop: 6 }]} />
+                  <View style={[styles.skeletonLine, { width: '30%', backgroundColor: t.fill, marginTop: 6 }]} />
+                </View>
+              ))}
+            </View>
+          ) : connected ? (
             <EmptyState
               icon={query ? 'magnifyingglass' : 'sparkles'}
               title={query ? 'No results' : 'Do anything'}
@@ -338,4 +360,7 @@ const styles = StyleSheet.create({
     borderRadius: radii.row, borderWidth: StyleSheet.hairlineWidth,
   },
   suggestionIcon: { width: 30, height: 30, borderRadius: radii.control, alignItems: 'center', justifyContent: 'center' },
+  skeletonList: { paddingHorizontal: edge, paddingTop: spacing(3), gap: spacing(2) },
+  skeletonRow: { padding: spacing(3), borderRadius: radii.row, borderCurve: 'continuous' },
+  skeletonLine: { height: 10, borderRadius: 5, borderCurve: 'continuous' },
 });

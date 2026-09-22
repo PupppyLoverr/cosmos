@@ -1,9 +1,11 @@
-import React from 'react';
-import { Platform } from 'react-native';
+import React, { useEffect, useState } from 'react';
+import { Platform, View } from 'react-native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { CosmosProvider } from '../lib/client';
 import { ThemeProvider, loadThemePrefs, useTheme } from '../lib/theme';
+import { Onboarding } from '../lib/onboarding';
+import { hasSeenOnboarding, markOnboardingSeen } from '../lib/onboarding-store';
 
 // Restore the pinned appearance before the first frame so the launch doesn't flash.
 void loadThemePrefs();
@@ -11,6 +13,33 @@ void loadThemePrefs();
 function ThemedStack() {
   const t = useTheme();
   const dark = t.scheme === 'dark';
+  const [booted, setBooted] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+
+  useEffect(() => {
+    void hasSeenOnboarding().then((seen) => {
+      setShowOnboarding(!seen);
+      setBooted(true);
+    });
+  }, []);
+
+  if (!booted) {
+    // Hold the launch on the theme background until we know which root to draw.
+    return <View style={{ flex: 1, backgroundColor: t.background }} />;
+  }
+
+  if (showOnboarding) {
+    return (
+      <ThemeProvider>
+        <StatusBar style="light" />
+        <Onboarding
+          onFinish={() => { void markOnboardingSeen(); setShowOnboarding(false); }}
+          onSkip={() => { void markOnboardingSeen(); setShowOnboarding(false); }}
+        />
+      </ThemeProvider>
+    );
+  }
+
   return (
     <>
       <StatusBar style={dark ? 'light' : 'dark'} />
