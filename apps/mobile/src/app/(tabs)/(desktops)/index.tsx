@@ -154,7 +154,7 @@ export default function DesktopsScreen() {
         {active ? (
           <Link href="/(tabs)/(desktops)" asChild>
             <Link.Trigger>
-              <Pressable onLongPress={Platform.OS !== 'ios' ? () => actions(active) : undefined} accessibilityLabel={`${active.name}, ${connectionLabel(connection, t).label}`} accessibilityHint="Long press for options">
+              <Pressable onLongPress={Platform.OS !== 'ios' ? () => actions(active) : undefined} accessibilityRole="button" accessibilityLabel={`${active.name}, ${connectionLabel(connection, t).label}`} accessibilityHint="Long press for options">
                 <ActiveDesktop
                   desktop={active}
                   connection={connection}
