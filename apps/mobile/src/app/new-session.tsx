@@ -1,13 +1,13 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { ActionSheetIOS, Alert, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { router, useLocalSearchParams } from 'expo-router';
+import { router, Stack, useLocalSearchParams } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCosmos, useSnapshot } from '../lib/client';
 import { HarnessId, ReasoningLevel, SandboxLevel } from '../lib/protocol';
 import { PickedFile, ensureDecodable, fileToBase64Chunks } from '../lib/attachments';
-import { spacing, type, useTheme } from '../lib/theme';
-import { Row, Group, SectionLabel, Segmented, Notice, Icon, Caption } from '../components/bits';
+import { radii, spacing, type, useTheme } from '../lib/theme';
+import { Caption, Group, Notice, Row, SectionLabel, Segmented, SuggestionCard } from '../components/bits';
 import { HarnessMark, harnessLabel } from '../components/harness-mark';
 import { Composer, ComposerChip } from '../components/composer';
 import { Screen } from '../components/surface';
@@ -129,26 +129,45 @@ export default function NewSessionScreen() {
 
   return (
     <Screen>
+      {Platform.OS === 'ios' ? (
+        <>
+          <Stack.Toolbar placement="left">
+            <Stack.Toolbar.Button onPress={() => router.back()}>Cancel</Stack.Toolbar.Button>
+          </Stack.Toolbar>
+          <Stack.Toolbar placement="right">
+            <Stack.Toolbar.Button
+              icon="slider.horizontal.3"
+              accessibilityLabel="Session setup"
+              onPress={() => setSetup(true)}
+            />
+          </Stack.Toolbar>
+        </>
+      ) : null}
       <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={insets.top + 44}>
         <View style={styles.flex}>
           {!online ? (
             <View style={styles.notice}><Notice kind="warning" title="Desktop offline" body="Link or reconnect a desktop before starting a session." /></View>
           ) : null}
 
+          {online && !seedText && !typed ? (
+            <View style={styles.hero}>
+              <HarnessMark harness={harness} size={56} />
+              <Text style={[type.footnote, { color: t.textSecondary }]}>{harnessName} · {space.label}</Text>
+            </View>
+          ) : null}
+
           <View style={styles.canvas} />
 
           {!seedText && !typed ? (
             <View style={styles.ideas}>
+              <Caption style={styles.promptLabel}>Try one of these</Caption>
               {PROMPTS.map((p) => (
-                <Pressable
+                <SuggestionCard
                   key={p}
                   onPress={() => { void Haptics.selectionAsync(); setSeedText(p); }}
-                  style={({ pressed }) => [styles.idea, { opacity: pressed ? 0.6 : 1, minHeight: 44 }]}
-                  accessibilityRole="button"
-                >
-                  <Icon name="arrow.up.left" size={12} color={t.textTertiary} />
-                  <Caption style={styles.ideaText}>{p}</Caption>
-                </Pressable>
+                  icon="sparkles"
+                  title={p}
+                />
               ))}
             </View>
           ) : null}
@@ -170,6 +189,7 @@ export default function NewSessionScreen() {
           chips={
             <>
               <ComposerChip
+                icon="sparkles"
                 label={harnessName}
                 accessibilityLabel={`Agent, ${harnessName}`}
                 onPress={() => pickFrom('Agent', harnessChoices.map((h) => h.name ?? harnessLabel(h.id) ?? String(h.id)), harnessName, (i) => {
@@ -190,11 +210,13 @@ export default function NewSessionScreen() {
                 onPress={() => pickFrom('Checkout', spaceChoices.map((s) => s.label), space.label, (i) => setSpaceId(spaceChoices[i]!.id))}
               />
               <ComposerChip
+                icon="gauge.with.dots.needle.33percent"
                 label={effortLabel}
                 accessibilityLabel={`Effort, ${effortLabel}`}
                 onPress={() => pickFrom('Effort', REASONING.map((r) => r.label), effortLabel, (i) => setReasoning(REASONING[i]!.id))}
               />
               <ComposerChip
+                icon={SANDBOX.find((s) => s.id === sandbox)!.icon}
                 label={sandboxLabel}
                 accessibilityLabel={`Permissions, ${sandboxLabel}`}
                 onPress={() => { void Haptics.selectionAsync(); setSetup(true); }}
@@ -206,9 +228,10 @@ export default function NewSessionScreen() {
 
       <Modal visible={setup} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setSetup(false)}>
         <View style={[styles.flex, { backgroundColor: t.background }]}>
+          <View style={[styles.grabber, { backgroundColor: t.fill }]} />
           <View style={styles.sheetHeader}>
             <Text style={[type.headline, { color: t.text }]}>Session setup</Text>
-            <Pressable onPress={() => setSetup(false)} hitSlop={10} accessibilityRole="button" accessibilityLabel="Done">
+            <Pressable style={styles.done} onPress={() => setSetup(false)} hitSlop={10} accessibilityRole="button" accessibilityLabel="Done">
               <Text style={[type.body, { color: t.link, fontWeight: '600' }]}>Done</Text>
             </Pressable>
           </View>
@@ -260,12 +283,12 @@ const styles = StyleSheet.create({
   flex: { flex: 1 },
   notice: { paddingHorizontal: spacing(4), paddingTop: spacing(3) },
   canvas: { flex: 1 },
-  ideas: { paddingHorizontal: spacing(5), paddingBottom: spacing(3), gap: spacing(1) },
-  idea: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), minHeight: 36 },
-  ideaText: { flex: 1 },
-  setupChip: { alignSelf: 'flex-start', marginLeft: spacing(4), marginBottom: spacing(1) },
-  setupInner: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), paddingLeft: spacing(2), paddingRight: spacing(2.5), height: 30, borderWidth: StyleSheet.hairlineWidth, maxWidth: 320 },
-  sheetHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: spacing(4), paddingTop: spacing(4), paddingBottom: spacing(2) },
+  hero: { alignItems: 'center', gap: spacing(1.5), paddingTop: spacing(4), paddingHorizontal: spacing(4) },
+  ideas: { paddingHorizontal: spacing(5), paddingBottom: spacing(3), gap: spacing(2) },
+  promptLabel: { marginLeft: spacing(1), marginBottom: spacing(1), textTransform: 'none' },
+  sheetHeader: { position: 'relative', alignItems: 'center', justifyContent: 'center', paddingHorizontal: spacing(4), paddingTop: spacing(2), paddingBottom: spacing(2) },
+  done: { position: 'absolute', right: spacing(4), top: spacing(1.5) },
+  grabber: { width: 36, height: 5, borderRadius: radii.pill, alignSelf: 'center', marginTop: spacing(2) },
   sheetContent: { paddingHorizontal: spacing(4), paddingBottom: spacing(10) },
   sheetGroup: { marginTop: spacing(4) },
   sheetFooter: { marginTop: spacing(2), marginHorizontal: spacing(2) },

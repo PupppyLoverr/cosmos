@@ -490,7 +490,7 @@ export function StatusPill({ status, label, pulse, size = 'sm' }: {
       ]}
     >
       <StatusDot status={status} size={size === 'md' ? 7 : 6} pulse={pulse} />
-      <Text style={[textStyle, { color, fontWeight: '600' }]}>{label}</Text>
+      <Text maxFontSizeMultiplier={1.6} style={[textStyle, { color, fontWeight: '600' }]}>{label}</Text>
     </View>
   );
 }

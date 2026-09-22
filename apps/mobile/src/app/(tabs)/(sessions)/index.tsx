@@ -88,6 +88,14 @@ type ListItem =
       startedAt?: string | null;
     };
 
+function listItemKeyExtractor(item: ListItem): string {
+  return item.key;
+}
+
+function listItemType(item: ListItem): ListItem['kind'] {
+  return item.kind;
+}
+
 export default function SessionsScreen() {
   const t = useTheme();
   const client = useCosmos();
@@ -215,8 +223,8 @@ export default function SessionsScreen() {
       <FlashList
         data={items}
         extraData={tick}
-        keyExtractor={(item) => item.key}
-        getItemType={(item) => item.kind}
+        keyExtractor={listItemKeyExtractor}
+        getItemType={listItemType}
         contentContainerStyle={styles.list}
         contentInsetAdjustmentBehavior="automatic"
         keyboardDismissMode="on-drag"

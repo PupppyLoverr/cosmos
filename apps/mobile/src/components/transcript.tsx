@@ -299,10 +299,10 @@ function Typing({ color }: { color: string }) {
   const phase = useSharedValue(0);
   useEffect(() => {
     if (reduce) {
-      phase.value = 0;
+      phase.set(0);
       return;
     }
-    phase.value = withRepeat(withTiming(1, { duration: 1100, easing: Easing.linear }), -1, false);
+    phase.set(withRepeat(withTiming(1, { duration: 1100, easing: Easing.linear }), -1, false));
   }, [phase, reduce]);
   return (
     <View style={styles.typing} accessibilityElementsHidden>
@@ -313,15 +313,15 @@ function Typing({ color }: { color: string }) {
 
 function TypingDot({ color, phase, offset, reduce }: { color: string; phase: SharedValue<number>; offset: number; reduce: boolean }) {
   const style = useAnimatedStyle(() => ({
-    opacity: reduce ? 0.6 : 0.25 + 0.75 * Math.abs(Math.sin((phase.value + offset) * Math.PI)),
-    transform: [{ translateY: reduce ? 0 : -2 * Math.abs(Math.sin((phase.value + offset) * Math.PI)) }],
+    opacity: reduce ? 0.6 : 0.25 + 0.75 * Math.abs(Math.sin((phase.get() + offset) * Math.PI)),
+    transform: [{ translateY: reduce ? 0 : -2 * Math.abs(Math.sin((phase.get() + offset) * Math.PI)) }],
   }));
   return <Animated.View style={[styles.typingDot, { backgroundColor: color }, style]} />;
 }
 
 // ---------------------------------------------------------------------------
 
-export function MessageView({ entry, onAnswer, grouped, arrive }: {
+export const MessageView = React.memo(function MessageView({ entry, onAnswer, grouped, arrive }: {
   entry: SessionMessageEntry;
   onAnswer: (requestId: string, answers: { questionId: string; labels: string[] }[]) => void;
   /** True when the previous message has the same role, so vertical spacing tightens. */
@@ -415,7 +415,7 @@ export function MessageView({ entry, onAnswer, grouped, arrive }: {
     </View>
     </Arrive>
   );
-}
+});
 
 const styles = StyleSheet.create({
   entry: { paddingHorizontal: spacing(4), marginBottom: spacing(4) },

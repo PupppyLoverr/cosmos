@@ -5,6 +5,7 @@ import { useLocalSearchParams, router, Stack } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import Animated, { Easing, useAnimatedStyle, useSharedValue, withRepeat, withTiming } from 'react-native-reanimated';
 import { useCosmos, useSnapshot } from '../../lib/client';
+import { useReduceMotion } from '../../lib/motion';
 import { alpha, radii, spacing, type, useTheme } from '../../lib/theme';
 import { Button, Icon, IconButton } from '../../components/bits';
 import { Glass, Screen } from '../../components/surface';
@@ -17,13 +18,20 @@ const POLL_MS = 2_500;
 
 function LivePill({ running }: { running: boolean }) {
   const t = useTheme();
+  const reduce = useReduceMotion();
   const v = useSharedValue(1);
-  useEffect(() => { v.value = running ? withRepeat(withTiming(0.35, { duration: 700, easing: Easing.inOut(Easing.quad) }), -1, true) : 1; }, [running, v]);
-  const blink = useAnimatedStyle(() => ({ opacity: v.value }));
+  useEffect(() => {
+    if (reduce) {
+      v.set(1);
+      return;
+    }
+    v.set(running ? withRepeat(withTiming(0.35, { duration: 700, easing: Easing.inOut(Easing.quad) }), -1, true) : 1);
+  }, [reduce, running, v]);
+  const blink = useAnimatedStyle(() => ({ opacity: v.get() }));
   return (
     <View style={[styles.pill, { backgroundColor: running ? t.danger : alpha('#FFFFFF', 0.14) }]} accessibilityLabel={running ? 'Live' : 'Idle'}>
       <Animated.View style={[styles.pillDot, { backgroundColor: '#fff' }, blink]} />
-      <Text style={[type.caption2, { color: '#fff', fontWeight: '700', letterSpacing: 0.6 }]}>{running ? 'LIVE' : 'IDLE'}</Text>
+      <Text maxFontSizeMultiplier={1.6} style={[type.caption2, { color: '#fff', fontWeight: '700', letterSpacing: 0.6 }]}>{running ? 'LIVE' : 'IDLE'}</Text>
     </View>
   );
 }
@@ -131,11 +139,11 @@ export default function WatchLiveScreen() {
             {control ? (
               <View style={styles.badge}>
                 <Icon name="display" size={11} color="#fff" weight="semibold" />
-                <Text style={[type.caption2, { color: '#fff', fontWeight: '600' }]} numberOfLines={1}>{control}</Text>
+                <Text maxFontSizeMultiplier={1.6} style={[type.caption2, { color: '#fff', fontWeight: '600' }]} numberOfLines={1}>{control}</Text>
               </View>
             ) : null}
             <View style={styles.badge}>
-              <Text style={[type.caption2, { color: alpha('#FFFFFF', 0.85), fontWeight: '600' }]}>{ageLabel}</Text>
+              <Text maxFontSizeMultiplier={1.6} style={[type.caption2, { color: alpha('#FFFFFF', 0.85), fontWeight: '600' }]} numberOfLines={1}>{ageLabel}</Text>
             </View>
           </View>
         </View>
@@ -181,10 +189,10 @@ const styles = StyleSheet.create({
   stageText: { color: alpha('#FFFFFF', 0.7), textAlign: 'center' },
   overlayTop: { position: 'absolute', top: spacing(3), left: spacing(3), right: spacing(3), flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   overlayRight: { flexDirection: 'row', gap: spacing(1.5), maxWidth: '60%' },
-  pill: { flexDirection: 'row', alignItems: 'center', gap: 5, height: 24, paddingHorizontal: spacing(2.5), borderRadius: radii.pill },
+  pill: { flexDirection: 'row', alignItems: 'center', gap: 5, minHeight: 24, paddingHorizontal: spacing(2.5), borderRadius: radii.pill },
   pillDot: { width: 6, height: 6, borderRadius: 3 },
   badge: {
-    flexDirection: 'row', alignItems: 'center', gap: 5, height: 24, paddingHorizontal: spacing(2.5),
+    flexDirection: 'row', alignItems: 'center', gap: 5, minHeight: 24, paddingHorizontal: spacing(2.5),
     borderRadius: radii.pill, backgroundColor: alpha('#000000', 0.55),
   },
   pause: { position: 'absolute', bottom: spacing(3), right: spacing(3) },

@@ -18,6 +18,10 @@ import { HarnessMark, harnessLabel } from '../../components/harness-mark';
 import { Glass, Screen } from '../../components/surface';
 import { SessionBanner } from '../../components/session-banner';
 
+function entryKeyExtractor(entry: SessionMessageEntry): string {
+  return entry.id;
+}
+
 /** Compact header: title with the harness + live status beneath, iMessage-style. */
 function HeaderTitle({ title, chat, status, desktop, t, chatId }: { title: string; chat?: Chat; status: string; desktop?: string; t: Theme; chatId: string }) {
   const parts = [harnessLabel(chat?.config?.harness), desktop].filter(Boolean);
@@ -331,7 +335,7 @@ export default function SessionScreen() {
             <FlashList
               ref={listRef}
               data={entries}
-              keyExtractor={(e) => e.id}
+              keyExtractor={entryKeyExtractor}
               renderItem={({ item, index }) => (
                 <MessageView
                   entry={item}

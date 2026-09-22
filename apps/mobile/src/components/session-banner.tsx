@@ -40,7 +40,12 @@ export function SessionBanner({ kind, title, body, onPress, actions }: SessionBa
       accessibilityLabel={`${title}${body ? `. ${body}` : ''}`}
     >
       {onPress ? (
-        <Pressable onPress={onPress} style={({ pressed }) => [styles.pressable, pressed && { opacity: 0.7 }]}>
+        <Pressable
+          onPress={onPress}
+          accessibilityRole="button"
+          accessibilityLabel={`${title}${body ? `. ${body}` : ''}`}
+          style={({ pressed }) => [styles.pressable, pressed && { opacity: 0.7 }]}
+        >
           {content}
         </Pressable>
       ) : (
