@@ -63,6 +63,28 @@ export function StatusDot({ status, size = 8, pulse = false }: { status?: string
   return <View accessibilityElementsHidden style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: color }} />;
 }
 
+export function Pulse({ color }: { color: string }) {
+  const reduce = useReduceMotion();
+  const v = useSharedValue(0);
+  useEffect(() => {
+    if (reduce) {
+      v.set(0);
+      return;
+    }
+    v.set(withRepeat(withTiming(1, { duration: 750, easing: Easing.inOut(Easing.sin) }), -1, true));
+  }, [v, reduce]);
+  const halo = useAnimatedStyle(() => ({
+    opacity: reduce ? 0 : 0.55 - 0.45 * v.get(),
+    transform: [{ scale: 1 + (reduce ? 0 : 1.2 * v.get()) }],
+  }));
+  return (
+    <View style={styles.pulse}>
+      <Animated.View style={[styles.pulseHalo, { backgroundColor: color }, halo]} />
+      <View style={[styles.pulseDot, { backgroundColor: color }]} />
+    </View>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Buttons
 
@@ -162,6 +184,35 @@ export function Chip({ label, icon, onPress, selected }: { label: string; icon?:
         {icon ? <Icon name={icon} size={14} color={selected ? fg : t.link} /> : null}
         <Text style={[type.subhead, { color: fg, fontWeight: '600' }]} numberOfLines={1}>{label}</Text>
       </View>
+    </Pressable>
+  );
+}
+
+export function SuggestionCard({ icon, title, subtitle, onPress }: {
+  icon: string;
+  title: string;
+  subtitle?: string;
+  onPress: () => void;
+}) {
+  const t = useTheme();
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={subtitle ? `${title}. ${subtitle}` : title}
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.suggestionCard,
+        { backgroundColor: pressed ? t.fill : t.surface, borderColor: t.separator, opacity: pressed ? 0.7 : 1 },
+      ]}
+    >
+      <View style={[styles.suggestionIcon, { backgroundColor: t.accentMuted }]}>
+        <Icon name={icon} size={16} color={t.link} />
+      </View>
+      <View style={styles.suggestionText}>
+        <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]} numberOfLines={1}>{title}</Text>
+        {subtitle ? <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>{subtitle}</Text> : null}
+      </View>
+      <Icon name="arrow.up.right" size={12} color={t.textTertiary} />
     </Pressable>
   );
 }
@@ -491,10 +542,20 @@ const styles = StyleSheet.create({
   buttonLg: { minHeight: 50, paddingHorizontal: spacing(6) },
   buttonMd: { minHeight: 44, paddingHorizontal: spacing(4) },
   buttonSm: { minHeight: 30, paddingHorizontal: spacing(3) },
+  pulse: { width: 10, height: 10, alignItems: 'center', justifyContent: 'center' },
+  pulseHalo: { position: 'absolute', width: 8, height: 8, borderRadius: 4 },
+  pulseDot: { width: 7, height: 7, borderRadius: 3.5 },
   chip: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(1.5),
     paddingHorizontal: spacing(3.5), minHeight: 36, borderRadius: radii.pill,
   },
+  suggestionCard: {
+    flexDirection: 'row', alignItems: 'center', gap: spacing(3),
+    paddingHorizontal: spacing(3.5), minHeight: 44,
+    borderRadius: radii.row, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth,
+  },
+  suggestionIcon: { width: 30, height: 30, borderRadius: radii.control, alignItems: 'center', justifyContent: 'center' },
+  suggestionText: { flex: 1, minWidth: 0 },
   segmented: { flexDirection: 'row', padding: 2, borderRadius: radii.sm + 1, borderCurve: 'continuous' },
   segment: { flex: 1, flexDirection: 'row', gap: spacing(1), alignItems: 'center', justifyContent: 'center', minHeight: 44, paddingHorizontal: spacing(1), borderRadius: radii.control, borderCurve: 'continuous' },
   sliderHost: { height: 34, width: '100%' },

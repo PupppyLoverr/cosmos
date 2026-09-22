@@ -91,10 +91,12 @@ function summarizeInput(input: unknown): string {
 
 function ToolLine({ part, t, last }: { part: ToolPart; t: Theme; last: boolean }) {
   const [open, setOpen] = useState(false);
+  const [showAll, setShowAll] = useState(false);
   const reduce = useReduceMotion();
   const face = describe(part.call);
   const running = !part.resolved;
   const body = part.output ?? part.subagentTail ?? '';
+  const bodyLines = body.trim() ? body.trim().split(/\r?\n/) : [];
   const expandable = body.length > 0 || (part.diffStats?.length ?? 0) > 0;
   const tint = part.isError ? t.danger : running ? t.link : t.textSecondary;
 
@@ -112,7 +114,7 @@ function ToolLine({ part, t, last }: { part: ToolPart; t: Theme; last: boolean }
         </View>
         <Text style={[type.footnote, { color: t.text, flex: 1 }]} numberOfLines={open ? undefined : 1}>
           <Text style={{ fontWeight: '600', color: part.isError ? t.danger : t.text }}>{face.verb}</Text>
-          {face.detail ? <Text style={[{ color: t.textSecondary }, face.mono && { fontFamily: type.mono.fontFamily, fontSize: 11.5 }]}>  {face.detail}</Text> : null}
+          {face.detail ? <Text style={[{ color: t.textSecondary }, face.mono && { fontFamily: type.mono.fontFamily, fontSize: type.mono.fontSize }]}>  {face.detail}</Text> : null}
         </Text>
         {expandable ? <Disclosure open={open} color={t.textTertiary} /> : null}
       </Pressable>
@@ -123,7 +125,23 @@ function ToolLine({ part, t, last }: { part: ToolPart; t: Theme; last: boolean }
               {d.path}  <Text style={{ color: t.success }}>+{d.additions}</Text> <Text style={{ color: t.danger }}>−{d.deletions}</Text>
             </Text>
           ))}
-          {body ? <Text style={[type.mono, { color: t.textSecondary }]} numberOfLines={60} selectable>{body.trim()}</Text> : null}
+          {body ? (
+            <>
+              <Text style={[type.mono, { color: t.textSecondary }]} numberOfLines={showAll ? 60 : 24} selectable>{body.trim()}</Text>
+              {bodyLines.length > 24 && !showAll ? (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Show all ${bodyLines.length} lines`}
+                  onPress={(event) => {
+                    event.stopPropagation();
+                    setShowAll(true);
+                  }}
+                >
+                  <Text style={[type.caption, { color: t.link }]}>Show all ({bodyLines.length} lines)</Text>
+                </Pressable>
+              ) : null}
+            </>
+          ) : null}
           {part.outputBytes && !part.output ? <Text style={[type.caption, { color: t.textTertiary }]}>{Math.round(part.outputBytes / 1024)} KB — full output on the desktop</Text> : null}
         </View>
       ) : null}
@@ -143,6 +161,17 @@ function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
   const summary = toolGroupSummary(parts);
   const state = running ? 'Running' : errors ? `${errors} failed` : 'Done';
   const stateColor = running ? t.link : errors ? t.danger : t.success;
+  const diffStats = parts.reduce(
+    (totals, part) => {
+      for (const diff of part.diffStats ?? []) {
+        totals.additions += diff.additions;
+        totals.deletions += diff.deletions;
+      }
+      return totals;
+    },
+    { additions: 0, deletions: 0 },
+  );
+  const hasDiffStats = !running && (diffStats.additions > 0 || diffStats.deletions > 0);
 
   return (
     <View style={[
@@ -158,7 +187,16 @@ function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
         style={({ pressed }) => [styles.toolHead, pressed && { backgroundColor: t.fill }]}
       >
         <Disclosure open={open} color={t.textTertiary} />
-        <Text style={[type.footnote, { color: t.text, flex: 1, fontWeight: '500' }]} numberOfLines={open ? 2 : 1}>{summary}</Text>
+        <View style={styles.toolSummary}>
+          <Text style={[type.footnote, { color: t.text, flexShrink: 1, fontWeight: '500' }]} numberOfLines={open ? 2 : 1}>{summary}</Text>
+          {!open && hasDiffStats ? (
+            <Text style={[type.caption, { color: t.textTertiary }]}>
+              <Text style={{ color: t.success }}>+{diffStats.additions}</Text>
+              {' '}
+              <Text style={{ color: t.danger }}>−{diffStats.deletions}</Text>
+            </Text>
+          ) : null}
+        </View>
         <StatusPill status={running ? 'working' : errors ? 'errored' : 'completed'} label={state} pulse={running} />
       </Pressable>
       {open ? parts.map((p, i) => <ToolLine key={p.id} part={p} t={t} last={i === parts.length - 1} />) : null}
@@ -257,21 +295,26 @@ export function ApprovalCard({ part, onAnswer }: {
 
 /** Three-dot breathing indicator while the assistant is still producing output. */
 function Typing({ color }: { color: string }) {
+  const reduce = useReduceMotion();
   const phase = useSharedValue(0);
   useEffect(() => {
+    if (reduce) {
+      phase.value = 0;
+      return;
+    }
     phase.value = withRepeat(withTiming(1, { duration: 1100, easing: Easing.linear }), -1, false);
-  }, [phase]);
+  }, [phase, reduce]);
   return (
     <View style={styles.typing} accessibilityElementsHidden>
-      {[0, 0.33, 0.66].map((offset) => <TypingDot key={offset} color={color} phase={phase} offset={offset} />)}
+      {[0, 0.33, 0.66].map((offset) => <TypingDot key={offset} color={color} phase={phase} offset={offset} reduce={reduce} />)}
     </View>
   );
 }
 
-function TypingDot({ color, phase, offset }: { color: string; phase: SharedValue<number>; offset: number }) {
+function TypingDot({ color, phase, offset, reduce }: { color: string; phase: SharedValue<number>; offset: number; reduce: boolean }) {
   const style = useAnimatedStyle(() => ({
-    opacity: 0.25 + 0.75 * Math.abs(Math.sin((phase.value + offset) * Math.PI)),
-    transform: [{ translateY: -2 * Math.abs(Math.sin((phase.value + offset) * Math.PI)) }],
+    opacity: reduce ? 0.6 : 0.25 + 0.75 * Math.abs(Math.sin((phase.value + offset) * Math.PI)),
+    transform: [{ translateY: reduce ? 0 : -2 * Math.abs(Math.sin((phase.value + offset) * Math.PI)) }],
   }));
   return <Animated.View style={[styles.typingDot, { backgroundColor: color }, style]} />;
 }
@@ -398,6 +441,7 @@ const styles = StyleSheet.create({
 
   toolCard: { borderRadius: radii.panel, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
   toolHead: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), minHeight: 44 },
+  toolSummary: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'baseline', gap: spacing(2) },
   toolLine: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), minHeight: 44 },
   toolIcon: { width: 20, height: 20, alignItems: 'center', justifyContent: 'center' },
   toolSep: { height: StyleSheet.hairlineWidth, marginLeft: spacing(3) + 20 + spacing(2) },
