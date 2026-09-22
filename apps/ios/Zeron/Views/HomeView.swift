@@ -197,14 +197,10 @@ struct HomeView: View {
             // device lives on the menu rows ("@ mac"), not up here.
             .frame(maxWidth: 200, alignment: .leading)
             .fixedSize(horizontal: true, vertical: false)
-            .padding(.horizontal, 6)
+            .padding(.horizontal, 2)
             .frame(minHeight: 32)
         }
-        // Put glass on the Menu control, not inside its captured label.
-        // UIKit morphs the menu's own surface and can restore its new width
-        // after selection; a label-level glass effect retained a stale mask.
-        .buttonStyle(.glass)
-        .buttonBorderShape(.capsule)
+        .buttonStyle(.plain)
         .fixedSize(horizontal: true, vertical: false)
         .accessibilityLabel("Filter by space")
         .accessibilityIdentifier("space-filter")

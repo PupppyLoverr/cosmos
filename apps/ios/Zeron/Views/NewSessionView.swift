@@ -104,10 +104,10 @@ struct NewSessionView: View {
             // Canvas — tap dismisses the keyboard, like the old app.
             ZStack {
                 Theme.bg
-                VStack(spacing: 24) {
+                VStack(spacing: 16) {
                     CosmosMark()
-                        .frame(width: 84, height: 84)
-                        .opacity(0.22)
+                        .frame(width: 56, height: 56)
+                        .opacity(0.16)
                     Text("What are we building?")
                         .font(Theme.sans(15))
                         .foregroundStyle(Theme.textFaint)
@@ -361,10 +361,10 @@ struct NewSessionView: View {
                     .foregroundStyle(Theme.text.opacity(0.9))
                     .lineLimit(1)
             }
-            .padding(.horizontal, 12)
-            .frame(height: 40)
-            .background(whiteAlpha(0.08), in: Capsule())
-            .overlay(Capsule().strokeBorder(whiteAlpha(0.08), lineWidth: 1))
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+            .background(Theme.elementHover, in: Capsule())
+            .overlay(Capsule().strokeBorder(Theme.border, lineWidth: 1))
         }
         .buttonStyle(ChipPressButtonStyle())
     }
@@ -591,10 +591,10 @@ struct ComposerChip: View {
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(Theme.textFaint)
             }
-            .padding(.horizontal, 13)
-            .frame(height: 40)
-            .background(whiteAlpha(0.08), in: Capsule())
-            .overlay(Capsule().strokeBorder(whiteAlpha(0.08), lineWidth: 1))
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+            .background(Theme.elementHover, in: Capsule())
+            .overlay(Capsule().strokeBorder(Theme.border, lineWidth: 1))
         }
         .buttonStyle(ChipPressButtonStyle())
     }

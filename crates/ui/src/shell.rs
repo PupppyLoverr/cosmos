@@ -1438,6 +1438,20 @@ fn sync_flow_after_auth(
     }
 }
 
+/// First-run chooser. Only a local, signed-out profile that has not dismissed
+/// it. Signed-in (and still-loading) sessions must not see it — the old
+/// condition was inverted, so a finished Woozlit login put the card straight
+/// back up, and "Use locally" could not dismiss it.
+fn show_first_run_welcome(
+    scope: Option<WorkspaceScope>,
+    auth: Option<&AuthState>,
+    first_run_seen: bool,
+) -> bool {
+    scope == Some(WorkspaceScope::Local)
+        && matches!(auth, Some(AuthState::SignedOut))
+        && !first_run_seen
+}
+
 /// The "Create your workspace" gate (feature-inventory §1.2 OrgGate).
 struct OrgGateUi {
     name_input: Entity<ComposerInput>,
@@ -8754,19 +8768,21 @@ impl Shell {
         // local-vs-sign-in fork once (persisted in ui-settings.json). Local
         // mode pairs the phone over the LAN; logging in starts the Woozlit
         // browser flow and the existing switch wizard migrates local work.
-        let welcome_shown = {
+        let show_welcome = {
             let state = self.state.read(cx);
-            state.workspace_scope == Some(WorkspaceScope::Local)
-                && matches!(state.auth, Some(AuthState::SignedOut))
-                && settings::current(cx).first_run_seen
+            show_first_run_welcome(
+                state.workspace_scope,
+                state.auth.as_ref(),
+                settings::current(cx).first_run_seen,
+            )
         };
-        if !welcome_shown {
+        if show_welcome {
             let card = popover::dialog_card(&theme)
                 .child(popover::dialog_title(&theme, "Welcome to Cosmos"))
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Use Cosmos locally — no account, everything stays on this Mac, and your phone still pairs on the same network — or log in to sync your workspace across devices.",
+                        "Use Cosmos locally — no account, everything stays on this device, and your phone still pairs on the same network — or log in to sync your workspace across devices.",
                     )),
                 )
                 .child(
@@ -8783,6 +8799,10 @@ impl Shell {
                                     settings::update(SavePolicy::Immediate, cx, |settings| {
                                         settings.first_run_seen = true;
                                     });
+                                    // settings::update writes a global — it
+                                    // does not dirty this view. Notify or the
+                                    // card stays up after the click.
+                                    cx.notify();
                                 })),
                         )
                         .child(
@@ -8793,6 +8813,7 @@ impl Shell {
                                         settings.first_run_seen = true;
                                     });
                                     this.start_sign_in(cx);
+                                    cx.notify();
                                 })),
                         ),
                 )
@@ -12336,6 +12357,41 @@ mod tests {
 
         assert!(error.contains("did not finish stopping"));
         drop(listener);
+    }
+
+    #[test]
+    fn first_run_welcome_only_for_a_local_signed_out_profile() {
+        assert!(show_first_run_welcome(
+            Some(WorkspaceScope::Local),
+            Some(&AuthState::SignedOut),
+            false
+        ));
+        assert!(
+            !show_first_run_welcome(
+                Some(WorkspaceScope::Local),
+                Some(&AuthState::SignedOut),
+                true
+            ),
+            "Use locally persists first_run_seen and must dismiss the card"
+        );
+        let signed_in = AuthState::SignedIn {
+            user: zeron_proto::UserProfile {
+                id: "user-1".into(),
+                email: "user@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org-1".into()),
+        };
+        assert!(
+            !show_first_run_welcome(Some(WorkspaceScope::Local), Some(&signed_in), false),
+            "a finished Woozlit login must not put the card back"
+        );
+        assert!(!show_first_run_welcome(
+            Some(WorkspaceScope::Synced),
+            Some(&AuthState::SignedOut),
+            false
+        ));
+        assert!(!show_first_run_welcome(None, None, false));
     }
 
     #[test]

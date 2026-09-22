@@ -32,6 +32,18 @@ use crate::http_error::describe_http_error;
 use zeron_rpc::TokenError;
 
 const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
+/// Loopback address the browser is sent to after Woozlit login.
+///
+/// Woozlit's `/login?desktop=1` page shows "You're all set", then delivers the
+/// token differently based on the callback host: `127.0.0.1` and `localhost`
+/// are loaded in a hidden iframe, and every other host is a top-level
+/// navigation (`window.location`). Chrome and Edge block that iframe under
+/// Local Network Access — the frame is created without
+/// `allow="local-network-access"` — so the request never reaches us and the
+/// app stays on the signed-out screen. `127.0.0.2` is still inside
+/// `127.0.0.0/8` (loopback on Windows, macOS, and Linux) but is not one of
+/// the two hosts Woozlit iframes, so the browser navigates here for real.
+const SIGN_IN_CALLBACK_HOST: &str = "127.0.0.2";
 /// Refresh when the cached token has less than this much life left.
 const TOKEN_SLACK: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -544,7 +556,9 @@ impl Auth {
             return Ok(String::new()); // dev mode: nothing to do
         }
         let port = self.ensure_loopback().await?;
-        Ok(self.begin_woozlit_sign_in(&format!("http://127.0.0.1:{port}/callback")))
+        Ok(self.begin_woozlit_sign_in(&format!(
+            "http://{SIGN_IN_CALLBACK_HOST}:{port}/callback"
+        )))
     }
 
     /// Same Woozlit login URL as headed sign-in. CLI uses the loopback callback
@@ -1068,7 +1082,7 @@ impl Auth {
             return Ok(port);
         }
         let requested = self.inner.config.callback_port.unwrap_or(0);
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", requested))
+        let listener = tokio::net::TcpListener::bind((SIGN_IN_CALLBACK_HOST, requested))
             .await
             .map_err(|e| EngineError::Other(format!("sign-in callback bind failed: {e}")))?;
         let port = listener

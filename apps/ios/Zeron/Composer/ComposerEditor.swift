@@ -79,7 +79,7 @@ struct ComposerEditor: UIViewRepresentable {
         controller.textChanged = { if text != $0 { text = $0 } }
         controller.focusChanged = { if focused != $0 { focused = $0 } }
         view.font = UIFontMetrics(forTextStyle: .body).scaledFont(
-            for: UIFont(name: "Geist-Regular", size: 17) ?? .systemFont(ofSize: 17),
+            for: UIFont(name: "Geist-Regular", size: 15) ?? .systemFont(ofSize: 15),
             compatibleWith: UITraitCollection(preferredContentSizeCategory: dynamicTypeSize.uiCategory))
         view.textColor = UIColor(Theme.text)
         view.tintColor = UIColor(Theme.text)

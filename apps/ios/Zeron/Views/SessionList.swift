@@ -46,14 +46,14 @@ struct SessionList: View {
         .contentMargins(.top, 2, for: .scrollContent)
         .scrollContentBackground(.hidden)
         .scrollEdgeEffectStyle(.soft, for: .top)
-        .background(Theme.surface.ignoresSafeArea())
+        .background(Theme.bg.ignoresSafeArea())
         .accessibilityIdentifier("session-list")
     }
 
     private var filterBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(SessionFilter.allCases) { filter in
+            HStack(spacing: 18) {
+                ForEach(SessionFilter.allCases) { filter in }
                     let count = scopedChats.filter {
                         model.matchesSearch($0, query: searchText)
                             && filter.includes($0, indicator: model.indicator(for: $0),
@@ -67,11 +67,18 @@ struct SessionList: View {
                             Text(count, format: .number).monospacedDigit()
                                 .foregroundStyle(Theme.textMuted)
                         }
-                        .font(Theme.sans(13, weight: .medium))
-                        .padding(.horizontal, 12)
-                        .frame(minHeight: 44)
-                        .background(sessionFilter == filter ? Theme.surfaceRaised : Color.clear, in: Capsule())
-                        .contentShape(Capsule())
+                        .font(Theme.sans(13, weight: sessionFilter == filter ? .semibold : .regular))
+                        .padding(.horizontal, 4)
+                        .frame(minHeight: 36)
+                        .overlay(alignment: .bottom) {
+                            if sessionFilter == filter {
+                                Capsule()
+                                    .fill(Theme.text)
+                                    .frame(width: 14, height: 2)
+                                    .padding(.bottom, 6)
+                            }
+                        }
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(sessionFilter == filter ? Theme.text : Theme.textMuted)
@@ -80,10 +87,10 @@ struct SessionList: View {
                     .accessibilityIdentifier("session-filter-\(filter.rawValue)")
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 4)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 2)
         }
-        .background(Theme.surface)
+        .background(Theme.bg)
         .overlay(alignment: .bottom) {
             Theme.border.frame(height: 1)
         }
@@ -276,7 +283,7 @@ struct ChatRow: View {
             }
 
             Text(chat.displayTitle)
-                .font(Theme.sans(17, weight: .medium))
+                .font(Theme.sans(15, weight: .medium))
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -284,7 +291,7 @@ struct ChatRow: View {
             if let preview = chat.lastMessagePreview?.trimmingCharacters(in: .whitespacesAndNewlines),
                !preview.isEmpty {
                 Text(preview)
-                    .font(Theme.sans(14))
+                    .font(Theme.sans(13))
                     .foregroundStyle(Theme.textMuted.opacity(0.72))
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)

@@ -42,11 +42,12 @@ struct TranscriptView: View {
                         scroll.jumpToLatest?(!reduceMotion)
                     } label: {
                         Image(systemName: "arrow.down")
-                            .font(.system(size: 16, weight: .medium))
+                            .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(Theme.text)
-                            .frame(width: 44, height: 44)
+                            .frame(width: 36, height: 36)
+                            .background(Theme.surface, in: Circle())
+                            .overlay(Circle().strokeBorder(Theme.border, lineWidth: 1))
                     }
-                    .glassEffect(.regular.interactive(), in: Circle())
                     .accessibilityLabel("Jump to latest")
                     .accessibilityIdentifier("jump-to-latest")
                     .padding(12)
@@ -302,7 +303,7 @@ struct UserBubble: View {
                 }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
-                    .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius, style: .continuous))
+                    .background(Theme.userBubble, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius, style: .continuous))
                     .frame(maxWidth: TranscriptView.maxContentWidth * 0.8, alignment: .trailing)
                     .contextMenu {
                         Button {
@@ -456,8 +457,8 @@ struct ToolGroupView: View {
                         .font(.system(size: 11, weight: .semibold))
                         .rotationEffect(.degrees(open ? 90 : 0))
                         .frame(width: 26)
-                    Text(toolGroupSummary(tools))
-                        .font(Theme.sans(14))
+                        Text(toolGroupSummary(tools))
+                        .font(Theme.sans(13))
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
                     Spacer(minLength: 0)
@@ -596,7 +597,7 @@ struct InputChipView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(Theme.textMuted)
                 .frame(width: 20, height: 20)
-                .background(whiteAlpha(0.09), in: RoundedRectangle(cornerRadius: 6))
+                .background(Theme.elementActive, in: RoundedRectangle(cornerRadius: 6))
             Text("Question")
                 .font(Theme.sans(12, weight: .medium))
                 .foregroundStyle(Theme.text)
@@ -608,7 +609,7 @@ struct InputChipView: View {
         }
         .padding(.horizontal, 8)
         .frame(height: 34)
-        .background(whiteAlpha(0.045), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(whiteAlpha(0.08), lineWidth: 1))
+        .background(Theme.elementHover, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.border, lineWidth: 1))
     }
 }

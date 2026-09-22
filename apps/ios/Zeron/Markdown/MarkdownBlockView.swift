@@ -1,25 +1,25 @@
-// Desktop markdown palette and hierarchy at a mobile reading scale.
-// Body 17/26, code 14/21; code rows and list markers scale with Dynamic Type.
-// Highlighting remains a paint-only update.
+// Desktop markdown palette (14px body) at a phone reading size that still
+// matches the desktop transcript. Code rows and list markers scale with
+// Dynamic Type. Highlighting remains a paint-only update.
 
 import SwiftUI
 
 enum MD {
-    static let textSize: CGFloat = 17
-    static let lineHeight: CGFloat = 26
+    static let textSize: CGFloat = 15
+    static let lineHeight: CGFloat = 23
     static let blockGap: CGFloat = 12
-    static let codeTextSize: CGFloat = 14
-    static let codeLineHeight: CGFloat = 21
+    static let codeTextSize: CGFloat = 13
+    static let codeLineHeight: CGFloat = 20
     static let codePaddingX: CGFloat = 12
     static let codePaddingY: CGFloat = 10
     static let inlineCodeRadius: CGFloat = 4.5
 
     static func headingMetrics(_ level: Int) -> (size: CGFloat, line: CGFloat) {
         switch level {
-        case 1: return (23, 31)
-        case 2: return (20, 28)
-        case 3: return (18, 26)
-        default: return (17, 26)
+        case 1: return (20, 28)
+        case 2: return (18, 26)
+        case 3: return (16, 24)
+        default: return (15, 23)
         }
     }
 }

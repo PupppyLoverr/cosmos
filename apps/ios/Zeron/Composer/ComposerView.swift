@@ -1,8 +1,8 @@
-// Composer — the floating glass shell in the t3 mobile composer's shape: a
-// collapsed capsule (editor + send circle) that morphs into an expanded card
-// with a toolbar ROW below it (attach circle · scrolling chips · pinned send)
-// when the editor takes focus. A live run plus text queues the message;
-// a live run with an empty composer offers Stop.
+// Composer — the desktop pill (26pt radius, hairline, opaque surface): a
+// collapsed row (editor + send) that grows into a card with a toolbar row
+// (attach · scrolling chips · pinned send) when the editor takes focus.
+// A live run plus text queues the message; a live run with an empty
+// composer offers Stop.
 //
 // Expansion is focus-driven like t3's, with the old deterministic content
 // triggers kept as a floor (attachments, newline, >26 chars) — content-size
@@ -55,10 +55,9 @@ struct ComposerShell<Chips: View>: View {
             || draft.contains("\n") || draft.count > 26
     }
 
-    /// One animatable shape for background/glass/hairline: capsule-radius
-    /// collapsed (46pt tall pill), 20pt card expanded (t3's 999↔20 morph).
+    /// Desktop composer radius, collapsed and expanded.
     private var surfaceShape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: expanded ? 20 : 24)
+        RoundedRectangle(cornerRadius: Theme.composerRadius, style: .continuous)
     }
 
     // Switching between VStack/HStack via AnyLayout (rather than an if/else
@@ -74,7 +73,9 @@ struct ComposerShell<Chips: View>: View {
     var body: some View {
         surface
             // Focus-widen: margins pull in slightly while typing (chat-session.tsx).
-            .padding(.horizontal, focused ? 10 : 16)
+            .padding(.horizontal, focused ? 12 : 16)
+            .frame(maxWidth: 768)
+            .frame(maxWidth: .infinity)
             .motionAnimation(Motion.resize, value: focused)
             .motionAnimation(Motion.resize, value: expanded)
             .onAppear {
@@ -86,7 +87,7 @@ struct ComposerShell<Chips: View>: View {
             }
     }
 
-    /// The glass surface: collapsed = editor + send in one capsule row;
+    /// The pill: collapsed = editor + send in one row;
     /// expanded = attachment strip over a tall editor, with the control row
     /// (attach circle · scrolling chips · pinned send) along the card's
     /// bottom edge — everything stays inside the glass.
@@ -122,11 +123,10 @@ struct ComposerShell<Chips: View>: View {
                 actionButton
             }
         }
-        .padding(.horizontal, expanded ? 12 : 5)
-        .padding(.vertical, expanded ? 12 : 5)
-        .background(whiteAlpha(0.04), in: surfaceShape)
-        .glassEffect(.regular.interactive(), in: surfaceShape)
-        .overlay(surfaceShape.strokeBorder(whiteAlpha(0.05), lineWidth: 1))
+        .padding(.horizontal, expanded ? 12 : 6)
+        .padding(.vertical, expanded ? 10 : 4)
+        .background(Theme.surface, in: surfaceShape)
+        .overlay(surfaceShape.strokeBorder(Theme.border, lineWidth: 1))
         // The whole glass surface focuses the editor, not just the TextField's
         // own text box: the collapsed pill is mostly padding, and a tap that
         // misses the text box falls through to the transcript underneath —
@@ -155,7 +155,7 @@ struct ComposerShell<Chips: View>: View {
             .overlay(alignment: .topLeading) {
                 if draft.isEmpty {
                     Text(placeholder)
-                        .font(Theme.sans(17))
+                        .font(Theme.sans(15))
                         .foregroundStyle(Theme.text.opacity(0.3))
                         .allowsHitTesting(false)
                         .accessibilityHidden(true)
@@ -168,11 +168,11 @@ struct ComposerShell<Chips: View>: View {
             onAttach?()
         } label: {
             Image(systemName: "plus")
-                .font(.system(size: 16, weight: .medium))
+                .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(Theme.textMuted)
-                .frame(width: 44, height: 44)
-                .background(whiteAlpha(0.06), in: Circle())
-                .overlay(Circle().strokeBorder(whiteAlpha(0.08), lineWidth: 1))
+                .frame(width: 32, height: 32)
+                .background(Theme.elementHover, in: Circle())
+                .overlay(Circle().strokeBorder(Theme.border, lineWidth: 1))
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -209,12 +209,12 @@ struct ComposerShell<Chips: View>: View {
                         .frame(width: 12, height: 12)
                 } else {
                     Image(systemName: "arrow.up")
-                        .font(.system(size: 16, weight: .semibold))
+                        .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(buttonActive ? Theme.bg : Theme.textFaint)
                 }
             }
-            .frame(width: 44, height: 44)
-            .background(buttonActive ? AnyShapeStyle(Theme.text) : AnyShapeStyle(whiteAlpha(0.10)),
+            .frame(width: 32, height: 32)
+            .background(buttonActive ? AnyShapeStyle(Theme.text) : AnyShapeStyle(Theme.elementHover),
                         in: Circle())
             .contentShape(Circle())
         }
@@ -765,7 +765,7 @@ struct QuestionPanel: View {
                         .foregroundStyle(Theme.textMuted)
                         .padding(.horizontal, 6)
                         .frame(height: 20)
-                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: 6))
+                        .background(Theme.elementHover, in: RoundedRectangle(cornerRadius: 6))
                 }
             }
 
@@ -787,7 +787,7 @@ struct QuestionPanel: View {
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Rectangle().fill(whiteAlpha(0.06)).frame(height: 1)
+                Rectangle().fill(Theme.border).frame(height: 1)
                 TextField("Or type your own answer", text: Binding(
                     get: { typed[question.id] ?? "" },
                     set: { typed[question.id] = $0 }
@@ -819,9 +819,12 @@ struct QuestionPanel: View {
             }
         }
         .padding(16)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26))
-        .overlay(RoundedRectangle(cornerRadius: 26).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
-        .padding(.horizontal, 12)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.composerRadius, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: Theme.composerRadius, style: .continuous)
+            .strokeBorder(Theme.border, lineWidth: 1))
+        .padding(.horizontal, 16)
+        .frame(maxWidth: 768)
+        .frame(maxWidth: .infinity)
         .transition(.opacity)
     }
 
@@ -844,15 +847,15 @@ struct QuestionPanel: View {
                         .font(Theme.sans(11))
                         .foregroundStyle(Theme.textMuted)
                         .frame(width: 22, height: 22)
-                        .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: 6))
+                        .background(Theme.elementActive, in: RoundedRectangle(cornerRadius: 6))
                 }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .background(isPicked ? whiteAlpha(0.09) : whiteAlpha(0.025),
+            .background(isPicked ? Theme.elementActive : Theme.elementHover,
                         in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(isPicked ? whiteAlpha(0.16) : .clear, lineWidth: 1))
+                .strokeBorder(isPicked ? Theme.borderStrong : .clear, lineWidth: 1))
         }
         .buttonStyle(.plain)
     }

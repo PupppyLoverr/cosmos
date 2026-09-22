@@ -83,6 +83,9 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
+            .tint(Theme.text)
+            .scrollContentBackground(.hidden)
+            .background(Theme.bg.ignoresSafeArea())
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }

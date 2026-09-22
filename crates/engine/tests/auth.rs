@@ -766,8 +766,12 @@ async fn loopback_callback_completes_headed_sign_in() {
     assert!(url.contains("www.woozlit.com/login?desktop=1"));
     let callback = login_callback(&url);
     assert!(
-        callback.starts_with("http://127.0.0.1:"),
-        "loopback callback: {callback}"
+        callback.starts_with("http://127.0.0.2:"),
+        "loopback callback must be 127.0.0.2 so Woozlit top-level-navigates instead of iframe-ing 127.0.0.1: {callback}"
+    );
+    assert!(
+        !callback.contains("://127.0.0.1") && !callback.contains("://localhost"),
+        "127.0.0.1/localhost callbacks are dropped by the browser: {callback}"
     );
     let _state = query_param(&callback, "state").expect("state");
     let callback_base = callback.split('?').next().unwrap();

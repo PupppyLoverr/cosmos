@@ -20,6 +20,8 @@ enum Theme {
     static let surface = dynamic(dark: grey(13), light: .white)
     /// Raised surface: popovers, dialogs, cards.
     static let surfaceRaised = dynamic(dark: neutral(0.235), light: neutral(0.925))
+    /// User-message plate — desktop `user_bubble_bg` (a soft wash, not a slab).
+    static let userBubble = dynamic(dark: whiteAlpha(0.08), light: blackAlpha(0.04))
     /// Hover/pressed wash for interactive rows.
     static let elementHover = dynamic(dark: whiteAlpha(0.06), light: blackAlpha(0.05))
     /// Active/selected wash.
@@ -72,6 +74,8 @@ enum Theme {
 
     // ---- numbers drive layout (pt) ----
     static let bubbleRadius: CGFloat = 22
+    /// Composer and question panel — desktop `COMPOSER_RADIUS` (26).
+    static let composerRadius: CGFloat = 26
     static let panelRadius: CGFloat = 10
     static let controlRadius: CGFloat = 6
     static let spaceXS: CGFloat = 4

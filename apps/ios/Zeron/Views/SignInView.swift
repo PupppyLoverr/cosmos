@@ -65,8 +65,8 @@ struct SignInView: View {
                             }
                         }
                         .frame(maxWidth: .infinity)
-                        .frame(height: 50)
-                        .background(Theme.text, in: RoundedRectangle(cornerRadius: 16))
+                        .frame(height: 48)
+                        .background(Theme.text, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                     .buttonStyle(.plain)
                     .disabled(busy)
@@ -202,7 +202,9 @@ struct OrgPickerView: View {
                             }
                             .padding(.horizontal, 16)
                             .frame(height: 48)
-                            .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 14))
+                            .background(Theme.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .strokeBorder(Theme.border, lineWidth: 1))
                         }
                         .disabled(busy)
                     }
