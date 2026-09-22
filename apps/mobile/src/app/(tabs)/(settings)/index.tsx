@@ -1,14 +1,23 @@
 import React from 'react';
-import { Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router, Stack } from 'expo-router';
 import { Host, Switch } from '@expo/ui';
+import Constants from 'expo-constants';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../../../lib/client';
-import { useTheme, spacing, type, familyById, useThemePrefs, edge, surfaceOptions, backdropPresets } from '../../../lib/theme';
-import { Row, Group, ConnectionBadge } from '../../../components/bits';
+import { alpha, useTheme, spacing, type, familyById, useThemePrefs, edge, radii, surfaceOptions, backdropPresets } from '../../../lib/theme';
+import { Icon, Row, Group, StatusPill, Tag } from '../../../components/bits';
 import { HarnessMark } from '../../../components/harness-mark';
-import { Screen } from '../../../components/surface';
+import { Glass, Screen } from '../../../components/surface';
 import { ensureNotificationPermission } from '../../../lib/notify';
 import { markOnboardingUnseen } from '../../../lib/onboarding-store';
+
+function connectionLabel(status: string, detail?: string) {
+  if (status === 'connected') return { label: 'Online', color: 'success' as const };
+  if (status === 'connecting') return { label: 'Connecting…', color: 'warning' as const };
+  if (status === 'reconnecting') return { label: 'Reconnecting…', color: 'warning' as const };
+  if (status === 'disconnected') return { label: 'Offline', color: 'tertiary' as const };
+  return { label: detail ?? 'Error', color: 'danger' as const };
+}
 
 export default function SettingsScreen() {
   const t = useTheme();
@@ -30,20 +39,31 @@ export default function SettingsScreen() {
       ? (backdropPresets.find((p) => p.id === b.id)?.name ?? 'Gradient')
       : 'None';
   const openAppearance = () => router.push('/(tabs)/(settings)/appearance' as never);
+  const initials = (auth?.user.name || auth?.user.email || '?')
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]!.toUpperCase())
+    .join('');
+  const connectionStatus = connectionLabel(connection.status, connection.detail);
 
   return (
     <Screen>
       <Stack.Screen options={{ title: 'Settings', headerShown: true }} />
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.content}>
-        <Group>
-          {auth ? (
-            <Row
-              tall
-              title={auth.user.name || auth.user.email}
-              subtitle={auth.user.email}
-              leading={<HarnessMark size={32} />}
-            />
-          ) : (
+        {auth ? (
+          <Glass radius={radii.xl} style={styles.accountCard}>
+            <View style={[styles.avatar, { backgroundColor: alpha(t.accent, 0.16) }]}>
+              <Text style={[type.headline, { color: t.link }]}>{initials}</Text>
+            </View>
+            <View style={styles.accountCopy}>
+              <Text style={[type.headline, { color: t.text }]} numberOfLines={1}>{auth.user.name || auth.user.email}</Text>
+              <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>{auth.user.email}</Text>
+            </View>
+            <Tag label="Woozlit" color={t.link} />
+          </Glass>
+        ) : (
+          <Group>
             <Row
               tall
               title="Sign in with Woozlit"
@@ -52,8 +72,8 @@ export default function SettingsScreen() {
               onPress={() => router.push('/sign-in')}
               chevron
             />
-          )}
-        </Group>
+          </Group>
+        )}
 
         <Group header="Desktop">
           <Row
@@ -61,16 +81,22 @@ export default function SettingsScreen() {
             iconTint={connection.status === 'connected' ? t.success : t.textTertiary}
             title={connection.desktop ? desktopDisplayName(connection.desktop) : 'Not linked'}
             subtitle={connection.desktop ? (connection.desktop.kind === 'local' ? 'Local network' : 'Via Woozlit') : 'Link a desktop to get started'}
-            trailing={<ConnectionBadge status={connection.status} detail={connection.detail} />}
+            trailing={<StatusPill status={connection.status} label={connectionStatus.label} />}
             onPress={() => router.push('/(tabs)/(desktops)' as never)}
             chevron
           />
         </Group>
 
         <Group header="Appearance">
-          <Row title="Theme" value={familyById(prefs.family).name} onPress={openAppearance} chevron />
-          <Row title="Material" value={material} onPress={openAppearance} chevron />
-          <Row title="Backdrop" value={backdrop} onPress={openAppearance} chevron />
+          <Row
+            title="Theme"
+            value={familyById(prefs.family).name}
+            leading={<View style={styles.appearanceLeading}><View style={[styles.swatch, { backgroundColor: t.accent }]} /><Icon name="paintpalette" size={16} color={t.textSecondary} /></View>}
+            onPress={openAppearance}
+            chevron
+          />
+          <Row title="Material" value={material} icon="square.on.square" onPress={openAppearance} chevron />
+          <Row title="Backdrop" value={backdrop} icon="photo" onPress={openAppearance} chevron />
         </Group>
 
         <Group header="Notifications" footer="Get notified when a session finishes, needs your input, fails, or the desktop connection changes.">
@@ -87,7 +113,14 @@ export default function SettingsScreen() {
 
         {auth ? (
           <Group header="Account">
-            <Row title="Sign Out" danger onPress={() => void client.signOut()} />
+            <Row
+              title="Sign Out"
+              danger
+              onPress={() => Alert.alert('Sign out?', 'Remote desktops need you signed in to pair.', [
+                { text: 'Cancel', style: 'cancel' },
+                { text: 'Sign Out', style: 'destructive', onPress: () => void client.signOut() },
+              ])}
+            />
           </Group>
         ) : null}
 
@@ -104,6 +137,7 @@ export default function SettingsScreen() {
         <View style={styles.about}>
           <Text style={[type.footnote, { color: t.textTertiary }]}>Cosmos for {Platform.OS === 'ios' ? 'iOS' : 'Android'}</Text>
           <Text style={[type.caption, { color: t.textTertiary }]}>Local-first companion for the Cosmos desktop.</Text>
+          {Constants.expoConfig?.version ? <Text style={[type.caption, { color: t.textTertiary }]}>Version {Constants.expoConfig.version}</Text> : null}
         </View>
       </ScrollView>
     </Screen>
@@ -112,5 +146,10 @@ export default function SettingsScreen() {
 
 const styles = StyleSheet.create({
   content: { paddingHorizontal: edge, paddingBottom: spacing(12) },
+  accountCard: { flexDirection: 'row', alignItems: 'center', gap: spacing(3), padding: spacing(4) },
+  avatar: { width: 48, height: 48, borderRadius: radii.pill, alignItems: 'center', justifyContent: 'center' },
+  accountCopy: { flex: 1, minWidth: 0, gap: 2 },
+  swatch: { width: 20, height: 20, borderRadius: radii.pill },
+  appearanceLeading: { width: 50, flexDirection: 'row', alignItems: 'center', gap: spacing(2) },
   about: { alignItems: 'center', gap: 2, marginTop: spacing(10) },
 });
