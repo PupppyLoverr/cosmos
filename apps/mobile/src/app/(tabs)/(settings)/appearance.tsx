@@ -314,7 +314,7 @@ const styles = StyleSheet.create({
   previewRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(3) },
   previewMark: { width: 34, height: 34, borderRadius: 11, borderCurve: 'continuous', alignItems: 'center', justifyContent: 'center' },
   previewDot: { width: 8, height: 8, borderRadius: 4 },
-  previewBubble: { alignSelf: 'flex-end', maxWidth: '78%', paddingHorizontal: spacing(3.5), paddingVertical: spacing(2.25), borderRadius: radii.lg + 2, borderCurve: 'continuous' },
+  previewBubble: { alignSelf: 'flex-end', maxWidth: '78%', paddingHorizontal: spacing(4), paddingVertical: 10, borderRadius: radii.bubble, borderCurve: 'continuous' },
   previewAssistant: { paddingHorizontal: spacing(1) },
   previewComposer: { flexDirection: 'row', alignItems: 'center', paddingLeft: spacing(4), paddingRight: spacing(1.25), height: 44, gap: spacing(2) },
   previewSend: { width: 32, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },

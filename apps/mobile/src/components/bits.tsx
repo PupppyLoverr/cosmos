@@ -1,10 +1,12 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { ActivityIndicator, Pressable, StyleProp, StyleSheet, Text, TextInput, View, ViewStyle, type TextInputProps, type TextStyle } from 'react-native';
+import Animated, { Easing, useAnimatedStyle, useSharedValue, withRepeat, withTiming } from 'react-native-reanimated';
 import { SymbolView, type SymbolViewProps } from 'expo-symbols';
 import { SvgXml } from 'react-native-svg';
 import { Host, Slider as NativeSlider } from '@expo/ui';
 import * as Haptics from 'expo-haptics';
-import { Theme, alpha, edge, radii, shadows, spacing, statusColor, type, useTheme } from '../lib/theme';
+import { Theme, alpha, edge, motion, radii, shadows, spacing, statusColor, type, useTheme } from '../lib/theme';
+import { useReduceMotion } from '../lib/motion';
 import { icons, solarFor } from '../lib/icons';
 import { SOLAR_ICONS } from '../lib/solar-icons';
 import { Glass } from './surface';
@@ -34,9 +36,29 @@ export function Icon({ name, size = 17, color, weight = 'medium' }: { name: stri
   return <SymbolView name={symbol} size={size} tintColor={tint} weight={weight} resizeMode="scaleAspectFit" />;
 }
 
-export function StatusDot({ status, size = 8 }: { status?: string; size?: number }) {
+function PulsingDot({ color, size }: { color: string; size: number }) {
+  const phase = useSharedValue(0);
+  useEffect(() => {
+    phase.set(withRepeat(withTiming(1, { duration: motion.workingPulse, easing: Easing.inOut(Easing.sin) }), -1, true));
+  }, [phase]);
+  const halo = useAnimatedStyle(() => ({
+    opacity: 0.45 * (1 - phase.get()),
+    transform: [{ scale: 1 + phase.get() }],
+  }));
+  return (
+    <View style={{ width: size, height: size, alignItems: 'center', justifyContent: 'center' }} accessibilityElementsHidden>
+      <Animated.View style={[{ position: 'absolute', width: size, height: size, borderRadius: size / 2, backgroundColor: color }, halo]} />
+      <View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: color }} />
+    </View>
+  );
+}
+
+export function StatusDot({ status, size = 8, pulse = false }: { status?: string; size?: number; pulse?: boolean }) {
   const t = useTheme();
-  return <View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: statusColor(t, status) }} />;
+  const reduce = useReduceMotion();
+  const color = statusColor(t, status);
+  if (pulse && !reduce) return <PulsingDot color={color} size={size} />;
+  return <View accessibilityElementsHidden style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: color }} />;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +85,8 @@ export function Button({ title, onPress, variant = 'primary', size = 'lg', loadi
   const t = useTheme();
   const v = buttonVariants(t)[variant];
   const off = disabled || loading;
+  const visual = size === 'lg' ? 50 : size === 'md' ? 44 : 32;
+  const pad = Math.max(0, Math.ceil((44 - visual) / 2));
   const label = size === 'lg' ? type.headline : size === 'md' ? { ...type.subhead, fontWeight: '600' as const } : { ...type.footnote, fontWeight: '600' as const };
   return (
     <Pressable
@@ -70,6 +94,7 @@ export function Button({ title, onPress, variant = 'primary', size = 'lg', loadi
       accessibilityLabel={title}
       accessibilityState={{ disabled: !!off, busy: !!loading }}
       disabled={off}
+      hitSlop={{ top: pad, bottom: pad, left: 4, right: 4 }}
       onPress={() => { void Haptics.selectionAsync(); onPress?.(); }}
       style={({ pressed }) => [
         styles.button,
@@ -95,13 +120,14 @@ export function IconButton({ icon, onPress, label, size = 36, tint, filled = tru
   fill?: string;
 }) {
   const t = useTheme();
-  const glyph = <Icon name={icon} size={size * 0.46} color={tint ?? t.text} weight="semibold" />;
+  const glyph = <Icon name={icon} size={Math.min(17, size * 0.46)} color={tint ?? t.text} weight="semibold" />;
   const box: ViewStyle = { width: size, height: size, alignItems: 'center', justifyContent: 'center' };
+  const slop = Math.max(0, Math.ceil((44 - size) / 2));
   return (
     <Pressable
       onPress={() => { void Haptics.selectionAsync(); onPress?.(); }}
       disabled={disabled}
-      hitSlop={6}
+      hitSlop={slop}
       accessibilityRole="button"
       accessibilityLabel={label}
       style={({ pressed }) => ({ opacity: disabled ? 0.35 : pressed ? 0.6 : 1 })}
@@ -126,6 +152,7 @@ export function Chip({ label, icon, onPress, selected }: { label: string; icon?:
       onPress={() => { void Haptics.selectionAsync(); onPress?.(); }}
       accessibilityRole="button"
       accessibilityState={{ selected: !!selected }}
+      hitSlop={{ top: 4, bottom: 4 }}
       style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
     >
       <View style={[styles.chip, { backgroundColor: selected ? t.accentStrong : t.fill }]}>
@@ -384,14 +411,14 @@ export function Notice({ kind = 'info', title, body, action }: { kind?: 'info' |
 const styles = StyleSheet.create({
   button: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing(2), borderRadius: radii.pill },
   buttonLg: { minHeight: 50, paddingHorizontal: spacing(6) },
-  buttonMd: { minHeight: 40, paddingHorizontal: spacing(4) },
+  buttonMd: { minHeight: 44, paddingHorizontal: spacing(4) },
   buttonSm: { minHeight: 30, paddingHorizontal: spacing(3) },
   chip: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(1.5),
     paddingHorizontal: spacing(3.5), minHeight: 36, borderRadius: radii.pill,
   },
   segmented: { flexDirection: 'row', padding: 2, borderRadius: radii.sm + 1, borderCurve: 'continuous' },
-  segment: { flex: 1, flexDirection: 'row', gap: spacing(1), alignItems: 'center', justifyContent: 'center', minHeight: 30, paddingHorizontal: spacing(1), borderRadius: radii.sm - 1, borderCurve: 'continuous' },
+  segment: { flex: 1, flexDirection: 'row', gap: spacing(1), alignItems: 'center', justifyContent: 'center', minHeight: 44, paddingHorizontal: spacing(1), borderRadius: radii.control, borderCurve: 'continuous' },
   sliderHost: { height: 34, width: '100%' },
   tag: { borderRadius: radii.sm - 3, paddingHorizontal: spacing(1.5), paddingVertical: 2, maxWidth: 140 },
   row: {

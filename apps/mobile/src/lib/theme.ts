@@ -355,8 +355,10 @@ export function resolveTheme(prefs: ThemePrefs, systemScheme: Scheme, reduceTran
     warning: base.warning,
     success: base.success,
     composerBg: translucent ? alpha(surface, dark ? 0.55 : 0.7) : surface,
-    userBubble: accentStrong,
-    userBubbleText: onColor(accentStrong),
+    // Desktop `user_bubble_bg`: a soft wash, not an accent slab.
+    // Dark wash(0.08) white, light wash(0.04) black. Text stays `theme.text`.
+    userBubble: alpha(dark ? '#ffffff' : '#000000', dark ? 0.08 : 0.04),
+    userBubbleText: base.text,
     codeBg: mix(surface, base.text, dark ? 0.06 : 0.05),
     glassFallback: alpha(surface, dark ? 0.72 : 0.78),
     glassStroke: alpha(dark ? '#ffffff' : '#000000', dark ? 0.12 : 0.06),
@@ -470,8 +472,22 @@ export const liquidGlassSupported = liquidAvailable;
 
 export const spacing = (n: number) => n * 4;
 
-// Tight corners on purpose: rows and cards are content, not tiles.
-export const radii = { sm: 6, md: 10, lg: 12, xl: 14, xxl: 18, pill: 999 };
+// Desktop layout numbers from crates/ui/src/theme.rs and composer.rs.
+// sm/control = CONTROL_RADIUS 6, panel/md = PANEL_RADIUS 10, row = sidebar
+// session radius 8, bubble = BUBBLE_RADIUS 16, composer = COMPOSER_RADIUS 26.
+export const radii = {
+  control: 6,
+  sm: 6,
+  row: 8,
+  panel: 10,
+  md: 10,
+  lg: 12,
+  xl: 14,
+  bubble: 16,
+  xxl: 18,
+  composer: 26,
+  pill: 999,
+};
 
 /** Screen edge inset — one value, used everywhere content meets the screen edge. */
 export const edge = spacing(4);
@@ -489,6 +505,14 @@ export const type = {
   footnote: { fontSize: 13, fontWeight: '400', lineHeight: 18 },
   caption: { fontSize: 12, fontWeight: '400', lineHeight: 16 },
   caption2: { fontSize: 11, fontWeight: '500', lineHeight: 13, letterSpacing: 0.3 },
+  /** Desktop sidebar metadata (`ui_rems(11)`, line-height 14). */
+  meta: { fontSize: 11, fontWeight: '400', lineHeight: 14 },
+  /** Desktop session title (`ui_rems(13)`, line-height 17). */
+  sessionTitle: { fontSize: 13, fontWeight: '500', lineHeight: 17 },
+  /** Desktop composer `INPUT_TEXT_SIZE` (14). */
+  composer: { fontSize: 14, fontWeight: '400', lineHeight: 20 },
+  /** Desktop transcript (`MD_TEXT_SIZE` 14, user line-height 22). Scales with Dynamic Type. */
+  transcript: { fontSize: 14, fontWeight: '400', lineHeight: 22 },
   mono: { fontSize: 13, fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }), lineHeight: 18 },
 } as const satisfies Record<string, TextStyle>;
 
@@ -498,13 +522,31 @@ export const shadows = {
   overlay: '0 10px 30px rgba(0,0,0,0.22)',
 } as const;
 
-export const motion = { fast: 150, base: 250, slow: 400 } as const;
+// Durations from crates/ui/src/motion.rs. `fadeIn` is shortened from the
+// desktop's 500ms entrance: the same curve, under 300ms, so a new message
+// doesn't lag behind the thumb.
+export const motion = {
+  fast: 150,
+  base: 250,
+  slow: 400,
+  fadeIn: 280,
+  fadeQuick: 150,
+  collapse: 180,
+  resort: 260,
+  /** WorkingIndicator `gradient-spin-pulse` period. */
+  workingPulse: 750,
+} as const;
+
+/** Desktop fade-in cubic-bezier(0.16, 1, 0.3, 1). */
+export const enterBezier = [0.16, 1, 0.3, 1] as const;
+/** Desktop collapse cubic-bezier(0, 0, 0.58, 1). */
+export const collapseBezier = [0, 0, 0.58, 1] as const;
 
 export const statusColor = (t: Theme, s?: string): string =>
   s === 'working' ? t.link
     : s === 'awaitingInput' ? t.warning
     : s === 'errored' ? t.danger
-    : s === 'completed' ? t.success
+    : s === 'completed' || s === 'connected' ? t.success
     : t.textTertiary;
 
 // Deterministic per-chat tint for avatars (mirrors the desktop palette).

@@ -1,5 +1,5 @@
 import React, { useRef, useState } from 'react';
-import { ActionSheetIOS, ActivityIndicator, Alert, Platform, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActionSheetIOS, ActivityIndicator, Alert, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { Image } from 'expo-image';
 import * as Haptics from 'expo-haptics';
 import { PickedFile, pickPhoto, pickDocument, pickFromClipboard } from '../lib/attachments';
@@ -18,11 +18,48 @@ interface ComposerProps {
   running: boolean;
   /** An upload/send is in progress. */
   sending?: boolean;
+  /** False while the desktop is unreachable — Stop still works. */
+  enabled?: boolean;
+  /** Model / checkout chips, the desktop composer's secondary row. */
+  chips?: React.ReactNode;
   attachments: PickedFile[];
   onAddAttachment: (f: PickedFile) => void;
   onRemoveAttachment: (index: number) => void;
   onSend: (text: string) => void;
   onStop: () => void;
+}
+
+/** Dropdown-style chip for the composer toolbar. 32pt visual, 44pt target. */
+export function ComposerChip({ label, icon, onPress, accessibilityLabel, accessibilityHint }: {
+  label: string;
+  icon?: string;
+  onPress?: () => void;
+  accessibilityLabel?: string;
+  accessibilityHint?: string;
+}) {
+  const t = useTheme();
+  const body = (
+    <View style={[styles.composerChip, { borderColor: t.separator, backgroundColor: t.fill }]}>
+      {icon ? <Icon name={icon} size={13} color={t.textSecondary} /> : null}
+      <Text style={[type.meta, { color: t.text, fontWeight: '500', maxWidth: 160 }]} numberOfLines={1}>{label}</Text>
+      {onPress ? <Icon name="chevron.down" size={9} color={t.textTertiary} weight="semibold" /> : null}
+    </View>
+  );
+  if (!onPress) {
+    return <View accessibilityLabel={accessibilityLabel ?? label}>{body}</View>;
+  }
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel ?? label}
+      accessibilityHint={accessibilityHint}
+      hitSlop={{ top: 6, bottom: 6 }}
+      style={({ pressed }) => ({ opacity: pressed ? 0.65 : 1 })}
+    >
+      {body}
+    </Pressable>
+  );
 }
 
 type Source = 'camera' | 'photos' | 'files' | 'clipboard';
@@ -57,7 +94,7 @@ function AttachmentChip({ file, onRemove }: { file: PickedFile; onRemove: () => 
   );
 }
 
-export function Composer({ placeholder, initialText, onChangeText, bottomInset, running, sending, attachments, onAddAttachment, onRemoveAttachment, onSend, onStop }: ComposerProps) {
+export function Composer({ placeholder, initialText, onChangeText, bottomInset, running, sending, enabled = true, chips, attachments, onAddAttachment, onRemoveAttachment, onSend, onStop }: ComposerProps) {
   const t = useTheme();
   const [text, setTextState] = useState(initialText ?? '');
   const setText = (v: string) => { setTextState(v); onChangeText?.(v); };
@@ -97,7 +134,7 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
     }
   };
 
-  const canSend = (text.trim().length > 0 || attachments.length > 0) && !sending;
+  const canSend = enabled && (text.trim().length > 0 || attachments.length > 0) && !sending;
   const send = () => {
     if (!canSend) return;
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -109,7 +146,7 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
     onStop();
   };
 
-  const hint = placeholder ?? (running ? 'Steer while it works…' : 'Message Cosmos');
+  const hint = placeholder ?? (running ? 'Steer while it works…' : 'Do anything…');
   const showStop = running && !text.trim() && attachments.length === 0;
 
   return (
@@ -122,58 +159,72 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
       {/* The desktop composer is a rounded-rect plate with a hairline rim,
           not a floating glass pill — keep the same silhouette. */}
       <Glass
-        radius={radii.xl}
+        radius={radii.composer}
         tint={t.translucent ? undefined : t.composerBg}
-        style={[styles.bar, { borderColor: focused ? alpha(t.accent, 0.45) : t.separator }]}
+        style={[styles.bar, { borderColor: focused ? alpha(t.text, t.scheme === 'dark' ? 0.28 : 0.22) : t.separator }]}
       >
-        <Pressable
-          onPress={openAttachSheet}
-          disabled={busy || sending}
-          hitSlop={6}
-          style={({ pressed }) => [styles.round, { backgroundColor: t.fill, opacity: pressed || busy ? 0.6 : 1 }]}
-          accessibilityLabel="Add attachment"
-          accessibilityRole="button"
-        >
-          {busy ? <ActivityIndicator size="small" color={t.textSecondary} style={{ transform: [{ scale: 0.8 }] }} /> : <Icon name="plus" size={18} color={t.text} weight="medium" />}
-        </Pressable>
-        <TextInput
-          ref={input}
-          style={[styles.input, type.body, { color: t.text }]}
-          placeholder={hint}
-          placeholderTextColor={t.textTertiary}
-          value={text}
-          onChangeText={setText}
-          autoFocus={!!initialText}
-          onFocus={() => setFocused(true)}
-          onBlur={() => setFocused(false)}
-          multiline
-          maxLength={20000}
-          keyboardAppearance={t.scheme}
-          selectionColor={t.accent}
-          submitBehavior="newline"
-          accessibilityLabel="Message"
-        />
-        {showStop ? (
-          <Pressable onPress={stop} hitSlop={6} style={({ pressed }) => [styles.round, { backgroundColor: t.text, opacity: pressed ? 0.75 : 1 }]} accessibilityLabel="Stop the run" accessibilityRole="button">
-            <Icon name="stop.fill" size={13} color={t.background} />
-          </Pressable>
-        ) : (
+        <View style={styles.inputRow}>
           <Pressable
-            onPress={send}
-            disabled={!canSend}
-            hitSlop={6}
-            style={({ pressed }) => [styles.round, { backgroundColor: canSend ? t.accentStrong : t.fill, opacity: pressed ? 0.8 : 1 }]}
-            accessibilityLabel={running ? 'Send steering message' : 'Send'}
+            onPress={openAttachSheet}
+            disabled={busy || sending}
+            style={({ pressed }) => [styles.hit, { opacity: pressed || busy ? 0.6 : 1 }]}
+            accessibilityLabel="Attach files"
             accessibilityRole="button"
-            accessibilityState={{ disabled: !canSend }}
           >
-            {sending ? (
-              <ActivityIndicator size="small" color={t.accentContrast} style={{ transform: [{ scale: 0.8 }] }} />
-            ) : (
-              <Icon name="arrow.up" size={16} color={canSend ? t.accentContrast : t.textTertiary} weight="bold" />
-            )}
+            {busy ? <ActivityIndicator size="small" color={t.textSecondary} /> : <Icon name="paperclip" size={18} color={t.textSecondary} weight="medium" />}
           </Pressable>
-        )}
+          <TextInput
+            ref={input}
+            style={[styles.input, type.composer, { color: t.text }]}
+            placeholder={hint}
+            placeholderTextColor={t.textTertiary}
+            value={text}
+            onChangeText={setText}
+            autoFocus={!!initialText}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
+            multiline
+            maxLength={20000}
+            keyboardAppearance={t.scheme}
+            selectionColor={t.accent}
+            submitBehavior="newline"
+            accessibilityLabel="Message"
+          />
+          {showStop ? (
+            <Pressable onPress={stop} style={({ pressed }) => [styles.hit, { opacity: pressed ? 0.75 : 1 }]} accessibilityLabel="Stop the run" accessibilityRole="button">
+              <View style={[styles.round, { backgroundColor: t.text }]}>
+                <View style={[styles.stop, { backgroundColor: t.background }]} />
+              </View>
+            </Pressable>
+          ) : (
+            <Pressable
+              onPress={send}
+              disabled={!canSend}
+              style={({ pressed }) => [styles.hit, { opacity: pressed ? 0.8 : 1 }]}
+              accessibilityLabel={running ? 'Send steering message' : 'Send'}
+              accessibilityRole="button"
+              accessibilityState={{ disabled: !canSend }}
+            >
+              <View style={[styles.round, { backgroundColor: t.text, opacity: canSend ? 1 : 0.35 }]}>
+                {sending ? (
+                  <ActivityIndicator size="small" color={t.background} />
+                ) : (
+                  <Icon name="arrow.up" size={14} color={t.background} weight="bold" />
+                )}
+              </View>
+            </Pressable>
+          )}
+        </View>
+        {chips ? (
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
+            contentContainerStyle={styles.chipRow}
+          >
+            {chips}
+          </ScrollView>
+        ) : null}
       </Glass>
     </View>
   );
@@ -191,10 +242,18 @@ const styles = StyleSheet.create({
   docThumb: { alignItems: 'center', justifyContent: 'center' },
   chipX: { marginLeft: -spacing(0.5) },
   bar: {
-    flexDirection: 'row', alignItems: 'flex-end', gap: spacing(1.5),
-    paddingHorizontal: spacing(1.5), paddingVertical: spacing(1.5),
+    paddingLeft: spacing(1), paddingRight: spacing(1.5), paddingVertical: spacing(1),
     borderWidth: StyleSheet.hairlineWidth,
   },
-  round: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
-  input: { flex: 1, maxHeight: 132, paddingVertical: Platform.OS === 'ios' ? spacing(2) : spacing(1.25), paddingHorizontal: spacing(1.5), lineHeight: 22 },
+  inputRow: { flexDirection: 'row', alignItems: 'flex-end' },
+  hit: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
+  round: { width: 28, height: 28, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
+  stop: { width: 11, height: 11, borderRadius: 3 },
+  input: { flex: 1, maxHeight: 132, paddingTop: Platform.OS === 'ios' ? 12 : 8, paddingBottom: Platform.OS === 'ios' ? 12 : 8, paddingHorizontal: spacing(1) },
+  chipRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingLeft: spacing(1), paddingRight: spacing(1), paddingBottom: spacing(1.5) },
+  composerChip: {
+    flexDirection: 'row', alignItems: 'center', gap: spacing(1),
+    minHeight: 32, paddingHorizontal: spacing(2),
+    borderRadius: radii.control, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth,
+  },
 });

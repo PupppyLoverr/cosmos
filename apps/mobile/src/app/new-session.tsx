@@ -6,11 +6,11 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCosmos, useSnapshot } from '../lib/client';
 import { HarnessId, ReasoningLevel, SandboxLevel } from '../lib/protocol';
 import { PickedFile, ensureDecodable, fileToBase64Chunks } from '../lib/attachments';
-import { radii, spacing, type, useTheme } from '../lib/theme';
+import { spacing, type, useTheme } from '../lib/theme';
 import { Row, Group, SectionLabel, Segmented, Notice, Icon, Caption } from '../components/bits';
 import { HarnessMark, harnessLabel } from '../components/harness-mark';
-import { Composer } from '../components/composer';
-import { Glass, Screen } from '../components/surface';
+import { Composer, ComposerChip } from '../components/composer';
+import { Screen } from '../components/surface';
 
 const REASONING: { id: ReasoningLevel; label: string }[] = [
   { id: 'low', label: 'Low' },
@@ -87,7 +87,7 @@ export default function NewSessionScreen() {
   const modelName = model ? (models.find((m) => m.id === model)?.name ?? model) : 'Default';
 
   const spaceChoices = useMemo(
-    () => [{ id: null as string | null, label: 'Desktop', path: undefined as string | undefined }, ...spaces.map((s) => ({ id: s.id as string | null, label: s.name || s.path.split('/').pop() || s.path, path: s.path }))],
+    () => [{ id: null as string | null, label: 'Current checkout', path: undefined as string | undefined }, ...spaces.map((s) => ({ id: s.id as string | null, label: s.name || s.path.split('/').pop() || s.path, path: s.path }))],
     [spaces],
   );
   const space = spaceChoices.find((s) => s.id === spaceId) ?? spaceChoices[0]!;
@@ -124,9 +124,8 @@ export default function NewSessionScreen() {
     }
   };
 
-  const summary = [harnessName, modelName !== 'Default' ? modelName : null, REASONING.find((r) => r.id === reasoning)!.label, space.label]
-    .filter(Boolean)
-    .join(' · ');
+  const effortLabel = REASONING.find((r) => r.id === reasoning)!.label;
+  const sandboxLabel = SANDBOX.find((s) => s.id === sandbox)!.label;
 
   return (
     <Screen>
@@ -144,7 +143,7 @@ export default function NewSessionScreen() {
                 <Pressable
                   key={p}
                   onPress={() => { void Haptics.selectionAsync(); setSeedText(p); }}
-                  style={({ pressed }) => [styles.idea, { opacity: pressed ? 0.6 : 1 }]}
+                  style={({ pressed }) => [styles.idea, { opacity: pressed ? 0.6 : 1, minHeight: 44 }]}
                   accessibilityRole="button"
                 >
                   <Icon name="arrow.up.left" size={12} color={t.textTertiary} />
@@ -155,33 +154,53 @@ export default function NewSessionScreen() {
           ) : null}
         </View>
 
-        <Pressable
-          onPress={() => { void Haptics.selectionAsync(); setSetup(true); }}
-          style={({ pressed }) => [styles.setupChip, { opacity: pressed ? 0.7 : 1 }]}
-          accessibilityRole="button"
-          accessibilityLabel={`Session setup: ${summary}`}
-          accessibilityHint="Agent, model, effort and project"
-        >
-          <Glass radius={radii.pill} thin style={[styles.setupInner, { borderColor: t.glassStroke }]}>
-            <HarnessMark harness={harness} size={15} plain />
-            <Text style={[type.footnote, { color: t.textSecondary, fontWeight: '500' }]} numberOfLines={1}>{summary}</Text>
-            <Icon name="chevron.up" size={10} color={t.textTertiary} weight="semibold" />
-          </Glass>
-        </Pressable>
-
         <Composer
           key={seedText}
-          placeholder="Message Cosmos…"
           initialText={seedText}
           onChangeText={(v) => setTyped(v.length > 0)}
           running={false}
           sending={busy}
+          enabled={online}
           attachments={attachments}
           onAddAttachment={(f) => setAttachments((a) => [...a, f])}
           onRemoveAttachment={(i) => setAttachments((a) => a.filter((_, j) => j !== i))}
           onSend={(text) => void start(text)}
           onStop={() => {}}
           bottomInset={Math.max(insets.bottom, spacing(2))}
+          chips={
+            <>
+              <ComposerChip
+                label={harnessName}
+                accessibilityLabel={`Agent, ${harnessName}`}
+                onPress={() => pickFrom('Agent', harnessChoices.map((h) => h.name ?? harnessLabel(h.id) ?? String(h.id)), harnessName, (i) => {
+                  setHarness(harnessChoices[i]!.id);
+                  setModel(null);
+                })}
+              />
+              <ComposerChip
+                icon="cpu"
+                label={modelName}
+                accessibilityLabel={`Model, ${modelName}`}
+                onPress={() => pickFrom('Model', ['Default', ...models.map((m) => m.name ?? m.id)], modelName, (i) => setModel(i === 0 ? null : models[i - 1]!.id))}
+              />
+              <ComposerChip
+                icon="folder"
+                label={space.label}
+                accessibilityLabel={space.id ? `Project, ${space.label}` : 'Current checkout'}
+                onPress={() => pickFrom('Checkout', spaceChoices.map((s) => s.label), space.label, (i) => setSpaceId(spaceChoices[i]!.id))}
+              />
+              <ComposerChip
+                label={effortLabel}
+                accessibilityLabel={`Effort, ${effortLabel}`}
+                onPress={() => pickFrom('Effort', REASONING.map((r) => r.label), effortLabel, (i) => setReasoning(REASONING[i]!.id))}
+              />
+              <ComposerChip
+                label={sandboxLabel}
+                accessibilityLabel={`Permissions, ${sandboxLabel}`}
+                onPress={() => { void Haptics.selectionAsync(); setSetup(true); }}
+              />
+            </>
+          }
         />
       </KeyboardAvoidingView>
 

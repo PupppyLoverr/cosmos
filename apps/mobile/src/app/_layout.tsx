@@ -30,7 +30,9 @@ function ThemedStack() {
           name="session/[id]"
           options={({ route }) => ({
             title: (route.params as { title?: string })?.title ?? 'Session',
-            headerBackTitle: 'Back',
+            headerBackTitle: 'Sessions',
+            gestureEnabled: true,
+            fullScreenGestureEnabled: true,
             ...(Platform.OS === 'ios' && t.translucent
               ? { headerTransparent: true, headerBlurEffect: dark ? 'systemChromeMaterialDark' : 'systemChromeMaterial' }
               : {}),

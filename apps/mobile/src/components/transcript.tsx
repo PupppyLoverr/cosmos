@@ -2,15 +2,47 @@ import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, LayoutAnimation, Pressable, StyleSheet, Text, View } from 'react-native';
 import Animated, { Easing, useAnimatedStyle, useSharedValue, withRepeat, withTiming, type SharedValue } from 'react-native-reanimated';
 import * as Haptics from 'expo-haptics';
+import { toolGroupSummary } from '../lib/activity';
+import { Arrive, useReduceMotion } from '../lib/motion';
 import { SessionMessageEntry, MessagePart, ToolCall, toolCallName } from '../lib/protocol';
-import { Theme, alpha, radii, spacing, type, useTheme } from '../lib/theme';
+import { Theme, alpha, collapseBezier, motion, radii, spacing, type, useTheme } from '../lib/theme';
 import { Button, Icon } from './bits';
 
 type ToolPart = Extract<MessagePart, { kind: 'tool' }>;
 type InputPart = Extract<MessagePart, { kind: 'input' }>;
 type ReasoningPart = Extract<MessagePart, { kind: 'reasoning' }>;
 
-const animateLayout = () => LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+function animateLayout(reduce: boolean) {
+  if (reduce) return;
+  LayoutAnimation.configureNext({
+    duration: motion.collapse,
+    update: { type: LayoutAnimation.Types.easeInEaseOut },
+    create: { type: LayoutAnimation.Types.easeInEaseOut, property: LayoutAnimation.Properties.opacity },
+    delete: { type: LayoutAnimation.Types.easeInEaseOut, property: LayoutAnimation.Properties.opacity },
+  });
+}
+
+/** iOS disclosure: a right chevron that rotates down. Snaps when Reduce Motion is on. */
+function Disclosure({ open, color }: { open: boolean; color: string }) {
+  const reduce = useReduceMotion();
+  const turn = useSharedValue(open ? 1 : 0);
+  useEffect(() => {
+    if (reduce) {
+      turn.set(open ? 1 : 0);
+      return;
+    }
+    turn.set(withTiming(open ? 1 : 0, {
+      duration: motion.collapse,
+      easing: Easing.bezier(collapseBezier[0], collapseBezier[1], collapseBezier[2], collapseBezier[3]),
+    }));
+  }, [open, reduce, turn]);
+  const style = useAnimatedStyle(() => ({ transform: [{ rotate: `${turn.get() * 90}deg` }] }));
+  return (
+    <Animated.View style={style}>
+      <Icon name="chevron.right" size={12} color={color} weight="semibold" />
+    </Animated.View>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Tool call presentation
@@ -58,30 +90,30 @@ function summarizeInput(input: unknown): string {
 
 function ToolLine({ part, t, last }: { part: ToolPart; t: Theme; last: boolean }) {
   const [open, setOpen] = useState(false);
+  const reduce = useReduceMotion();
   const face = describe(part.call);
   const running = !part.resolved;
   const body = part.output ?? part.subagentTail ?? '';
   const expandable = body.length > 0 || (part.diffStats?.length ?? 0) > 0;
-  const tint = part.isError ? t.danger : face.computer ? t.link : t.textSecondary;
+  const tint = part.isError ? t.danger : running ? t.link : t.textSecondary;
 
   return (
     <View>
       <Pressable
-        onPress={expandable ? () => { animateLayout(); setOpen((v) => !v); } : undefined}
+        onPress={expandable ? () => { animateLayout(reduce); setOpen((v) => !v); } : undefined}
         accessibilityRole={expandable ? 'button' : undefined}
         accessibilityState={expandable ? { expanded: open } : undefined}
-        accessibilityLabel={`${face.verb} ${face.detail}${running ? ', running' : part.isError ? ', failed' : ''}`}
+        accessibilityLabel={`${face.verb} ${face.detail}${running ? ', running' : part.isError ? ', failed' : ', done'}`}
         style={({ pressed }) => [styles.toolLine, pressed && expandable && { backgroundColor: t.fill }]}
       >
         <View style={styles.toolIcon}>
-          {running ? <ActivityIndicator size="small" color={t.link} style={{ transform: [{ scale: 0.7 }] }} /> : <Icon name={face.icon} size={14} color={tint} />}
+          {running ? <ActivityIndicator size="small" color={t.link} style={{ transform: [{ scale: 0.7 }] }} /> : part.isError ? <Icon name="exclamationmark.circle.fill" size={14} color={t.danger} /> : <Icon name={face.icon} size={14} color={tint} />}
         </View>
-        <Text style={[type.subhead, { color: t.text, flex: 1 }]} numberOfLines={open ? undefined : 1}>
+        <Text style={[type.footnote, { color: t.text, flex: 1 }]} numberOfLines={open ? undefined : 1}>
           <Text style={{ fontWeight: '600', color: part.isError ? t.danger : t.text }}>{face.verb}</Text>
           {face.detail ? <Text style={{ color: t.textSecondary }}>  {face.detail}</Text> : null}
         </Text>
-        {part.isError ? <Icon name="exclamationmark.circle.fill" size={14} color={t.danger} /> : null}
-        {expandable ? <Icon name="chevron.right" size={10} color={t.textTertiary} weight="semibold" /> : null}
+        {expandable ? <Disclosure open={open} color={t.textTertiary} /> : null}
       </Pressable>
       {open ? (
         <View style={[styles.toolOutput, { backgroundColor: t.codeBg }]}>
@@ -99,31 +131,32 @@ function ToolLine({ part, t, last }: { part: ToolPart; t: Theme; last: boolean }
   );
 }
 
-/** Consecutive tool calls fold into one activity card so long runs stay scannable. */
+/** Consecutive tool calls fold behind the desktop summary ("Ran 2 commands · 1 failed"). */
 function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
-  const [expanded, setExpanded] = useState(false);
+  const reduce = useReduceMotion();
   const running = parts.some((p) => !p.resolved);
   const errors = parts.filter((p) => p.isError).length;
-  const computer = parts.some((p) => describe(p.call).computer);
-  const collapsible = parts.length > 3;
-  const shown = collapsible && !expanded ? parts.slice(-3) : parts;
-  const hidden = parts.length - shown.length;
+  // Null until the user toggles: open while the group is still running, closed once it settles.
+  const [pinned, setPinned] = useState<boolean | null>(null);
+  const open = pinned ?? running;
+  const summary = toolGroupSummary(parts);
+  const state = running ? 'Running' : errors ? `${errors} failed` : 'Done';
+  const stateColor = running ? t.link : errors ? t.danger : t.success;
 
   return (
     <View style={[styles.toolCard, { backgroundColor: t.surface, borderColor: t.separator }]}>
-      <View style={styles.toolHead}>
-        <Icon name={computer ? 'display' : 'gearshape.2'} size={12} color={t.textTertiary} />
-        <Text style={[type.caption2, { color: t.textTertiary, flex: 1 }]}>
-          {(computer ? 'COMPUTER USE' : 'ACTIVITY')} · {parts.length} {parts.length === 1 ? 'STEP' : 'STEPS'}
-        </Text>
-        {running ? <Text style={[type.caption2, { color: t.link }]}>RUNNING</Text> : errors ? <Text style={[type.caption2, { color: t.danger }]}>{errors} FAILED</Text> : <Icon name="checkmark" size={11} color={t.success} weight="bold" />}
-      </View>
-      {hidden > 0 ? (
-        <Pressable onPress={() => { animateLayout(); setExpanded(true); }} style={styles.toolMore} accessibilityRole="button">
-          <Text style={[type.footnote, { color: t.link }]}>Show {hidden} earlier {hidden === 1 ? 'step' : 'steps'}</Text>
-        </Pressable>
-      ) : null}
-      {shown.map((p, i) => <ToolLine key={p.id} part={p} t={t} last={i === shown.length - 1} />)}
+      <Pressable
+        onPress={() => { animateLayout(reduce); setPinned(!(pinned ?? running)); }}
+        accessibilityRole="button"
+        accessibilityState={{ expanded: open }}
+        accessibilityLabel={`${summary}, ${state}`}
+        style={({ pressed }) => [styles.toolHead, pressed && { backgroundColor: t.fill }]}
+      >
+        <Disclosure open={open} color={t.textTertiary} />
+        <Text style={[type.footnote, { color: t.text, flex: 1, fontWeight: '500' }]} numberOfLines={open ? 2 : 1}>{summary}</Text>
+        <Text style={[type.meta, { color: stateColor, fontWeight: '600' }]}>{state}</Text>
+      </Pressable>
+      {open ? parts.map((p, i) => <ToolLine key={p.id} part={p} t={t} last={i === parts.length - 1} />) : null}
     </View>
   );
 }
@@ -132,22 +165,23 @@ function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
 
 function ReasoningRow({ part, t }: { part: ReasoningPart; t: Theme }) {
   const [open, setOpen] = useState(false);
+  const reduce = useReduceMotion();
   const firstLine = part.text.trim().split('\n').find((l) => l.trim()) ?? '';
   return (
     <Pressable
-      onPress={() => { animateLayout(); setOpen((v) => !v); }}
+      onPress={() => { animateLayout(reduce); setOpen((v) => !v); }}
       accessibilityRole="button"
       accessibilityState={{ expanded: open }}
+      accessibilityLabel={open ? 'Thought process' : firstLine || 'Thought process'}
       style={({ pressed }) => [styles.reasoning, { opacity: pressed ? 0.7 : 1 }]}
     >
       <View style={styles.reasoningHead}>
-        <Icon name="sparkle" size={12} color={t.textTertiary} />
-        <Text style={[type.footnote, { color: t.textTertiary, flex: 1, fontWeight: '500' }]} numberOfLines={open ? undefined : 1}>
-          {open ? 'Thinking' : firstLine || 'Thinking…'}
+        <Disclosure open={open} color={t.textTertiary} />
+        <Text style={[type.footnote, { color: t.textSecondary, flex: 1 }]} numberOfLines={open ? undefined : 1}>
+          {open ? 'Thought process' : firstLine || 'Thought process'}
         </Text>
-        <Icon name={open ? 'chevron.up' : 'chevron.down'} size={10} color={t.textTertiary} weight="semibold" />
       </View>
-      {open ? <Text style={[type.footnote, styles.reasoningBody, { color: t.textSecondary, borderLeftColor: t.separator }]}>{part.text.trim()}</Text> : null}
+      {open ? <Text style={[type.footnote, styles.reasoningBody, { color: t.textSecondary, borderLeftColor: t.separator }]} selectable>{part.text.trim()}</Text> : null}
     </Pressable>
   );
 }
@@ -223,7 +257,7 @@ function Typing({ color }: { color: string }) {
     phase.value = withRepeat(withTiming(1, { duration: 1100, easing: Easing.linear }), -1, false);
   }, [phase]);
   return (
-    <View style={styles.typing} accessibilityLabel="Cosmos is typing">
+    <View style={styles.typing} accessibilityElementsHidden>
       {[0, 0.33, 0.66].map((offset) => <TypingDot key={offset} color={color} phase={phase} offset={offset} />)}
     </View>
   );
@@ -239,11 +273,13 @@ function TypingDot({ color, phase, offset }: { color: string; phase: SharedValue
 
 // ---------------------------------------------------------------------------
 
-export function MessageView({ entry, onAnswer, grouped }: {
+export function MessageView({ entry, onAnswer, grouped, arrive }: {
   entry: SessionMessageEntry;
   onAnswer: (requestId: string, answers: { questionId: string; labels: string[] }[]) => void;
   /** True when the previous message has the same role, so vertical spacing tightens. */
   grouped?: boolean;
+  /** Play the desktop fade-in once, for a message that just arrived. */
+  arrive?: boolean;
 }) {
   const t = useTheme();
   const isUser = entry.role === 'user';
@@ -253,6 +289,7 @@ export function MessageView({ entry, onAnswer, grouped }: {
     const images = entry.parts.filter((p): p is Extract<MessagePart, { kind: 'image' }> => p.kind === 'image');
     if (!text && !images.length) return null;
     return (
+      <Arrive active={!!arrive}>
       <View style={[styles.entry, styles.userEntry, grouped && styles.grouped]}>
         {images.length ? (
           <View style={styles.attachments}>
@@ -266,10 +303,11 @@ export function MessageView({ entry, onAnswer, grouped }: {
         ) : null}
         {text ? (
           <View style={[styles.userBubble, { backgroundColor: t.userBubble }]}>
-            <Text style={[type.body, { color: t.userBubbleText }]} selectable>{text}</Text>
+            <Text style={[type.transcript, { color: t.userBubbleText }]} selectable>{text}</Text>
           </View>
         ) : null}
       </View>
+      </Arrive>
     );
   }
 
@@ -288,12 +326,13 @@ export function MessageView({ entry, onAnswer, grouped }: {
   const hasText = entry.parts.some((p) => p.kind === 'text' && p.text.trim());
 
   return (
+    <Arrive active={!!arrive}>
     <View style={[styles.entry, grouped && styles.grouped]}>
       <View style={styles.assistant}>
         {blocks.map((b) => {
           switch (b.kind) {
             case 'text':
-              return b.text.trim() ? <Text key={b.id} style={[type.body, styles.assistantText, { color: t.text }]} selectable>{b.text.trim()}</Text> : null;
+              return b.text.trim() ? <Text key={b.id} style={[type.transcript, styles.assistantText, { color: t.text }]} selectable>{b.text.trim()}</Text> : null;
             case 'reasoning':
               return b.text.trim() ? <ReasoningRow key={b.id} part={b} t={t} /> : null;
             case 'tools':
@@ -318,9 +357,15 @@ export function MessageView({ entry, onAnswer, grouped }: {
               return null;
           }
         })}
-        {streaming && !hasText ? <Typing color={t.textTertiary} /> : null}
+        {streaming && !hasText ? (
+          <View style={styles.working} accessibilityLabel="Working">
+            <Typing color={t.link} />
+            <Text style={[type.footnote, { color: t.link, fontWeight: '500' }]}>Working</Text>
+          </View>
+        ) : null}
       </View>
     </View>
+    </Arrive>
   );
 }
 
@@ -329,9 +374,8 @@ const styles = StyleSheet.create({
   grouped: { marginTop: -spacing(2) },
   userEntry: { alignItems: 'flex-end', gap: spacing(1.5) },
   userBubble: {
-    maxWidth: '80%', borderRadius: 20, borderCurve: 'continuous',
-    paddingHorizontal: spacing(3.5), paddingVertical: spacing(2.25),
-    borderBottomRightRadius: 6,
+    maxWidth: '80%', borderRadius: radii.bubble, borderCurve: 'continuous',
+    paddingHorizontal: spacing(4), paddingVertical: 10,
   },
   attachments: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'flex-end', gap: spacing(1.5), maxWidth: '80%' },
   attachment: {
@@ -340,16 +384,16 @@ const styles = StyleSheet.create({
     borderRadius: radii.md, borderCurve: 'continuous', maxWidth: 220,
   },
   assistant: { gap: spacing(2.5) },
-  assistantText: { lineHeight: 24 },
+  assistantText: { lineHeight: 22 },
+  working: { flexDirection: 'row', alignItems: 'center', gap: spacing(2) },
 
   reasoning: { paddingVertical: spacing(0.5) },
   reasoningHead: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
   reasoningBody: { marginTop: spacing(2), paddingLeft: spacing(3), borderLeftWidth: 2, lineHeight: 19 },
 
-  toolCard: { borderRadius: radii.lg, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
-  toolHead: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), paddingHorizontal: spacing(3), paddingTop: spacing(2.5), paddingBottom: spacing(1.5) },
-  toolMore: { paddingHorizontal: spacing(3), paddingVertical: spacing(1.5) },
-  toolLine: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), paddingVertical: spacing(2.25), minHeight: 40 },
+  toolCard: { borderRadius: radii.panel, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
+  toolHead: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), minHeight: 44 },
+  toolLine: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), minHeight: 44 },
   toolIcon: { width: 20, height: 20, alignItems: 'center', justifyContent: 'center' },
   toolSep: { height: StyleSheet.hairlineWidth, marginLeft: spacing(3) + 20 + spacing(2) },
   toolOutput: { marginHorizontal: spacing(3), marginBottom: spacing(2.5), padding: spacing(2.5), borderRadius: radii.sm, borderCurve: 'continuous', gap: spacing(1) },
@@ -358,7 +402,7 @@ const styles = StyleSheet.create({
   approvalHead: { flexDirection: 'row', alignItems: 'center', gap: spacing(2.5) },
   approvalGlyph: { width: 30, height: 30, borderRadius: 9, borderCurve: 'continuous', alignItems: 'center', justifyContent: 'center' },
   options: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing(2) },
-  option: { borderRadius: radii.pill, paddingHorizontal: spacing(3.5), paddingVertical: spacing(2), minHeight: 36, justifyContent: 'center' },
+  option: { borderRadius: radii.pill, paddingHorizontal: spacing(3.5), paddingVertical: spacing(2), minHeight: 44, justifyContent: 'center' },
   resolved: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), alignSelf: 'flex-start', paddingHorizontal: spacing(2.5), paddingVertical: spacing(1.5), borderRadius: radii.pill },
 
   error: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing(2), padding: spacing(3), borderRadius: radii.md, borderCurve: 'continuous' },

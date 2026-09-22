@@ -62,7 +62,7 @@ function Fact({ icon, label, value, accent }: { icon: string; label: string; val
   return (
     <View style={styles.fact}>
       <Icon name={icon} size={15} color={accent ? t.link : t.textSecondary} />
-      <Text style={[type.caption2, { color: t.textTertiary, marginTop: spacing(1.5) }]}>{label.toUpperCase()}</Text>
+      <Text style={[type.meta, { color: t.textTertiary, marginTop: spacing(1.5) }]}>{label}</Text>
       <Text style={[type.footnote, { color: accent ? t.link : t.text, fontWeight: '600' }]} numberOfLines={1}>{value}</Text>
     </View>
   );

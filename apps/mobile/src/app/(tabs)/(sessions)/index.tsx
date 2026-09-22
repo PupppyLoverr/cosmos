@@ -3,9 +3,10 @@ import { ActionSheetIOS, Alert, Platform, Pressable, StyleSheet, Text, View } fr
 import { FlashList } from '@shopify/flash-list';
 import { router, Stack } from 'expo-router';
 import * as Haptics from 'expo-haptics';
+import { formatTimeAgo } from '../../../lib/activity';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../../../lib/client';
-import { Chat, Session } from '../../../lib/protocol';
-import { useTheme, spacing, radii, type, edge, alpha } from '../../../lib/theme';
+import { Chat, Device, Session, Space } from '../../../lib/protocol';
+import { useTheme, spacing, radii, type, edge, alpha, statusColor } from '../../../lib/theme';
 import { EmptyState, Icon, StatusDot, Notice, Button } from '../../../components/bits';
 import { HarnessMark } from '../../../components/harness-mark';
 import { Glass, Screen } from '../../../components/surface';
@@ -21,26 +22,26 @@ function indicator(chat: Chat, sessions: Session[]): Indicator {
   return 'idle';
 }
 
-function relTime(iso?: string | null): string {
-  if (!iso) return '';
-  const d = new Date(iso);
-  const diff = Date.now() - d.getTime();
-  const m = Math.floor(diff / 60000);
-  if (m < 1) return 'Now';
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-  if (h < 24 * 7) return d.toLocaleDateString([], { weekday: 'short' });
-  return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
-}
-
 const STATUS_LABEL: Record<Indicator, string | null> = {
   working: 'Working',
-  awaitingInput: 'Needs your input',
+  awaitingInput: 'Input',
   errored: 'Failed',
-  completed: 'New reply',
+  completed: 'Done',
   idle: null,
 };
+
+function projectName(chat: Chat, spaces: Space[]): string {
+  const space = chat.spaceId ? spaces.find((s) => s.id === chat.spaceId) : undefined;
+  const named = space?.name?.trim();
+  if (named) return named;
+  const path = (space?.path ?? chat.cwd ?? '').replace(/\\/g, '/');
+  const leaf = path.split('/').filter(Boolean).pop();
+  return leaf || 'No project';
+}
+
+function deviceName(chat: Chat, devices: Device[]): string {
+  return devices.find((d) => d.id === chat.deviceId)?.name?.trim() || 'Desktop';
+}
 
 const SUGGESTIONS = [
   { label: 'Tidy my Downloads', sub: 'Sort files into folders', icon: 'folder' },
@@ -84,41 +85,75 @@ function chatActions(client: ReturnType<typeof useCosmos>, chat: Chat) {
   }
 }
 
+function StatusCorner({ ind, when, color }: { ind: Indicator; when: string; color: string }) {
+  if (ind === 'idle') {
+    return <Text style={[type.meta, { color: color }]}>{when}</Text>;
+  }
+  const label = STATUS_LABEL[ind]!;
+  return (
+    <View style={styles.status}>
+      {ind === 'completed' ? (
+        <Icon name="checkmark" size={11} color={color} weight="bold" />
+      ) : (
+        <StatusDot status={ind} size={6} pulse={ind === 'working'} />
+      )}
+      <Text style={[type.meta, { color, fontWeight: '600' }]}>{label}</Text>
+    </View>
+  );
+}
+
 type ListItem =
   | { kind: 'section'; key: string; title: string }
-  | { kind: 'chat'; key: string; chat: Chat; ind: Indicator; first: boolean; last: boolean };
+  | { kind: 'archive'; key: string; count: number; open: boolean }
+  | { kind: 'chat'; key: string; chat: Chat; ind: Indicator };
 
 export default function SessionsScreen() {
   const t = useTheme();
   const client = useCosmos();
   const chats = useSnapshot(client.chats);
   const sessions = useSnapshot(client.sessions);
+  const spaces = useSnapshot(client.spaces);
+  const devices = useSnapshot(client.devices);
   const connection = useSnapshot(client.connection);
   const [query, setQuery] = useState('');
+  const [archiveOpen, setArchiveOpen] = useState(false);
 
   const items = useMemo<ListItem[]>(() => {
     const q = query.trim().toLowerCase();
-    const visible = chats
-      .filter((c) => !c.archived)
-      .filter((c) => !q || (c.title ?? '').toLowerCase().includes(q) || (c.lastMessagePreview ?? '').toLowerCase().includes(q))
+    const matches = (c: Chat) => !q || (c.title ?? '').toLowerCase().includes(q) || (c.lastMessagePreview ?? '').toLowerCase().includes(q) || (c.branch ?? '').toLowerCase().includes(q);
+    const live = chats
+      .filter((c) => !c.archived && matches(c))
       .sort((a, b) => (b.lastMessageAt ?? b.createdAt).localeCompare(a.lastMessageAt ?? a.createdAt))
       .map((chat) => ({ chat, ind: indicator(chat, sessions) }));
+    const archived = chats
+      .filter((c) => c.archived && matches(c))
+      .sort((a, b) => (b.lastMessageAt ?? b.createdAt).localeCompare(a.lastMessageAt ?? a.createdAt));
 
-    const active = visible.filter((v) => v.ind === 'working' || v.ind === 'awaitingInput' || v.ind === 'errored');
-    const rest = visible.filter((v) => !active.includes(v));
+    const active = live.filter((v) => v.ind === 'working' || v.ind === 'awaitingInput' || v.ind === 'errored');
+    const recent = live.filter((v) => v.ind === 'completed' || v.ind === 'idle');
+    const groups = [active.length > 0, recent.length > 0, archived.length > 0].filter(Boolean).length;
+    const headed = groups > 1;
     const out: ListItem[] = [];
-    const push = (title: string, group: typeof visible) => {
+    const pushChats = (title: string, group: typeof live) => {
       if (!group.length) return;
-      if (active.length && rest.length) out.push({ kind: 'section', key: `s:${title}`, title });
-      group.forEach((v, i) => out.push({ kind: 'chat', key: v.chat.id, chat: v.chat, ind: v.ind, first: i === 0, last: i === group.length - 1 }));
+      if (headed) out.push({ kind: 'section', key: `s:${title}`, title });
+      for (const v of group) out.push({ kind: 'chat', key: v.chat.id, chat: v.chat, ind: v.ind });
     };
-    push('Active', active);
-    push('Recent', rest);
+    pushChats('Active', active);
+    pushChats('Recent', recent);
+    if (archived.length) {
+      const open = archiveOpen || q.length > 0;
+      out.push({ kind: 'archive', key: 'archive', count: archived.length, open });
+      if (open) {
+        for (const chat of archived) out.push({ kind: 'chat', key: `arch:${chat.id}`, chat, ind: 'idle' });
+      }
+    }
     return out;
-  }, [chats, sessions, query]);
+  }, [chats, sessions, query, archiveOpen]);
 
   const connected = connection.status === 'connected';
   const connecting = connection.status === 'connecting' || connection.status === 'reconnecting';
+  const startNew = () => { void Haptics.selectionAsync(); router.push('/new-session'); };
 
   return (
     <Screen>
@@ -132,6 +167,16 @@ export default function SessionsScreen() {
             onChangeText: (e) => setQuery(e.nativeEvent.text),
             hideWhenScrolling: true,
           },
+          headerRight: () => connected ? (
+            <Pressable
+              onPress={startNew}
+              accessibilityRole="button"
+              accessibilityLabel="New session"
+              style={styles.newButton}
+            >
+              <Icon name="square.and.pencil" size={18} color={t.text} />
+            </Pressable>
+          ) : null,
         }}
       />
       <FlashList
@@ -149,26 +194,15 @@ export default function SessionsScreen() {
               accessibilityLabel={connection.desktop ? `${connection.desktop.name}, ${connection.status}` : 'No desktop linked'}
               style={({ pressed }) => [styles.desktopPill, { backgroundColor: alpha(t.fill, pressed ? 1 : 0.7) }]}
             >
-              <StatusDot status={connected ? 'connected' : connecting ? 'working' : 'errored'} size={7} />
+              <StatusDot status={connected ? 'connected' : connecting ? 'working' : 'errored'} size={7} pulse={connecting} />
               <Text style={[type.footnote, { color: t.textSecondary, fontWeight: '500' }]} numberOfLines={1}>
                 {connection.desktop ? desktopDisplayName(connection.desktop) : 'No desktop linked'}
                 {connection.desktop ? ` · ${connected ? 'Connected' : connecting ? 'Connecting…' : 'Offline'}` : ''}
               </Text>
               <Icon name="chevron.right" size={10} color={t.textTertiary} weight="semibold" />
             </Pressable>
-            {connected && items.length ? (
-              <Pressable
-                onPress={() => { void Haptics.selectionAsync(); router.push('/new-session'); }}
-                accessibilityRole="button"
-                accessibilityLabel="New session"
-                style={({ pressed }) => [styles.newRow, { backgroundColor: pressed ? t.fill : t.surface, borderColor: t.separator }]}
-              >
-                <Icon name="plus" size={14} color={t.textSecondary} weight="semibold" />
-                <Text style={[type.subhead, { color: t.textSecondary }]}>New session</Text>
-              </Pressable>
-            ) : null}
             {!connected && connection.detail ? (
-              <Notice kind="warning" title={connecting ? 'Reconnecting' : "Can't reach the desktop"} body={connection.detail} />
+              <Notice kind="warning" title={connecting ? 'Connecting to desktop' : "Can't reach the desktop"} body={connection.detail} />
             ) : null}
           </View>
         }
@@ -176,8 +210,8 @@ export default function SessionsScreen() {
           connected ? (
             <EmptyState
               icon={query ? 'magnifyingglass' : 'sparkles'}
-              title={query ? 'No Results' : 'Start Something'}
-              body={query ? `Nothing matches “${query}”.` : 'Your desktop is ready. Ask Cosmos to do anything on it.'}
+              title={query ? 'No results' : 'Do anything'}
+              body={query ? `Nothing matches “${query}”.` : 'Your desktop is ready. Start a session and Cosmos will work on it.'}
             >
               {!query ? (
                 <View style={styles.suggestions}>
@@ -185,6 +219,7 @@ export default function SessionsScreen() {
                     <Pressable
                       key={s.label}
                       accessibilityRole="button"
+                      accessibilityLabel={`${s.label}. ${s.sub}`}
                       onPress={() => router.push({ pathname: '/new-session', params: { prompt: `${s.label}: ${s.sub}` } })}
                       style={({ pressed }) => [styles.suggestion, { backgroundColor: pressed ? t.fill : t.surface, borderColor: t.separator }]}
                     >
@@ -204,65 +239,76 @@ export default function SessionsScreen() {
           ) : (
             <EmptyState
               icon="laptopcomputer"
-              title={connecting ? 'Connecting…' : 'Link Your Desktop'}
+              title={connecting ? 'Connecting to desktop' : 'Link your desktop'}
               body="Cosmos runs on your desktop. Pair it once — same network or signed in from anywhere — and control it from here."
             >
-              {!connecting ? <Button title="Link a Desktop" onPress={() => router.push('/pair')} size="md" style={{ marginTop: spacing(4) }} /> : null}
+              {!connecting ? <Button title="Link a desktop" onPress={() => router.push('/pair')} size="md" style={{ marginTop: spacing(4) }} /> : null}
             </EmptyState>
           )
         }
         renderItem={({ item }) => {
           if (item.kind === 'section') {
-            return <Text style={[type.footnote, styles.section, { color: t.textSecondary }]}>{item.title.toUpperCase()}</Text>;
+            return <Text style={[type.meta, styles.section, { color: t.textSecondary }]} accessibilityRole="header">{item.title}</Text>;
           }
-          const { chat, ind, first, last } = item;
-          const title = chat.title || 'Untitled session';
+          if (item.kind === 'archive') {
+            return (
+              <Pressable
+                onPress={() => setArchiveOpen((v) => !v)}
+                accessibilityRole="button"
+                accessibilityState={{ expanded: item.open }}
+                accessibilityLabel={`Archived, ${item.count}`}
+                style={styles.archive}
+              >
+                <Icon name={item.open ? 'chevron.down' : 'chevron.right'} size={12} color={t.textTertiary} weight="semibold" />
+                <Text style={[type.meta, { color: t.textSecondary, fontWeight: '500' }]}>Archived ({item.count})</Text>
+              </Pressable>
+            );
+          }
+          const { chat, ind } = item;
+          const title = chat.title || chat.lastMessagePreview || 'Untitled session';
           const status = STATUS_LABEL[ind];
+          const when = formatTimeAgo(chat.lastMessageAt ?? chat.createdAt);
+          const location = `${projectName(chat, spaces)} @ ${deviceName(chat, devices)}`;
           const open = () => {
             void client.markChatSeen(chat.id);
             router.push({ pathname: '/session/[id]', params: { id: chat.id, title } });
           };
-          // Over a wallpaper each row is its own glass cell; otherwise rows form an inset-grouped list.
           const cells = t.hasBackdrop && t.translucent;
-          const shape = cells
-            ? { borderRadius: radii.md }
-            : {
-                borderTopLeftRadius: first ? radii.md : 0,
-                borderTopRightRadius: first ? radii.md : 0,
-                borderBottomLeftRadius: last ? radii.md : 0,
-                borderBottomRightRadius: last ? radii.md : 0,
-              };
-          const content = (
-            <>
-              <HarnessMark key={`${chat.id}:${chat.config?.harness ?? 'cosmos'}`} harness={chat.config?.harness} size={30} />
-              <Text style={[type.body, styles.chatTitle, { color: t.text }]} numberOfLines={1}>{title}</Text>
-              {ind !== 'idle' ? <StatusDot status={ind} size={7} /> : null}
-              <Text style={[type.footnote, { color: ind === 'completed' ? t.link : t.textTertiary, fontWeight: ind === 'completed' ? '600' : '400' }]}>
-                {relTime(chat.lastMessageAt ?? chat.createdAt)}
-              </Text>
-            </>
-          );
-          const pressable = (bg: string | undefined) => (
+          const row = (
             <Pressable
               onPress={open}
               onLongPress={() => chatActions(client, chat)}
               delayLongPress={350}
               accessibilityRole="button"
-              accessibilityLabel={`${title}${status ? `, ${status}` : ''}`}
-              style={({ pressed }) => [styles.chatRow, bg ? { backgroundColor: pressed ? t.fill : bg } : pressed && { backgroundColor: t.fill }, shape]}
+              accessibilityLabel={`${title}, ${location}${status ? `, ${status}` : when ? `, ${when}` : ''}${chat.branch ? `, ${chat.branch}` : ''}`}
+              style={({ pressed }) => [
+                styles.chatRow,
+                { backgroundColor: pressed ? t.fill : cells ? undefined : t.surface, opacity: chat.archived ? 0.72 : 1 },
+                { borderRadius: radii.row },
+              ]}
             >
-              {content}
+              <View style={styles.line}>
+                <Text style={[type.meta, styles.grow, { color: t.textTertiary }]} numberOfLines={1}>{location}</Text>
+                <StatusCorner ind={ind} when={when} color={ind === 'idle' ? t.textTertiary : statusColor(t, ind)} />
+              </View>
+              <View style={styles.line}>
+                <HarnessMark key={`${chat.id}:${chat.config?.harness ?? 'cosmos'}`} harness={chat.config?.harness} size={13} />
+                <Text style={[type.sessionTitle, styles.grow, { color: t.text }]} numberOfLines={1}>{title}</Text>
+              </View>
+              {chat.branch ? (
+                <View style={styles.line}>
+                  <Icon name="git.branch" size={11} color={t.textTertiary} />
+                  <Text style={[type.meta, styles.grow, { color: t.textTertiary }]} numberOfLines={1}>{chat.branch}</Text>
+                </View>
+              ) : null}
             </Pressable>
           );
           return cells ? (
             <View style={styles.cellWrap}>
-              <Glass radius={radii.md} interactive>{pressable(undefined)}</Glass>
+              <Glass radius={radii.row}>{row}</Glass>
             </View>
           ) : (
-            <View>
-              {pressable(t.surface)}
-              {!last ? <View style={[styles.sep, { backgroundColor: t.separator }]} /> : null}
-            </View>
+            <View style={styles.cellWrap}>{row}</View>
           );
         }}
       />
@@ -275,25 +321,21 @@ const styles = StyleSheet.create({
   header: { gap: spacing(3), paddingTop: spacing(1), paddingBottom: spacing(2) },
   desktopPill: {
     alignSelf: 'flex-start', flexDirection: 'row', alignItems: 'center', gap: spacing(2),
-    paddingLeft: spacing(3), paddingRight: spacing(2.5), height: 30, borderRadius: radii.pill,
+    paddingLeft: spacing(3), paddingRight: spacing(2.5), minHeight: 44, borderRadius: radii.pill,
   },
-  section: { fontWeight: '500', letterSpacing: 0.3, marginTop: spacing(4), marginBottom: spacing(2), marginLeft: edge },
-  cellWrap: { paddingBottom: spacing(2) },
-  chatRow: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing(3),
-    paddingHorizontal: edge, paddingVertical: spacing(2.5), minHeight: 56,
-  },
-  newRow: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing(2),
-    paddingHorizontal: edge, minHeight: 44, borderRadius: radii.md, borderWidth: StyleSheet.hairlineWidth,
-  },
-  chatTitle: { fontWeight: '600', flex: 1, minWidth: 0 },
-  sep: { height: StyleSheet.hairlineWidth, marginLeft: edge + 30 + spacing(3) },
+  newButton: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
+  section: { marginTop: spacing(4), marginBottom: spacing(1), marginLeft: spacing(2) },
+  archive: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), minHeight: 44, marginTop: spacing(2), paddingHorizontal: spacing(2) },
+  cellWrap: { paddingBottom: spacing(0.5) },
+  chatRow: { paddingHorizontal: spacing(2), paddingVertical: 6, gap: 2, minHeight: 44 },
+  line: { flexDirection: 'row', alignItems: 'center', gap: spacing(2) },
+  grow: { flex: 1, minWidth: 0 },
+  status: { flexDirection: 'row', alignItems: 'center', gap: 4 },
   suggestions: { alignSelf: 'stretch', gap: spacing(2.5), marginTop: spacing(6) },
   suggestion: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(3),
-    paddingHorizontal: spacing(3.5), paddingVertical: spacing(3),
-    borderRadius: radii.md, borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: spacing(3.5), minHeight: 44,
+    borderRadius: radii.row, borderWidth: StyleSheet.hairlineWidth,
   },
-  suggestionIcon: { width: 30, height: 30, borderRadius: radii.sm, alignItems: 'center', justifyContent: 'center' },
+  suggestionIcon: { width: 30, height: 30, borderRadius: radii.control, alignItems: 'center', justifyContent: 'center' },
 });

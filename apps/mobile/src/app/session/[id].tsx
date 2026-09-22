@@ -9,9 +9,10 @@ import { SessionMessageEntry, TranscriptUpdate, isComputerCall, type Chat } from
 import { applyTranscriptUpdate } from '../../lib/transcript';
 import { PickedFile, ensureDecodable, fileToBase64Chunks } from '../../lib/attachments';
 import { notifySessionEvent } from '../../lib/notify';
+import { useReduceMotion } from '../../lib/motion';
 import { alpha, radii, spacing, type, useTheme, type Theme } from '../../lib/theme';
 import { MessageView } from '../../components/transcript';
-import { Composer } from '../../components/composer';
+import { Composer, ComposerChip } from '../../components/composer';
 import { Button, EmptyState, Icon, IconButton, Notice } from '../../components/bits';
 import { HarnessMark, harnessLabel } from '../../components/harness-mark';
 import { Glass, Screen } from '../../components/surface';
@@ -24,9 +25,13 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 function Pulse({ color }: { color: string }) {
+  const reduce = useReduceMotion();
   const v = useSharedValue(0);
-  useEffect(() => { v.value = withRepeat(withTiming(1, { duration: 1200, easing: Easing.inOut(Easing.sin) }), -1, true); }, [v]);
-  const halo = useAnimatedStyle(() => ({ opacity: 0.55 - 0.45 * v.value, transform: [{ scale: 1 + 1.2 * v.value }] }));
+  useEffect(() => {
+    if (reduce) { v.set(0); return; }
+    v.set(withRepeat(withTiming(1, { duration: 750, easing: Easing.inOut(Easing.sin) }), -1, true));
+  }, [v, reduce]);
+  const halo = useAnimatedStyle(() => ({ opacity: reduce ? 0 : 0.55 - 0.45 * v.get(), transform: [{ scale: 1 + (reduce ? 0 : 1.2 * v.get()) }] }));
   return (
     <View style={styles.pulse}>
       <Animated.View style={[styles.pulseHalo, { backgroundColor: color }, halo]} />
@@ -70,7 +75,10 @@ export default function SessionScreen() {
   const [attachments, setAttachments] = useState<PickedFile[]>([]);
   const [sending, setSending] = useState(false);
   const [atBottom, setAtBottom] = useState(true);
+  const [streamEpoch, setStreamEpoch] = useState(0);
+  const [freshId, setFreshId] = useState<string | null>(null);
   const listRef = useRef<FlashListRef<SessionMessageEntry>>(null);
+  const seenIds = useRef<Set<string>>(new Set());
   const prevStatus = useRef<string>('idle');
 
   const chat = chats.find((c) => c.id === chatId);
@@ -97,7 +105,16 @@ export default function SessionScreen() {
     const settle = setTimeout(() => setLoaded(true), 1500);
     stream.done.catch(() => setStreamLost(true));
     return () => { clearTimeout(settle); stream.cancel(); };
-  }, [chatId, connection.status, client]);
+  }, [chatId, connection.status, client, streamEpoch]);
+
+  useEffect(() => {
+    if (!loaded || entries.length === 0) return;
+    const last = entries[entries.length - 1]!;
+    const isNew = !seenIds.current.has(last.id);
+    const hadHistory = seenIds.current.size > 0;
+    for (const entry of entries) seenIds.current.add(entry.id);
+    if (isNew && hadHistory) setFreshId(last.id);
+  }, [entries, loaded]);
 
   useEffect(() => {
     const prev = prevStatus.current;
@@ -179,20 +196,26 @@ export default function SessionScreen() {
     }
   };
 
+  const baseConfig = () => chat?.config ?? { harness: 'opencode' as const, sandbox: 'workspace-write' as const, modelOptions: {} };
+
+  const openModel = async () => {
+    if (!chat) return;
+    const base = baseConfig();
+    const models = await client.listModels(base.harness).catch(() => [] as { id: string; name?: string }[]);
+    if (!models.length) { Alert.alert('No models available', 'The desktop did not report any models for this harness.'); return; }
+    pickFrom('Model', models.slice(0, 12).map((m) => ({
+      label: `${base.model === m.id ? '✓ ' : ''}${m.name ?? m.id}`,
+      onPress: () => void client.setChatConfig(chatId, { ...base, model: m.id }),
+    })));
+  };
+
   const sessionMenu = () => {
     if (!chat) return;
-    const base = chat.config ?? { harness: 'opencode' as const, sandbox: 'workspace-write' as const, modelOptions: {} };
+    const base = baseConfig();
     pickFrom(title, [
       {
         label: `Model${base.model ? ` · ${base.model}` : ''}`,
-        onPress: async () => {
-          const models = await client.listModels(base.harness).catch(() => [] as { id: string; name?: string }[]);
-          if (!models.length) { Alert.alert('No models available', 'The desktop did not report any models for this harness.'); return; }
-          pickFrom('Model', models.slice(0, 12).map((m) => ({
-            label: `${base.model === m.id ? '✓ ' : ''}${m.name ?? m.id}`,
-            onPress: () => void client.setChatConfig(chatId, { ...base, model: m.id }),
-          })));
-        },
+        onPress: () => void openModel(),
       },
       {
         label: `Effort${base.reasoning ? ` · ${base.reasoning}` : ''}`,
@@ -244,10 +267,20 @@ export default function SessionScreen() {
       >
         {streamLost && connection.status === 'connected' ? (
           <View style={[styles.fill, styles.center]}>
-            <Notice kind="warning" title="Transcript stream ended" body="The desktop closed the live transcript." action={<Button title="Reconnect" size="sm" variant="tinted" style={{ alignSelf: 'flex-start', marginTop: spacing(2) }} onPress={() => setStreamLost(false)} />} />
+            <Notice kind="warning" title="Session disconnected" body="The desktop closed the live transcript." action={<Button title="Reconnect" size="sm" variant="tinted" style={{ alignSelf: 'flex-start', marginTop: spacing(2) }} onPress={() => { setStreamLost(false); setStreamEpoch((n) => n + 1); }} />} />
           </View>
         ) : !loaded && entries.length === 0 && connection.status === 'connected' ? (
           <View style={[styles.fill, styles.center]}><ActivityIndicator color={t.textTertiary} /></View>
+        ) : connection.status !== 'connected' && entries.length === 0 ? (
+          <View style={[styles.fill, styles.center]}>
+            <EmptyState
+              icon="laptopcomputer"
+              title={connection.status === 'connecting' || connection.status === 'reconnecting' ? 'Connecting to desktop' : 'Session disconnected'}
+              body={connection.detail ?? 'Link the desktop again to load this session.'}
+            >
+              <Button title="Desktops" size="md" variant="tinted" style={{ marginTop: spacing(4) }} onPress={() => router.push('/(tabs)/(desktops)' as never)} />
+            </EmptyState>
+          </View>
         ) : entries.length === 0 ? (
           <View style={[styles.fill, styles.center]}>
             <View style={styles.emptyMark}>
@@ -262,7 +295,12 @@ export default function SessionScreen() {
               data={entries}
               keyExtractor={(e) => e.id}
               renderItem={({ item, index }) => (
-                <MessageView entry={item} onAnswer={onAnswer} grouped={index > 0 && entries[index - 1]?.role === item.role} />
+                <MessageView
+                  entry={item}
+                  onAnswer={onAnswer}
+                  grouped={index > 0 && entries[index - 1]?.role === item.role}
+                  arrive={item.id === freshId}
+                />
               )}
               contentInsetAdjustmentBehavior="automatic"
               contentContainerStyle={{ paddingTop: spacing(3), paddingBottom: spacing(3) }}
@@ -312,12 +350,31 @@ export default function SessionScreen() {
         <Composer
           running={status === 'working' || status === 'awaitingInput'}
           sending={sending}
+          enabled={connection.status === 'connected'}
           attachments={attachments}
           onAddAttachment={(f) => setAttachments((a) => [...a, f])}
           onRemoveAttachment={(i) => setAttachments((a) => a.filter((_, j) => j !== i))}
           onSend={(text) => void send(text)}
           onStop={stop}
           placeholder={connection.status !== 'connected' ? 'Desktop offline' : undefined}
+          chips={
+            <>
+              <ComposerChip
+                icon="cpu"
+                label={chat?.config?.model ?? 'Model'}
+                accessibilityLabel={`Model, ${chat?.config?.model ?? 'default'}`}
+                onPress={() => void openModel()}
+              />
+              {chat?.branch ? (
+                <ComposerChip
+                  icon="git.branch"
+                  label={chat.branch}
+                  accessibilityLabel={`Branch ${chat.branch}`}
+                  accessibilityHint="The branch this session is on. Changing the checkout stays on the desktop."
+                />
+              ) : null}
+            </>
+          }
         />
       </KeyboardAvoidingView>
     </Screen>
@@ -335,7 +392,7 @@ const styles = StyleSheet.create({
   pulseHalo: { position: 'absolute', width: 8, height: 8, borderRadius: 4 },
   pulseDot: { width: 7, height: 7, borderRadius: 3.5 },
   jumpWrap: { position: 'absolute', bottom: spacing(3), left: 0, right: 0, alignItems: 'center' },
-  jump: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), paddingHorizontal: spacing(3.5), height: 34 },
+  jump: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), paddingHorizontal: spacing(3.5), minHeight: 44 },
   bannerWrap: { paddingHorizontal: spacing(3), paddingTop: spacing(2) },
   banner: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(2.5),
