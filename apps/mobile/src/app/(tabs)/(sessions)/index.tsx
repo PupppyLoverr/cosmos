@@ -6,8 +6,8 @@ import * as Haptics from 'expo-haptics';
 import { formatTimeAgo } from '../../../lib/activity';
 import { useCosmos, useSnapshot } from '../../../lib/client';
 import { Chat, Device, Session, Space } from '../../../lib/protocol';
-import { edge, radii, spacing, type, useTheme } from '../../../lib/theme';
-import { Button, ConnectionBanner, EmptyState, Icon, IconButton, SkeletonRows } from '../../../components/bits';
+import { edge, spacing, type, useTheme } from '../../../lib/theme';
+import { Button, ConnectionBanner, EmptyState, Icon, IconButton, SkeletonRows, SuggestionCard } from '../../../components/bits';
 import { Screen } from '../../../components/surface';
 import { SessionRow, SessionRowIndicator } from '../../../components/session-row';
 
@@ -240,22 +240,13 @@ export default function SessionsScreen() {
               {!query ? (
                 <View style={styles.suggestions}>
                   {SUGGESTIONS.map((suggestion) => (
-                    <Pressable
+                    <SuggestionCard
                       key={suggestion.label}
-                      accessibilityRole="button"
-                      accessibilityLabel={`${suggestion.label}. ${suggestion.sub}`}
                       onPress={() => router.push({ pathname: '/new-session', params: { prompt: `${suggestion.label}: ${suggestion.sub}` } })}
-                      style={({ pressed }) => [styles.suggestion, { backgroundColor: pressed ? t.fill : t.surface, borderColor: t.separator }]}
-                    >
-                      <View style={[styles.suggestionIcon, { backgroundColor: t.accentMuted }]}>
-                        <Icon name={suggestion.icon} size={16} color={t.link} />
-                      </View>
-                      <View style={{ flex: 1 }}>
-                        <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>{suggestion.label}</Text>
-                        <Text style={[type.footnote, { color: t.textSecondary }]}>{suggestion.sub}</Text>
-                      </View>
-                      <Icon name="arrow.up.right" size={12} color={t.textTertiary} />
-                    </Pressable>
+                      icon={suggestion.icon}
+                      title={suggestion.label}
+                      subtitle={suggestion.sub}
+                    />
                   ))}
                 </View>
               ) : null}
@@ -351,10 +342,4 @@ const styles = StyleSheet.create({
   },
   archive: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), minHeight: 44, marginTop: spacing(2), paddingHorizontal: spacing(2) },
   suggestions: { alignSelf: 'stretch', gap: spacing(2.5), marginTop: spacing(6) },
-  suggestion: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing(3),
-    paddingHorizontal: spacing(3.5), minHeight: 44,
-    borderRadius: radii.row, borderWidth: StyleSheet.hairlineWidth,
-  },
-  suggestionIcon: { width: 30, height: 30, borderRadius: radii.control, alignItems: 'center', justifyContent: 'center' },
 });
