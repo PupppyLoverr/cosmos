@@ -4,6 +4,7 @@ import { Link } from 'expo-router';
 import ReanimatedSwipeable from 'react-native-gesture-handler/ReanimatedSwipeable';
 import type { SwipeableMethods } from 'react-native-gesture-handler/ReanimatedSwipeable';
 import * as Haptics from 'expo-haptics';
+import Animated, { Extrapolation, interpolate, useAnimatedStyle, type SharedValue } from 'react-native-reanimated';
 import { useLargeText } from '../lib/a11y';
 import { radii, spacing, type, useTheme } from '../lib/theme';
 import { Chat } from '../lib/protocol';
@@ -57,6 +58,41 @@ function SwipeAction({
       <Icon name={icon} size={18} color="#fff" weight="semibold" />
       <Text style={[type.caption2, styles.swipeLabel]}>{label}</Text>
     </Pressable>
+  );
+}
+
+function RightActions({
+  progress,
+  swipeable,
+  archived,
+  color,
+  danger,
+  onArchive,
+  onDelete,
+}: {
+  progress: SharedValue<number>;
+  swipeable: SwipeableMethods;
+  archived: boolean;
+  color: string;
+  danger: string;
+  onArchive: () => void;
+  onDelete: () => void;
+}) {
+  const style = useAnimatedStyle(() => ({
+    opacity: interpolate(progress.value, [0, 0.15], [0, 1], Extrapolation.CLAMP),
+  }));
+
+  return (
+    <Animated.View style={[styles.actions, style]}>
+      <SwipeAction
+        icon={archived ? 'tray.and.arrow.up' : 'archivebox'}
+        label={archived ? 'Unarchive' : 'Archive'}
+        color={color}
+        onPress={onArchive}
+        swipeable={swipeable}
+      />
+      <SwipeAction icon="trash" label="Delete" color={danger} onPress={onDelete} swipeable={swipeable} />
+    </Animated.View>
   );
 }
 
@@ -160,17 +196,16 @@ export const SessionRow = React.memo(function SessionRow({
         overshootRight={false}
         containerStyle={styles.swipeContainer}
         childrenContainerStyle={styles.swipeChildren}
-        renderRightActions={(_, __, swipeable) => (
-          <View style={styles.actions}>
-            <SwipeAction
-              icon={chat.archived ? 'tray.and.arrow.up' : 'archivebox'}
-              label={chat.archived ? 'Unarchive' : 'Archive'}
-              color={t.link}
-              onPress={onArchive}
-              swipeable={swipeable}
-            />
-            <SwipeAction icon="trash" label="Delete" color={t.danger} onPress={onDelete} swipeable={swipeable} />
-          </View>
+        renderRightActions={(progress, _, swipeable) => (
+          <RightActions
+            progress={progress}
+            swipeable={swipeable}
+            archived={chat.archived}
+            color={t.link}
+            danger={t.danger}
+            onArchive={onArchive}
+            onDelete={onDelete}
+          />
         )}
       >
         {translucent ? <Glass radius={radii.row}>{row}</Glass> : row}

@@ -6,7 +6,7 @@ import * as Haptics from 'expo-haptics';
 import { formatTimeAgo } from '../../../lib/activity';
 import { useCosmos, useSnapshot } from '../../../lib/client';
 import { Chat, Device, Session, Space } from '../../../lib/protocol';
-import { edge, spacing, type, useTheme } from '../../../lib/theme';
+import { edge, radii, spacing, type, useTheme } from '../../../lib/theme';
 import { Button, ConnectionBanner, EmptyState, Icon, IconButton, SkeletonRows } from '../../../components/bits';
 import { Screen } from '../../../components/surface';
 import { SessionRow, SessionRowIndicator } from '../../../components/session-row';
@@ -354,7 +354,7 @@ const styles = StyleSheet.create({
   suggestion: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(3),
     paddingHorizontal: spacing(3.5), minHeight: 44,
-    borderRadius: 8, borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: radii.row, borderWidth: StyleSheet.hairlineWidth,
   },
-  suggestionIcon: { width: 30, height: 30, borderRadius: 6, alignItems: 'center', justifyContent: 'center' },
+  suggestionIcon: { width: 30, height: 30, borderRadius: radii.control, alignItems: 'center', justifyContent: 'center' },
 });
