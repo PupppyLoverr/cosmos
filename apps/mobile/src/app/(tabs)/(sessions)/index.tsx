@@ -4,10 +4,10 @@ import { FlashList } from '@shopify/flash-list';
 import { router, Stack } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import { formatTimeAgo } from '../../../lib/activity';
-import { desktopDisplayName, useCosmos, useSnapshot } from '../../../lib/client';
+import { useCosmos, useSnapshot } from '../../../lib/client';
 import { Chat, Device, Session, Space } from '../../../lib/protocol';
-import { useTheme, spacing, radii, type, edge, alpha, statusColor } from '../../../lib/theme';
-import { EmptyState, Icon, StatusDot, Notice, Button } from '../../../components/bits';
+import { useTheme, spacing, radii, type, edge, statusColor } from '../../../lib/theme';
+import { EmptyState, Icon, StatusPill, ConnectionBanner, SkeletonRows, Button } from '../../../components/bits';
 import { HarnessMark } from '../../../components/harness-mark';
 import { Glass, Screen } from '../../../components/surface';
 
@@ -90,13 +90,12 @@ function StatusCorner({ ind, when, color }: { ind: Indicator; when: string; colo
     return <Text style={[type.meta, { color: color }]}>{when}</Text>;
   }
   const label = STATUS_LABEL[ind]!;
+  if (ind !== 'completed') {
+    return <StatusPill status={ind} label={label} pulse={ind === 'working'} />;
+  }
   return (
     <View style={styles.status}>
-      {ind === 'completed' ? (
-        <Icon name="checkmark" size={11} color={color} weight="bold" />
-      ) : (
-        <StatusDot status={ind} size={6} pulse={ind === 'working'} />
-      )}
+      <Icon name="checkmark" size={11} color={color} weight="bold" />
       <Text style={[type.meta, { color, fontWeight: '600' }]}>{label}</Text>
     </View>
   );
@@ -200,35 +199,12 @@ export default function SessionsScreen() {
         }
         ListHeaderComponent={
           <View style={styles.header}>
-            <Pressable
-              onPress={() => router.push('/(tabs)/(desktops)' as never)}
-              accessibilityRole="button"
-              accessibilityLabel={connection.desktop ? `${connection.desktop.name}, ${connection.status}` : 'No desktop linked'}
-              style={({ pressed }) => [styles.desktopPill, { backgroundColor: alpha(t.fill, pressed ? 1 : 0.7) }]}
-            >
-              <StatusDot status={connected ? 'connected' : connecting ? 'working' : 'errored'} size={7} pulse={connecting} />
-              <Text style={[type.footnote, { color: t.textSecondary, fontWeight: '500' }]} numberOfLines={1}>
-                {connection.desktop ? desktopDisplayName(connection.desktop) : 'No desktop linked'}
-                {connection.desktop ? ` · ${connected ? 'Connected' : connecting ? 'Connecting…' : 'Offline'}` : ''}
-              </Text>
-              <Icon name="chevron.right" size={10} color={t.textTertiary} weight="semibold" />
-            </Pressable>
-            {!connected && connection.detail ? (
-              <Notice kind="warning" title={connecting ? 'Connecting to desktop' : "Can't reach the desktop"} body={connection.detail} />
-            ) : null}
+            <ConnectionBanner connection={connection} onPress={() => router.push('/(tabs)/(desktops)' as never)} />
           </View>
         }
         ListEmptyComponent={
           loading ? (
-            <View style={styles.skeletonList}>
-              {Array.from({ length: 5 }).map((_, i) => (
-                <View key={i} style={[styles.skeletonRow, { backgroundColor: t.surface }]}>
-                  <View style={[styles.skeletonLine, { width: '40%', backgroundColor: t.fill }]} />
-                  <View style={[styles.skeletonLine, { width: '70%', backgroundColor: t.fill, marginTop: 6 }]} />
-                  <View style={[styles.skeletonLine, { width: '30%', backgroundColor: t.fill, marginTop: 6 }]} />
-                </View>
-              ))}
-            </View>
+            <SkeletonRows />
           ) : connected ? (
             <EmptyState
               icon={query ? 'magnifyingglass' : 'sparkles'}
@@ -360,7 +336,4 @@ const styles = StyleSheet.create({
     borderRadius: radii.row, borderWidth: StyleSheet.hairlineWidth,
   },
   suggestionIcon: { width: 30, height: 30, borderRadius: radii.control, alignItems: 'center', justifyContent: 'center' },
-  skeletonList: { paddingHorizontal: edge, paddingTop: spacing(3), gap: spacing(2) },
-  skeletonRow: { padding: spacing(3), borderRadius: radii.row, borderCurve: 'continuous' },
-  skeletonLine: { height: 10, borderRadius: 5, borderCurve: 'continuous' },
 });

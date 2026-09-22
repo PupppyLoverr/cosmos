@@ -6,7 +6,7 @@ import { toolGroupSummary } from '../lib/activity';
 import { Arrive, useReduceMotion } from '../lib/motion';
 import { SessionMessageEntry, MessagePart, ToolCall, toolCallName } from '../lib/protocol';
 import { Theme, alpha, collapseBezier, motion, radii, spacing, type, useTheme } from '../lib/theme';
-import { Button, Icon } from './bits';
+import { Button, Icon, StatusPill } from './bits';
 import { Md } from './markdown';
 
 type ToolPart = Extract<MessagePart, { kind: 'tool' }>;
@@ -159,9 +159,7 @@ function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
       >
         <Disclosure open={open} color={t.textTertiary} />
         <Text style={[type.footnote, { color: t.text, flex: 1, fontWeight: '500' }]} numberOfLines={open ? 2 : 1}>{summary}</Text>
-        <View style={[styles.statePill, { backgroundColor: alpha(stateColor, 0.14) }]}>
-          <Text style={[type.caption2, { color: stateColor, fontWeight: '700' }]}>{state}</Text>
-        </View>
+        <StatusPill status={running ? 'working' : errors ? 'errored' : 'completed'} label={state} pulse={running} />
       </Pressable>
       {open ? parts.map((p, i) => <ToolLine key={p.id} part={p} t={t} last={i === parts.length - 1} />) : null}
     </View>
@@ -399,7 +397,6 @@ const styles = StyleSheet.create({
   reasoningBody: { marginTop: spacing(2), paddingLeft: spacing(3), borderLeftWidth: 2, lineHeight: 19 },
 
   toolCard: { borderRadius: radii.panel, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
-  statePill: { borderRadius: radii.pill, paddingHorizontal: spacing(2), paddingVertical: spacing(0.75) },
   toolHead: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), minHeight: 44 },
   toolLine: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), minHeight: 44 },
   toolIcon: { width: 20, height: 20, alignItems: 'center', justifyContent: 'center' },
