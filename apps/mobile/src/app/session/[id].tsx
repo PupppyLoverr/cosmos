@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
-import { FlashList, FlashListRef } from '@shopify/flash-list';
+import { ActivityIndicator, Alert, FlatList, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useLocalSearchParams, router, Stack } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import { useHeaderHeight } from 'expo-router/react-navigation';
@@ -64,7 +63,7 @@ export default function SessionScreen() {
   const [newEntryCount, setNewEntryCount] = useState(0);
   const [streamEpoch, setStreamEpoch] = useState(0);
   const [freshId, setFreshId] = useState<string | null>(null);
-  const listRef = useRef<FlashListRef<SessionMessageEntry>>(null);
+  const listRef = useRef<FlatList<SessionMessageEntry>>(null);
   const seenIds = useRef<Set<string>>(new Set());
   const atBottomRef = useRef(true);
   const prevStatus = useRef<string>('idle');
@@ -332,7 +331,7 @@ export default function SessionScreen() {
           </View>
         ) : (
           <View style={styles.fill}>
-            <FlashList
+            <FlatList
               ref={listRef}
               data={entries}
               keyExtractor={entryKeyExtractor}
@@ -344,9 +343,9 @@ export default function SessionScreen() {
                   arrive={item.id === freshId}
                 />
               )}
-              contentInsetAdjustmentBehavior="automatic"
-              contentContainerStyle={{ paddingTop: spacing(3), paddingBottom: spacing(3) }}
-              maintainVisibleContentPosition={{ autoscrollToBottomThreshold: 0.2, startRenderingFromBottom: true }}
+              contentContainerStyle={{ paddingTop: headerHeight + spacing(3), paddingBottom: spacing(3) }}
+              onLayout={() => { if (atBottomRef.current) listRef.current?.scrollToEnd({ animated: false }); }}
+              onContentSizeChange={() => { if (atBottomRef.current) listRef.current?.scrollToEnd({ animated: false }); }}
               onScroll={(e) => {
                 const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
                 const nextAtBottom = contentSize.height - contentOffset.y - layoutMeasurement.height < 120;
