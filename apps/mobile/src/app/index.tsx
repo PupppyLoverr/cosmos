@@ -8,11 +8,12 @@ import { Link, router } from 'expo-router';
 import Animated, { useAnimatedKeyboard, useAnimatedStyle } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
+import { LinearGradient } from 'expo-linear-gradient';
 import { formatTimeAgo } from '../lib/activity';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../lib/client';
 import { Chat, Device, Session, Space } from '../lib/protocol';
 import { showMenu } from '../lib/menu';
-import { spacing, statusColor, type, useTheme } from '../lib/theme';
+import { alpha, spacing, statusColor, type, useTheme } from '../lib/theme';
 import { EmptyState, Icon, Notice, StatusDot } from '../components/bits';
 import { CircleButton, FilterChip, PillButton, ScreenTitle, TopBar } from '../components/chrome';
 import { DrawerEdge, useDrawer } from '../components/drawer';
@@ -82,8 +83,9 @@ function SessionItem({ chat, state, desktop, startedAt }: { chat: Chat; state: S
           } : undefined}
           accessibilityRole="button"
           accessibilityLabel={[title, stateLabel, meta, formatTimeAgo(chat.lastMessageAt ?? chat.createdAt)].filter(Boolean).join(', ')}
-          style={({ pressed }) => [styles.row, { backgroundColor: pressed ? t.surface : t.background, opacity: chat.archived ? 0.55 : 1 }]}
+          style={({ pressed }) => ({ backgroundColor: pressed ? t.surface : t.background, opacity: chat.archived ? 0.55 : 1 })}
         >
+          <View style={styles.row}>
           <View style={styles.dotCol}>
             {state === 'working' ? <StatusDot status="working" size={8} pulse /> : <View style={[styles.dot, { backgroundColor: dot }]} />}
           </View>
@@ -96,6 +98,7 @@ function SessionItem({ chat, state, desktop, startedAt }: { chat: Chat; state: S
               {meta}
               {stateLabel ? <Text style={{ color: stateTone, fontWeight: '600' }}>{`  ${stateLabel}`}</Text> : null}
             </Text>
+          </View>
           </View>
         </Pressable>
       </Link.Trigger>
@@ -294,6 +297,11 @@ export default function HomeScreen() {
         }}
       />
 
+      <LinearGradient
+        pointerEvents="none"
+        colors={[alpha(t.background, 0), t.background]}
+        style={[styles.fade, { height: insets.bottom + 120 }]}
+      />
       <Animated.View style={[styles.bar, { paddingBottom: insets.bottom + spacing(2) }, barStyle]} pointerEvents="box-none">
         <View style={[styles.search, { backgroundColor: t.floating, boxShadow: t.floatShadow }]}>
           <Icon name="magnifyingglass" size={18} color={t.textSecondary} />
@@ -330,6 +338,7 @@ const styles = StyleSheet.create({
   rowCopy: { flex: 1, minWidth: 0, gap: 3 },
   rowTop: { flexDirection: 'row', alignItems: 'baseline', gap: spacing(2) },
   rowTitle: { flex: 1, fontSize: 17, lineHeight: 22 },
+  fade: { position: 'absolute', left: 0, right: 0, bottom: 0 },
   bar: { position: 'absolute', left: 0, right: 0, bottom: 0, flexDirection: 'row', alignItems: 'center', gap: spacing(3), paddingHorizontal: spacing(4) },
   search: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: spacing(2), minHeight: 52, paddingHorizontal: spacing(4), borderRadius: 999 },
   searchInput: { flex: 1, paddingVertical: spacing(2) },
