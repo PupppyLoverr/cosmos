@@ -4,7 +4,8 @@ import { router } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCosmos } from '../lib/client';
 import { useTheme, spacing, type } from '../lib/theme';
-import { Button, IconButton, Notice } from '../components/bits';
+import { Button, Notice } from '../components/bits';
+import { CircleButton } from '../components/chrome';
 import { Screen } from '../components/surface';
 import { HarnessMark } from '../components/harness-mark';
 
@@ -38,7 +39,7 @@ export default function SignInScreen() {
   return (
     <Screen style={[styles.screen, { paddingTop: insets.top + spacing(4), paddingBottom: insets.bottom + spacing(4) }]}>
       <View style={[styles.close, { top: insets.top + spacing(2) }]}>
-        <IconButton icon="xmark" label="Close" tint={t.textSecondary} onPress={leave} />
+        <CircleButton icon="xmark" label="Close" tint={t.textSecondary} onPress={leave} />
       </View>
       <View style={styles.hero}>
         <HarnessMark size={44} plain />

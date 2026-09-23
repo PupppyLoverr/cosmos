@@ -138,10 +138,10 @@ const s = (
 export const families: ThemeFamily[] = [
   {
     id: 'cosmos', name: 'Cosmos',
-    // Near-black / paper — the same two values as the app.json splash. Ink
-    // text, one quiet link-blue accent; everything else is tonal.
-    dark: s('#0B0B0C', '#111113', '#2A2A2E', '#161618', '#EDEDEF', '#A1A1A8', '#6E6E76', '#5E9EFF', '#FF6B6B', '#E8B04B', '#3DD68C', true),
-    light: s('#F5F5F7', '#ECECEF', '#E4E4E8', '#FFFFFF', '#1C1C1E', '#6B6B72', '#8E8E94', '#0A66D9', '#D92D20', '#B25E09', '#16873D', true),
+    // Codex/Cursor field: white (light) or near-black (dark) page, a soft
+    // grey for grouped fills, ink text, one quiet link-blue accent.
+    dark: s('#0B0B0C', '#141416', '#2A2A2E', '#18181B', '#F2F2F3', '#A1A1A8', '#6E6E76', '#5E9EFF', '#FF6B6B', '#E8B04B', '#3DD68C', true),
+    light: s('#FFFFFF', '#F4F4F5', '#E9E9EC', '#F4F4F5', '#111113', '#6B6B72', '#9A9AA1', '#0A66D9', '#D92D20', '#C2570C', '#16873D', true),
   },
   {
     id: 'vscode', name: 'Dark+ / Light+',
@@ -296,6 +296,10 @@ export interface Theme {
   warning: string;
   success: string;
   composerBg: string;
+  /** Floating cards and circle buttons (composer, bottom bar): white in light, lifted grey in dark. */
+  floating: string;
+  /** Soft drop shadow for floating chrome. */
+  floatShadow: string;
   userBubble: string;
   userBubbleText: string;
   codeBg: string;
@@ -357,6 +361,10 @@ export function resolveTheme(prefs: ThemePrefs, systemScheme: Scheme, reduceTran
     warning: base.warning,
     success: base.success,
     composerBg: translucent ? alpha(surface, dark ? 0.55 : 0.7) : surface,
+    floating: dark ? mix(base.background, base.text, 0.1) : '#FFFFFF',
+    floatShadow: dark
+      ? '0 0 0 1px rgba(255,255,255,0.06), 0 8px 24px rgba(0,0,0,0.5)'
+      : '0 0 0 1px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.08)',
     // User turns read as inverse ink (Codex-style): ink slab on paper in
     // light, a raised grey slab in dark so it doesn't glare.
     userBubble: dark ? mix(base.background, base.text, 0.16) : base.text,
@@ -474,21 +482,22 @@ export const liquidGlassSupported = liquidAvailable;
 
 export const spacing = (n: number) => n * 4;
 
-// One radius ramp: 8 on chips/controls, 10–14 on cards and sheets, 20–22
-// only on the primary CTA. `pill` survives for dots and the send circle.
+// Radius ramp after the Codex / Cursor references: soft, generous curves on
+// floating chrome (composer 24, bubbles 20), capsule chips and CTAs, 12–16
+// on grouped cards, 8 on small controls.
 export const radii = {
   control: 8,
   sm: 8,
-  chip: 8,
+  chip: 999,
   row: 12,
-  panel: 12,
-  md: 12,
-  lg: 14,
-  xl: 14,
-  bubble: 14,
-  xxl: 14,
-  composer: 14,
-  cta: 22,
+  panel: 14,
+  md: 14,
+  lg: 16,
+  xl: 20,
+  bubble: 20,
+  xxl: 24,
+  composer: 24,
+  cta: 999,
   pill: 999,
 };
 

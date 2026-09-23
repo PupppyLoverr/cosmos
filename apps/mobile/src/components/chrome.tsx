@@ -1,0 +1,167 @@
+// Custom chrome after the Codex / Cursor references: floating circle buttons,
+// a flat top bar with a title + subtitle, capsule pills. Replaces the stock
+// native large-title headers and tab bar.
+
+import React from 'react';
+import { Keyboard, Platform, Pressable, StyleSheet, Text, View, type StyleProp, type ViewStyle } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import * as Haptics from 'expo-haptics';
+import { spacing, type, useTheme } from '../lib/theme';
+import { HIT_SLOP_44 } from '../lib/a11y';
+import { Icon } from './bits';
+
+/**
+ * Bottom padding for a composer docked at the screen edge: the home-indicator
+ * inset while the keyboard is down, a small gap while it is up.
+ */
+export function useDockInset(): number {
+  const insets = useSafeAreaInsets();
+  const [up, setUp] = React.useState(false);
+  React.useEffect(() => {
+    const show = Keyboard.addListener(Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow', () => setUp(true));
+    const hide = Keyboard.addListener(Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide', () => setUp(false));
+    return () => { show.remove(); hide.remove(); };
+  }, []);
+  return up ? spacing(2) : Math.max(insets.bottom, spacing(3));
+}
+
+/** 44pt floating circle (menu, back, more). White with a soft shadow in light. */
+export function CircleButton({ icon, label, onPress, size = 44, tint, disabled, badge }: {
+  icon: string; label: string; onPress?: () => void; size?: number; tint?: string; disabled?: boolean;
+  /** Small accent dot (e.g. "something needs you"). */
+  badge?: boolean;
+}) {
+  const t = useTheme();
+  return (
+    <Pressable
+      onPress={() => { void Haptics.selectionAsync(); onPress?.(); }}
+      disabled={disabled}
+      hitSlop={HIT_SLOP_44(size)}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      style={({ pressed }) => [
+        styles.circle,
+        { width: size, height: size, borderRadius: size / 2, backgroundColor: t.floating, boxShadow: t.floatShadow },
+        { opacity: disabled ? 0.4 : pressed ? 0.7 : 1, transform: [{ scale: pressed ? 0.96 : 1 }] },
+      ]}
+    >
+      <Icon name={icon} size={Math.round(size * 0.42)} color={tint ?? t.text} weight="medium" />
+      {badge ? <View style={[styles.badge, { backgroundColor: t.warning, borderColor: t.floating }]} /> : null}
+    </Pressable>
+  );
+}
+
+/**
+ * Screen top bar: left circle, a title (optionally with a subtitle, Codex
+ * thread style) and right-hand circles. Sits in flow under the status bar.
+ */
+export function TopBar({ left, title, subtitle, right, center = false, style }: {
+  left?: React.ReactNode;
+  title?: React.ReactNode;
+  subtitle?: string;
+  right?: React.ReactNode;
+  /** Centre the title (Cowork) instead of leading it (Codex thread). */
+  center?: boolean;
+  style?: StyleProp<ViewStyle>;
+}) {
+  const t = useTheme();
+  const insets = useSafeAreaInsets();
+  return (
+    <View style={[styles.bar, { paddingTop: insets.top + spacing(1.5) }, style]}>
+      <View style={styles.side}>{left}</View>
+      <View style={[styles.titleWrap, center ? styles.centered : null]} accessibilityRole="header">
+        {typeof title === 'string' ? (
+          <Text style={[type.headline, { color: t.text }]} numberOfLines={1}>{title}</Text>
+        ) : title}
+        {subtitle ? <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>{subtitle}</Text> : null}
+      </View>
+      <View style={[styles.side, styles.sideRight]}>{right}</View>
+    </View>
+  );
+}
+
+/** Codex-style large screen title under the top bar. */
+export function ScreenTitle({ children, style }: { children: string; style?: StyleProp<ViewStyle> }) {
+  const t = useTheme();
+  return (
+    <View style={[styles.screenTitle, style]}>
+      <Text accessibilityRole="header" style={[styles.screenTitleText, { color: t.text }]} numberOfLines={1}>{children}</Text>
+    </View>
+  );
+}
+
+/** Solid ink capsule — the one primary action on a screen ("New", "Pair phone"). */
+export function PillButton({ title, icon, onPress, disabled, style, variant = 'ink' }: {
+  title: string; icon?: string; onPress: () => void; disabled?: boolean; style?: StyleProp<ViewStyle>;
+  /** `ink` = solid primary; `quiet` = floating white capsule (secondary). */
+  variant?: 'ink' | 'quiet';
+}) {
+  const t = useTheme();
+  const ink = variant === 'ink';
+  const fg = ink ? t.background : t.text;
+  return (
+    <Pressable
+      onPress={() => { void Haptics.selectionAsync(); onPress(); }}
+      disabled={disabled}
+      accessibilityRole="button"
+      accessibilityLabel={title}
+      style={({ pressed }) => [
+        styles.pill,
+        { backgroundColor: ink ? t.text : t.floating, boxShadow: ink ? undefined : t.floatShadow },
+        { opacity: disabled ? 0.4 : pressed ? 0.8 : 1, transform: [{ scale: pressed ? 0.97 : 1 }] },
+        style,
+      ]}
+    >
+      {icon ? <Icon name={icon} size={18} color={fg} weight="semibold" /> : null}
+      <Text style={[type.headline, { color: fg }]}>{title}</Text>
+    </Pressable>
+  );
+}
+
+/** Capsule host/filter chip (Codex "All · MBP.local · Mac-Studio.local"). */
+export function FilterChip({ label, selected, dot, icon, onPress, onLongPress }: {
+  label: string; selected?: boolean; dot?: 'online' | 'connecting' | 'offline'; icon?: string;
+  onPress?: () => void; onLongPress?: () => void;
+}) {
+  const t = useTheme();
+  const dotColor = dot === 'online' ? t.success : dot === 'connecting' ? t.warning : t.textTertiary;
+  return (
+    <Pressable
+      onPress={() => { void Haptics.selectionAsync(); onPress?.(); }}
+      onLongPress={onLongPress}
+      hitSlop={{ top: 6, bottom: 6 }}
+      accessibilityRole="button"
+      accessibilityState={{ selected: !!selected }}
+      accessibilityLabel={dot ? `${label}, ${dot}` : label}
+      style={({ pressed }) => [
+        styles.chip,
+        { backgroundColor: selected ? t.text : t.surface, opacity: pressed ? 0.7 : 1 },
+      ]}
+    >
+      {dot ? <View style={[styles.dot, { backgroundColor: dotColor }]} /> : null}
+      {icon ? <Icon name={icon} size={15} color={selected ? t.background : t.textSecondary} /> : null}
+      <Text style={[type.subhead, { color: selected ? t.background : t.text, fontWeight: '500' }]} numberOfLines={1}>{label}</Text>
+    </Pressable>
+  );
+}
+
+const styles = StyleSheet.create({
+  circle: { alignItems: 'center', justifyContent: 'center' },
+  badge: { position: 'absolute', top: 9, right: 9, width: 9, height: 9, borderRadius: 5, borderWidth: 1.5 },
+  bar: { flexDirection: 'row', alignItems: 'center', gap: spacing(3), paddingHorizontal: spacing(4), paddingBottom: spacing(2) },
+  side: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), minWidth: 44 },
+  sideRight: { justifyContent: 'flex-end' },
+  titleWrap: { flex: 1, minWidth: 0 },
+  centered: { alignItems: 'center' },
+  screenTitle: { paddingHorizontal: spacing(4), paddingTop: spacing(3), paddingBottom: spacing(3) },
+  screenTitleText: { fontSize: 34, fontWeight: '600', letterSpacing: -0.4, lineHeight: 40 },
+  pill: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing(2),
+    minHeight: 52, paddingHorizontal: spacing(6), borderRadius: 999,
+  },
+  chip: {
+    flexDirection: 'row', alignItems: 'center', gap: spacing(2),
+    minHeight: 36, paddingHorizontal: spacing(3.5), borderRadius: 999,
+  },
+  dot: { width: 8, height: 8, borderRadius: 4 },
+});

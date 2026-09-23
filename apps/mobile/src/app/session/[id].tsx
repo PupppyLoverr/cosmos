@@ -1,19 +1,20 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
-import { useLocalSearchParams, router, Stack } from 'expo-router';
-import { useHeaderHeight } from 'expo-router/react-navigation';
+import { useLocalSearchParams, router } from 'expo-router';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../../lib/client';
 import { SessionMessageEntry, TranscriptUpdate, isComputerCall, type Chat } from '../../lib/protocol';
 import { applyTranscriptUpdate } from '../../lib/transcript';
 import { PickedFile, ensureDecodable, fileToBase64Chunks } from '../../lib/attachments';
 import { notifySessionEvent } from '../../lib/notify';
 import { useFlavourWord } from '../../lib/motion';
-import { radii, spacing, type, useTheme, type Theme } from '../../lib/theme';
+import { spacing, type, useTheme, type Theme } from '../../lib/theme';
 import { MessageView } from '../../components/transcript';
 import { Composer, ComposerChip } from '../../components/composer';
-import { Button, EmptyState, Icon, IconButton, Notice, Pulse } from '../../components/bits';
+import { Button, EmptyState, Icon, Notice, Pulse } from '../../components/bits';
 import { HarnessMark, harnessLabel } from '../../components/harness-mark';
-import { Glass, Screen } from '../../components/surface';
+import { Screen } from '../../components/surface';
+import { CircleButton, TopBar, useDockInset } from '../../components/chrome';
+import { showMenu } from '../../lib/menu';
 import { SessionBanner } from '../../components/session-banner';
 
 function entryKeyExtractor(entry: SessionMessageEntry): string {
@@ -53,7 +54,6 @@ export default function SessionScreen() {
   const chats = useSnapshot(client.chats);
   const spaces = useSnapshot(client.spaces);
   const connection = useSnapshot(client.connection);
-  const headerHeight = useHeaderHeight();
 
   const [entries, setEntries] = useState<SessionMessageEntry[]>([]);
   const [loaded, setLoaded] = useState(false);
@@ -64,6 +64,7 @@ export default function SessionScreen() {
   const [newEntryCount, setNewEntryCount] = useState(0);
   const [streamEpoch, setStreamEpoch] = useState(0);
   const [freshId, setFreshId] = useState<string | null>(null);
+  const dockInset = useDockInset();
   const listRef = useRef<FlatList<SessionMessageEntry>>(null);
   const seenIds = useRef<Set<string>>(new Set());
   const atBottomRef = useRef(true);
@@ -170,13 +171,7 @@ export default function SessionScreen() {
   const watch = () => router.push({ pathname: '/watch/[chatId]', params: { chatId } });
   // Watch live is offered whenever a desktop is connected, not only mid-run.
   const canWatch = connection.status === 'connected';
-
-  const pickFrom = (heading: string, options: { label: string; onPress: () => void; destructive?: boolean }[]) => {
-    Alert.alert(heading, undefined, [
-      ...options.map((o) => ({ text: o.label, onPress: o.onPress, style: o.destructive ? ('destructive' as const) : ('default' as const) })),
-      { text: 'Cancel', style: 'cancel' as const },
-    ]);
-  };
+  const back = () => { if (router.canGoBack()) router.back(); else router.replace('/'); };
 
   const baseConfig = () => chat?.config ?? { harness: 'opencode' as const, sandbox: 'workspace-write' as const, modelOptions: {} };
 
@@ -185,8 +180,9 @@ export default function SessionScreen() {
     const base = baseConfig();
     const models = await client.listModels(base.harness).catch(() => [] as { id: string; name?: string }[]);
     if (!models.length) { Alert.alert('No models available', 'The desktop did not report any models for this harness.'); return; }
-    pickFrom('Model', models.slice(0, 12).map((m) => ({
-      label: `${base.model === m.id ? '✓ ' : ''}${m.name ?? m.id}`,
+    showMenu('Model', models.slice(0, 12).map((m) => ({
+      label: m.name ?? m.id,
+      checked: base.model === m.id,
       onPress: () => void client.setChatConfig(chatId, { ...base, model: m.id }),
     })));
   };
@@ -194,109 +190,52 @@ export default function SessionScreen() {
   const archiveCurrent = () => {
     if (!chat) return;
     void client.setChatArchived(chatId, !chat.archived);
-    if (router.canGoBack()) router.back();
-    else router.replace('/');
+    back();
   };
 
   const sessionMenu = () => {
     if (!chat) return;
     const base = baseConfig();
-    pickFrom(title, [
-      {
-        label: `Model${base.model ? ` · ${base.model}` : ''}`,
-        onPress: () => void openModel(),
-      },
+    showMenu(title, [
+      { label: `Model${base.model ? ` · ${base.model}` : ''}`, onPress: () => void openModel() },
       {
         label: `Effort${base.reasoning ? ` · ${base.reasoning}` : ''}`,
-        onPress: () => pickFrom('Effort', (['low', 'medium', 'high'] as const).map((r) => ({
-          label: `${base.reasoning === r ? '✓ ' : ''}${r[0]!.toUpperCase()}${r.slice(1)}`,
+        onPress: () => showMenu('Effort', (['low', 'medium', 'high'] as const).map((r) => ({
+          label: `${r[0]!.toUpperCase()}${r.slice(1)}`,
+          checked: base.reasoning === r,
           onPress: () => void client.setChatConfig(chatId, { ...base, reasoning: r }),
         }))),
       },
       {
-        label: `Sandbox · ${base.sandbox}`,
-        onPress: () => pickFrom('Sandbox', (['read-only', 'workspace-write', 'danger-full-access'] as const).map((s) => ({
-          label: `${base.sandbox === s ? '✓ ' : ''}${s}`,
+        label: `Access · ${ACCESS_LABEL[base.sandbox] ?? base.sandbox}`,
+        onPress: () => showMenu('Access', (['read-only', 'workspace-write', 'danger-full-access'] as const).map((s) => ({
+          label: ACCESS_LABEL[s]!,
+          checked: base.sandbox === s,
           onPress: () => void client.setChatConfig(chatId, { ...base, sandbox: s }),
         }))),
       },
       ...(canWatch ? [{ label: 'Watch live', onPress: watch }] : []),
-      {
-        label: chat.archived ? 'Unarchive' : 'Archive',
-        destructive: !chat.archived,
-        onPress: archiveCurrent,
-      },
+      { label: chat.archived ? 'Unarchive' : 'Archive', destructive: !chat.archived, onPress: archiveCurrent },
     ]);
   };
 
   const desktopName = connection.status === 'connected' && connection.desktop ? desktopDisplayName(connection.desktop) : undefined;
   const base = baseConfig();
-  const emptyTitle = connection.status === 'connected' ? 'What should we do on the desktop?' : 'Waiting for the desktop…';
 
   return (
     <Screen>
-      <Stack.Screen
-        options={{
-          headerTitle: () => <HeaderTitle title={title} chat={chat} status={status} desktop={desktopName} t={t} chatId={chatId} />,
-          ...(Platform.OS !== 'ios' ? {
-            headerRight: () => (
-              <View style={styles.headerRight}>
-                {canWatch ? (
-                  <IconButton icon="display" label="Watch live" size={32} onPress={watch} tint={cuActive ? t.link : t.textSecondary} filled={false} />
-                ) : null}
-                <IconButton icon="ellipsis.circle" label="Session options" size={32} onPress={sessionMenu} tint={t.textSecondary} filled={false} />
-              </View>
-            ),
-          } : {}),
-        }}
-      />
-      {Platform.OS === 'ios' && chat ? (
-        <Stack.Toolbar placement="right">
-          {canWatch ? <Stack.Toolbar.Button icon="display" accessibilityLabel="Watch live" onPress={watch} /> : null}
-          <Stack.Toolbar.Menu icon="ellipsis.circle" accessibilityLabel="Session options">
-            <Stack.Toolbar.MenuAction icon="cpu" onPress={() => void openModel()}>
-              {`Model${base.model ? ` · ${base.model}` : ''}`}
-            </Stack.Toolbar.MenuAction>
-            <Stack.Toolbar.Menu title="Effort" icon="gauge.with.dots.needle.33percent">
-              {(['low', 'medium', 'high'] as const).map((r) => (
-                <Stack.Toolbar.MenuAction
-                  key={r}
-                  isOn={base.reasoning === r}
-                  onPress={() => void client.setChatConfig(chatId, { ...base, reasoning: r })}
-                >
-                  {r[0]!.toUpperCase() + r.slice(1)}
-                </Stack.Toolbar.MenuAction>
-              ))}
-            </Stack.Toolbar.Menu>
-            <Stack.Toolbar.Menu title="Sandbox" icon="lock.shield">
-              {(['read-only', 'workspace-write', 'danger-full-access'] as const).map((s) => (
-                <Stack.Toolbar.MenuAction
-                  key={s}
-                  isOn={base.sandbox === s}
-                  onPress={() => void client.setChatConfig(chatId, { ...base, sandbox: s })}
-                >
-                  {s}
-                </Stack.Toolbar.MenuAction>
-              ))}
-            </Stack.Toolbar.Menu>
-            {canWatch ? (
-              <Stack.Toolbar.MenuAction icon="display" onPress={watch}>Watch live</Stack.Toolbar.MenuAction>
-            ) : null}
-            <Stack.Toolbar.MenuAction
-              icon={chat.archived ? 'tray.and.arrow.up' : 'archivebox'}
-              destructive={!chat.archived}
-              onPress={archiveCurrent}
-            >
-              {chat.archived ? 'Unarchive' : 'Archive'}
-            </Stack.Toolbar.MenuAction>
-          </Stack.Toolbar.Menu>
-        </Stack.Toolbar>
-      ) : null}
-      <KeyboardAvoidingView
-        style={styles.fill}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? headerHeight : 0}
-      >
+      <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <TopBar
+          left={<CircleButton icon="chevron.left" label="Back" onPress={back} />}
+          title={<HeaderTitle title={title} chat={chat} status={status} desktop={desktopName} t={t} chatId={chatId} />}
+          right={(
+            <>
+              {canWatch ? <CircleButton icon="display" label="Watch live" onPress={watch} tint={cuActive ? t.link : undefined} /> : null}
+              <CircleButton icon="ellipsis" label="Session options" onPress={sessionMenu} />
+            </>
+          )}
+        />
+
         {streamLost && connection.status === 'connected' ? (
           <View style={[styles.fill, styles.center]}>
             <Notice kind="warning" title="Session disconnected" body="The desktop closed the live transcript." action={<Button title="Reconnect" size="sm" variant="tinted" style={{ alignSelf: 'flex-start', marginTop: spacing(2) }} onPress={() => { setStreamLost(false); setStreamEpoch((n) => n + 1); }} />} />
@@ -309,12 +248,12 @@ export default function SessionScreen() {
               title={connection.status === 'connecting' || connection.status === 'reconnecting' ? 'Connecting to the desktop…' : 'Desktop offline'}
               body={connection.detail}
               actionLabel="Desktops"
-              onAction={() => router.push('/(tabs)/(desktops)' as never)}
+              onAction={() => router.push('/desktops')}
             />
           </View>
         ) : entries.length === 0 ? (
           <View style={[styles.fill, styles.center]}>
-            <EmptyState title={emptyTitle} />
+            <Text style={[styles.question, { color: t.text }]}>What should we work on?</Text>
           </View>
         ) : (
           <View style={styles.fill}>
@@ -330,7 +269,7 @@ export default function SessionScreen() {
                   arrive={item.id === freshId}
                 />
               )}
-              contentContainerStyle={{ paddingTop: headerHeight + spacing(3), paddingBottom: spacing(3) }}
+              contentContainerStyle={{ paddingTop: spacing(3), paddingBottom: spacing(3) }}
               onLayout={() => { if (atBottomRef.current) listRef.current?.scrollToEnd({ animated: false }); }}
               onContentSizeChange={() => { if (atBottomRef.current) listRef.current?.scrollToEnd({ animated: false }); }}
               onScroll={(e) => {
@@ -346,12 +285,15 @@ export default function SessionScreen() {
             />
             {!atBottom ? (
               <View style={styles.jumpWrap} pointerEvents="box-none">
-                <Glass radius={radii.md} thin interactive>
-                  <Pressable onPress={scrollToEnd} style={styles.jump} accessibilityRole="button" accessibilityLabel={newEntryCount ? `Jump to latest, ${newEntryCount} new` : 'Jump to latest'}>
-                    <Icon name="arrow.down" size={13} color={t.text} weight="semibold" />
-                    <Text style={[type.footnote, { color: t.text, fontWeight: '600' }]}>{newEntryCount ? `${newEntryCount} new` : 'Latest'}</Text>
-                  </Pressable>
-                </Glass>
+                <Pressable
+                  onPress={scrollToEnd}
+                  style={[styles.jump, { backgroundColor: t.floating, boxShadow: t.floatShadow }]}
+                  accessibilityRole="button"
+                  accessibilityLabel={newEntryCount ? `Jump to latest, ${newEntryCount} new` : 'Jump to latest'}
+                >
+                  <Icon name="arrow.down" size={14} color={t.text} weight="semibold" />
+                  {newEntryCount ? <Text style={[type.footnote, { color: t.text, fontWeight: '600' }]}>{`${newEntryCount} new`}</Text> : null}
+                </Pressable>
               </View>
             ) : null}
           </View>
@@ -369,7 +311,7 @@ export default function SessionScreen() {
                 title="Controlling your desktop"
                 actions={(
                   <>
-                    <Button title="Watch" size="sm" variant="tinted" icon="display" onPress={watch} />
+                    <Button title="Watch" size="sm" variant="secondary" icon="display" onPress={watch} />
                     <Button title="Stop" size="sm" variant="secondary" onPress={stop} />
                   </>
                 )}
@@ -387,13 +329,25 @@ export default function SessionScreen() {
           onRemoveAttachment={(i) => setAttachments((a) => a.filter((_, j) => j !== i))}
           onSend={(text) => void send(text)}
           onStop={stop}
+          bottomInset={dockInset}
           placeholder={connection.status !== 'connected' ? 'Desktop offline' : undefined}
           chips={
             <>
               <ComposerChip
-                icon="cpu"
-                label={chat?.config?.model ?? 'Model'}
-                accessibilityLabel={`Model, ${chat?.config?.model ?? 'default'}`}
+                icon={base.sandbox === 'danger-full-access' ? 'exclamationmark.shield' : 'lock.shield'}
+                tone={base.sandbox === 'danger-full-access' ? 'warning' : undefined}
+                label={ACCESS_LABEL[base.sandbox] ?? base.sandbox}
+                accessibilityLabel={`Access, ${ACCESS_LABEL[base.sandbox] ?? base.sandbox}`}
+                onPress={chat ? () => showMenu('Access', (['read-only', 'workspace-write', 'danger-full-access'] as const).map((s) => ({
+                  label: ACCESS_LABEL[s]!,
+                  checked: base.sandbox === s,
+                  onPress: () => void client.setChatConfig(chatId, { ...base, sandbox: s }),
+                }))) : undefined}
+              />
+              <ComposerChip
+                icon="bolt"
+                label={base.model ?? 'Default'}
+                accessibilityLabel={`Model, ${base.model ?? 'default'}`}
                 onPress={() => void openModel()}
               />
               {chat?.branch ? (
@@ -412,14 +366,20 @@ export default function SessionScreen() {
   );
 }
 
+const ACCESS_LABEL: Record<string, string> = {
+  'read-only': 'Read only',
+  'workspace-write': 'Workspace',
+  'danger-full-access': 'Full access',
+};
+
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   center: { alignItems: 'center', justifyContent: 'center', padding: spacing(6) },
-  headerTitle: { alignItems: Platform.OS === 'ios' ? 'center' : 'flex-start', maxWidth: 240 },
-  headerMain: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
+  question: { fontSize: 24, fontWeight: '500', lineHeight: 30, textAlign: 'center' },
+  headerTitle: { alignItems: 'flex-start', minWidth: 0 },
+  headerMain: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), minWidth: 0 },
   headerSub: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), marginTop: 1 },
-  headerRight: { flexDirection: 'row', alignItems: 'center', gap: spacing(1) },
   jumpWrap: { position: 'absolute', bottom: spacing(3), left: 0, right: 0, alignItems: 'center' },
-  jump: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), paddingHorizontal: spacing(3.5), minHeight: 44 },
+  jump: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing(1.5), minWidth: 44, paddingHorizontal: spacing(3.5), minHeight: 44, borderRadius: 999 },
   bannerWrap: { paddingHorizontal: spacing(3), paddingTop: spacing(2) },
 });

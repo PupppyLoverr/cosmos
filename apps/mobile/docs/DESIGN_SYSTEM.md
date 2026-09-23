@@ -12,17 +12,26 @@ those values rather than redefining them in screens.
 |---|---:|---|
 | `spacing(n)` | `n * 4` | 4-point layout grid |
 | `edge` | 16 | Screen-edge content inset |
-| `radii.control` / `sm` / `chip` | 8 | Chips and compact controls |
-| `radii.row` | 12 | Session cards and list rows |
-| `radii.panel` / `md` | 12 | Grouped panels, secondary buttons |
-| `radii.lg` / `xl` / `xxl` | 14 | Cards |
-| `radii.bubble` | 14 | Transcript bubbles |
-| `radii.composer` | 14 | Composer card and the docked composer |
-| `radii.cta` | 22 | The primary (ink) CTA only, and sheet corners |
-| `radii.pill` | 999 | Dots and the 36pt send circle only |
+| `radii.control` / `sm` | 8 | Small controls |
+| `radii.row` | 12 | Icon tiles, attachment chips |
+| `radii.panel` / `md` | 14 | Grouped settings cards, secondary buttons |
+| `radii.lg` | 16 | Cards |
+| `radii.xl` / `bubble` | 20 | Transcript bubbles |
+| `radii.xxl` / `composer` | 24 | The floating composer card |
+| `radii.chip` / `cta` / `pill` | 999 | Host/filter chips, ink CTAs, search pill, circle buttons |
 
-Rule of thumb: 8 on chips, 10–14 on cards, 20–22 only on the primary CTA.
-No squircle-everything. `spacing`, `edge`, and `radii` live in `src/lib/theme.ts`.
+The shape language follows the Codex / Cursor references: floating white
+chrome (circle buttons, the search pill, the composer card) with a soft
+`floatShadow`, capsule chips and CTAs, plain list rows with no card behind
+them. `spacing`, `edge`, and `radii` live in `src/lib/theme.ts`.
+
+### Navigation
+
+There is no tab bar. Home (`app/index.tsx`) is the root; the sidebar
+(`components/drawer.tsx`) opens from the menu circle or a swipe from the left
+edge and links to Sessions, Desktops, Pair and Settings, plus recent sessions.
+Every screen draws its own chrome with `TopBar` / `CircleButton` /
+`ScreenTitle` from `components/chrome.tsx` — no native headers.
 
 ### Typography
 
@@ -54,8 +63,8 @@ content to wrap at larger Dynamic Type sizes.
 
 ### Color, status, and accents
 
-The default Cosmos family is paper `#F5F5F7` / near-black `#0B0B0C` (the
-splash values in `app.json`) with ink text and one quiet link-blue accent
+The default Cosmos family is white `#FFFFFF` (grouped fills `#F4F4F5`) / near-black `#0B0B0C` (the
+dark splash value in `app.json`) with ink text and one quiet link-blue accent
 (`#0A66D9` light, `#5E9EFF` dark). Primary buttons are ink, not accent. User
 turns are an inverse ink bubble. No purple, no gradient mesh.
 

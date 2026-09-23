@@ -29,22 +29,30 @@ interface ComposerProps {
   onRemoveAttachment: (index: number) => void;
   onSend: (text: string) => void;
   onStop: () => void;
+  /** Focus the field on mount (New session). */
+  autoFocus?: boolean;
 }
 
-/** Dropdown-style chip for the composer toolbar. 32pt visual, 44pt target. */
-export function ComposerChip({ label, icon, onPress, accessibilityLabel, accessibilityHint }: {
+/**
+ * Codex-style tool pill in the composer's bottom row: icon + label, no fill.
+ * `tone="warning"` for a risky setting (Full access), `leading` for a mark.
+ */
+export function ComposerChip({ label, icon, leading, tone, onPress, accessibilityLabel, accessibilityHint }: {
   label: string;
   icon?: string;
+  leading?: React.ReactNode;
+  tone?: 'warning';
   onPress?: () => void;
   accessibilityLabel?: string;
   accessibilityHint?: string;
 }) {
   const t = useTheme();
+  const fg = tone === 'warning' ? t.warning : t.textSecondary;
   const body = (
-    <View style={[styles.composerChip, { backgroundColor: t.fill }]}>
-      {icon ? <Icon name={icon} size={13} color={t.textSecondary} /> : null}
-      <Text style={[type.footnote, { color: t.text, fontWeight: '500', maxWidth: 160 }]} numberOfLines={1}>{label}</Text>
-      {onPress ? <Icon name="chevron.down" size={9} color={t.textTertiary} weight="semibold" /> : null}
+    <View style={styles.composerChip}>
+      {leading}
+      {icon ? <Icon name={icon} size={15} color={fg} /> : null}
+      <Text style={[type.subhead, { color: fg, fontWeight: '500', maxWidth: 170 }]} numberOfLines={1}>{label}</Text>
     </View>
   );
   if (!onPress) {
@@ -153,7 +161,7 @@ export function SendButton({ onPress, enabled, sending, label = 'Send' }: { onPr
   );
 }
 
-export function Composer({ placeholder, initialText, onChangeText, bottomInset, running, sending, enabled = true, chips, attachments, onAddAttachment, onRemoveAttachment, onSend, onStop }: ComposerProps) {
+export function Composer({ placeholder, initialText, onChangeText, bottomInset, running, sending, enabled = true, chips, attachments, onAddAttachment, onRemoveAttachment, onSend, onStop, autoFocus }: ComposerProps) {
   const t = useTheme();
   const reduce = useReduceMotion();
   const [text, setTextState] = useState(initialText ?? '');
@@ -183,109 +191,111 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
     onStop();
   };
 
-  const hint = placeholder ?? (running ? 'Steer while it works…' : 'Message the desktop…');
-  const showStop = running && !text.trim() && attachments.length === 0;
-  const liftStyle = useAnimatedStyle(() => ({
-    shadowOpacity: (t.scheme === 'dark' ? 0.5 : 0.14) * lift.get(),
-    transform: [{ translateY: -2 * lift.get() }],
-  }));
-  const sendAnimStyle = useAnimatedStyle(() => ({ transform: [{ scale: sendScale.get() }] }));
 
-  return (
-    <View style={[styles.wrap, bottomInset !== undefined ? { paddingBottom: bottomInset } : null]}>
+  const hint = placeholder ?? (running ? 'Steer while it works…' : 'Ask Cosmos');
+  const showStop = running && !text.trim() && attachments.length === 0;
+  const liftStyle = useAnimatedStyle(() => ({ transform: [{ translateY: -2 * lift.get() }] }));
+  const sendAnimStyle = useAnimatedStyle(() => ({ transform: [{ scale: sendScale.get() }] }));
+  const overWallpaper = t.hasBackdrop && t.translucent;
+
+  const body = (
+    <>
       {attachments.length > 0 ? (
         <View style={styles.chips}>
           {attachments.map((f, i) => <AttachmentChip key={`${f.uri}-${i}`} file={f} onRemove={() => onRemoveAttachment(i)} />)}
         </View>
       ) : null}
-      {/* A card, not a pill: 14pt corners, hairline rim, lifts on focus. */}
-      <Animated.View style={[styles.liftShadow, liftStyle]}>
-      <Glass
-        radius={radii.composer}
-        tint={t.translucent ? undefined : t.surface}
-        style={[styles.bar, { borderColor: focused ? t.textTertiary : t.separator }]}
-      >
-        <View style={styles.inputRow}>
-          <Pressable
-            onPress={openAttachSheet}
-            disabled={busy || sending}
-            style={({ pressed }) => [styles.hit, { opacity: pressed || busy ? 0.6 : 1 }]}
-            accessibilityLabel="Attach files"
-            accessibilityRole="button"
-          >
-            {busy ? <ActivityIndicator size="small" color={t.textSecondary} /> : <Icon name="plus" size={20} color={t.textSecondary} weight="medium" />}
+      <TextInput
+        ref={input}
+        style={[styles.input, type.composer, { color: t.text }]}
+        placeholder={hint}
+        placeholderTextColor={t.textTertiary}
+        value={text}
+        onChangeText={setText}
+        autoFocus={autoFocus || !!initialText}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        multiline
+        maxLength={20000}
+        keyboardAppearance={t.scheme}
+        selectionColor={t.accent}
+        submitBehavior="newline"
+        accessibilityLabel="Message"
+      />
+      <View style={styles.toolRow}>
+        <Pressable
+          onPress={openAttachSheet}
+          disabled={busy || sending}
+          hitSlop={4}
+          style={({ pressed }) => [styles.hit, { opacity: pressed || busy ? 0.6 : 1 }]}
+          accessibilityLabel="Attach files"
+          accessibilityRole="button"
+        >
+          {busy ? <ActivityIndicator size="small" color={t.textSecondary} /> : <Icon name="plus" size={22} color={t.text} weight="regular" />}
+        </Pressable>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
+          style={styles.chipScroll}
+          contentContainerStyle={styles.chipRow}
+        >
+          {chips}
+        </ScrollView>
+        {showStop ? (
+          <Pressable onPress={stop} style={({ pressed }) => [styles.hit, { opacity: pressed ? 0.75 : 1 }]} accessibilityLabel="Stop the run" accessibilityRole="button">
+            <View style={[styles.round, { backgroundColor: t.text }]}>
+              <View style={[styles.stop, { backgroundColor: t.background }]} />
+            </View>
           </Pressable>
-          <TextInput
-            ref={input}
-            style={[styles.input, type.composer, { color: t.text }]}
-            placeholder={hint}
-            placeholderTextColor={t.textTertiary}
-            value={text}
-            onChangeText={setText}
-            autoFocus={!!initialText}
-            onFocus={() => setFocused(true)}
-            onBlur={() => setFocused(false)}
-            multiline
-            maxLength={20000}
-            keyboardAppearance={t.scheme}
-            selectionColor={t.accent}
-            submitBehavior="newline"
-            accessibilityLabel="Message"
-          />
-          {showStop ? (
-            <Pressable onPress={stop} style={({ pressed }) => [styles.hit, { opacity: pressed ? 0.75 : 1 }]} accessibilityLabel="Stop the run" accessibilityRole="button">
-              <View style={[styles.round, { backgroundColor: t.text }]}>
-                <View style={[styles.stop, { backgroundColor: t.background }]} />
-              </View>
-            </Pressable>
-          ) : (
-            <Animated.View style={sendAnimStyle}>
-              <SendButton onPress={send} enabled={canSend} sending={sending} label={running ? 'Send steering message' : 'Send'} />
-            </Animated.View>
-          )}
-        </View>
-        {chips ? (
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            keyboardShouldPersistTaps="handled"
-            contentContainerStyle={styles.chipRow}
-          >
-            {chips}
-          </ScrollView>
-        ) : null}
-      </Glass>
+        ) : (
+          <Animated.View style={sendAnimStyle}>
+            <SendButton onPress={send} enabled={canSend} sending={sending} label={running ? 'Send steering message' : 'Send'} />
+          </Animated.View>
+        )}
+      </View>
+    </>
+  );
+
+  return (
+    <View style={[styles.wrap, bottomInset !== undefined ? { paddingBottom: bottomInset } : null]}>
+      {/* Floating card (Codex / Cursor): field on top, tools underneath. */}
+      <Animated.View style={liftStyle}>
+        {overWallpaper ? (
+          <Glass radius={radii.composer} style={styles.card}>{body}</Glass>
+        ) : (
+          <View style={[styles.card, { backgroundColor: t.floating, boxShadow: t.floatShadow }]}>{body}</View>
+        )}
       </Animated.View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  wrap: { paddingHorizontal: spacing(3), paddingTop: spacing(1.5), paddingBottom: spacing(2) },
-  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing(2), paddingHorizontal: spacing(1), paddingBottom: spacing(2) },
+  wrap: { paddingHorizontal: spacing(3), paddingTop: spacing(2), paddingBottom: spacing(2) },
+  card: { borderRadius: radii.composer, borderCurve: 'continuous', paddingTop: spacing(1.5), paddingBottom: spacing(1.5), paddingHorizontal: spacing(1.5) },
+  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing(2), paddingHorizontal: spacing(2), paddingTop: spacing(1) },
   chip: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(2),
     paddingLeft: spacing(1), paddingRight: spacing(1.5), paddingVertical: spacing(1),
-    borderRadius: radii.md, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: radii.row, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth,
   },
   thumb: { width: 32, height: 32, borderRadius: 8, borderCurve: 'continuous' },
   docThumb: { alignItems: 'center', justifyContent: 'center' },
   chipX: { marginLeft: -spacing(0.5) },
-  liftShadow: { shadowColor: '#000', shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0, borderRadius: radii.composer },
-  bar: {
-    paddingLeft: spacing(1), paddingRight: spacing(1), paddingVertical: spacing(1),
-    borderWidth: StyleSheet.hairlineWidth,
-    overflow: 'hidden',
+  input: {
+    minHeight: 44, maxHeight: 160,
+    paddingTop: Platform.OS === 'ios' ? 10 : 6, paddingBottom: Platform.OS === 'ios' ? 6 : 4, paddingHorizontal: spacing(2.5),
   },
-  inputRow: { flexDirection: 'row', alignItems: 'flex-end' },
+  toolRow: { flexDirection: 'row', alignItems: 'center' },
+  chipScroll: { flex: 1 },
   hit: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
   round: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
   stop: { width: 11, height: 11, borderRadius: 3 },
-  input: { flex: 1, maxHeight: 132, paddingTop: Platform.OS === 'ios' ? 12 : 8, paddingBottom: Platform.OS === 'ios' ? 12 : 8, paddingHorizontal: spacing(1) },
-  chipRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingLeft: spacing(1), paddingRight: spacing(1), paddingBottom: spacing(1.5) },
+  chipRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(1), paddingHorizontal: spacing(1) },
   composerChip: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing(1),
-    minHeight: 30, paddingHorizontal: spacing(2.5),
-    borderRadius: radii.chip, borderCurve: 'continuous',
+    flexDirection: 'row', alignItems: 'center', gap: spacing(1.5),
+    minHeight: 36, paddingHorizontal: spacing(2),
+    borderRadius: radii.chip,
   },
 });

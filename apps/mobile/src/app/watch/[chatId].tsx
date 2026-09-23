@@ -6,7 +6,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import { useCosmos, useSnapshot } from '../../lib/client';
 import { radii, spacing, type, useTheme } from '../../lib/theme';
-import { Button, Icon, IconButton, StatusChip } from '../../components/bits';
+import { Button, Icon, StatusChip } from '../../components/bits';
+import { CircleButton } from '../../components/chrome';
 import { Screen } from '../../components/surface';
 
 // Watch Live: the desktop frame fills the screen; controls live in a thin
@@ -91,7 +92,7 @@ export default function WatchLiveScreen() {
   return (
     <Screen>
       <View style={[styles.top, { paddingTop: insets.top + spacing(1) }]}>
-        <IconButton icon="xmark" label="Close" size={36} tint={t.textSecondary} onPress={close} />
+        <CircleButton icon="xmark" label="Close" onPress={close} />
         <View style={styles.titleWrap}>
           <Text style={[type.headline, { color: t.text }]} numberOfLines={1}>{chat?.title ?? 'Watch live'}</Text>
           <Text style={[type.meta, { color: offline ? t.warning : t.textSecondary }]} numberOfLines={1}>
@@ -138,7 +139,7 @@ export default function WatchLiveScreen() {
 const styles = StyleSheet.create({
   top: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), paddingBottom: spacing(2) },
   titleWrap: { flex: 1, alignItems: 'center', minWidth: 0 },
-  topSpacer: { width: 36 },
+  topSpacer: { width: 44 },
   canvas: { flex: 1 },
   frame: { flex: 1 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: spacing(8) },

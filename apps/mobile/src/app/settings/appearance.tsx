@@ -1,6 +1,7 @@
 import React from 'react';
 import { Alert, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { Stack } from 'expo-router';
+import { router, Stack } from 'expo-router';
+import { CircleButton, TopBar } from '../../components/chrome';
 import * as Haptics from 'expo-haptics';
 import {
   accentOptions,
@@ -24,11 +25,11 @@ import {
   type SurfacePref,
   type ThemeFamily,
   type Backdrop,
-} from '../../../lib/theme';
-import { pickWallpaper, removeWallpaper, wallpaperPath } from '../../../lib/wallpaper-store';
-import { Caption, Group, Icon, Row, SectionLabel, Segmented, Slider } from '../../../components/bits';
-import { Glass, PresetGradient, Screen } from '../../../components/surface';
-import { Wallpaper } from '../../../components/wallpaper';
+} from '../../lib/theme';
+import { pickWallpaper, removeWallpaper, wallpaperPath } from '../../lib/wallpaper-store';
+import { Caption, Group, Icon, Row, SectionLabel, Segmented, Slider } from '../../components/bits';
+import { Glass, PresetGradient, Screen } from '../../components/surface';
+import { Wallpaper } from '../../components/wallpaper';
 
 export default function AppearanceScreen() {
   const t = useTheme();
@@ -78,8 +79,9 @@ export default function AppearanceScreen() {
 
   return (
     <Screen>
-      <Stack.Screen options={{ title: 'Appearance', headerLargeTitle: false, gestureEnabled: !t.hasBackdrop, fullScreenGestureEnabled: false }} />
-      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.content} keyboardDismissMode="on-drag">
+      <Stack.Screen options={{ gestureEnabled: !t.hasBackdrop, fullScreenGestureEnabled: false }} />
+      <TopBar left={<CircleButton icon="chevron.left" label="Back" onPress={() => router.back()} />} title="Appearance" center right={<View style={{ width: 44 }} />} />
+      <ScrollView contentContainerStyle={styles.content} keyboardDismissMode="on-drag">
         <Preview />
 
         <Group header="Wallpaper" footer={photo ? 'Your photo is stored inside Cosmos; the original in Photos is untouched.' : 'Pick a photo from your library or one of the gradients below.'}>

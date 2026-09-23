@@ -5,7 +5,8 @@ import * as Haptics from 'expo-haptics';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { AccountDevice, PLACEHOLDER_NAME, useCosmos, useSnapshot } from '../lib/client';
 import { alpha, motion, radii, spacing, type, useTheme } from '../lib/theme';
-import { Button, Field, Group, Icon, IconButton, IconTile, Notice, Row, SectionLabel } from '../components/bits';
+import { Button, Field, Group, Icon, IconTile, Notice, Row, SectionLabel } from '../components/bits';
+import { CircleButton } from '../components/chrome';
 import { localSpec, RpcClient } from '../lib/rpc';
 import { EngineInfo } from '../lib/protocol';
 import { useReduceMotion } from '../lib/motion';
@@ -273,7 +274,7 @@ export default function PairScreen() {
               <Text accessibilityRole="header" style={[type.title2, { color: t.text }]}>Pair this phone</Text>
               <Text style={[type.footnote, { color: t.textSecondary }]}>Scan the code in Cosmos on your desktop. Works from any network.</Text>
             </View>
-            <IconButton icon="xmark" label="Close" size={32} tint={t.textSecondary} onPress={leave} />
+            <CircleButton icon="xmark" label="Close" size={40} tint={t.textSecondary} onPress={leave} />
           </View>
           {!auth ? (
             <View style={styles.signIn}>
