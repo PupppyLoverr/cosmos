@@ -192,7 +192,7 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
   };
 
 
-  const hint = placeholder ?? (running ? 'Steer while it works…' : 'Ask Cosmos');
+  const hint = placeholder ?? (running ? 'Steer the run' : 'Message');
   const showStop = running && !text.trim() && attachments.length === 0;
   const liftStyle = useAnimatedStyle(() => ({ transform: [{ translateY: -2 * lift.get() }] }));
   const sendAnimStyle = useAnimatedStyle(() => ({ transform: [{ scale: sendScale.get() }] }));

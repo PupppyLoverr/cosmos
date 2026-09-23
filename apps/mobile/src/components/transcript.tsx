@@ -160,7 +160,6 @@ function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
   const open = pinned ?? running;
   const summary = toolGroupSummary(parts);
   const state = running ? 'Running' : errors ? `${errors} failed` : 'Done';
-  const stateColor = running ? t.link : errors ? t.danger : t.success;
   const diffStats = parts.reduce(
     (totals, part) => {
       for (const diff of part.diffStats ?? []) {
@@ -177,7 +176,6 @@ function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
     <View style={[
       styles.toolCard,
       { backgroundColor: t.surface, borderColor: t.separator },
-      (running || errors > 0) && { borderLeftWidth: 2, borderLeftColor: alpha(stateColor, 0.85) },
     ]}>
       <Pressable
         onPress={() => { animateLayout(reduce); setPinned(!(pinned ?? running)); }}
@@ -197,7 +195,7 @@ function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
             </Text>
           ) : null}
         </View>
-        <StatusPill status={running ? 'working' : errors ? 'errored' : 'completed'} label={state} pulse={running} />
+        {running || errors > 0 ? <StatusPill status={running ? 'working' : 'errored'} label={state} pulse={running} /> : null}
       </Pressable>
       {open ? parts.map((p, i) => <ToolLine key={p.id} part={p} t={t} last={i === parts.length - 1} />) : null}
     </View>
@@ -251,7 +249,7 @@ export function ApprovalCard({ part, onAnswer }: {
         <View style={[styles.approvalGlyph, { backgroundColor: alpha(t.warning, 0.18) }]}>
           <Icon name="hand.raised.fill" size={14} color={t.warning} />
         </View>
-        <Text style={[type.headline, { color: t.text, flex: 1 }]}>Cosmos needs your input</Text>
+        <Text style={[type.headline, { color: t.text, flex: 1 }]}>Needs your input</Text>
       </View>
       {part.questions.map((q) => (
         <View key={q.id} style={{ gap: spacing(2.5) }}>

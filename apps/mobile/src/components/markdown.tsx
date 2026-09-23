@@ -1,7 +1,11 @@
 import React, { useMemo } from 'react';
-import { Linking, StyleSheet } from 'react-native';
+import { Linking, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import * as Clipboard from 'expo-clipboard';
+import * as Haptics from 'expo-haptics';
 import Markdown, { sealIncompleteMarkdown } from '@ronradtke/react-native-markdown-display';
+import type { ASTNode, MarkdownStyleMap, RenderRules } from '@ronradtke/react-native-markdown-display';
 import { alpha, radii, spacing, type, useTheme, type Theme } from '../lib/theme';
+import { Icon } from './bits';
 
 /**
  * Themed markdown for assistant text. Agent output is markdown — headings,
@@ -80,15 +84,48 @@ function stylesFor(t: Theme) {
   });
 }
 
+function codeLanguage(node: ASTNode): string {
+  if (typeof node.sourceInfo !== 'string') return 'code';
+  return node.sourceInfo.trim().split(/\s+/)[0]?.toLowerCase() || 'code';
+}
+
 /** Assistant-message markdown. `streaming` seals an unclosed fence/inline so a
  *  partial chunk doesn't render as garbage mid-token. */
 export function Md({ children, streaming }: { children: string; streaming?: boolean }) {
   const t = useTheme();
   const style = useMemo(() => stylesFor(t), [t]);
+  const rules = useMemo<RenderRules>(() => {
+    const renderCodeBlock = (node: ASTNode, _children: React.ReactNode[], _parent: ASTNode[], markdownStyles: MarkdownStyleMap) => {
+      const code = node.content.replace(/\n+$/, '');
+      return (
+        <View key={node.key} style={[markdownStyles.fence ?? markdownStyles.code_block, { padding: 0 }]}>
+          <View style={[styles.codeHeader, { borderBottomColor: t.separator }]}>
+            <Text style={[type.caption, { color: t.textTertiary }]}>{codeLanguage(node)}</Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Copy code"
+              hitSlop={8}
+              onPress={() => {
+                void Clipboard.setStringAsync(node.content);
+                void Haptics.selectionAsync();
+              }}
+            >
+              <Icon name="doc.on.doc" size={14} color={t.textTertiary} />
+            </Pressable>
+          </View>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} nestedScrollEnabled>
+            <Text selectable style={[type.mono, styles.codeText, { color: t.text }]}>{code}</Text>
+          </ScrollView>
+        </View>
+      );
+    };
+    return { fence: renderCodeBlock, code_block: renderCodeBlock };
+  }, [t, style]);
   const text = streaming ? sealIncompleteMarkdown(children) : children;
   return (
     <Markdown
       style={style}
+      rules={rules}
       colorScheme={t.scheme}
       mergeStyle
       onLinkPress={(url) => { void Linking.openURL(url).catch(() => {}); return true; }}
@@ -97,3 +134,19 @@ export function Md({ children, streaming }: { children: string; streaming?: bool
     </Markdown>
   );
 }
+
+const styles = StyleSheet.create({
+  codeHeader: {
+    minHeight: 32,
+    paddingHorizontal: spacing(2.5),
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  codeText: {
+    fontSize: 12.5,
+    lineHeight: 17,
+    padding: spacing(2.5),
+  },
+});

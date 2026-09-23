@@ -6,12 +6,11 @@ import { SessionMessageEntry, TranscriptUpdate, isComputerCall, type Chat } from
 import { applyTranscriptUpdate } from '../../lib/transcript';
 import { PickedFile, ensureDecodable, fileToBase64Chunks } from '../../lib/attachments';
 import { notifySessionEvent } from '../../lib/notify';
-import { useFlavourWord } from '../../lib/motion';
 import { spacing, type, useTheme, type Theme } from '../../lib/theme';
 import { MessageView } from '../../components/transcript';
 import { Composer, ComposerChip } from '../../components/composer';
 import { Button, EmptyState, Icon, Notice, Pulse } from '../../components/bits';
-import { HarnessMark, harnessLabel } from '../../components/harness-mark';
+import { harnessLabel } from '../../components/harness-mark';
 import { Screen } from '../../components/surface';
 import { CircleButton, TopBar, useDockInset } from '../../components/chrome';
 import { showMenu } from '../../lib/menu';
@@ -22,17 +21,15 @@ function entryKeyExtractor(entry: SessionMessageEntry): string {
 }
 
 /** Compact header: title with the harness + live status beneath, iMessage-style. */
-function HeaderTitle({ title, chat, status, desktop, t, chatId }: { title: string; chat?: Chat; status: string; desktop?: string; t: Theme; chatId: string }) {
+function HeaderTitle({ title, chat, status, desktop, t }: { title: string; chat?: Chat; status: string; desktop?: string; t: Theme }) {
   const parts = [harnessLabel(chat?.config?.harness), desktop].filter(Boolean);
   const live = status === 'working' || status === 'awaitingInput';
-  const flavour = useFlavourWord(chatId, status === 'working');
   const sub = live
-    ? (status === 'working' ? (flavour || 'Working') : 'Needs your input')
+    ? (status === 'working' ? 'Working' : 'Needs your input')
     : (parts.join(' · ') || 'Cosmos');
   return (
     <View style={styles.headerTitle} accessibilityRole="header" accessibilityLabel={`${title}, ${sub}`}>
       <View style={styles.headerMain}>
-        <HarnessMark harness={chat?.config?.harness} size={16} plain />
         <Text style={[type.headline, { color: t.text, flexShrink: 1 }]} numberOfLines={1}>{title}</Text>
       </View>
       <View style={styles.headerSub}>
@@ -122,7 +119,8 @@ export default function SessionScreen() {
     }
   }, [status, title, chatId]);
 
-  const scrollToEnd = useCallback(() => listRef.current?.scrollToEnd({ animated: true }), []);
+  const reversed = useMemo(() => [...entries].reverse(), [entries]);
+  const scrollToEnd = useCallback(() => listRef.current?.scrollToOffset({ offset: 0, animated: true }), []);
 
   const send = async (text: string) => {
     if (!client.raw()) return;
@@ -197,6 +195,7 @@ export default function SessionScreen() {
     if (!chat) return;
     const base = baseConfig();
     showMenu(title, [
+      ...(canWatch ? [{ label: 'Watch live', onPress: watch }] : []),
       { label: `Model${base.model ? ` · ${base.model}` : ''}`, onPress: () => void openModel() },
       {
         label: `Effort${base.reasoning ? ` · ${base.reasoning}` : ''}`,
@@ -214,7 +213,6 @@ export default function SessionScreen() {
           onPress: () => void client.setChatConfig(chatId, { ...base, sandbox: s }),
         }))),
       },
-      ...(canWatch ? [{ label: 'Watch live', onPress: watch }] : []),
       { label: chat.archived ? 'Unarchive' : 'Archive', destructive: !chat.archived, onPress: archiveCurrent },
     ]);
   };
@@ -227,13 +225,8 @@ export default function SessionScreen() {
       <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <TopBar
           left={<CircleButton icon="chevron.left" label="Back" onPress={back} />}
-          title={<HeaderTitle title={title} chat={chat} status={status} desktop={desktopName} t={t} chatId={chatId} />}
-          right={(
-            <>
-              {canWatch ? <CircleButton icon="display" label="Watch live" onPress={watch} tint={cuActive ? t.link : undefined} /> : null}
-              <CircleButton icon="ellipsis" label="Session options" onPress={sessionMenu} />
-            </>
-          )}
+          title={<HeaderTitle title={title} chat={chat} status={status} desktop={desktopName} t={t} />}
+          right={<CircleButton icon="ellipsis" label="Session options" onPress={sessionMenu} />}
         />
 
         {streamLost && connection.status === 'connected' ? (
@@ -259,22 +252,21 @@ export default function SessionScreen() {
           <View style={styles.fill}>
             <FlatList
               ref={listRef}
-              data={entries}
+              data={reversed}
+              inverted
               keyExtractor={entryKeyExtractor}
               renderItem={({ item, index }) => (
                 <MessageView
                   entry={item}
                   onAnswer={onAnswer}
-                  grouped={index > 0 && entries[index - 1]?.role === item.role}
+                  grouped={reversed[index + 1]?.role === item.role}
                   arrive={item.id === freshId}
                 />
               )}
-              contentContainerStyle={{ paddingTop: spacing(3), paddingBottom: spacing(3) }}
-              onLayout={() => { if (atBottomRef.current) listRef.current?.scrollToEnd({ animated: false }); }}
-              onContentSizeChange={() => { if (atBottomRef.current) listRef.current?.scrollToEnd({ animated: false }); }}
+              contentContainerStyle={{ paddingTop: spacing(2), paddingBottom: spacing(3) }}
+              maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
               onScroll={(e) => {
-                const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
-                const nextAtBottom = contentSize.height - contentOffset.y - layoutMeasurement.height < 120;
+                const nextAtBottom = e.nativeEvent.contentOffset.y < 120;
                 atBottomRef.current = nextAtBottom;
                 setAtBottom(nextAtBottom);
                 if (nextAtBottom) setNewEntryCount(0);
@@ -304,7 +296,7 @@ export default function SessionScreen() {
             {status === 'errored' ? (
               <SessionBanner kind="error" title="The last turn failed" body="Send a new message to retry" />
             ) : pendingInput ? (
-              <SessionBanner kind="input" title="Cosmos is waiting for your answer" body="Tap to jump to the question" onPress={scrollToEnd} />
+              <SessionBanner kind="input" title="Waiting for your answer" body="Tap to jump to the question" onPress={scrollToEnd} />
             ) : (
               <SessionBanner
                 kind="controlling"
