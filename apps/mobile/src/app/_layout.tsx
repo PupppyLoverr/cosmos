@@ -78,10 +78,7 @@ function ThemedStack() {
           <Stack.Screen
             name="pair"
             options={{
-              presentation: 'formSheet',
-              sheetAllowedDetents: [0.8, 1],
-              sheetGrabberVisible: true,
-              sheetCornerRadius: 28,
+              presentation: 'modal',
               contentStyle: { backgroundColor: t.background },
             }}
           />
