@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, KeyboardAvoidingView, LayoutAnimation, Platform, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
-import { router } from 'expo-router';
+import { router, useLocalSearchParams } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { AccountDevice, PLACEHOLDER_NAME, useCosmos, useSnapshot } from '../lib/client';
@@ -8,7 +8,6 @@ import { alpha, motion, radii, spacing, type, useTheme } from '../lib/theme';
 import { Button, Field, Group, Icon, IconButton, IconTile, Notice, Row, SectionLabel } from '../components/bits';
 import { localSpec, RpcClient } from '../lib/rpc';
 import { EngineInfo } from '../lib/protocol';
-import { Glass } from '../components/surface';
 import { useReduceMotion } from '../lib/motion';
 
 type Probe = { state: 'idle' | 'probing' | 'ok' | 'fail'; info?: EngineInfo; error?: string };
@@ -50,7 +49,9 @@ function AdvancedNetworkSection({
   found,
   link,
   busy,
+  initialOpen,
 }: {
+  initialOpen?: boolean;
   host: string;
   onHost: (value: string) => void;
   name: string;
@@ -63,7 +64,7 @@ function AdvancedNetworkSection({
 }) {
   const t = useTheme();
   const reduce = useReduceMotion();
-  const [advanced, setAdvanced] = useState(!!host);
+  const [advanced, setAdvanced] = useState(!!host || !!initialOpen);
   const toggle = () => {
     if (!reduce) {
       LayoutAnimation.configureNext({
@@ -79,10 +80,12 @@ function AdvancedNetworkSection({
   return (
     <Group footer={found ? undefined : `Direct engine link on port ${DEFAULT_PORT} — both devices on one Wi-Fi.`}>
       <Row
-        title="Same network (advanced)"
-        subtitle="Direct link over one Wi-Fi"
+        title="On this network"
+        subtitle="Link directly over one Wi-Fi"
+        icon="wifi"
         onPress={toggle}
-        chevron
+        trailing={<Icon name={advanced ? 'chevron.down' : 'chevron.right'} size={13} color={t.textTertiary} weight="semibold" />}
+        accessibilityLabel={`On this network, ${advanced ? 'expanded' : 'collapsed'}`}
       />
       {advanced ? (
         <View style={styles.advancedContent}>
@@ -135,6 +138,7 @@ function AdvancedNetworkSection({
 
 export default function PairScreen() {
   const t = useTheme();
+  const { mode } = useLocalSearchParams<{ mode?: string }>();
   const client = useCosmos();
   const auth = useSnapshot(client.auth);
   const desktops = useSnapshot(client.desktops);
@@ -264,23 +268,22 @@ export default function PairScreen() {
           keyboardShouldPersistTaps="handled"
           automaticallyAdjustKeyboardInsets
         >
-          <View style={styles.sheetHeader}>
-            <View style={styles.grabber} />
-            <View style={styles.headerRow}>
-              <View style={styles.headerCopy}>
-                <Text style={[type.title2, { color: t.text }]}>Link a Desktop</Text>
-                <Text style={[type.footnote, { color: t.textSecondary }]}>Pair once over your account. Works from any network.</Text>
-              </View>
-              <IconButton icon="xmark" label="Close" size={32} filled={false} onPress={() => router.back()} />
+          <View style={styles.headerRow}>
+            <View style={styles.headerCopy}>
+              <Text accessibilityRole="header" style={[type.title2, { color: t.text }]}>Pair this phone</Text>
+              <Text style={[type.footnote, { color: t.textSecondary }]}>Scan the code in Cosmos on your desktop. Works from any network.</Text>
             </View>
+            <IconButton icon="xmark" label="Close" size={32} tint={t.textSecondary} onPress={leave} />
           </View>
           {!auth ? (
-            <Group footer="Remote pairing needs the same account on both devices. Same-Wi-Fi linking is below if you skip this.">
-              <Row title="Sign in to Woozlit" subtitle="Required to pair over any network" icon="person.crop.circle" onPress={() => router.push('/sign-in')} chevron />
-            </Group>
+            <View style={styles.signIn}>
+              <Button title="Continue with Woozlit" onPress={() => router.push('/sign-in')} />
+              <Text style={[type.footnote, { color: t.textSecondary, textAlign: 'center' }]}>
+                Pairing over any network needs the same account on both devices.
+              </Text>
+            </View>
           ) : (
             <>
-              <SectionLabel>Pair phone</SectionLabel>
               {permission?.granted ? (
                 <View style={[styles.cameraCard, { borderColor: t.separator }]}>
                   <CameraView
@@ -290,13 +293,13 @@ export default function PairScreen() {
                     onBarcodeScanned={onBarcode}
                   />
                   <View pointerEvents="none" style={styles.scanOverlay}>
-                    <View style={[styles.corner, styles.cornerTopLeft, { borderColor: alpha(t.background, 0.9) }]} />
-                    <View style={[styles.corner, styles.cornerTopRight, { borderColor: alpha(t.background, 0.9) }]} />
-                    <View style={[styles.corner, styles.cornerBottomLeft, { borderColor: alpha(t.background, 0.9) }]} />
-                    <View style={[styles.corner, styles.cornerBottomRight, { borderColor: alpha(t.background, 0.9) }]} />
-                    <Glass thin radius={radii.pill} style={styles.scanCaption}>
-                      <Text style={[type.caption, { color: t.text }]}>Point at the QR on the desktop</Text>
-                    </Glass>
+                    <View style={[styles.corner, styles.cornerTopLeft]} />
+                    <View style={[styles.corner, styles.cornerTopRight]} />
+                    <View style={[styles.corner, styles.cornerBottomLeft]} />
+                    <View style={[styles.corner, styles.cornerBottomRight]} />
+                    <View style={styles.scanCaption}>
+                      <Text style={[type.footnote, { color: '#FFFFFF', fontWeight: '500' }]}>Point at the code on the desktop</Text>
+                    </View>
                   </View>
                 </View>
               ) : (
@@ -304,7 +307,7 @@ export default function PairScreen() {
                   <Row
                     title="Scan the desktop QR"
                     subtitle="Cosmos → Settings → Devices → Pair phone"
-                    leading={<IconTile name="camera" tint={t.link} />}
+                    leading={<IconTile name="camera" />}
                     trailing={<Text style={[type.body, { color: t.link }]}>Allow</Text>}
                     onPress={() => void requestPermission()}
                   />
@@ -317,7 +320,7 @@ export default function PairScreen() {
                 <View style={[styles.divider, { backgroundColor: t.separator }]} />
               </View>
               <TextInput
-                style={[styles.codeInput, type.title2, { color: t.text, backgroundColor: t.fill, borderColor: t.separator }]}
+                style={[styles.codeInput, type.title2, { color: t.text, backgroundColor: t.surface, borderColor: t.separator }]}
                 value={code}
                 onChangeText={(v) => { setCode(v.toUpperCase()); setPairError(null); }}
                 autoCapitalize="characters"
@@ -354,7 +357,7 @@ export default function PairScreen() {
                         tall
                         title={d.name}
                         subtitle={`${d.platform ?? 'desktop'} · ${d.online ? 'online' : 'offline'}${paired ? ' · paired' : ''}`}
-                        leading={<IconTile name="desktopcomputer" tint={d.online ? t.link : t.textTertiary} size={32} />}
+                        leading={<IconTile name="desktopcomputer" size={32} />}
                         trailing={
                           paired && linked ? (
                             busy ? <ActivityIndicator size="small" /> : <Text style={[type.body, { color: t.link }]}>Connect</Text>
@@ -382,6 +385,7 @@ export default function PairScreen() {
             found={found}
             link={() => void link()}
             busy={busy}
+            initialOpen={mode === 'local'}
           />
         </ScrollView>
       </KeyboardAvoidingView>
@@ -391,10 +395,9 @@ export default function PairScreen() {
 
 const styles = StyleSheet.create({
   sheet: { flex: 1 },
-  content: { paddingHorizontal: spacing(4), paddingTop: spacing(2), paddingBottom: spacing(10), gap: spacing(3) },
-  sheetHeader: { gap: spacing(3), paddingTop: spacing(1), paddingBottom: spacing(1) },
-  grabber: { width: 36, height: 5, borderRadius: radii.pill, alignSelf: 'center' },
-  headerRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: spacing(3) },
+  content: { paddingHorizontal: spacing(4), paddingTop: spacing(6), paddingBottom: spacing(10), gap: spacing(3) },
+  headerRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: spacing(3), marginBottom: spacing(2) },
+  signIn: { gap: spacing(3), marginTop: spacing(2) },
   headerCopy: { flex: 1, gap: spacing(1) },
   sep: { height: StyleSheet.hairlineWidth, marginLeft: spacing(4) },
   result: {
@@ -408,16 +411,19 @@ const styles = StyleSheet.create({
   },
   camera: StyleSheet.absoluteFill,
   scanOverlay: StyleSheet.absoluteFill,
-  corner: { position: 'absolute', width: 28, height: 28, borderWidth: 2 },
+  corner: { position: 'absolute', width: 28, height: 28, borderWidth: 2, borderColor: 'rgba(255,255,255,0.9)' },
   cornerTopLeft: { top: spacing(6), left: spacing(6), borderRightWidth: 0, borderBottomWidth: 0 },
   cornerTopRight: { top: spacing(6), right: spacing(6), borderLeftWidth: 0, borderBottomWidth: 0 },
   cornerBottomLeft: { bottom: spacing(6), left: spacing(6), borderRightWidth: 0, borderTopWidth: 0 },
   cornerBottomRight: { bottom: spacing(6), right: spacing(6), borderLeftWidth: 0, borderTopWidth: 0 },
-  scanCaption: { position: 'absolute', bottom: spacing(4), alignSelf: 'center', paddingHorizontal: spacing(3), paddingVertical: spacing(1.5) },
+  scanCaption: {
+    position: 'absolute', bottom: spacing(4), alignSelf: 'center', paddingHorizontal: spacing(3), paddingVertical: spacing(1.5),
+    borderRadius: radii.chip, backgroundColor: 'rgba(0,0,0,0.55)',
+  },
   dividerRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), marginTop: spacing(2) },
   divider: { flex: 1, height: StyleSheet.hairlineWidth },
   codeInput: {
-    width: '100%', height: 56, borderRadius: radii.lg, borderCurve: 'continuous',
+    width: '100%', height: 56, borderRadius: radii.md, borderCurve: 'continuous',
     borderWidth: StyleSheet.hairlineWidth, textAlign: 'center', fontFamily: type.mono.fontFamily,
     letterSpacing: 6, paddingHorizontal: spacing(3), marginTop: spacing(1),
   },

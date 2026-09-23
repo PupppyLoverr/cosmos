@@ -8,16 +8,16 @@ export default function TabsLayout() {
   const ios = Platform.OS === 'ios';
   return (
     <NativeTabs
-      tintColor={t.link}
+      tintColor={t.text}
       // iOS 26 draws its own Liquid Glass bar; older iOS gets a system blur,
       // Android gets a Material 3 navigation bar tinted from the theme.
       minimizeBehavior="onScrollDown"
       blurEffect={ios && !t.liquid && t.translucent ? (t.scheme === 'dark' ? 'systemChromeMaterialDark' : 'systemChromeMaterial') : undefined}
       backgroundColor={ios ? (t.liquid ? undefined : t.translucent ? alpha(t.background, 0.6) : t.background) : t.surface}
-      indicatorColor={ios ? undefined : t.accentMuted}
-      rippleColor={ios ? undefined : t.accentMuted}
-      iconColor={ios ? undefined : { default: t.textSecondary, selected: t.link }}
-      labelStyle={ios ? undefined : { default: { color: t.textSecondary }, selected: { color: t.link } }}
+      indicatorColor={ios ? undefined : t.fill}
+      rippleColor={ios ? undefined : t.fill}
+      iconColor={ios ? undefined : { default: t.textSecondary, selected: t.text }}
+      labelStyle={ios ? undefined : { default: { color: t.textSecondary }, selected: { color: t.text } }}
     >
       <NativeTabs.Trigger name="(sessions)">
         <NativeTabs.Trigger.Label>Sessions</NativeTabs.Trigger.Label>

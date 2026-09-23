@@ -8,11 +8,11 @@ import Animated, { Extrapolation, interpolate, useAnimatedStyle, type SharedValu
 import { useLargeText } from '../lib/a11y';
 import { radii, spacing, type, useTheme } from '../lib/theme';
 import { Chat } from '../lib/protocol';
-import { Icon, StatusPill } from './bits';
-import { HarnessMark } from './harness-mark';
+import { Icon, StatusChip, type SessionState } from './bits';
+import { HarnessMark, harnessLabel } from './harness-mark';
 import { Glass } from './surface';
 
-export type SessionRowIndicator = 'working' | 'awaitingInput' | 'errored' | 'completed' | 'idle';
+export type SessionRowIndicator = SessionState;
 
 export interface SessionRowProps {
   chat: Chat;
@@ -20,8 +20,6 @@ export interface SessionRowProps {
   indicator: SessionRowIndicator;
   timeAgo: string;
   desktop: string;
-  project: string;
-  branch?: string | null;
   elapsed?: string;
   translucent: boolean;
   onPress: () => void;
@@ -102,8 +100,6 @@ export const SessionRow = React.memo(function SessionRow({
   indicator,
   timeAgo,
   desktop,
-  project,
-  branch,
   elapsed,
   translucent,
   onPress,
@@ -114,16 +110,11 @@ export const SessionRow = React.memo(function SessionRow({
 }: SessionRowProps) {
   const t = useTheme();
   const largeText = useLargeText();
-  const statusLabel = indicator === 'working'
-    ? 'Working'
-    : indicator === 'awaitingInput'
-      ? 'Needs input'
-      : indicator === 'errored'
-        ? 'Failed'
-        : indicator === 'completed'
-          ? 'Done'
-          : timeAgo;
-  const accessibleLabel = `${title}, ${statusLabel}, ${desktop}, ${project}${branch ? `, ${branch}` : ''}`;
+  const harness = harnessLabel(chat.config?.harness);
+  // harness · desktop · time — the running clock replaces "ago" while live.
+  const when = indicator === 'working' && elapsed ? elapsed : timeAgo;
+  const meta = [harness, desktop, when].filter(Boolean).join(' · ');
+  const accessibleLabel = [title, indicator === 'idle' ? undefined : indicator, meta].filter(Boolean).join(', ');
   const href = { pathname: '/session/[id]' as const, params: { id: chat.id, title } };
   const row = (
     <Link asChild href={href}>
@@ -138,45 +129,19 @@ export const SessionRow = React.memo(function SessionRow({
             styles.row,
             {
               backgroundColor: pressed ? t.fill : translucent ? undefined : t.surface,
-              opacity: chat.archived ? 0.72 : 1,
+              borderColor: translucent ? 'transparent' : t.glassStroke,
+              opacity: chat.archived ? 0.6 : 1,
             },
           ]}
         >
-          <View style={styles.titleLine}>
-            <HarnessMark harness={chat.config?.harness} size={14} />
-            <Text style={[type.subhead, styles.title, { color: t.text, fontWeight: '600' }]} numberOfLines={largeText ? 2 : 1}>
+          <HarnessMark harness={chat.config?.harness} size={30} />
+          <View style={styles.copy}>
+            <Text style={[type.sessionTitle, { color: t.text }]} numberOfLines={largeText ? 2 : 1}>
               {title}
             </Text>
-            {indicator === 'idle' ? (
-              <Text style={[type.meta, { color: t.textTertiary }]}>{timeAgo}</Text>
-            ) : indicator === 'completed' ? (
-              <View style={styles.done}>
-                <Icon name="checkmark" size={11} color={t.success} weight="bold" />
-                <Text style={[type.meta, { color: t.success, fontWeight: '600' }]}>Done</Text>
-              </View>
-            ) : (
-              <StatusPill
-                status={indicator}
-                label={statusLabel}
-                pulse={indicator === 'working'}
-              />
-            )}
+            <Text style={[type.meta, { color: t.textSecondary }]} numberOfLines={1}>{meta}</Text>
           </View>
-          <View style={styles.metaLine}>
-            <Text style={[type.footnote, styles.metaText, { color: t.textTertiary }]} numberOfLines={1}>
-              {desktop} · {project}
-            </Text>
-            {branch ? (
-              <View style={styles.branch}>
-                <Text style={[type.footnote, { color: t.textTertiary }]}> · </Text>
-                <Icon name="git.branch" size={11} color={t.textTertiary} />
-                <Text style={[type.footnote, styles.branchText, { color: t.textTertiary }]} numberOfLines={1}>{branch}</Text>
-              </View>
-            ) : null}
-            {indicator === 'working' && elapsed ? (
-              <Text style={[type.footnote, { color: t.textTertiary }]}> · {elapsed}</Text>
-            ) : null}
-          </View>
+          <StatusChip state={indicator} />
         </Pressable>
       </Link.Trigger>
       <Link.Menu title={title}>
@@ -217,21 +182,17 @@ export const SessionRow = React.memo(function SessionRow({
 const styles = StyleSheet.create({
   cellWrap: { paddingBottom: spacing(2) },
   row: {
-    minHeight: 56,
+    minHeight: 64,
     paddingHorizontal: spacing(3),
-    paddingVertical: spacing(2.5),
+    paddingVertical: spacing(3),
     borderRadius: radii.row,
-    flexDirection: 'column',
-    justifyContent: 'center',
-    gap: spacing(1),
+    borderCurve: 'continuous',
+    borderWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing(3),
   },
-  titleLine: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), minWidth: 0 },
-  title: { flex: 1, minWidth: 0 },
-  done: { flexDirection: 'row', alignItems: 'center', gap: spacing(1) },
-  metaLine: { flexDirection: 'row', alignItems: 'center', minWidth: 0, gap: 0 },
-  metaText: { flexShrink: 1 },
-  branch: { flexDirection: 'row', alignItems: 'center', flexShrink: 1 },
-  branchText: { flexShrink: 1, marginLeft: spacing(1) },
+  copy: { flex: 1, minWidth: 0, gap: 2 },
   swipeContainer: { borderRadius: radii.row, overflow: 'hidden' },
   swipeChildren: { flex: 1 },
   actions: { flexDirection: 'row', width: 144, borderRadius: radii.row, overflow: 'hidden' },

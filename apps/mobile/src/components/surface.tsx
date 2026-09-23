@@ -97,6 +97,25 @@ export function Glass({ radius = radii.lg, interactive, thin, tint, material, st
   );
 }
 
+/**
+ * Content card. Solid theme surface on the plain paper/near-black field —
+ * material only earns its place over a wallpaper, where it keeps text legible.
+ */
+export function Card({ radius = radii.lg, style, children, ...rest }: ViewProps & { radius?: number }) {
+  const t = useTheme();
+  if (t.hasBackdrop && t.translucent) {
+    return <Glass radius={radius} style={style} {...rest}>{children}</Glass>;
+  }
+  return (
+    <View
+      style={[{ borderRadius: radius, borderCurve: 'continuous', backgroundColor: t.surface, borderWidth: StyleSheet.hairlineWidth, borderColor: t.glassStroke }, styles.clip, style]}
+      {...rest}
+    >
+      {children}
+    </View>
+  );
+}
+
 /** Gradient preset painted for a theme; shared by the screen backdrop and the appearance previews. */
 export function PresetGradient({ id, scheme, style }: { id: string; scheme: Theme['scheme']; style?: StyleProp<ViewStyle> }) {
   const preset = backdropPresets.find((p) => p.id === id) ?? backdropPresets[0]!;

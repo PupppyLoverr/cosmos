@@ -16,7 +16,7 @@ export function TabStack() {
         headerBlurEffect: t.translucent ? (dark ? 'systemChromeMaterialDark' : 'systemChromeMaterial') : 'none',
         headerTintColor: t.text,
         headerTitleStyle: { fontWeight: '600' },
-        headerLargeTitleStyle: { fontWeight: '700' },
+        headerLargeTitleStyle: { fontWeight: '600' },
         headerLargeStyle: { backgroundColor: t.hasBackdrop ? 'transparent' : t.background },
         headerStyle: ios ? undefined : { backgroundColor: t.background },
         headerLargeTitleShadowVisible: false,

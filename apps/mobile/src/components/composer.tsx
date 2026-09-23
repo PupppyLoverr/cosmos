@@ -2,10 +2,10 @@ import React, { useEffect, useRef, useState } from 'react';
 import { ActionSheetIOS, ActivityIndicator, Alert, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { Image } from 'expo-image';
 import * as Haptics from 'expo-haptics';
-import Animated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
+import Animated, { useAnimatedStyle, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
 import { PickedFile, pickPhoto, pickDocument, pickFromClipboard } from '../lib/attachments';
 import { useReduceMotion } from '../lib/motion';
-import { radii, spacing, type, useTheme } from '../lib/theme';
+import { motion, radii, spacing, type, useTheme } from '../lib/theme';
 import { Icon } from './bits';
 import { Glass } from './surface';
 
@@ -41,9 +41,9 @@ export function ComposerChip({ label, icon, onPress, accessibilityLabel, accessi
 }) {
   const t = useTheme();
   const body = (
-    <View style={[styles.composerChip, { borderColor: t.separator, backgroundColor: t.fill }]}>
+    <View style={[styles.composerChip, { backgroundColor: t.fill }]}>
       {icon ? <Icon name={icon} size={13} color={t.textSecondary} /> : null}
-      <Text style={[type.meta, { color: t.text, fontWeight: '500', maxWidth: 160 }]} numberOfLines={1}>{label}</Text>
+      <Text style={[type.footnote, { color: t.text, fontWeight: '500', maxWidth: 160 }]} numberOfLines={1}>{label}</Text>
       {onPress ? <Icon name="chevron.down" size={9} color={t.textTertiary} weight="semibold" /> : null}
     </View>
   );
@@ -96,22 +96,9 @@ function AttachmentChip({ file, onRemove }: { file: PickedFile; onRemove: () => 
   );
 }
 
-export function Composer({ placeholder, initialText, onChangeText, bottomInset, running, sending, enabled = true, chips, attachments, onAddAttachment, onRemoveAttachment, onSend, onStop }: ComposerProps) {
-  const t = useTheme();
-  const reduce = useReduceMotion();
-  const [text, setTextState] = useState(initialText ?? '');
-  const setText = (v: string) => { setTextState(v); onChangeText?.(v); };
+/** Photo / file / clipboard picker behind the composer's "+" — shared with the New Session sheet. */
+export function useAttachPicker(onAddAttachment: (f: PickedFile) => void): { busy: boolean; open: () => void } {
   const [busy, setBusy] = useState(false);
-  const [focused, setFocused] = useState(false);
-  const input = useRef<TextInput>(null);
-  const halo = useSharedValue(0);
-  const sendScale = useSharedValue(1);
-
-  useEffect(() => {
-    if (reduce) { halo.set(focused ? 1 : 0); return; }
-    halo.set(withSpring(focused ? 1 : 0, { duration: 280, dampingRatio: 0.9 }));
-  }, [focused, reduce, halo]);
-
   const attach = async (which: Source) => {
     setBusy(true);
     try {
@@ -143,6 +130,45 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
       ]);
     }
   };
+  return { busy, open: openAttachSheet };
+}
+
+/** The 36pt filled send circle. Ink on paper; dims when there's nothing to send. */
+export function SendButton({ onPress, enabled, sending, label = 'Send' }: { onPress: () => void; enabled: boolean; sending?: boolean; label?: string }) {
+  const t = useTheme();
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={!enabled}
+      hitSlop={4}
+      style={({ pressed }) => [styles.hit, { opacity: pressed ? 0.8 : 1 }]}
+      accessibilityLabel={label}
+      accessibilityRole="button"
+      accessibilityState={{ disabled: !enabled }}
+    >
+      <View style={[styles.round, { backgroundColor: t.text, opacity: enabled ? 1 : 0.3 }]}>
+        {sending ? <ActivityIndicator size="small" color={t.background} /> : <Icon name="arrow.up" size={16} color={t.background} weight="bold" />}
+      </View>
+    </Pressable>
+  );
+}
+
+export function Composer({ placeholder, initialText, onChangeText, bottomInset, running, sending, enabled = true, chips, attachments, onAddAttachment, onRemoveAttachment, onSend, onStop }: ComposerProps) {
+  const t = useTheme();
+  const reduce = useReduceMotion();
+  const [text, setTextState] = useState(initialText ?? '');
+  const setText = (v: string) => { setTextState(v); onChangeText?.(v); };
+  const { busy, open: openAttachSheet } = useAttachPicker(onAddAttachment);
+  const [focused, setFocused] = useState(false);
+  const input = useRef<TextInput>(null);
+  const lift = useSharedValue(0);
+  const sendScale = useSharedValue(1);
+
+  // Focus lifts the card: ~8pt of soft shadow and a 2pt rise, 240ms, no bounce.
+  useEffect(() => {
+    if (reduce) { lift.set(focused ? 1 : 0); return; }
+    lift.set(withTiming(focused ? 1 : 0, { duration: motion.axis }));
+  }, [focused, reduce, lift]);
 
   const canSend = enabled && (text.trim().length > 0 || attachments.length > 0) && !sending;
   const send = () => {
@@ -157,10 +183,11 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
     onStop();
   };
 
-  const hint = placeholder ?? (running ? 'Steer while it works…' : 'Do anything…');
+  const hint = placeholder ?? (running ? 'Steer while it works…' : 'Message the desktop…');
   const showStop = running && !text.trim() && attachments.length === 0;
-  const haloStyle = useAnimatedStyle(() => ({
-    borderColor: `rgba(${t.scheme === 'dark' ? '255,255,255' : '0,0,0'},${0.08 + 0.20 * halo.get()})`,
+  const liftStyle = useAnimatedStyle(() => ({
+    shadowOpacity: (t.scheme === 'dark' ? 0.5 : 0.14) * lift.get(),
+    transform: [{ translateY: -2 * lift.get() }],
   }));
   const sendAnimStyle = useAnimatedStyle(() => ({ transform: [{ scale: sendScale.get() }] }));
 
@@ -171,14 +198,13 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
           {attachments.map((f, i) => <AttachmentChip key={`${f.uri}-${i}`} file={f} onRemove={() => onRemoveAttachment(i)} />)}
         </View>
       ) : null}
-      {/* The desktop composer is a rounded-rect plate with a hairline rim,
-          not a floating glass pill — keep the same silhouette. */}
+      {/* A card, not a pill: 14pt corners, hairline rim, lifts on focus. */}
+      <Animated.View style={[styles.liftShadow, liftStyle]}>
       <Glass
         radius={radii.composer}
-        tint={t.translucent ? undefined : t.composerBg}
-        style={[styles.bar, { borderColor: t.separator }]}
+        tint={t.translucent ? undefined : t.surface}
+        style={[styles.bar, { borderColor: focused ? t.textTertiary : t.separator }]}
       >
-        <Animated.View style={[styles.haloWrap, haloStyle]} pointerEvents="none" />
         <View style={styles.inputRow}>
           <Pressable
             onPress={openAttachSheet}
@@ -187,7 +213,7 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
             accessibilityLabel="Attach files"
             accessibilityRole="button"
           >
-            {busy ? <ActivityIndicator size="small" color={t.textSecondary} /> : <Icon name="paperclip" size={18} color={t.textSecondary} weight="medium" />}
+            {busy ? <ActivityIndicator size="small" color={t.textSecondary} /> : <Icon name="plus" size={20} color={t.textSecondary} weight="medium" />}
           </Pressable>
           <TextInput
             ref={input}
@@ -213,24 +239,9 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
               </View>
             </Pressable>
           ) : (
-            <Pressable
-              onPress={send}
-              disabled={!canSend}
-              style={({ pressed }) => [styles.hit, { opacity: pressed ? 0.8 : 1 }]}
-              accessibilityLabel={running ? 'Send steering message' : 'Send'}
-              accessibilityRole="button"
-              accessibilityState={{ disabled: !canSend }}
-            >
-              <Animated.View style={sendAnimStyle}>
-                <View style={[styles.round, { backgroundColor: t.text, opacity: canSend ? 1 : 0.35 }]}>
-                  {sending ? (
-                    <ActivityIndicator size="small" color={t.background} />
-                  ) : (
-                    <Icon name="arrow.up" size={14} color={t.background} weight="bold" />
-                  )}
-                </View>
-              </Animated.View>
-            </Pressable>
+            <Animated.View style={sendAnimStyle}>
+              <SendButton onPress={send} enabled={canSend} sending={sending} label={running ? 'Send steering message' : 'Send'} />
+            </Animated.View>
           )}
         </View>
         {chips ? (
@@ -244,6 +255,7 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
           </ScrollView>
         ) : null}
       </Glass>
+      </Animated.View>
     </View>
   );
 }
@@ -259,21 +271,21 @@ const styles = StyleSheet.create({
   thumb: { width: 32, height: 32, borderRadius: 8, borderCurve: 'continuous' },
   docThumb: { alignItems: 'center', justifyContent: 'center' },
   chipX: { marginLeft: -spacing(0.5) },
+  liftShadow: { shadowColor: '#000', shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0, borderRadius: radii.composer },
   bar: {
-    paddingLeft: spacing(1), paddingRight: spacing(1.5), paddingVertical: spacing(1),
+    paddingLeft: spacing(1), paddingRight: spacing(1), paddingVertical: spacing(1),
     borderWidth: StyleSheet.hairlineWidth,
     overflow: 'hidden',
   },
-  haloWrap: { position: 'absolute', top: -1, left: -1, right: -1, bottom: -1, borderRadius: radii.composer + 1, borderWidth: 1.5, borderCurve: 'continuous' },
   inputRow: { flexDirection: 'row', alignItems: 'flex-end' },
   hit: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
-  round: { width: 28, height: 28, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
+  round: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
   stop: { width: 11, height: 11, borderRadius: 3 },
   input: { flex: 1, maxHeight: 132, paddingTop: Platform.OS === 'ios' ? 12 : 8, paddingBottom: Platform.OS === 'ios' ? 12 : 8, paddingHorizontal: spacing(1) },
   chipRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingLeft: spacing(1), paddingRight: spacing(1), paddingBottom: spacing(1.5) },
   composerChip: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(1),
-    minHeight: 32, paddingHorizontal: spacing(2),
-    borderRadius: radii.control, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth,
+    minHeight: 30, paddingHorizontal: spacing(2.5),
+    borderRadius: radii.chip, borderCurve: 'continuous',
   },
 });

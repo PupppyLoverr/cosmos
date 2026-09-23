@@ -407,8 +407,8 @@ export const MessageView = React.memo(function MessageView({ entry, onAnswer, gr
         })}
         {streaming && !hasText ? (
           <View style={styles.working} accessibilityLabel="Working">
-            <Typing color={t.link} />
-            <Text style={[type.footnote, { color: t.link, fontWeight: '500' }]}>Working</Text>
+            <Typing color={t.textTertiary} />
+            <Text style={[type.footnote, { color: t.textSecondary, fontWeight: '500' }]}>Working</Text>
           </View>
         ) : null}
       </View>
@@ -422,8 +422,8 @@ const styles = StyleSheet.create({
   grouped: { marginTop: -spacing(2) },
   userEntry: { alignItems: 'flex-end', gap: spacing(1.5) },
   userBubble: {
-    maxWidth: '80%', borderRadius: radii.bubble, borderCurve: 'continuous',
-    paddingHorizontal: spacing(4), paddingVertical: 10,
+    maxWidth: '82%', borderRadius: radii.bubble, borderCurve: 'continuous',
+    paddingHorizontal: spacing(3.5), paddingVertical: spacing(2.5),
   },
   attachments: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'flex-end', gap: spacing(1.5), maxWidth: '80%' },
   attachment: {

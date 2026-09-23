@@ -138,8 +138,10 @@ const s = (
 export const families: ThemeFamily[] = [
   {
     id: 'cosmos', name: 'Cosmos',
-    dark: s('#060606', '#0d0d0d', '#343438', '#0e0e0e', '#e8e8ea', '#a9a9ae', '#85858a', '#8b7cf6', '#f87171', '#facc15', '#34d399', true),
-    light: s('#ffffff', '#f3f3f5', '#ededf0', '#ffffff', '#303035', '#62626a', '#797981', '#5b43e8', '#dc2626', '#a16207', '#15803d', true),
+    // Near-black / paper — the same two values as the app.json splash. Ink
+    // text, one quiet link-blue accent; everything else is tonal.
+    dark: s('#0B0B0C', '#111113', '#2A2A2E', '#161618', '#EDEDEF', '#A1A1A8', '#6E6E76', '#5E9EFF', '#FF6B6B', '#E8B04B', '#3DD68C', true),
+    light: s('#F5F5F7', '#ECECEF', '#E4E4E8', '#FFFFFF', '#1C1C1E', '#6B6B72', '#8E8E94', '#0A66D9', '#D92D20', '#B25E09', '#16873D', true),
   },
   {
     id: 'vscode', name: 'Dark+ / Light+',
@@ -216,7 +218,7 @@ export const familyById = (id: string): ThemeFamily => families.find((f) => f.id
 // Accent families — the desktop's OKLCH pairs pre-resolved to sRGB.
 // [primary, strong] per appearance; `strong` carries `onAccent` text.
 const ACCENTS: Record<Exclude<AccentId, 'theme' | 'mono'>, { label: string; dark: [string, string]; light: [string, string] }> = {
-  cosmos: { label: 'Cosmos', dark: ['#7c86ff', '#615fff'], light: ['#4f39f6', '#4f39f6'] },
+  cosmos: { label: 'Stone', dark: ['#C8BCA8', '#8A7E6B'], light: ['#6E6353', '#6E6353'] },
   orange: { label: 'Orange', dark: ['#ff8918', '#bc4200'], light: ['#ae3400', '#ae3400'] },
   amber: { label: 'Amber', dark: ['#f1b200', '#8e5f00'], light: ['#825300', '#825300'] },
   green: { label: 'Green', dark: ['#4bcb71', '#00792f'], light: ['#006c28', '#006c28'] },
@@ -355,10 +357,10 @@ export function resolveTheme(prefs: ThemePrefs, systemScheme: Scheme, reduceTran
     warning: base.warning,
     success: base.success,
     composerBg: translucent ? alpha(surface, dark ? 0.55 : 0.7) : surface,
-    // Desktop `user_bubble_bg`: a soft wash, not an accent slab.
-    // Dark wash(0.08) white, light wash(0.04) black. Text stays `theme.text`.
-    userBubble: alpha(dark ? '#ffffff' : '#000000', dark ? 0.08 : 0.04),
-    userBubbleText: base.text,
+    // User turns read as inverse ink (Codex-style): ink slab on paper in
+    // light, a raised grey slab in dark so it doesn't glare.
+    userBubble: dark ? mix(base.background, base.text, 0.16) : base.text,
+    userBubbleText: dark ? base.text : base.background,
     codeBg: mix(surface, base.text, dark ? 0.06 : 0.05),
     glassFallback: alpha(surface, dark ? 0.72 : 0.78),
     glassStroke: alpha(dark ? '#ffffff' : '#000000', dark ? 0.12 : 0.06),
@@ -472,53 +474,55 @@ export const liquidGlassSupported = liquidAvailable;
 
 export const spacing = (n: number) => n * 4;
 
-// Desktop layout numbers from crates/ui/src/theme.rs and composer.rs.
-// sm/control = CONTROL_RADIUS 6, panel/md = PANEL_RADIUS 10, row = sidebar
-// session radius 8, bubble = BUBBLE_RADIUS 16, composer = COMPOSER_RADIUS 26.
+// One radius ramp: 8 on chips/controls, 10–14 on cards and sheets, 20–22
+// only on the primary CTA. `pill` survives for dots and the send circle.
 export const radii = {
-  control: 6,
-  sm: 6,
-  row: 8,
-  panel: 10,
-  md: 10,
-  lg: 12,
+  control: 8,
+  sm: 8,
+  chip: 8,
+  row: 12,
+  panel: 12,
+  md: 12,
+  lg: 14,
   xl: 14,
-  bubble: 16,
-  xxl: 18,
-  composer: 26,
+  bubble: 14,
+  xxl: 14,
+  composer: 14,
+  cta: 22,
   pill: 999,
 };
 
 /** Screen edge inset — one value, used everywhere content meets the screen edge. */
 export const edge = spacing(4);
 
-// Apple text ramp (SF defaults); colors are applied at the call site from the theme.
+// One family (SF Pro / Roboto). Titles 28–34 semibold, body 16, meta 13.
 export const type = {
-  largeTitle: { fontSize: 34, fontWeight: '700', letterSpacing: 0.2, lineHeight: 41 },
-  title: { fontSize: 28, fontWeight: '700', lineHeight: 34 },
-  title2: { fontSize: 22, fontWeight: '700', lineHeight: 28 },
+  largeTitle: { fontSize: 34, fontWeight: '600', letterSpacing: 0.2, lineHeight: 41 },
+  title: { fontSize: 28, fontWeight: '600', lineHeight: 34 },
+  title2: { fontSize: 22, fontWeight: '600', lineHeight: 28 },
   title3: { fontSize: 20, fontWeight: '600', lineHeight: 25 },
   headline: { fontSize: 17, fontWeight: '600', lineHeight: 22 },
-  body: { fontSize: 17, fontWeight: '400', lineHeight: 22 },
+  body: { fontSize: 16, fontWeight: '400', lineHeight: 22 },
   callout: { fontSize: 16, fontWeight: '400', lineHeight: 21 },
   subhead: { fontSize: 15, fontWeight: '400', lineHeight: 20 },
   footnote: { fontSize: 13, fontWeight: '400', lineHeight: 18 },
   caption: { fontSize: 12, fontWeight: '400', lineHeight: 16 },
   caption2: { fontSize: 11, fontWeight: '500', lineHeight: 13, letterSpacing: 0.3 },
-  /** Desktop sidebar metadata (`ui_rems(11)`, line-height 14). */
-  meta: { fontSize: 11, fontWeight: '400', lineHeight: 14 },
-  /** Desktop session title (`ui_rems(13)`, line-height 17). */
-  sessionTitle: { fontSize: 13, fontWeight: '500', lineHeight: 17 },
-  /** Desktop composer `INPUT_TEXT_SIZE` (14). */
-  composer: { fontSize: 14, fontWeight: '400', lineHeight: 20 },
-  /** Desktop transcript (`MD_TEXT_SIZE` 14, user line-height 22). Scales with Dynamic Type. */
-  transcript: { fontSize: 14, fontWeight: '400', lineHeight: 22 },
+  /** Secondary metadata under a title: harness · desktop · time. */
+  meta: { fontSize: 13, fontWeight: '400', lineHeight: 18 },
+  /** Session card title. */
+  sessionTitle: { fontSize: 16, fontWeight: '600', lineHeight: 21 },
+  composer: { fontSize: 16, fontWeight: '400', lineHeight: 22 },
+  /** Transcript body. Scales with Dynamic Type. */
+  transcript: { fontSize: 16, fontWeight: '400', lineHeight: 23 },
   mono: { fontSize: 13, fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }), lineHeight: 18 },
 } as const satisfies Record<string, TextStyle>;
 
 export const shadows = {
   card: '0 1px 2px rgba(0,0,0,0.06)',
   raised: '0 6px 18px rgba(0,0,0,0.12)',
+  /** Focused composer: the card lifts off the page by ~8pt of shadow. */
+  lift: '0 8px 24px rgba(0,0,0,0.14)',
   overlay: '0 10px 30px rgba(0,0,0,0.22)',
 } as const;
 
@@ -533,6 +537,8 @@ export const motion = {
   fadeQuick: 150,
   collapse: 180,
   resort: 260,
+  /** Tab / push shared-axis transition. */
+  axis: 240,
   /** WorkingIndicator `gradient-spin-pulse` period. */
   workingPulse: 750,
 } as const;

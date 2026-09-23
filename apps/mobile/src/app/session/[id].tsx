@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useLocalSearchParams, router, Stack } from 'expo-router';
-import * as Haptics from 'expo-haptics';
 import { useHeaderHeight } from 'expo-router/react-navigation';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../../lib/client';
 import { SessionMessageEntry, TranscriptUpdate, isComputerCall, type Chat } from '../../lib/protocol';
@@ -12,7 +11,7 @@ import { useFlavourWord } from '../../lib/motion';
 import { radii, spacing, type, useTheme, type Theme } from '../../lib/theme';
 import { MessageView } from '../../components/transcript';
 import { Composer, ComposerChip } from '../../components/composer';
-import { Button, EmptyState, Icon, IconButton, Notice, Pulse, SuggestionCard } from '../../components/bits';
+import { Button, EmptyState, Icon, IconButton, Notice, Pulse } from '../../components/bits';
 import { HarnessMark, harnessLabel } from '../../components/harness-mark';
 import { Glass, Screen } from '../../components/surface';
 import { SessionBanner } from '../../components/session-banner';
@@ -31,7 +30,10 @@ function HeaderTitle({ title, chat, status, desktop, t, chatId }: { title: strin
     : (parts.join(' · ') || 'Cosmos');
   return (
     <View style={styles.headerTitle} accessibilityRole="header" accessibilityLabel={`${title}, ${sub}`}>
-      <Text style={[type.headline, { color: t.text }]} numberOfLines={1}>{title}</Text>
+      <View style={styles.headerMain}>
+        <HarnessMark harness={chat?.config?.harness} size={16} plain />
+        <Text style={[type.headline, { color: t.text, flexShrink: 1 }]} numberOfLines={1}>{title}</Text>
+      </View>
       <View style={styles.headerSub}>
         {live ? <Pulse color={status === 'working' ? t.link : t.warning} /> : null}
         <Text style={[type.caption, { color: live ? (status === 'working' ? t.link : t.warning) : t.textTertiary }]} numberOfLines={1}>
@@ -51,7 +53,6 @@ export default function SessionScreen() {
   const chats = useSnapshot(client.chats);
   const spaces = useSnapshot(client.spaces);
   const connection = useSnapshot(client.connection);
-  const computer = useSnapshot(client.computer);
   const headerHeight = useHeaderHeight();
 
   const [entries, setEntries] = useState<SessionMessageEntry[]>([]);
@@ -167,6 +168,8 @@ export default function SessionScreen() {
 
   const stop = () => void client.interrupt(chatId);
   const watch = () => router.push({ pathname: '/watch/[chatId]', params: { chatId } });
+  // Watch live is offered whenever a desktop is connected, not only mid-run.
+  const canWatch = connection.status === 'connected';
 
   const pickFrom = (heading: string, options: { label: string; onPress: () => void; destructive?: boolean }[]) => {
     Alert.alert(heading, undefined, [
@@ -217,7 +220,7 @@ export default function SessionScreen() {
           onPress: () => void client.setChatConfig(chatId, { ...base, sandbox: s }),
         }))),
       },
-      ...(cuActive || computer ? [{ label: 'Watch Live', onPress: watch }] : []),
+      ...(canWatch ? [{ label: 'Watch live', onPress: watch }] : []),
       {
         label: chat.archived ? 'Unarchive' : 'Archive',
         destructive: !chat.archived,
@@ -228,9 +231,7 @@ export default function SessionScreen() {
 
   const desktopName = connection.status === 'connected' && connection.desktop ? desktopDisplayName(connection.desktop) : undefined;
   const base = baseConfig();
-  const emptyBody = connection.status === 'connected'
-    ? 'Ask for anything — code, files, or a Computer Use task on your desktop.'
-    : 'Waiting for the desktop connection…';
+  const emptyTitle = connection.status === 'connected' ? 'What should we do on the desktop?' : 'Waiting for the desktop…';
 
   return (
     <Screen>
@@ -240,7 +241,7 @@ export default function SessionScreen() {
           ...(Platform.OS !== 'ios' ? {
             headerRight: () => (
               <View style={styles.headerRight}>
-                {cuActive || computer ? (
+                {canWatch ? (
                   <IconButton icon="display" label="Watch live" size={32} onPress={watch} tint={cuActive ? t.link : t.textSecondary} filled={false} />
                 ) : null}
                 <IconButton icon="ellipsis.circle" label="Session options" size={32} onPress={sessionMenu} tint={t.textSecondary} filled={false} />
@@ -251,7 +252,7 @@ export default function SessionScreen() {
       />
       {Platform.OS === 'ios' && chat ? (
         <Stack.Toolbar placement="right">
-          {cuActive || computer ? <Stack.Toolbar.Button icon="display" accessibilityLabel="Watch live" onPress={watch} /> : null}
+          {canWatch ? <Stack.Toolbar.Button icon="display" accessibilityLabel="Watch live" onPress={watch} /> : null}
           <Stack.Toolbar.Menu icon="ellipsis.circle" accessibilityLabel="Session options">
             <Stack.Toolbar.MenuAction icon="cpu" onPress={() => void openModel()}>
               {`Model${base.model ? ` · ${base.model}` : ''}`}
@@ -278,8 +279,8 @@ export default function SessionScreen() {
                 </Stack.Toolbar.MenuAction>
               ))}
             </Stack.Toolbar.Menu>
-            {cuActive || computer ? (
-              <Stack.Toolbar.MenuAction icon="display" onPress={watch}>Watch Live</Stack.Toolbar.MenuAction>
+            {canWatch ? (
+              <Stack.Toolbar.MenuAction icon="display" onPress={watch}>Watch live</Stack.Toolbar.MenuAction>
             ) : null}
             <Stack.Toolbar.MenuAction
               icon={chat.archived ? 'tray.and.arrow.up' : 'archivebox'}
@@ -305,29 +306,15 @@ export default function SessionScreen() {
         ) : connection.status !== 'connected' && entries.length === 0 ? (
           <View style={[styles.fill, styles.center]}>
             <EmptyState
-              icon="laptopcomputer"
-              title={connection.status === 'connecting' || connection.status === 'reconnecting' ? 'Connecting to desktop' : 'Session disconnected'}
-              body={connection.detail ?? 'Link the desktop again to load this session.'}
-            >
-              <Button title="Desktops" size="md" variant="tinted" style={{ marginTop: spacing(4) }} onPress={() => router.push('/(tabs)/(desktops)' as never)} />
-            </EmptyState>
+              title={connection.status === 'connecting' || connection.status === 'reconnecting' ? 'Connecting to the desktop…' : 'Desktop offline'}
+              body={connection.detail}
+              actionLabel="Desktops"
+              onAction={() => router.push('/(tabs)/(desktops)' as never)}
+            />
           </View>
         ) : entries.length === 0 ? (
           <View style={[styles.fill, styles.center]}>
-            <View style={styles.emptyMark}>
-              <HarnessMark harness={chat?.config?.harness} size={64} />
-            </View>
-            <EmptyState icon="bubble.left.fill" title={harnessLabel(chat?.config?.harness) ?? 'Cosmos'} body={emptyBody} />
-            <View style={styles.firstPrompts}>
-              {['Summarise what changed in this repo today', 'Open Finder and tidy my Downloads', 'Find and fix the failing test'].map((p) => (
-                <SuggestionCard
-                  key={p}
-                  onPress={() => { void Haptics.selectionAsync(); void send(p); }}
-                  icon="sparkles"
-                  title={p}
-                />
-              ))}
-            </View>
+            <EmptyState title={emptyTitle} />
           </View>
         ) : (
           <View style={styles.fill}>
@@ -359,7 +346,7 @@ export default function SessionScreen() {
             />
             {!atBottom ? (
               <View style={styles.jumpWrap} pointerEvents="box-none">
-                <Glass radius={radii.pill} thin interactive>
+                <Glass radius={radii.md} thin interactive>
                   <Pressable onPress={scrollToEnd} style={styles.jump} accessibilityRole="button" accessibilityLabel={newEntryCount ? `Jump to latest, ${newEntryCount} new` : 'Jump to latest'}>
                     <Icon name="arrow.down" size={13} color={t.text} weight="semibold" />
                     <Text style={[type.footnote, { color: t.text, fontWeight: '600' }]}>{newEntryCount ? `${newEntryCount} new` : 'Latest'}</Text>
@@ -428,12 +415,11 @@ export default function SessionScreen() {
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   center: { alignItems: 'center', justifyContent: 'center', padding: spacing(6) },
-  emptyMark: { marginBottom: -spacing(2) },
-  headerTitle: { alignItems: Platform.OS === 'ios' ? 'center' : 'flex-start', maxWidth: 220 },
+  headerTitle: { alignItems: Platform.OS === 'ios' ? 'center' : 'flex-start', maxWidth: 240 },
+  headerMain: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
   headerSub: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), marginTop: 1 },
   headerRight: { flexDirection: 'row', alignItems: 'center', gap: spacing(1) },
   jumpWrap: { position: 'absolute', bottom: spacing(3), left: 0, right: 0, alignItems: 'center' },
   jump: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), paddingHorizontal: spacing(3.5), minHeight: 44 },
   bannerWrap: { paddingHorizontal: spacing(3), paddingTop: spacing(2) },
-  firstPrompts: { alignSelf: 'stretch', gap: spacing(2), marginTop: spacing(5), paddingHorizontal: spacing(4) },
 });

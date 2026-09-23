@@ -2,8 +2,11 @@
 // and reinstall re-shows it, but a settings change does not.
 
 import * as SecureStore from 'expo-secure-store';
+import { loadSession } from './auth';
 
 const KEY = 'cosmos.onboarding.seen';
+/** Mirrors `DESKTOPS_KEY` in client.tsx (read-only here). */
+const DESKTOPS_KEY = 'cosmos.desktops';
 
 let cached: boolean | null = null;
 
@@ -23,6 +26,29 @@ export async function hasSeenOnboarding(): Promise<boolean> {
     cached = false;
   }
   return cached;
+}
+
+/**
+ * First launch shows the four-beat welcome — unless this phone is already
+ * set up (signed in with a desktop linked), which marks it seen silently.
+ * Reads the same persisted records `CosmosClient.hydrate` restores.
+ */
+export async function shouldShowOnboarding(): Promise<boolean> {
+  if (await hasSeenOnboarding()) return false;
+  const [session, desktopsRaw] = await Promise.all([
+    loadSession().catch(() => null),
+    SecureStore.getItemAsync(DESKTOPS_KEY).catch(() => null),
+  ]);
+  let linked = false;
+  try {
+    const list: unknown = JSON.parse(desktopsRaw ?? '[]');
+    linked = Array.isArray(list) && list.length > 0;
+  } catch { /* ignore */ }
+  if (session && linked) {
+    await markOnboardingSeen();
+    return false;
+  }
+  return true;
 }
 
 export async function markOnboardingSeen(): Promise<void> {

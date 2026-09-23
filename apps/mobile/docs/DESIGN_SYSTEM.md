@@ -12,19 +12,17 @@ those values rather than redefining them in screens.
 |---|---:|---|
 | `spacing(n)` | `n * 4` | 4-point layout grid |
 | `edge` | 16 | Screen-edge content inset |
-| `radii.control` | 6 | Compact controls |
-| `radii.sm` | 6 | Small surfaces |
-| `radii.row` | 8 | Session and list rows |
-| `radii.panel` / `md` | 10 | Cards and grouped panels |
-| `radii.lg` | 12 | Larger controls |
-| `radii.xl` | 14 | Large cards |
-| `radii.bubble` | 16 | Transcript bubbles |
-| `radii.xxl` | 18 | Extra-large surfaces |
-| `radii.composer` | 26 | Composer surface |
-| `radii.pill` | 999 | Capsule controls and status pills |
+| `radii.control` / `sm` / `chip` | 8 | Chips and compact controls |
+| `radii.row` | 12 | Session cards and list rows |
+| `radii.panel` / `md` | 12 | Grouped panels, secondary buttons |
+| `radii.lg` / `xl` / `xxl` | 14 | Cards |
+| `radii.bubble` | 14 | Transcript bubbles |
+| `radii.composer` | 14 | Composer card and the docked composer |
+| `radii.cta` | 22 | The primary (ink) CTA only, and sheet corners |
+| `radii.pill` | 999 | Dots and the 36pt send circle only |
 
-`spacing`, `edge`, and `radii` are exported from `src/lib/theme.ts:473-493`.
-Use `gap`, padding, and these radii for repeated layout values.
+Rule of thumb: 8 on chips, 10–14 on cards, 20–22 only on the primary CTA.
+No squircle-everything. `spacing`, `edge`, and `radii` live in `src/lib/theme.ts`.
 
 ### Typography
 
@@ -33,27 +31,33 @@ from the resolved theme at the component call site.
 
 | Token | Size / line height | Primary use |
 |---|---|---|
-| `largeTitle` | 34 / 41 | Native large navigation titles |
-| `title` | 28 / 34 | Screen-level title |
-| `title2` | 22 / 28 | Secondary title |
-| `title3` | 20 / 25 | Empty-state title |
-| `headline` | 17 / 22 | Emphasized button text |
-| `body` | 17 / 22 | Main row and form text |
+| `largeTitle` | 34 / 41, semibold | Native large navigation titles |
+| `title` | 28 / 34, semibold | Screen-level title (onboarding beats) |
+| `title2` | 22 / 28 | Sheet title |
+| `title3` | 20 / 25 | Section hero |
+| `headline` | 17 / 22 | Emphasized button text, empty-state line |
+| `body` | 16 / 22 | Main row and form text |
 | `callout` | 16 / 21 | Supporting prominent text |
 | `subhead` | 15 / 20 | Supporting row text |
-| `footnote` | 13 / 18 | Secondary metadata |
-| `caption` | 12 / 16 | Compact supporting text |
+| `footnote` | 13 / 18 | Secondary text |
+| `caption` | 12 / 16 | Status chips |
 | `caption2` | 11 / 13 | Small labels |
-| `meta` | 11 / 14 | Session-list metadata |
-| `sessionTitle` | 13 / 17 | Session-list title |
-| `composer` | 14 / 20 | Composer input |
-| `transcript` | 14 / 22 | Markdown transcript |
+| `meta` | 13 / 18 | harness · desktop · time under a title |
+| `sessionTitle` | 16 / 21, semibold | Session / desktop card title |
+| `composer` | 16 / 22 | Composer input |
+| `transcript` | 16 / 23 | Markdown transcript |
 | `mono` | 13 / 18 | Menlo on iOS, monospace elsewhere |
 
-The ramp is defined at `src/lib/theme.ts:495-517`. Text remains scalable by
-default; rows must allow content to wrap at larger Dynamic Type sizes.
+One family (SF Pro / Roboto). The only display type is the "Cosmos" wordmark
+on the onboarding splash. Text remains scalable by default; rows must allow
+content to wrap at larger Dynamic Type sizes.
 
 ### Color, status, and accents
+
+The default Cosmos family is paper `#F5F5F7` / near-black `#0B0B0C` (the
+splash values in `app.json`) with ink text and one quiet link-blue accent
+(`#0A66D9` light, `#5E9EFF` dark). Primary buttons are ink, not accent. User
+turns are an inverse ink bubble. No purple, no gradient mesh.
 
 `resolveTheme` produces semantic colors for light/dark schemes, surface
 materials, backdrops, wallpaper, and transparency preferences
@@ -135,10 +139,15 @@ already explains the state (`src/components/bits.tsx:56-62`).
 such as Working, Input, Failed, Running, and Done. It supports `sm` and `md`
 sizes and gates its pulse through Reduce Motion (`src/components/bits.tsx`).
 
-`ConnectionBanner` combines the linked-desktop pill with the connection
-warning notice. Use one instance for the global connection state; it consumes
-only `ConnectionInfo` and optionally navigates when pressed
-(`src/components/bits.tsx`).
+`StatusChip` is the trailing state on a session card: Live / Waiting / Done /
+Error on a 6pt-radius tint. Idle sessions draw no chip — the time is in the
+meta line.
+
+`DesktopChip` is the Codex-style host chip (name + presence dot) shown at the
+top of Sessions. Tapping it opens Desktops.
+
+`PromptRow` is a suggested prompt as a plain text row. Suggestions are never
+cards, never starred, and only name things Cosmos actually does.
 
 `SkeletonRows` renders the standard loading placeholders for list screens
 (`src/components/bits.tsx`).
@@ -150,11 +159,10 @@ content can remain in the current flow. Non-info notices expose the `alert`
 accessibility role; info notices expose a combined label
 (`src/components/bits.tsx:394-409`).
 
-`EmptyState` is for a screen or list with no content. Its title is a header and
-it may provide one primary action (`src/components/bits.tsx:355-372`).
+`EmptyState` is for a screen or list with no content: one line and at most
+one action. No glyph tiles, illustrations, or sparkles.
 
-Do not use `EmptyState` for transient connection warnings; use
-`ConnectionBanner` or `Notice`.
+Do not use `EmptyState` for transient connection warnings; use `Notice`.
 
 ## Accessibility
 

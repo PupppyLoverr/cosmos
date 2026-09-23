@@ -8,10 +8,9 @@ import * as Haptics from 'expo-haptics';
 import { Theme, alpha, edge, motion, radii, shadows, spacing, statusColor, type, useTheme } from '../lib/theme';
 import { useReduceMotion } from '../lib/motion';
 import { HIT_SLOP_44, useLargeText } from '../lib/a11y';
-import { desktopDisplayName, type ConnectionInfo } from '../lib/client';
 import { icons, solarFor } from '../lib/icons';
 import { SOLAR_ICONS } from '../lib/solar-icons';
-import { Glass } from './surface';
+import { Card, Glass } from './surface';
 
 // ---------------------------------------------------------------------------
 // Icons — the Solar Linear set the desktop embeds (1.5px strokes, 24px
@@ -88,8 +87,9 @@ export function Pulse({ color }: { color: string }) {
 // ---------------------------------------------------------------------------
 // Buttons
 
+// Primary is ink — one solid CTA per screen, never the accent.
 const buttonVariants = (t: Theme) => ({
-  primary: { bg: t.accentStrong, fg: t.accentContrast },
+  primary: { bg: t.text, fg: t.background },
   tinted: { bg: t.accentMuted, fg: t.link },
   secondary: { bg: t.fill, fg: t.text },
   ghost: { bg: 'transparent', fg: t.link },
@@ -188,31 +188,18 @@ export function Chip({ label, icon, onPress, selected }: { label: string; icon?:
   );
 }
 
-export function SuggestionCard({ icon, title, subtitle, onPress }: {
-  icon: string;
-  title: string;
-  subtitle?: string;
-  onPress: () => void;
-}) {
+/** A suggested prompt: a plain text row, not a card with a sparkle. */
+export function PromptRow({ title, onPress }: { title: string; onPress: () => void }) {
   const t = useTheme();
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={subtitle ? `${title}. ${subtitle}` : title}
-      onPress={onPress}
-      style={({ pressed }) => [
-        styles.suggestionCard,
-        { backgroundColor: pressed ? t.fill : t.surface, borderColor: t.separator, opacity: pressed ? 0.7 : 1 },
-      ]}
+      accessibilityLabel={title}
+      onPress={() => { void Haptics.selectionAsync(); onPress(); }}
+      style={({ pressed }) => [styles.promptRow, { opacity: pressed ? 0.55 : 1 }]}
     >
-      <View style={[styles.suggestionIcon, { backgroundColor: t.accentMuted }]}>
-        <Icon name={icon} size={16} color={t.link} />
-      </View>
-      <View style={styles.suggestionText}>
-        <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]} numberOfLines={1}>{title}</Text>
-        {subtitle ? <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>{subtitle}</Text> : null}
-      </View>
-      <Icon name="arrow.up.right" size={12} color={t.textTertiary} />
+      <Icon name="arrow.turn.down.right" size={14} color={t.textTertiary} />
+      <Text style={[type.body, { color: t.textSecondary, flex: 1 }]} numberOfLines={1}>{title}</Text>
     </Pressable>
   );
 }
@@ -369,7 +356,7 @@ export function Group({ children, header, footer, insetSeparators = true, style 
   return (
     <View style={style}>
       {header ? <SectionLabel>{header}</SectionLabel> : null}
-      <Glass radius={radii.md}>
+      <Card radius={radii.md}>
         <View style={styles.groupClip}>
           {items.map((child, i) => (
             <React.Fragment key={i}>
@@ -378,14 +365,14 @@ export function Group({ children, header, footer, insetSeparators = true, style 
             </React.Fragment>
           ))}
         </View>
-      </Glass>
+      </Card>
       {footer ? <Caption style={styles.footer}>{footer}</Caption> : null}
     </View>
   );
 }
 
 export function SectionLabel({ children }: { children: string }) {
-  return <Caption style={styles.section}>{children.toUpperCase()}</Caption>;
+  return <Caption style={styles.section}>{children}</Caption>;
 }
 
 /** Secondary text that stays legible over a photo wallpaper (primary colour + soft shadow). */
@@ -409,19 +396,17 @@ export function Caption({ children, style }: { children: React.ReactNode; style?
 // ---------------------------------------------------------------------------
 // States
 
-export function EmptyState({ icon, title, body, actionLabel, onAction, children }: {
-  icon: string; title: string; body?: string; actionLabel?: string; onAction?: () => void; children?: React.ReactNode;
+/** Empty state: one line, an optional quiet sentence, one action. No art. */
+export function EmptyState({ title, body, actionLabel, onAction, children }: {
+  title: string; body?: string; actionLabel?: string; onAction?: () => void; children?: React.ReactNode;
 }) {
   const t = useTheme();
   return (
     <View style={styles.empty}>
-      <View style={[styles.emptyGlyph, { backgroundColor: t.fill, borderColor: t.separator }]}>
-        <Icon name={icon} size={30} color={t.textSecondary} weight="regular" />
-      </View>
-      <Text accessibilityRole="header" style={[type.title3, { color: t.text, marginTop: spacing(4), textAlign: 'center' }]}>{title}</Text>
-      {body ? <Text style={[type.subhead, { color: t.textSecondary, textAlign: 'center', marginTop: spacing(1) }]}>{body}</Text> : null}
+      <Text accessibilityRole="header" style={[type.headline, { color: t.text, textAlign: 'center' }]}>{title}</Text>
+      {body ? <Text style={[type.footnote, { color: t.textSecondary, textAlign: 'center', marginTop: spacing(1), maxWidth: 300 }]}>{body}</Text> : null}
       {actionLabel && onAction ? (
-        <Button title={actionLabel} onPress={onAction} size="md" variant="tinted" style={{ marginTop: spacing(4), alignSelf: 'center', paddingHorizontal: spacing(5) }} />
+        <Button title={actionLabel} onPress={onAction} size="md" style={{ marginTop: spacing(4), alignSelf: 'center' }} />
       ) : null}
       {children}
     </View>
@@ -495,30 +480,44 @@ export function StatusPill({ status, label, pulse, size = 'sm' }: {
   );
 }
 
-export function ConnectionBanner({ connection, onPress }: { connection: ConnectionInfo; onPress?: () => void }) {
+export type SessionState = 'working' | 'awaitingInput' | 'errored' | 'completed' | 'idle';
+
+const STATE_LABEL: Record<Exclude<SessionState, 'idle'>, string> = {
+  working: 'Live', awaitingInput: 'Waiting', errored: 'Error', completed: 'Done',
+};
+
+/** Trailing status chip on a session: Live / Waiting / Done / Error. Idle draws nothing. */
+export function StatusChip({ state }: { state: SessionState }) {
   const t = useTheme();
-  const connected = connection.status === 'connected';
-  const connecting = connection.status === 'connecting' || connection.status === 'reconnecting';
+  if (state === 'idle') return null;
+  const color = state === 'completed' ? t.textSecondary : statusColor(t, state);
   return (
-    <View style={styles.connectionBanner}>
-      <Pressable
-        onPress={onPress}
-        disabled={!onPress}
-        accessibilityRole={onPress ? 'button' : undefined}
-        accessibilityLabel={connection.desktop ? `${connection.desktop.name}, ${connection.status}` : 'No desktop linked'}
-        style={({ pressed }) => [styles.desktopPill, { backgroundColor: alpha(t.fill, pressed ? 1 : 0.7) }]}
-      >
-        <StatusDot status={connected ? 'connected' : connecting ? 'working' : 'errored'} size={7} pulse={connecting} />
-        <Text style={[type.footnote, { color: t.textSecondary, fontWeight: '500', flex: 1 }]} numberOfLines={1}>
-          {connection.desktop ? desktopDisplayName(connection.desktop) : 'No desktop linked'}
-          {connection.desktop ? ` · ${connected ? 'Connected' : connecting ? 'Connecting…' : 'Offline'}` : ''}
-        </Text>
-        {onPress ? <Icon name="chevron.right" size={10} color={t.textTertiary} weight="semibold" /> : null}
-      </Pressable>
-      {!connected && connection.detail ? (
-        <Notice kind="warning" title={connecting ? 'Connecting to desktop' : "Can't reach the desktop"} body={connection.detail} />
-      ) : null}
+    <View
+      accessibilityLabel={STATE_LABEL[state]}
+      style={[styles.statusChip, { backgroundColor: state === 'completed' ? t.fill : alpha(color, 0.14) }]}
+    >
+      {state === 'working' ? <StatusDot status="working" size={6} pulse /> : null}
+      <Text maxFontSizeMultiplier={1.6} style={[type.caption, { color, fontWeight: '600' }]}>{STATE_LABEL[state]}</Text>
     </View>
+  );
+}
+
+/** Host chip (Codex-style): desktop name + presence dot. */
+export function DesktopChip({ name, state, onPress }: { name: string; state: 'online' | 'connecting' | 'offline'; onPress?: () => void }) {
+  const t = useTheme();
+  const status = state === 'online' ? 'connected' : state === 'connecting' ? 'awaitingInput' : undefined;
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={!onPress}
+      hitSlop={{ top: 6, bottom: 6 }}
+      accessibilityRole={onPress ? 'button' : undefined}
+      accessibilityLabel={`${name}, ${state}`}
+      style={({ pressed }) => [styles.desktopChip, { backgroundColor: t.fill, opacity: pressed ? 0.6 : 1 }]}
+    >
+      <StatusDot status={status} size={7} pulse={state === 'connecting'} />
+      <Text style={[type.footnote, { color: t.text, fontWeight: '500' }]} numberOfLines={1}>{name}</Text>
+    </Pressable>
   );
 }
 
@@ -538,24 +537,18 @@ export function SkeletonRows({ count = 5 }: { count?: number }) {
 }
 
 const styles = StyleSheet.create({
-  button: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing(2), borderRadius: radii.pill },
-  buttonLg: { minHeight: 50, paddingHorizontal: spacing(6) },
-  buttonMd: { minHeight: 44, paddingHorizontal: spacing(4) },
-  buttonSm: { minHeight: 30, paddingHorizontal: spacing(3) },
+  button: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing(2), borderCurve: 'continuous' },
+  buttonLg: { minHeight: 50, paddingHorizontal: spacing(6), borderRadius: radii.cta },
+  buttonMd: { minHeight: 44, paddingHorizontal: spacing(4), borderRadius: radii.md },
+  buttonSm: { minHeight: 30, paddingHorizontal: spacing(3), borderRadius: radii.control },
   pulse: { width: 10, height: 10, alignItems: 'center', justifyContent: 'center' },
   pulseHalo: { position: 'absolute', width: 8, height: 8, borderRadius: 4 },
   pulseDot: { width: 7, height: 7, borderRadius: 3.5 },
   chip: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(1.5),
-    paddingHorizontal: spacing(3.5), minHeight: 36, borderRadius: radii.pill,
+    paddingHorizontal: spacing(3), minHeight: 32, borderRadius: radii.chip, borderCurve: 'continuous',
   },
-  suggestionCard: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing(3),
-    paddingHorizontal: spacing(3.5), minHeight: 44,
-    borderRadius: radii.row, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth,
-  },
-  suggestionIcon: { width: 30, height: 30, borderRadius: radii.control, alignItems: 'center', justifyContent: 'center' },
-  suggestionText: { flex: 1, minWidth: 0 },
+  promptRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(2.5), minHeight: 44 },
   segmented: { flexDirection: 'row', padding: 2, borderRadius: radii.sm + 1, borderCurve: 'continuous' },
   segment: { flex: 1, flexDirection: 'row', gap: spacing(1), alignItems: 'center', justifyContent: 'center', minHeight: 44, paddingHorizontal: spacing(1), borderRadius: radii.control, borderCurve: 'continuous' },
   sliderHost: { height: 34, width: '100%' },
@@ -573,18 +566,17 @@ const styles = StyleSheet.create({
   groupClip: { borderRadius: radii.md, overflow: 'hidden' },
   groupSep: { height: StyleSheet.hairlineWidth, marginLeft: edge },
   groupSepInset: { marginLeft: edge + 29 + spacing(3) },
-  section: { fontWeight: '500', marginBottom: spacing(1.75), marginTop: spacing(5), marginLeft: edge, letterSpacing: 0.2 },
+  section: { fontWeight: '500', marginBottom: spacing(1.5), marginTop: spacing(6), marginLeft: edge },
   footer: { marginTop: spacing(1.75), marginHorizontal: edge },
   field: { flexDirection: 'row', alignItems: 'center', gap: spacing(3), paddingHorizontal: edge, minHeight: 46 },
   fieldInput: { flex: 1, textAlign: 'right', paddingVertical: spacing(2.5) },
-  empty: { alignItems: 'center', paddingVertical: spacing(12), paddingHorizontal: spacing(8) },
-  emptyGlyph: { width: 72, height: 72, borderRadius: 22, borderCurve: 'continuous', alignItems: 'center', justifyContent: 'center', borderWidth: StyleSheet.hairlineWidth },
+  empty: { alignItems: 'center', paddingVertical: spacing(16), paddingHorizontal: spacing(8) },
   badge: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
   badgeDot: { width: 7, height: 7, borderRadius: 4 },
   notice: { flexDirection: 'row', gap: spacing(2.5), padding: spacing(3), borderRadius: radii.md, borderCurve: 'continuous', alignItems: 'flex-start', borderWidth: StyleSheet.hairlineWidth },
-  statusPill: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), paddingHorizontal: spacing(2), borderRadius: radii.pill },
-  connectionBanner: { gap: spacing(2) },
-  desktopPill: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), minHeight: 44, paddingHorizontal: spacing(3), borderRadius: radii.pill },
+  statusPill: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), paddingHorizontal: spacing(2), borderRadius: radii.chip, borderCurve: 'continuous' },
+  statusChip: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.25), minHeight: 22, paddingHorizontal: spacing(2), borderRadius: 6, borderCurve: 'continuous' },
+  desktopChip: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.75), minHeight: 32, paddingHorizontal: spacing(3), borderRadius: radii.chip, borderCurve: 'continuous' },
   skeletonList: { paddingHorizontal: edge, paddingTop: spacing(3), gap: spacing(2) },
   skeletonRow: { padding: spacing(3), borderRadius: radii.row, borderCurve: 'continuous' },
   skeletonLine: { height: 10, borderRadius: 5, borderCurve: 'continuous' },
