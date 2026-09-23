@@ -8,6 +8,7 @@ import { ThemeProvider, loadThemePrefs, motion, useTheme } from '../lib/theme';
 import { DrawerProvider } from '../components/drawer';
 import { useReduceMotion } from '../lib/motion';
 import { shouldShowOnboarding, subscribeOnboardingGate } from '../lib/onboarding-store';
+import { useLiveActivity } from '../lib/live-activity';
 
 // Restore the pinned appearance before the first frame so the launch doesn't flash.
 void loadThemePrefs();
@@ -91,11 +92,17 @@ function ThemedStack() {
   );
 }
 
+function LiveActivityBridge() {
+  useLiveActivity();
+  return null;
+}
+
 export default function RootLayout() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <ThemeProvider>
         <CosmosProvider>
+          <LiveActivityBridge />
           <ThemedStack />
         </CosmosProvider>
       </ThemeProvider>

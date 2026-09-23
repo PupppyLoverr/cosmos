@@ -42,6 +42,7 @@
         }
       ],
       "expo-secure-store",
+      "expo-live-activity",
       "./plugins/with-scene-lifecycle.js",
       "expo-notifications",
       [
