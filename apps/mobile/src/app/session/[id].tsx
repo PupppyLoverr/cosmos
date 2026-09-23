@@ -264,7 +264,7 @@ export default function SessionScreen() {
                 />
               )}
               contentContainerStyle={{ paddingTop: spacing(2), paddingBottom: spacing(3) }}
-              maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+              maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 160 }}
               onScroll={(e) => {
                 const nextAtBottom = e.nativeEvent.contentOffset.y < 120;
                 atBottomRef.current = nextAtBottom;
