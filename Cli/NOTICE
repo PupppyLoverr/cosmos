@@ -1,0 +1,11 @@
+Cosmos CLI family
+=================
+
+This repository vendors the following third-party data:
+
+meridian-bridge/vendor/o200k_base.tiktoken
+    BPE rank table for the o200k_base encoding, from OpenAI's tiktoken
+    project (https://github.com/openai/tiktoken), MIT License.
+    Used offline by meridian-bridge's tokenizer; never fetched at runtime.
+
+All other code in this repository was written for this project.

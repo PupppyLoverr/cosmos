@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cosmos/event.schema.json",
+  "title": "Cosmos session event (CONTRACT.md §6)",
+  "type": "object",
+  "required": ["v", "id", "parent", "ts", "session", "harness", "kind", "data"],
+  "properties": {
+    "v": {"const": 1},
+    "id": {"type": "string", "pattern": "^[0-9a-z]{26}$"},
+    "parent": {"type": ["string", "null"], "pattern": "^[0-9a-z]{26}$"},
+    "ts": {"type": "string", "format": "date-time"},
+    "session": {"type": "string", "pattern": "^[0-9a-z]{26}$"},
+    "harness": {"enum": ["zcli", "zdev", "zagy"]},
+    "kind": {
+      "enum": [
+        "session_start", "session_end", "checkout", "user", "assistant",
+        "tool_call", "tool_result", "plan", "permission_request",
+        "permission_decision", "usage", "model_switch", "cache_break",
+        "compaction", "subagent_start", "subagent_end", "handoff", "error",
+        "mode"
+      ]
+    },
+    "data": {"type": "object"}
+  },
+  "additionalProperties": false
+}

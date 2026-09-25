@@ -1,0 +1,242 @@
+//! Session store — append-only JSONL at COSMOS_CLI_HOME/sessions/<id>.jsonl
+//! (contract §6), parent-linked for branching, replayable across harnesses.
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
+use zproto::{Block, Event, Message, Role};
+
+pub struct Session {
+    pub id: String,
+    pub file: PathBuf,
+    /// id of the last event appended — parent for the next one
+    pub leaf: Option<String>,
+    pub harness: String,
+}
+
+fn sessions_dir(home: &Path) -> PathBuf {
+    home.join("sessions")
+}
+
+impl Session {
+    pub fn create(home: &Path, harness: &str) -> Result<Self> {
+        fs::create_dir_all(sessions_dir(home))?;
+        let id = zproto::new_id();
+        Ok(Session {
+            file: sessions_dir(home).join(format!("{id}.jsonl")),
+            id,
+            leaf: None,
+            harness: harness.into(),
+        })
+    }
+
+    /// Open an existing session (any harness) — leaf = last event id.
+    pub fn open(home: &Path, id: &str) -> Result<Self> {
+        let file = sessions_dir(home).join(format!("{id}.jsonl"));
+        if !file.is_file() {
+            bail!("no session {id} (expected {file})", file = file.display());
+        }
+        let events = read_events(&file)?;
+        let leaf = events.last().map(|e| e.id.clone());
+        let harness = events
+            .first()
+            .map(|e| e.harness.clone())
+            .unwrap_or_default();
+        Ok(Session {
+            id: id.into(),
+            file,
+            leaf,
+            harness,
+        })
+    }
+
+    /// Append an event; returns it.
+    pub fn append(&mut self, kind: &str, data: Value) -> Event {
+        let ev = Event::new(&self.id, &self.harness, self.leaf.clone(), kind, data);
+        let line = ev.to_line();
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file)
+        {
+            let _ = writeln!(f, "{line}");
+        }
+        self.leaf = Some(ev.id.clone());
+        ev
+    }
+
+    /// Replay the parent chain from leaf → messages for the provider.
+    pub fn replay(home: &Path, id: &str) -> Result<Vec<Message>> {
+        let events = read_events(&sessions_dir(home).join(format!("{id}.jsonl")))?;
+        Ok(events_to_messages(&chain(&events)))
+    }
+
+    /// §6 branch: append a `checkout` event whose parent is `at`, rewinding
+    /// the replay chain to that point.
+    pub fn branch(&mut self, at: &str) -> Event {
+        self.leaf = Some(at.into());
+        self.append("checkout", json!({"at": at}))
+    }
+
+    pub fn list(home: &Path) -> Vec<Value> {
+        let mut out = Vec::new();
+        let dir = sessions_dir(home);
+        let Ok(rd) = fs::read_dir(&dir) else {
+            return out;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x == "jsonl") != Some(true) {
+                continue;
+            }
+            if let Ok(events) = read_events(&p) {
+                if events.is_empty() {
+                    continue;
+                }
+                let first_user = events
+                    .iter()
+                    .find(|e| e.kind == "user")
+                    .and_then(|e| e.data["text"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                out.push(json!({
+                    "id": p.file_stem().unwrap().to_string_lossy(),
+                    "harness": events[0].harness,
+                    "started": events[0].ts,
+                    "events": events.len(),
+                    "preview": first_user.chars().take(80).collect::<String>(),
+                }));
+            }
+        }
+        out.sort_by(|a, b| a["started"].as_str().cmp(&b["started"].as_str()));
+        out
+    }
+
+    /// Export as markdown or raw jsonl.
+    pub fn export(home: &Path, id: &str, format: &str) -> Result<String> {
+        let file = sessions_dir(home).join(format!("{id}.jsonl"));
+        let text = fs::read_to_string(&file).with_context(|| format!("session {id}"))?;
+        if format == "jsonl" {
+            return Ok(text);
+        }
+        let events = read_events(&file)?;
+        let mut md = format!("# session {id}\n\n");
+        for e in &events {
+            match e.kind.as_str() {
+                "user" => md.push_str(&format!(
+                    "## user · {}\n\n{}\n\n",
+                    e.ts,
+                    e.data["text"].as_str().unwrap_or("")
+                )),
+                "assistant" => {
+                    md.push_str(&format!("## assistant · {}\n\n", e.ts));
+                    if let Some(t) = e.data["text"].as_str() {
+                        md.push_str(t);
+                        md.push('\n');
+                    }
+                    if let Some(calls) = e.data["tool_calls"].as_array() {
+                        for c in calls {
+                            md.push_str(&format!(
+                                "\n- `{}` {}\n",
+                                c["name"].as_str().unwrap_or(""),
+                                c["input"]
+                            ));
+                        }
+                    }
+                    md.push('\n');
+                }
+                "tool_result" => md.push_str(&format!(
+                    "_{}_ → `{}`\n\n",
+                    e.data["name"].as_str().unwrap_or("tool"),
+                    e.data["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                )),
+                _ => {}
+            }
+        }
+        Ok(md)
+    }
+}
+
+pub fn read_events(file: &Path) -> Result<Vec<Event>> {
+    let text = fs::read_to_string(file)?;
+    Ok(text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect())
+}
+
+/// Follow `parent` links back from the last-appended event (the leaf) —
+/// a `checkout` event rewinds the chain (contract §6).
+pub fn chain(events: &[Event]) -> Vec<Event> {
+    use std::collections::HashMap;
+    let by_id: HashMap<&str, &Event> = events.iter().map(|e| (e.id.as_str(), e)).collect();
+    let mut out = Vec::new();
+    let mut cur = events.last();
+    while let Some(e) = cur {
+        out.push(e.clone());
+        cur = e
+            .parent
+            .as_ref()
+            .and_then(|p| by_id.get(p.as_str()).copied());
+    }
+    out.reverse();
+    out
+}
+
+/// Reconstruct provider messages from the event chain (parent-linked from
+/// the leaf — a `checkout` rewinds the chain).
+pub fn events_to_messages(events: &[Event]) -> Vec<Message> {
+    let mut msgs = Vec::new();
+    for e in events {
+        match e.kind.as_str() {
+            "user" => {
+                if let Some(t) = e.data["text"].as_str() {
+                    msgs.push(Message::text(Role::User, t));
+                }
+            }
+            "assistant" => {
+                let mut blocks = Vec::new();
+                if let Some(t) = e.data["text"].as_str() {
+                    if !t.is_empty() {
+                        blocks.push(Block::Text { text: t.into() });
+                    }
+                }
+                if let Some(calls) = e.data["tool_calls"].as_array() {
+                    for c in calls {
+                        blocks.push(Block::ToolUse {
+                            id: c["id"].as_str().unwrap_or("").into(),
+                            name: c["name"].as_str().unwrap_or("").into(),
+                            input: c["input"].clone(),
+                        });
+                    }
+                }
+                if !blocks.is_empty() {
+                    msgs.push(Message {
+                        role: Role::Assistant,
+                        content: blocks,
+                    });
+                }
+            }
+            "tool_result" => {
+                msgs.push(Message {
+                    role: Role::User,
+                    content: vec![Block::ToolResult {
+                        tool_use_id: e.data["tool_use_id"].as_str().unwrap_or("").into(),
+                        content: e.data["content"].as_str().unwrap_or("").into(),
+                        is_error: e.data["is_error"].as_bool().unwrap_or(false),
+                    }],
+                });
+            }
+            _ => {}
+        }
+    }
+    msgs
+}

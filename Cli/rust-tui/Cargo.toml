@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zcore",
+    "crates/zproto",
+    "crates/zproviders",
+    "crates/ztools",
+    "crates/zsandbox",
+    "crates/ztui",
+    "crates/zcli",
+    "crates/zwelcome",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+# Small, fast release binary: whole-program LTO, one codegen unit, no symbols.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

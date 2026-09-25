@@ -1,0 +1,3941 @@
+{
+ "source": "models.dev",
+ "generated": "2026-09-24",
+ "providers": [
+  {
+   "id": "openai",
+   "name": "OpenAI",
+   "kind": "responses",
+   "base_url": "https://api.openai.com/v1",
+   "env": [
+    "OPENAI_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "gpt-6-luna",
+     "name": "GPT-6 Luna",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      0.1,
+      0.5,
+      0.01,
+      0.125
+     ]
+    },
+    {
+     "id": "gpt-6-sol",
+     "name": "GPT-6 Sol",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      2,
+      10,
+      0.2,
+      2.5
+     ]
+    },
+    {
+     "id": "gpt-6-astra",
+     "name": "GPT-6 Astra",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      10,
+      50,
+      1,
+      12.5
+     ]
+    },
+    {
+     "id": "gpt-5.6",
+     "name": "GPT-5.6",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      4,
+      20,
+      0.4,
+      5
+     ]
+    },
+    {
+     "id": "gpt-5.6-luna",
+     "name": "GPT-5.6 Luna",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      0.2,
+      1.2,
+      0.02,
+      0.25
+     ]
+    },
+    {
+     "id": "gpt-5.6-terra",
+     "name": "GPT-5.6 Terra",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      2,
+      12,
+      0.2,
+      2.5
+     ]
+    },
+    {
+     "id": "gpt-5.6-sol",
+     "name": "GPT-5.6 Sol",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      4,
+      20,
+      0.4,
+      5
+     ]
+    },
+    {
+     "id": "gpt-realtime-2.1",
+     "name": "GPT-Realtime-2.1",
+     "context": 128000,
+     "output": 32000,
+     "reasoning": true,
+     "price": [
+      4,
+      24,
+      0.4,
+      0
+     ]
+    },
+    {
+     "id": "gpt-5.5-pro",
+     "name": "GPT-5.5 Pro",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      30,
+      180,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "gpt-5.5",
+     "name": "GPT-5.5",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      5,
+      30,
+      0.5,
+      0
+     ]
+    },
+    {
+     "id": "gpt-5.4-nano",
+     "name": "GPT-5.4 nano",
+     "context": 400000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      0.2,
+      1.25,
+      0.02,
+      0
+     ]
+    },
+    {
+     "id": "gpt-5.4-mini",
+     "name": "GPT-5.4 mini",
+     "context": 400000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      0.75,
+      4.5,
+      0.075,
+      0
+     ]
+    },
+    {
+     "id": "gpt-5.4",
+     "name": "GPT-5.4",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      2.5,
+      15,
+      0.25,
+      0
+     ]
+    },
+    {
+     "id": "gpt-5.4-pro",
+     "name": "GPT-5.4 Pro",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      30,
+      180,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "anthropic",
+   "name": "Anthropic",
+   "kind": "anthropic",
+   "base_url": "https://api.anthropic.com",
+   "env": [
+    "ANTHROPIC_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "claude-opus-5-5",
+     "name": "Claude Opus 5.5",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      4,
+      20,
+      0.2,
+      5
+     ]
+    },
+    {
+     "id": "claude-fable-5-1",
+     "name": "Claude Fable 5.1",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      10,
+      50,
+      0.25,
+      12.5
+     ]
+    },
+    {
+     "id": "claude-opus-5",
+     "name": "Claude Opus 5",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      5,
+      25,
+      0.5,
+      6.25
+     ]
+    },
+    {
+     "id": "claude-sonnet-5",
+     "name": "Claude Sonnet 5",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      2,
+      10,
+      0.2,
+      2.5
+     ]
+    },
+    {
+     "id": "claude-fable-5",
+     "name": "Claude Fable 5",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      10,
+      50,
+      1,
+      12.5
+     ]
+    },
+    {
+     "id": "claude-opus-4-8",
+     "name": "Claude Opus 4.8",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      5,
+      25,
+      0.5,
+      6.25
+     ]
+    },
+    {
+     "id": "claude-opus-4-7",
+     "name": "Claude Opus 4.7",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      5,
+      25,
+      0.5,
+      6.25
+     ]
+    },
+    {
+     "id": "claude-sonnet-4-6",
+     "name": "Claude Sonnet 4.6",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      3,
+      15,
+      0.3,
+      3.75
+     ]
+    },
+    {
+     "id": "claude-opus-4-6",
+     "name": "Claude Opus 4.6",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      5,
+      25,
+      0.5,
+      6.25
+     ]
+    },
+    {
+     "id": "claude-opus-4-5",
+     "name": "Claude Opus 4.5 (latest)",
+     "context": 200000,
+     "output": 64000,
+     "reasoning": true,
+     "price": [
+      5,
+      25,
+      0.5,
+      6.25
+     ]
+    }
+   ]
+  },
+  {
+   "id": "google",
+   "name": "Google Gemini",
+   "kind": "google",
+   "base_url": "https://generativelanguage.googleapis.com",
+   "env": [
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "gemini-3.8-flash",
+     "name": "Gemini 3.8 Flash",
+     "context": 1048576,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.75,
+      3.75,
+      0.075,
+      0
+     ]
+    },
+    {
+     "id": "gemini-flash-latest",
+     "name": "Gemini Flash Latest",
+     "context": 1048576,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.75,
+      3.75,
+      0.075,
+      0
+     ]
+    },
+    {
+     "id": "gemini-3.7-flash",
+     "name": "Gemini 3.7 Flash",
+     "context": 1048576,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.75,
+      3.75,
+      0.075,
+      0
+     ]
+    },
+    {
+     "id": "gemini-flash-lite-latest",
+     "name": "Gemini Flash-Lite Latest",
+     "context": 1048576,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.3,
+      2.5,
+      0.03,
+      0
+     ]
+    },
+    {
+     "id": "gemini-3.6-flash",
+     "name": "Gemini 3.6 Flash",
+     "context": 1048576,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.75,
+      3.75,
+      0.075,
+      0
+     ]
+    },
+    {
+     "id": "gemini-3.5-flash-lite",
+     "name": "Gemini 3.5 Flash Lite",
+     "context": 1048576,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.3,
+      2.5,
+      0.03,
+      0
+     ]
+    },
+    {
+     "id": "gemini-3.1-flash-lite-image",
+     "name": "Nano Banana 2 Lite",
+     "context": 65536,
+     "output": 4096,
+     "reasoning": true,
+     "price": [
+      0.25,
+      30,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "gemini-3.5-flash",
+     "name": "Gemini 3.5 Flash",
+     "context": 1048576,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      1.5,
+      9,
+      0.15,
+      0
+     ]
+    },
+    {
+     "id": "gemini-3.1-flash-lite",
+     "name": "Gemini 3.1 Flash Lite",
+     "context": 1048576,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.25,
+      1.5,
+      0.025,
+      0
+     ]
+    },
+    {
+     "id": "deep-research-preview-04-2026",
+     "name": "Deep Research Preview (Apr-21-2026)",
+     "context": 131072,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      2,
+      12,
+      0.2,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "xai",
+   "name": "xAI Grok",
+   "kind": "openai",
+   "base_url": "https://api.x.ai/v1",
+   "env": [
+    "XAI_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "grok-4.7",
+     "name": "Grok 4.7",
+     "context": 500000,
+     "output": 500000,
+     "reasoning": true,
+     "price": [
+      2,
+      6,
+      0.5,
+      0
+     ]
+    },
+    {
+     "id": "grok-4.6",
+     "name": "Grok 4.6",
+     "context": 500000,
+     "output": 500000,
+     "reasoning": true,
+     "price": [
+      2,
+      6,
+      0.5,
+      0
+     ]
+    },
+    {
+     "id": "grok-4.5",
+     "name": "Grok 4.5",
+     "context": 500000,
+     "output": 500000,
+     "reasoning": true,
+     "price": [
+      2,
+      6,
+      0.3,
+      0
+     ]
+    },
+    {
+     "id": "grok-4.3",
+     "name": "Grok 4.3",
+     "context": 1000000,
+     "output": 30000,
+     "reasoning": true,
+     "price": [
+      1.25,
+      2.5,
+      0.2,
+      0
+     ]
+    },
+    {
+     "id": "grok-build-0.1",
+     "name": "Grok Build 0.1",
+     "context": 256000,
+     "output": 256000,
+     "reasoning": true,
+     "price": [
+      1,
+      2,
+      0.2,
+      0
+     ]
+    },
+    {
+     "id": "grok-4.20-0309-reasoning",
+     "name": "Grok 4.20 (Reasoning)",
+     "context": 1000000,
+     "output": 30000,
+     "reasoning": true,
+     "price": [
+      1.25,
+      2.5,
+      0.2,
+      0
+     ]
+    },
+    {
+     "id": "grok-4.20-0309-non-reasoning",
+     "name": "Grok 4.20 (Non-Reasoning)",
+     "context": 1000000,
+     "output": 30000,
+     "reasoning": false,
+     "price": [
+      1.25,
+      2.5,
+      0.2,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "meta",
+   "name": "Meta",
+   "kind": "responses",
+   "base_url": "https://api.meta.ai/v1",
+   "env": [
+    "META_MODEL_API_KEY",
+    "META_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "muse-spark-1.3",
+     "name": "Muse Spark 1.3",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.25,
+      4.25,
+      0.15,
+      0
+     ]
+    },
+    {
+     "id": "muse-spark-1.3-contributor",
+     "name": "Muse Spark 1.3 Contributor",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.1,
+      0.2,
+      0.002,
+      0
+     ]
+    },
+    {
+     "id": "muse-spark-1.2",
+     "name": "Muse Spark 1.2",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.25,
+      4.25,
+      0.15,
+      0
+     ]
+    },
+    {
+     "id": "muse-spark-1.2-contributor",
+     "name": "Muse Spark 1.2 Contributor",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.1,
+      0.2,
+      0.002,
+      0
+     ]
+    },
+    {
+     "id": "muse-spark-1.1",
+     "name": "Muse Spark 1.1",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.25,
+      4.25,
+      0.15,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "llama",
+   "name": "Meta Llama API",
+   "kind": "openai",
+   "base_url": "https://api.llama.com/compat/v1",
+   "env": [
+    "LLAMA_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "llama-4-maverick-17b-128e-instruct-fp8",
+     "name": "Llama-4-Maverick-17B-128E-Instruct-FP8",
+     "context": 128000,
+     "output": 4096,
+     "reasoning": false,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "groq-llama-4-maverick-17b-128e-instruct",
+     "name": "Groq-Llama-4-Maverick-17B-128E-Instruct",
+     "context": 128000,
+     "output": 4096,
+     "reasoning": false,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "llama-4-scout-17b-16e-instruct-fp8",
+     "name": "Llama-4-Scout-17B-16E-Instruct-FP8",
+     "context": 128000,
+     "output": 4096,
+     "reasoning": false,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "cerebras-llama-4-maverick-17b-128e-instruct",
+     "name": "Cerebras-Llama-4-Maverick-17B-128E-Instruct",
+     "context": 128000,
+     "output": 4096,
+     "reasoning": false,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "cerebras-llama-4-scout-17b-16e-instruct",
+     "name": "Cerebras-Llama-4-Scout-17B-16E-Instruct",
+     "context": 128000,
+     "output": 4096,
+     "reasoning": false,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "llama-3.3-70b-instruct",
+     "name": "Llama-3.3-70B-Instruct",
+     "context": 128000,
+     "output": 4096,
+     "reasoning": false,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "llama-3.3-8b-instruct",
+     "name": "Llama-3.3-8B-Instruct",
+     "context": 128000,
+     "output": 4096,
+     "reasoning": false,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "xiaomi",
+   "name": "Xiaomi MiMo",
+   "kind": "openai",
+   "base_url": "https://api.xiaomimimo.com/v1",
+   "env": [
+    "XIAOMI_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "mimo-v2.6-pro",
+     "name": "MiMo-V2.6-Pro",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.435,
+      0.87,
+      0.0036,
+      0
+     ]
+    },
+    {
+     "id": "mimo-v2.6-flash",
+     "name": "MiMo-V2.6-Flash",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.14,
+      0.28,
+      0.0028,
+      0
+     ]
+    },
+    {
+     "id": "mimo-v2.6-pro-ultraspeed",
+     "name": "MiMo-V2.6-Pro-UltraSpeed",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      4.35,
+      8.7,
+      0.036,
+      0
+     ]
+    },
+    {
+     "id": "mimo-v2.5-pro-ultraspeed",
+     "name": "MiMo-V2.5-Pro-UltraSpeed",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.305,
+      2.61,
+      0.0108,
+      0
+     ]
+    },
+    {
+     "id": "mimo-v2.5",
+     "name": "MiMo-V2.5",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.14,
+      0.28,
+      0.0028,
+      0
+     ]
+    },
+    {
+     "id": "mimo-v2.5-pro",
+     "name": "MiMo-V2.5-Pro",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.435,
+      0.87,
+      0.0036,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "alibaba",
+   "name": "Alibaba Qwen (Bailian)",
+   "kind": "openai",
+   "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+   "env": [
+    "DASHSCOPE_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "qwen3.8-flash",
+     "name": "Qwen3.8 Flash",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.47,
+      0.016,
+      0.2
+     ]
+    },
+    {
+     "id": "qwen3.8-max",
+     "name": "Qwen3.8 Max",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      2,
+      6,
+      0.25,
+      2.5
+     ]
+    },
+    {
+     "id": "deepseek-v4-flash-0731",
+     "name": "DeepSeek V4 Flash 0731",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.2,
+      0.4,
+      0.04,
+      0
+     ]
+    },
+    {
+     "id": "kimi-k3",
+     "name": "Kimi K3",
+     "context": 1048576,
+     "output": 1048576,
+     "reasoning": true,
+     "price": [
+      3,
+      15,
+      0.3,
+      0
+     ]
+    },
+    {
+     "id": "glm-5.2",
+     "name": "GLM-5.2",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.28,
+      0
+     ]
+    },
+    {
+     "id": "qwen3.7-plus",
+     "name": "Qwen3.7 Plus",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.5,
+      3,
+      0.05,
+      0.625
+     ]
+    },
+    {
+     "id": "qwen3.7-max",
+     "name": "Qwen3.7 Max",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      2.5,
+      7.5,
+      0.5,
+      3.125
+     ]
+    },
+    {
+     "id": "qwen3.6-flash",
+     "name": "Qwen3.6 Flash",
+     "context": 1000000,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.1875,
+      1.125,
+      0,
+      0.2344
+     ]
+    },
+    {
+     "id": "qwen3.6-27b",
+     "name": "Qwen3.6 27B",
+     "context": 262144,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.6,
+      3.6,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "qwen3.6-max-preview",
+     "name": "Qwen3.6 Max Preview",
+     "context": 262144,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      1.3,
+      7.8,
+      0.13,
+      1.625
+     ]
+    },
+    {
+     "id": "qwen3.6-35b-a3b",
+     "name": "Qwen3.6 35B-A3B",
+     "context": 262144,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.248,
+      1.485,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "qwen3.6-plus",
+     "name": "Qwen3.6 Plus",
+     "context": 1000000,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.5,
+      3,
+      0.05,
+      0.625
+     ]
+    }
+   ]
+  },
+  {
+   "id": "alibaba-cn",
+   "name": "Alibaba Qwen (Bailian, China)",
+   "kind": "openai",
+   "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+   "env": [
+    "DASHSCOPE_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "deepseek-v4.1-flash",
+     "name": "DeepSeek V4.1 Flash",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.2975,
+      1.1902,
+      0.0149,
+      0
+     ]
+    },
+    {
+     "id": "qwen3.8-flash",
+     "name": "Qwen3.8 Flash",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.1188,
+      0.4007,
+      0.0119,
+      0.1484
+     ]
+    },
+    {
+     "id": "glm-5.3",
+     "name": "GLM-5.3",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.1,
+      3.851,
+      0.275,
+      0
+     ]
+    },
+    {
+     "id": "qwen3.8-max",
+     "name": "Qwen3.8 Max",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.7774,
+      5.3323,
+      0.2222,
+      2.2218
+     ]
+    },
+    {
+     "id": "kimi-k3",
+     "name": "Kimi K3",
+     "context": 1048576,
+     "output": 1048576,
+     "reasoning": true,
+     "price": [
+      2.827,
+      14.133,
+      0.283,
+      0
+     ]
+    },
+    {
+     "id": "qwen3.7-flash",
+     "name": "Qwen3.7 Flash",
+     "context": 1000000,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.0296,
+      0.1185,
+      0.003,
+      0.037
+     ]
+    },
+    {
+     "id": "glm-5.2",
+     "name": "GLM-5.2",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      1.1,
+      3.851,
+      0.275,
+      0
+     ]
+    },
+    {
+     "id": "qwen3.7-plus",
+     "name": "Qwen3.7 Plus",
+     "context": 1000000,
+     "output": 64000,
+     "reasoning": true,
+     "price": [
+      0.5,
+      3,
+      0.05,
+      0.625
+     ]
+    },
+    {
+     "id": "qwen3.7-max",
+     "name": "Qwen3.7 Max",
+     "context": 1000000,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      2.5,
+      7.5,
+      0.5,
+      3.125
+     ]
+    },
+    {
+     "id": "qwen3.6-flash",
+     "name": "Qwen3.6 Flash",
+     "context": 1000000,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.1875,
+      1.125,
+      0,
+      0.2344
+     ]
+    },
+    {
+     "id": "deepseek-v4-pro",
+     "name": "DeepSeek V4 Pro",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.435,
+      0.87,
+      0.0036,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-v4-flash",
+     "name": "DeepSeek V4 Flash",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.14,
+      0.28,
+      0.0028,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "bailing",
+   "name": "Ant Bailing (Ling)",
+   "kind": "openai",
+   "base_url": "https://api.tbox.cn/api/llm/v1",
+   "env": [
+    "BAILING_API_TOKEN"
+   ],
+   "models": [
+    {
+     "id": "Ling-1T",
+     "name": "Ling-1T",
+     "context": 128000,
+     "output": 32000,
+     "reasoning": false,
+     "price": [
+      0.57,
+      2.29,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "deepseek",
+   "name": "DeepSeek",
+   "kind": "openai",
+   "base_url": "https://api.deepseek.com/v1",
+   "env": [
+    "DEEPSEEK_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "deepseek-flash",
+     "name": "DeepSeek V4.1 Flash",
+     "context": 1000000,
+     "output": 393216,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.6,
+      0.003,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-v4-pro",
+     "name": "DeepSeek V4 Pro",
+     "context": 1000000,
+     "output": 393216,
+     "reasoning": true,
+     "price": [
+      0.435,
+      0.87,
+      0.0036,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "moonshotai",
+   "name": "Moonshot Kimi",
+   "kind": "openai",
+   "base_url": "https://api.moonshot.ai/v1",
+   "env": [
+    "MOONSHOT_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "kimi-k3",
+     "name": "Kimi K3",
+     "context": 1048576,
+     "output": 1048576,
+     "reasoning": true,
+     "price": [
+      3,
+      15,
+      0.3,
+      0
+     ]
+    },
+    {
+     "id": "kimi-k2.7-code-highspeed",
+     "name": "Kimi K2.7 Code HighSpeed",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      1.9,
+      8,
+      0.38,
+      0
+     ]
+    },
+    {
+     "id": "kimi-k2.7-code",
+     "name": "Kimi K2.7 Code",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      0.95,
+      4,
+      0.19,
+      0
+     ]
+    },
+    {
+     "id": "kimi-k2.6",
+     "name": "Kimi K2.6",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      0.95,
+      4,
+      0.16,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "zai",
+   "name": "Z.ai GLM",
+   "kind": "openai",
+   "base_url": "https://api.z.ai/api/paas/v4",
+   "env": [
+    "ZAI_API_KEY",
+    "ZHIPU_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "glm-5.3-flashx",
+     "name": "GLM-5.3-FlashX",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.37,
+      1.25,
+      0.075,
+      0
+     ]
+    },
+    {
+     "id": "glm-5.3-flash",
+     "name": "GLM-5.3-Flash",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.5,
+      0.03,
+      0
+     ]
+    },
+    {
+     "id": "glm-5.3",
+     "name": "GLM-5.3",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "glm-5.2",
+     "name": "GLM-5.2",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "glm-5.1",
+     "name": "GLM-5.1",
+     "context": 200000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "glm-5v-turbo",
+     "name": "GLM-5V-Turbo",
+     "context": 200000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.2,
+      4,
+      0.24,
+      0
+     ]
+    },
+    {
+     "id": "glm-5-turbo",
+     "name": "GLM-5-Turbo",
+     "context": 200000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.2,
+      4,
+      0.24,
+      0
+     ]
+    },
+    {
+     "id": "glm-5",
+     "name": "GLM-5",
+     "context": 204800,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1,
+      3.2,
+      0.2,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "zhipuai",
+   "name": "Zhipu GLM (China)",
+   "kind": "openai",
+   "base_url": "https://open.bigmodel.cn/api/paas/v4",
+   "env": [
+    "ZHIPU_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "glm-5.3-flashx",
+     "name": "GLM-5.3-FlashX",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.37,
+      1.25,
+      0.075,
+      0
+     ]
+    },
+    {
+     "id": "glm-5.3-flash",
+     "name": "GLM-5.3-Flash",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.5,
+      0.03,
+      0
+     ]
+    },
+    {
+     "id": "glm-5.3",
+     "name": "GLM-5.3",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "glm-5.2",
+     "name": "GLM-5.2",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "glm-5v-turbo",
+     "name": "GLM-5V-Turbo",
+     "context": 200000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      5,
+      22,
+      1.2,
+      0
+     ]
+    },
+    {
+     "id": "glm-5.1",
+     "name": "GLM-5.1",
+     "context": 200000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "glm-5",
+     "name": "GLM-5",
+     "context": 204800,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1,
+      3.2,
+      0.2,
+      0
+     ]
+    },
+    {
+     "id": "glm-4.7-flashx",
+     "name": "GLM-4.7-FlashX",
+     "context": 200000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.07,
+      0.4,
+      0.01,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "minimax",
+   "name": "MiniMax",
+   "kind": "anthropic",
+   "base_url": "https://api.minimax.io/anthropic",
+   "env": [
+    "MINIMAX_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "MiniMax-M3",
+     "name": "MiniMax-M3",
+     "context": 1000000,
+     "output": 512000,
+     "reasoning": true,
+     "price": [
+      0.3,
+      1.2,
+      0.06,
+      0
+     ]
+    },
+    {
+     "id": "MiniMax-M2.7",
+     "name": "MiniMax-M2.7",
+     "context": 204800,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.3,
+      1.2,
+      0.06,
+      0.375
+     ]
+    },
+    {
+     "id": "MiniMax-M2.7-highspeed",
+     "name": "MiniMax-M2.7-highspeed",
+     "context": 204800,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.6,
+      2.4,
+      0.06,
+      0.375
+     ]
+    },
+    {
+     "id": "MiniMax-M2.5-highspeed",
+     "name": "MiniMax-M2.5-highspeed",
+     "context": 204800,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.6,
+      2.4,
+      0.06,
+      0.375
+     ]
+    },
+    {
+     "id": "MiniMax-M2.5",
+     "name": "MiniMax-M2.5",
+     "context": 204800,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.3,
+      1.2,
+      0.03,
+      0.375
+     ]
+    },
+    {
+     "id": "MiniMax-M2.1",
+     "name": "MiniMax-M2.1",
+     "context": 204800,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.3,
+      1.2,
+      0.03,
+      0.375
+     ]
+    }
+   ]
+  },
+  {
+   "id": "mistral",
+   "name": "Mistral",
+   "kind": "openai",
+   "base_url": "https://api.mistral.ai/v1",
+   "env": [
+    "MISTRAL_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "zai-glm-5-3",
+     "name": "GLM-5.3",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.14,
+      0
+     ]
+    },
+    {
+     "id": "zai-glm-5-2",
+     "name": "GLM-5.2",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.14,
+      0
+     ]
+    },
+    {
+     "id": "mistral-medium-2604",
+     "name": "Mistral Medium 3.5",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      1.5,
+      7.5,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "mistral-medium-latest",
+     "name": "Mistral Medium (latest)",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      1.5,
+      7.5,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "mistral-small-latest",
+     "name": "Mistral Small (latest)",
+     "context": 256000,
+     "output": 256000,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.6,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "mistral-small-2603",
+     "name": "Mistral Small 4",
+     "context": 256000,
+     "output": 256000,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.6,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "mistral-medium-2508",
+     "name": "Mistral Medium 3.1",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": false,
+     "price": [
+      0.4,
+      2,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "voxtral-small-latest",
+     "name": "Voxtral Small (latest)",
+     "context": 32000,
+     "output": 32000,
+     "reasoning": false,
+     "price": [
+      0.1,
+      0.3,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "mistral-small-2506",
+     "name": "Mistral Small 3.2",
+     "context": 128000,
+     "output": 16384,
+     "reasoning": false,
+     "price": [
+      0.1,
+      0.3,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "mistral-medium-2505",
+     "name": "Mistral Medium 3",
+     "context": 131072,
+     "output": 131072,
+     "reasoning": false,
+     "price": [
+      0.4,
+      2,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "groq",
+   "name": "Groq",
+   "kind": "openai",
+   "base_url": "https://api.groq.com/openai/v1",
+   "env": [
+    "GROQ_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "qwen/qwen3.8-27b",
+     "name": "Qwen3.8 27B",
+     "context": 131042,
+     "output": 16384,
+     "reasoning": true,
+     "price": [
+      0.8,
+      4,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "qwen/qwen3.6-27b",
+     "name": "Qwen3.6 27B",
+     "context": 131072,
+     "output": 16384,
+     "reasoning": true,
+     "price": [
+      0.6,
+      3,
+      0.3,
+      0
+     ]
+    },
+    {
+     "id": "openai/gpt-oss-safeguard-20b",
+     "name": "Safety GPT OSS 20B",
+     "context": 131072,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.075,
+      0.3,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "openai/gpt-oss-20b",
+     "name": "GPT OSS 20B",
+     "context": 131072,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.075,
+      0.3,
+      0.0375,
+      0
+     ]
+    },
+    {
+     "id": "openai/gpt-oss-120b",
+     "name": "GPT OSS 120B",
+     "context": 131072,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.6,
+      0.075,
+      0
+     ]
+    },
+    {
+     "id": "llama-3.3-70b-versatile",
+     "name": "Llama 3.3 70B",
+     "context": 131072,
+     "output": 32768,
+     "reasoning": false,
+     "price": [
+      0.59,
+      0.79,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "llama-3.1-8b-instant",
+     "name": "Llama 3.1 8B",
+     "context": 131072,
+     "output": 131072,
+     "reasoning": false,
+     "price": [
+      0.05,
+      0.08,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "cerebras",
+   "name": "Cerebras",
+   "kind": "openai",
+   "base_url": "https://api.cerebras.ai/v1",
+   "env": [
+    "CEREBRAS_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "qwen-3.8-27b",
+     "name": "Qwen3.8 27B",
+     "context": 65536,
+     "output": 32768,
+     "reasoning": true,
+     "price": [
+      0.99,
+      1.49,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "gpt-oss-120b",
+     "name": "GPT OSS 120B",
+     "context": 131072,
+     "output": 40960,
+     "reasoning": true,
+     "price": [
+      0.35,
+      0.75,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "togetherai",
+   "name": "Together AI",
+   "kind": "openai",
+   "base_url": "https://api.together.xyz/v1",
+   "env": [
+    "TOGETHER_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "deepseek-ai/DeepSeek-V4.1-Flash",
+     "name": "DeepSeek V4.1 Flash",
+     "context": 1048576,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.3,
+      1.2,
+      0.006,
+      0
+     ]
+    },
+    {
+     "id": "zai-org/GLM-5.3-Flash",
+     "name": "GLM-5.3-Flash",
+     "context": 1048575,
+     "output": 400000,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.5,
+      0.03,
+      0
+     ]
+    },
+    {
+     "id": "zai-org/GLM-5.3",
+     "name": "GLM-5.3",
+     "context": 1048576,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/DeepSeek-V4-Pro-0813",
+     "name": "DeepSeek V4 Pro 0813",
+     "context": 1048576,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      1.32,
+      3.96,
+      0.13,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+     "name": "DeepSeek V4 Flash 0731",
+     "context": 1048576,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.14,
+      0.28,
+      0.03,
+      0
+     ]
+    },
+    {
+     "id": "moonshotai/Kimi-K3",
+     "name": "Kimi K3",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      3,
+      15,
+      0.3,
+      0
+     ]
+    },
+    {
+     "id": "thinkingmachines/Inkling",
+     "name": "Inkling",
+     "context": 524288,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1,
+      4.05,
+      0.17,
+      0
+     ]
+    },
+    {
+     "id": "zai-org/GLM-5.2",
+     "name": "GLM-5.2",
+     "context": 1048575,
+     "output": 164000,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "moonshotai/Kimi-K2.7-Code",
+     "name": "Kimi K2.7 Code",
+     "context": 262144,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.95,
+      4,
+      0.19,
+      0
+     ]
+    },
+    {
+     "id": "MiniMaxAI/MiniMax-M3",
+     "name": "MiniMax-M3",
+     "context": 524288,
+     "output": 250000,
+     "reasoning": true,
+     "price": [
+      0.3,
+      1.2,
+      0.06,
+      0
+     ]
+    },
+    {
+     "id": "nvidia/nemotron-3-ultra-550b-a55b",
+     "name": "Nemotron 3 Ultra 550B A55B",
+     "context": 512300,
+     "output": 512300,
+     "reasoning": true,
+     "price": [
+      0.6,
+      3.6,
+      0.2,
+      0
+     ]
+    },
+    {
+     "id": "Qwen/Qwen3.7-Max",
+     "name": "Qwen3.7 Max",
+     "context": 1000000,
+     "output": 500000,
+     "reasoning": false,
+     "price": [
+      1.25,
+      3.75,
+      0.125,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "fireworks-ai",
+   "name": "Fireworks AI",
+   "kind": "openai",
+   "base_url": "https://api.fireworks.ai/inference/v1",
+   "env": [
+    "FIREWORKS_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "accounts/fireworks/models/ember-1",
+     "name": "Ember-1",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      3,
+      15,
+      0.3,
+      0
+     ]
+    },
+    {
+     "id": "accounts/fireworks/models/deepseek-v4p1-flash",
+     "name": "DeepSeek V4.1 Flash",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.22,
+      0.66,
+      0.007,
+      0
+     ]
+    },
+    {
+     "id": "accounts/fireworks/routers/deepseek-flash-latest",
+     "name": "DeepSeek Flash Latest",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.22,
+      0.66,
+      0.007,
+      0
+     ]
+    },
+    {
+     "id": "accounts/fireworks/routers/glm-fast-latest",
+     "name": "GLM 5.3 Fast (Latest)",
+     "context": 1048572,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      2.1,
+      6.6,
+      0.39,
+      0
+     ]
+    },
+    {
+     "id": "accounts/fireworks/routers/glm-5p3-fast",
+     "name": "GLM 5.3 Fast",
+     "context": 1048572,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      2.1,
+      6.6,
+      0.39,
+      0
+     ]
+    },
+    {
+     "id": "accounts/fireworks/models/glm-5p3-flash",
+     "name": "GLM 5.3 Flash",
+     "context": 1048573,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.5,
+      0.03,
+      0
+     ]
+    },
+    {
+     "id": "accounts/fireworks/routers/glm-flash-latest",
+     "name": "GLM Flash Latest (GLM 5.3 Flash)",
+     "context": 1048573,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.5,
+      0.03,
+      0
+     ]
+    },
+    {
+     "id": "accounts/fireworks/models/glm-5p3",
+     "name": "GLM 5.3",
+     "context": 1048573,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "accounts/fireworks/routers/glm-latest",
+     "name": "GLM Latest",
+     "context": 1048573,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "accounts/fireworks/models/qwen3p8-2p4t-a95b",
+     "name": "Qwen3.8 2.4T A95B",
+     "context": 262144,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      2,
+      6,
+      0.25,
+      0
+     ]
+    },
+    {
+     "id": "accounts/fireworks/routers/deepseek-pro-latest",
+     "name": "DeepSeek Pro Latest",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      1.32,
+      3.96,
+      0.044,
+      0
+     ]
+    },
+    {
+     "id": "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b",
+     "name": "Nemotron 3.5 Lightning 30B A3B",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      0.05,
+      0.2,
+      0.01,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "openrouter",
+   "name": "OpenRouter",
+   "kind": "openai",
+   "base_url": "https://openrouter.ai/api/v1",
+   "env": [
+    "OPENROUTER_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "fireworks/ember-1",
+     "name": "Ember-1",
+     "context": 1048576,
+     "output": 943718,
+     "reasoning": true,
+     "price": [
+      3,
+      15,
+      0.3,
+      0
+     ]
+    },
+    {
+     "id": "stealth/space-bunny-alpha",
+     "name": "Space Bunny Alpha",
+     "context": 1000000,
+     "output": 524288,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "z-ai/glm-5.3-prime",
+     "name": "GLM 5.3 Prime",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      2.8,
+      8.8,
+      0.56,
+      0
+     ]
+    },
+    {
+     "id": "upstage/solar-mini4",
+     "name": "Solar Mini 4",
+     "context": 524288,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.05,
+      0.2,
+      0.005,
+      0
+     ]
+    },
+    {
+     "id": "aion-labs/aion-3.5",
+     "name": "Aion 3.5",
+     "context": 262144,
+     "output": 32768,
+     "reasoning": true,
+     "price": [
+      3,
+      6,
+      0.75,
+      0
+     ]
+    },
+    {
+     "id": "aion-labs/aion-3.5-mini",
+     "name": "Aion 3.5 Mini",
+     "context": 262144,
+     "output": 32768,
+     "reasoning": true,
+     "price": [
+      0.7,
+      1.4,
+      0.18,
+      0
+     ]
+    },
+    {
+     "id": "qwen/qwen3.8-max-prime",
+     "name": "Qwen 3.8 Max Prime",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      4,
+      12,
+      0.5,
+      0
+     ]
+    },
+    {
+     "id": "anthropic/claude-opus-5.5",
+     "name": "Claude Opus 5.5",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      4,
+      20,
+      0.2,
+      5
+     ]
+    },
+    {
+     "id": "cohere/command-a-plus",
+     "name": "Command A+",
+     "context": 192000,
+     "output": 64000,
+     "reasoning": true,
+     "price": [
+      0.3,
+      1.5,
+      0.15,
+      0
+     ]
+    },
+    {
+     "id": "xiaomi/mimo-v2.6-pro",
+     "name": "MiMo-V2.6-Pro",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.435,
+      0.87,
+      0.0036,
+      0
+     ]
+    },
+    {
+     "id": "xiaomi/mimo-v2.6-flash",
+     "name": "MiMo-V2.6-Flash",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.14,
+      0.28,
+      0.0028,
+      0
+     ]
+    },
+    {
+     "id": "openai/gpt-6-sol-pro",
+     "name": "GPT-6 Sol Pro",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      2,
+      10,
+      0.2,
+      2.5
+     ]
+    },
+    {
+     "id": "openai/gpt-6-luna",
+     "name": "GPT-6 Luna",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      0.1,
+      0.5,
+      0.01,
+      0.125
+     ]
+    },
+    {
+     "id": "openai/gpt-6-luna-pro",
+     "name": "GPT-6 Luna Pro",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      0.1,
+      0.5,
+      0.01,
+      0.125
+     ]
+    },
+    {
+     "id": "openai/gpt-6-sol",
+     "name": "GPT-6 Sol",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      2,
+      10,
+      0.2,
+      2.5
+     ]
+    },
+    {
+     "id": "x-ai/grok-4.7",
+     "name": "Grok 4.7",
+     "context": 500000,
+     "output": 450000,
+     "reasoning": true,
+     "price": [
+      1.6,
+      4.8,
+      0.4,
+      0
+     ]
+    },
+    {
+     "id": "xiaomi/mimo-v2.6-pro-ultraspeed",
+     "name": "MiMo-V2.6-Pro-UltraSpeed",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      4.35,
+      8.7,
+      0.036,
+      0
+     ]
+    },
+    {
+     "id": "prism-ml/ternary-bonsai-2-27b",
+     "name": "Ternary Bonsai 2 27B",
+     "context": 262144,
+     "output": 32768,
+     "reasoning": true,
+     "price": [
+      0.075,
+      0.5,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "z-ai/glm-5.3-flashx",
+     "name": "GLM 5.3 FlashX",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.37,
+      1.25,
+      0.09,
+      0
+     ]
+    },
+    {
+     "id": "unbiased/pareto",
+     "name": "Pareto",
+     "context": 262144,
+     "output": 131072,
+     "reasoning": false,
+     "price": [
+      2.5,
+      7.5,
+      0.25,
+      0
+     ]
+    },
+    {
+     "id": "qwen/qwen3.8-omni-flash",
+     "name": "Qwen3.8 Omni Flash",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.47,
+      0.016,
+      0
+     ]
+    },
+    {
+     "id": "~deepseek/deepseek-flash-latest",
+     "name": "DeepSeek Flash Latest",
+     "context": 1048576,
+     "output": 943718,
+     "reasoning": true,
+     "price": [
+      0.04,
+      1,
+      0.01,
+      0
+     ]
+    },
+    {
+     "id": "~deepseek/deepseek-pro-latest",
+     "name": "DeepSeek Pro Latest",
+     "context": 1048576,
+     "output": 943718,
+     "reasoning": true,
+     "price": [
+      0.39,
+      2.9,
+      0.25,
+      0
+     ]
+    },
+    {
+     "id": "~openai/gpt-terra-latest",
+     "name": "GPT Terra Latest",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      2,
+      12,
+      0.2,
+      2.5
+     ]
+    }
+   ]
+  },
+  {
+   "id": "vercel",
+   "name": "Vercel AI Gateway",
+   "kind": "openai",
+   "base_url": "https://ai-gateway.vercel.sh/v1",
+   "env": [
+    "AI_GATEWAY_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "alibaba/qwen3.8-max-prime",
+     "name": "Qwen 3.8 Max Prime",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      4,
+      12,
+      0.5,
+      0
+     ]
+    },
+    {
+     "id": "anthropic/claude-opus-5.5-fast",
+     "name": "Claude Opus 5.5 (Fast)",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      8,
+      40,
+      0.4,
+      10
+     ]
+    },
+    {
+     "id": "anthropic/claude-opus-5.5",
+     "name": "Claude Opus 5.5",
+     "context": 1000000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      4,
+      20,
+      0.2,
+      5
+     ]
+    },
+    {
+     "id": "xiaomi/mimo-v2.6-pro",
+     "name": "MiMo V2.6 Pro",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.435,
+      0.87,
+      0.0036,
+      0
+     ]
+    },
+    {
+     "id": "xiaomi/mimo-v2.6-flash",
+     "name": "MiMo V2.6 Flash",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.14,
+      0.28,
+      0.0028,
+      0
+     ]
+    },
+    {
+     "id": "openai/gpt-6-sol-fast",
+     "name": "GPT-6 Sol (Fast)",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      4,
+      20,
+      0.4,
+      5
+     ]
+    },
+    {
+     "id": "openai/gpt-6-luna-fast",
+     "name": "GPT-6 Luna (Fast)",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      0.2,
+      1,
+      0.02,
+      0.25
+     ]
+    },
+    {
+     "id": "openai/gpt-6-luna",
+     "name": "GPT-6 Luna",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      0.1,
+      0.5,
+      0.01,
+      0.125
+     ]
+    },
+    {
+     "id": "openai/gpt-6-sol",
+     "name": "GPT-6 Sol",
+     "context": 1050000,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      2,
+      10,
+      0.2,
+      2.5
+     ]
+    },
+    {
+     "id": "spacexai/grok-4.7",
+     "name": "Grok 4.7",
+     "context": 500000,
+     "output": 500000,
+     "reasoning": true,
+     "price": [
+      1.2,
+      3.6,
+      0.3,
+      0
+     ]
+    },
+    {
+     "id": "xiaomi/mimo-v2.6-pro-ultraspeed",
+     "name": "MiMo V2.6 Pro UltraSpeed",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      4.35,
+      8.7,
+      0.036,
+      0
+     ]
+    },
+    {
+     "id": "alibaba/qwen3.8-omni-flash",
+     "name": "Qwen 3.8 Omni Flash",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.47,
+      0.016,
+      0
+     ]
+    },
+    {
+     "id": "quiverai/arrow-2",
+     "name": "Arrow 2",
+     "context": 131072,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      4,
+      20,
+      0.4,
+      5
+     ]
+    },
+    {
+     "id": "quiverai/arrow-2-telos",
+     "name": "Arrow 2 Telos",
+     "context": 131072,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      6,
+      30,
+      0.6,
+      7.5
+     ]
+    },
+    {
+     "id": "deepseek/deepseek-v4.1-flash",
+     "name": "DeepSeek V4.1 Flash",
+     "context": 1048576,
+     "output": 32768,
+     "reasoning": true,
+     "price": [
+      0.3,
+      1.2,
+      0.007,
+      0
+     ]
+    },
+    {
+     "id": "sakana/fugu-max",
+     "name": "Fugu Max",
+     "context": 1000000,
+     "output": 1000000,
+     "reasoning": true,
+     "price": [
+      2,
+      6,
+      0.25,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "nvidia",
+   "name": "NVIDIA NIM",
+   "kind": "openai",
+   "base_url": "https://integrate.api.nvidia.com/v1",
+   "env": [
+    "NVIDIA_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "z-ai/glm-5.3-flash",
+     "name": "GLM-5.3-Flash",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "z-ai/glm-5.3",
+     "name": "GLM-5.3",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/deepseek-v4-pro-0813",
+     "name": "DeepSeek V4 Pro 0813",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "nvidia/nemotron-3.5-lightning-30b-a3b",
+     "name": "Nemotron 3.5 Lightning 30B A3B",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "meta/muse-glimmer-30b",
+     "name": "Muse Glimmer 30B",
+     "context": 131072,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/deepseek-v4-flash-0731",
+     "name": "DeepSeek V4 Flash 0731",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "moonshotai/kimi-k3",
+     "name": "Kimi K3",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "thinkingmachines/inkling",
+     "name": "Inkling",
+     "context": 1048576,
+     "output": 16384,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "poolside/laguna-xs-2.1",
+     "name": "Laguna XS 2.1",
+     "context": 262144,
+     "output": 16384,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "z-ai/glm-5.2",
+     "name": "GLM-5.2",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "nvidia/nemotron-3-ultra-550b-a55b",
+     "name": "Nemotron 3 Ultra 550B A55B",
+     "context": 1000000,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.5,
+      2.5,
+      0.15,
+      0
+     ]
+    },
+    {
+     "id": "minimaxai/minimax-m3",
+     "name": "MiniMax-M3",
+     "context": 1000000,
+     "output": 16384,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "deepinfra",
+   "name": "DeepInfra",
+   "kind": "openai",
+   "base_url": "https://api.deepinfra.com/v1/openai",
+   "env": [
+    "DEEPINFRA_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "XiaomiMiMo/MiMo-V2.6-Pro",
+     "name": "MiMo-V2.6-Pro",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.435,
+      0.87,
+      0.0036,
+      0
+     ]
+    },
+    {
+     "id": "XiaomiMiMo/MiMo-V2.6-Flash",
+     "name": "MiMo-V2.6-Flash",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.14,
+      0.28,
+      0.0028,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/DeepSeek-V4.1-Flash",
+     "name": "DeepSeek V4.1 Flash",
+     "context": 1048576,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.2,
+      0.6,
+      0.006,
+      0
+     ]
+    },
+    {
+     "id": "Qwen/Qwen3.8-Flash",
+     "name": "Qwen3.8 Flash",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": false,
+     "price": [
+      0.113,
+      0.382,
+      0.0141,
+      0
+     ]
+    },
+    {
+     "id": "zai-org/GLM-5.3-Flash",
+     "name": "GLM-5.3-Flash",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.5,
+      0.03,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+     "name": "DeepSeek V4 Flash Vision Exp",
+     "context": 1048576,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.44,
+      1.32,
+      0.014,
+      0
+     ]
+    },
+    {
+     "id": "Qwen/Qwen3.8-27B",
+     "name": "Qwen3.8 27B",
+     "context": 262144,
+     "output": 32768,
+     "reasoning": true,
+     "price": [
+      0.2,
+      2.5,
+      0.05,
+      0
+     ]
+    },
+    {
+     "id": "zai-org/GLM-5.3",
+     "name": "GLM-5.3",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.9,
+      4,
+      0.2,
+      0
+     ]
+    },
+    {
+     "id": "Qwen/Qwen3.8-2.4T-A95B",
+     "name": "Qwen3.8 2.4T A95B",
+     "context": 262144,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      2,
+      6,
+      0.2,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/DeepSeek-V4-Pro-0813",
+     "name": "DeepSeek V4 Pro 0813",
+     "context": 1048576,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      1.3,
+      2.6,
+      0.1,
+      0
+     ]
+    },
+    {
+     "id": "Qwen/Qwen3.8-Max",
+     "name": "Qwen3.8 Max",
+     "context": 256000,
+     "output": 131072,
+     "reasoning": false,
+     "price": [
+      1.65,
+      4.951,
+      0.206,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+     "name": "DeepSeek V4 Flash 0731",
+     "context": 1048576,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.06,
+      0.18,
+      0.015,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "huggingface",
+   "name": "Hugging Face",
+   "kind": "openai",
+   "base_url": "https://router.huggingface.co/v1",
+   "env": [
+    "HF_TOKEN"
+   ],
+   "models": [
+    {
+     "id": "deepseek-ai/DeepSeek-V4.1-Flash",
+     "name": "DeepSeek V4.1 Flash",
+     "context": 1048576,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.3,
+      1.2,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "tencent/Hy4-preview",
+     "name": "Hy4 preview",
+     "context": 1000000,
+     "output": 64000,
+     "reasoning": true,
+     "price": [
+      0.834,
+      2.501,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "zai-org/GLM-5.3-Flash",
+     "name": "GLM-5.3-Flash",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.5,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+     "name": "DeepSeek V4 Flash Vision Exp",
+     "context": 1048576,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.44,
+      1.32,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "Qwen/Qwen3.8-27B",
+     "name": "Qwen3.8 27B",
+     "context": 262144,
+     "output": 32768,
+     "reasoning": true,
+     "price": [
+      0.4,
+      3,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "zai-org/GLM-5.3",
+     "name": "GLM-5.3",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "Qwen/Qwen3.8-2.4T-A95B",
+     "name": "Qwen3.8 2.4T A95B",
+     "context": 262144,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      2.5,
+      6.25,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/DeepSeek-V4-Pro-0813",
+     "name": "DeepSeek V4 Pro 0813",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      1.32,
+      3.96,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+     "name": "DeepSeek V4 Flash 0731",
+     "context": 1048576,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.14,
+      0.28,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "thinkingmachines/Inkling-Small",
+     "name": "Inkling Small",
+     "context": 524288,
+     "output": 1048576,
+     "reasoning": true,
+     "price": [
+      0.5,
+      1.2,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "moonshotai/Kimi-K3",
+     "name": "Kimi K3",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      3,
+      15,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "thinkingmachines/Inkling",
+     "name": "Inkling",
+     "context": 1048576,
+     "output": 1048576,
+     "reasoning": true,
+     "price": [
+      1,
+      4.05,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "cohere",
+   "name": "Cohere",
+   "kind": "openai",
+   "base_url": "https://api.cohere.ai/compatibility/v1",
+   "env": [
+    "COHERE_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "north-mini-code-1-0",
+     "name": "North Mini Code",
+     "context": 256000,
+     "output": 64000,
+     "reasoning": true,
+     "price": [
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "command-a-plus-05-2026",
+     "name": "Command A Plus",
+     "context": 128000,
+     "output": 64000,
+     "reasoning": true,
+     "price": [
+      2.5,
+      10,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "command-a-translate-08-2025",
+     "name": "Command A Translate",
+     "context": 8000,
+     "output": 8000,
+     "reasoning": false,
+     "price": [
+      2.5,
+      10,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "command-a-reasoning-08-2025",
+     "name": "Command A Reasoning",
+     "context": 256000,
+     "output": 32000,
+     "reasoning": true,
+     "price": [
+      2.5,
+      10,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "command-a-03-2025",
+     "name": "Command A",
+     "context": 256000,
+     "output": 8000,
+     "reasoning": false,
+     "price": [
+      2.5,
+      10,
+      0,
+      0
+     ]
+    },
+    {
+     "id": "command-r7b-arabic-02-2025",
+     "name": "Command R7B Arabic",
+     "context": 128000,
+     "output": 4000,
+     "reasoning": false,
+     "price": [
+      0.0375,
+      0.15,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "stepfun",
+   "name": "StepFun",
+   "kind": "openai",
+   "base_url": "https://api.stepfun.com/v1",
+   "env": [
+    "STEPFUN_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "step-5-preview",
+     "name": "Step 5 Preview",
+     "context": 1000000,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.959,
+      2.741,
+      0.048,
+      0
+     ]
+    },
+    {
+     "id": "step-3.7-flash",
+     "name": "Step 3.7 Flash",
+     "context": 256000,
+     "output": 256000,
+     "reasoning": true,
+     "price": [
+      0.185,
+      1.11,
+      0.037,
+      0
+     ]
+    },
+    {
+     "id": "step-3.5-flash-2603",
+     "name": "Step 3.5 Flash 2603",
+     "context": 256000,
+     "output": 256000,
+     "reasoning": true,
+     "price": [
+      0.1,
+      0.3,
+      0.02,
+      0
+     ]
+    },
+    {
+     "id": "step-3.5-flash",
+     "name": "Step 3.5 Flash",
+     "context": 256000,
+     "output": 256000,
+     "reasoning": true,
+     "price": [
+      0.1,
+      0.3,
+      0.02,
+      0
+     ]
+    },
+    {
+     "id": "step-1-32k",
+     "name": "Step 1 (32K)",
+     "context": 32768,
+     "output": 32768,
+     "reasoning": false,
+     "price": [
+      2.05,
+      9.59,
+      0.41,
+      0
+     ]
+    },
+    {
+     "id": "step-2-16k",
+     "name": "Step 2 (16K)",
+     "context": 16384,
+     "output": 8192,
+     "reasoning": false,
+     "price": [
+      5.21,
+      16.44,
+      1.04,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "siliconflow",
+   "name": "SiliconFlow",
+   "kind": "openai",
+   "base_url": "https://api.siliconflow.com/v1",
+   "env": [
+    "SILICONFLOW_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "zai-org/GLM-5.3-Flash",
+     "name": "GLM-5.3-Flash",
+     "context": 1049000,
+     "output": 262000,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.5,
+      0.03,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+     "name": "DeepSeek V4 Flash Vision Exp",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.44,
+      1.32,
+      0.028,
+      0
+     ]
+    },
+    {
+     "id": "zai-org/GLM-5.3",
+     "name": "GLM-5.3",
+     "context": 1049000,
+     "output": 262000,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "Qwen/Qwen3.8-2.4T-A95B",
+     "name": "Qwen3.8 2.4T A95B",
+     "context": 1049000,
+     "output": 131000,
+     "reasoning": true,
+     "price": [
+      2,
+      6,
+      0.25,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/DeepSeek-V4-Pro-0813",
+     "name": "DeepSeek V4 Pro 0813",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      1.32,
+      3.96,
+      0.044,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+     "name": "DeepSeek V4 Flash 0731",
+     "context": 1000000,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.22,
+      0.66,
+      0.014,
+      0
+     ]
+    },
+    {
+     "id": "moonshotai/Kimi-K3",
+     "name": "Kimi K3",
+     "context": 1048576,
+     "output": 262000,
+     "reasoning": true,
+     "price": [
+      2.7,
+      13.5,
+      0.27,
+      0
+     ]
+    },
+    {
+     "id": "tencent/Hy3",
+     "name": "Hy3",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      0.132,
+      0.528,
+      0.033,
+      0
+     ]
+    },
+    {
+     "id": "meituan-longcat/LongCat-2.0",
+     "name": "LongCat-2.0",
+     "context": 1049000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.75,
+      2.95,
+      0.015,
+      0
+     ]
+    },
+    {
+     "id": "zai-org/GLM-5.2",
+     "name": "GLM-5.2",
+     "context": 1049000,
+     "output": 262000,
+     "reasoning": true,
+     "price": [
+      1.302,
+      4.092,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "moonshotai/Kimi-K2.7-Code",
+     "name": "Kimi K2.7 Code",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      0.8592,
+      3.8,
+      0.1799,
+      0
+     ]
+    },
+    {
+     "id": "google/gemma-4-12B-it",
+     "name": "Gemma 4 12B IT",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": false,
+     "price": [
+      0.1,
+      0.3,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "novita-ai",
+   "name": "Novita AI",
+   "kind": "openai",
+   "base_url": "https://api.novita.ai/openai",
+   "env": [
+    "NOVITA_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "moonshotai/kimi-k3",
+     "name": "Kimi K3",
+     "context": 1048576,
+     "output": 1048576,
+     "reasoning": true,
+     "price": [
+      3,
+      15,
+      0.3,
+      0
+     ]
+    },
+    {
+     "id": "zai-org/glm-5.2",
+     "name": "GLM-5.2",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "moonshotai/kimi-k2.7-code",
+     "name": "Kimi K2.7 Code",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      0.95,
+      4,
+      0.19,
+      0
+     ]
+    },
+    {
+     "id": "qwen/qwen3.7-max",
+     "name": "Qwen3.7-Max",
+     "context": 1000000,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      1.25,
+      3.75,
+      0.25,
+      1.5625
+     ]
+    },
+    {
+     "id": "inclusionai/ring-2.6-1t",
+     "name": "Ring-2.6-1T",
+     "context": 262144,
+     "output": 65536,
+     "reasoning": true,
+     "price": [
+      0.3,
+      2.5,
+      0.06,
+      0
+     ]
+    },
+    {
+     "id": "deepseek/deepseek-v4-pro",
+     "name": "DeepSeek V4 Pro",
+     "context": 1048576,
+     "output": 393216,
+     "reasoning": true,
+     "price": [
+      1.6,
+      3.2,
+      0.135,
+      0
+     ]
+    },
+    {
+     "id": "deepseek/deepseek-v4-flash",
+     "name": "DeepSeek V4 Flash",
+     "context": 1048576,
+     "output": 393216,
+     "reasoning": true,
+     "price": [
+      0.14,
+      0.28,
+      0.028,
+      0
+     ]
+    },
+    {
+     "id": "inclusionai/ling-2.6-flash",
+     "name": "Ling-2.6-flash",
+     "context": 262144,
+     "output": 32768,
+     "reasoning": false,
+     "price": [
+      0.1,
+      0.3,
+      0.02,
+      0
+     ]
+    },
+    {
+     "id": "inclusionai/ling-2.6-1t",
+     "name": "Ling-2.6-1T",
+     "context": 262144,
+     "output": 32768,
+     "reasoning": false,
+     "price": [
+      0.3,
+      2.5,
+      0.06,
+      0
+     ]
+    },
+    {
+     "id": "xiaomimimo/mimo-v2.5-pro",
+     "name": "MiMo-V2.5-Pro",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.522,
+      1.044,
+      0.0043,
+      0
+     ]
+    },
+    {
+     "id": "moonshotai/kimi-k2.6",
+     "name": "Kimi K2.6",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      0.8,
+      3.4,
+      0.16,
+      0
+     ]
+    },
+    {
+     "id": "google/gemma-4-31b-it",
+     "name": "Gemma 4 31B",
+     "context": 262144,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.14,
+      0.4,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "id": "ollama-cloud",
+   "name": "Ollama Cloud",
+   "kind": "openai",
+   "base_url": "https://ollama.com/v1",
+   "env": [
+    "OLLAMA_API_KEY"
+   ],
+   "models": [
+    {
+     "id": "deepseek-v4.1-flash",
+     "name": "DeepSeek V4.1 Flash",
+     "context": 1048576,
+     "output": 384000,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.6,
+      0.003,
+      0
+     ]
+    },
+    {
+     "id": "glm-5.3-flash",
+     "name": "GLM-5.3-Flash",
+     "context": 1000000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.15,
+      0.5,
+      0.03,
+      0
+     ]
+    },
+    {
+     "id": "glm-5.3",
+     "name": "GLM-5.3",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-v4-pro:0813",
+     "name": "DeepSeek V4 Pro 0813",
+     "context": 1048576,
+     "output": 1048576,
+     "reasoning": true,
+     "price": [
+      0.66,
+      1.98,
+      0.022,
+      0
+     ]
+    },
+    {
+     "id": "deepseek-v4-flash:0731",
+     "name": "DeepSeek V4 Flash 0731",
+     "context": 1048576,
+     "output": 1048576,
+     "reasoning": true,
+     "price": [
+      0.22,
+      0.66,
+      0.007,
+      0
+     ]
+    },
+    {
+     "id": "kimi-k3",
+     "name": "kimi-k3",
+     "context": 1048576,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      3,
+      15,
+      0.3,
+      0
+     ]
+    },
+    {
+     "id": "glm-5.2",
+     "name": "GLM-5.2",
+     "context": 976000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      1.4,
+      4.4,
+      0.26,
+      0
+     ]
+    },
+    {
+     "id": "kimi-k2.7-code",
+     "name": "kimi-k2.7-code",
+     "context": 262144,
+     "output": 262144,
+     "reasoning": true,
+     "price": [
+      0.95,
+      4,
+      0.19,
+      0
+     ]
+    },
+    {
+     "id": "nemotron-3-ultra",
+     "name": "nemotron-3-ultra",
+     "context": 262144,
+     "output": 128000,
+     "reasoning": true,
+     "price": [
+      0.1,
+      3,
+      0.1,
+      0
+     ]
+    },
+    {
+     "id": "minimax-m3",
+     "name": "minimax-m3",
+     "context": 512000,
+     "output": 131072,
+     "reasoning": true,
+     "price": [
+      0.6,
+      2.4,
+      0.12,
+      0
+     ]
+    }
+   ]
+  }
+ ]
+}

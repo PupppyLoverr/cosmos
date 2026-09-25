@@ -1,0 +1,16 @@
+[project]
+name = "cosmos-meridian"
+version = "0.1.0"
+description = "Python client for the Cosmos CLI meridian bridge (meridian serve --stdio)"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["uv_build>=0.8"]
+build-backend = "uv_build"
+
+[tool.uv]
+package = true

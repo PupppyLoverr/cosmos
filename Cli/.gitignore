@@ -1,0 +1,23 @@
+# build outputs
+target/
+*.exe
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+
+# local state
+.cosmos-cli/
+worktrees/
+*.lock.tmp
+
+# research clones are not shipped
+.research/
+
+# OS noise
+Thumbs.db
+.DS_Store
+
+# Windows `> nul` redirect artifacts
+nul
+.pytest_cache/

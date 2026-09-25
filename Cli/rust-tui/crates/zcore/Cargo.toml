@@ -1,0 +1,28 @@
+[package]
+name = "zcore"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+zproto = { path = "../zproto" }
+zproviders = { path = "../zproviders" }
+ztools = { path = "../ztools" }
+zsandbox = { path = "../zsandbox" }
+ureq = { version = "3", features = ["json"] }
+base64 = "0.22"
+sha2 = "0.10"
+getrandom = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", features = ["apple-native"] }
+
+[dev-dependencies]
+tempfile = "3"

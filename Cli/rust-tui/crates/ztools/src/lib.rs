@@ -1,0 +1,176 @@
+//! ztools — contract §2 tools. Schemas are the canonical `contracts/tools.json`
+//! bytes so `tools dump` is byte-identical across harnesses.
+
+mod files;
+mod mcp;
+mod memory;
+mod shell;
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+use serde_json::Value;
+use zproto::ToolSpec;
+
+pub const TOOLS_JSON: &str = include_str!("../../../../contracts/tools.json");
+
+/// Hard cap on any tool result (contract §2).
+pub const RESULT_CAP: usize = 30_000;
+/// Lines allowed in one unbounded read before the guard fires (bridge config
+/// can override via `large_read_lines`).
+pub const LARGE_READ_LINES: usize = 200;
+
+/// Raw bytes of contracts/tools.json — print verbatim so `tools dump` is
+/// byte-identical across harnesses (conformance gate).
+pub fn tools_dump() -> &'static str {
+    TOOLS_JSON
+}
+
+pub fn tool_specs() -> Vec<ToolSpec> {
+    serde_json::from_str(TOOLS_JSON).expect("contracts/tools.json parses")
+}
+
+/// Per-session tool state.
+pub struct ToolContext {
+    /// workspace root — all file tools are confined to it
+    pub workspace: PathBuf,
+    /// sandbox executable (zsandbox.exe)
+    pub sandbox_bin: Option<PathBuf>,
+    /// meridian binary for memory_* tools
+    pub meridian_bin: Option<PathBuf>,
+    /// meridian vault dir (MERIDIAN_VAULT)
+    pub meridian_vault: Option<PathBuf>,
+    /// files read this session → sha256 at read time (write STALE guard)
+    pub read_state: HashMap<String, String>,
+    /// operator-granted escalations this session
+    pub escalations: Vec<String>,
+    /// network allowed inside the sandbox this session
+    pub net_allow: bool,
+    /// sandbox availability: None = ok, Some(reason) = degraded
+    pub sandbox_degraded: Option<String>,
+    /// sandbox disabled entirely (--no-sandbox)
+    pub no_sandbox: bool,
+    /// large-read guard threshold
+    pub large_read_lines: usize,
+    /// MCP server name → config (spawned lazily)
+    pub mcp_servers: HashMap<String, McpServerCfg>,
+}
+
+#[derive(Clone)]
+pub struct McpServerCfg {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl ToolContext {
+    pub fn new(workspace: &Path) -> Self {
+        // Absolute + normalized root — a relative root would let
+        // `resolve`'s starts_with check be fooled by `..` components.
+        let ws = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+        let ws = strip_verbatim(&ws);
+        ToolContext {
+            workspace: ws,
+            sandbox_bin: None,
+            meridian_bin: None,
+            meridian_vault: None,
+            read_state: HashMap::new(),
+            escalations: Vec::new(),
+            net_allow: false,
+            sandbox_degraded: None,
+            no_sandbox: false,
+            large_read_lines: LARGE_READ_LINES,
+            mcp_servers: HashMap::new(),
+        }
+    }
+}
+
+/// Truncate to RESULT_CAP with an explicit notice (contract §2).
+pub fn cap_result(s: String) -> String {
+    if s.len() <= RESULT_CAP {
+        s
+    } else {
+        let keep = RESULT_CAP;
+        format!(
+            "{}\n[truncated: {} bytes > {} cap]",
+            &s[..keep.min(s.len())],
+            s.len(),
+            RESULT_CAP
+        )
+    }
+}
+
+/// Resolve a model-supplied path inside the workspace; reject escapes.
+pub fn resolve(ctx: &ToolContext, path: &str) -> Result<PathBuf> {
+    let p = PathBuf::from(path);
+    let joined = if p.is_absolute() {
+        p
+    } else {
+        ctx.workspace.join(p)
+    };
+    let norm = normalize(&joined);
+    let root = normalize(&ctx.workspace);
+    if !norm.starts_with(&root) {
+        anyhow::bail!("path escapes workspace: {path}");
+    }
+    Ok(norm)
+}
+
+/// Strip the `\\?\` verbatim prefix that canonicalize produces on Windows.
+pub fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    s.strip_prefix(r"\\?\")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| p.to_path_buf())
+}
+
+/// Lexical normalization (no filesystem access needed).
+pub fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Tools callable in plan mode (contract §3).
+pub const PLAN_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "glob",
+    "ls",
+    "memory_search",
+    "submit_plan",
+    "tool_search",
+];
+
+/// Execute a tool by name. Permission decisions happen in zcore — this assumes
+/// the call was allowed.
+pub fn run(ctx: &mut ToolContext, name: &str, input: &Value) -> String {
+    let r = match name {
+        "read" => files::read(ctx, input),
+        "edit" => files::edit(ctx, input),
+        "write" => files::write(ctx, input),
+        "ls" => files::ls(ctx, input),
+        "glob" => files::glob(ctx, input),
+        "grep" => files::grep(ctx, input),
+        "bash" => shell::bash(ctx, input),
+        "memory_search" => memory::search(ctx, input),
+        "memory_write" => memory::write(ctx, input),
+        "tool_search" | "mcp_call" => mcp::run(ctx, name, input),
+        "submit_plan" | "task" | "request_escalation" => Err(anyhow::anyhow!(
+            "{name} is handled by the harness, not the tool layer"
+        )),
+        _ => Err(anyhow::anyhow!("unknown tool: {name}")),
+    };
+    match r {
+        Ok(s) => cap_result(s),
+        Err(e) => format!("ERROR: {e:#}"),
+    }
+}

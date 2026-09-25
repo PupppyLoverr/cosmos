@@ -1,0 +1,101 @@
+# Cosmos CLI family — reference config. Copy to %USERPROFILE%\.cosmos-cli\config.toml.
+default_model = "local"
+
+[providers.ollama]
+kind = "openai"
+base_url = "http://localhost:11434/v1"
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[providers.google]
+kind = "google"
+base_url = "https://generativelanguage.googleapis.com"
+api_key_env = "GEMINI_API_KEY"
+
+[providers.xai]
+kind = "openai"
+base_url = "https://api.x.ai/v1"
+api_key_env = "XAI_API_KEY"
+
+# ── BYOK catalog (same as the onboarding picker; kind "openai" covers every
+#    OpenAI-compatible endpoint — keys always live in env vars) ───────────────
+# groq:      base_url https://api.groq.com/openai/v1       env GROQ_API_KEY
+# deepseek:  base_url https://api.deepseek.com             env DEEPSEEK_API_KEY
+# mistral:   base_url https://api.mistral.ai/v1            env MISTRAL_API_KEY
+# meta:      base_url https://api.llama.com/compat/v1      env LLAMA_API_KEY
+# mimo:      base_url https://api.xiaomimimo.com/v1        env MIMO_API_KEY
+# moonshot:  base_url https://api.moonshot.ai/v1           env MOONSHOT_API_KEY
+# zhipu:     base_url https://open.bigmodel.cn/api/paas/v4 env ZHIPU_API_KEY
+# baidu:     base_url https://qianfan.baidubce.com/v2      env BAIDU_API_KEY
+# together:  base_url https://api.together.xyz/v1          env TOGETHER_API_KEY
+# openrouter: base_url https://openrouter.ai/api/v1        env OPENROUTER_API_KEY
+# router9:   base_url http://localhost:20128/v1            env ROUTER9_API_KEY
+
+# ChatGPT subscription — no API key. `zdev login` (or onboarding → ChatGPT)
+# runs the PKCE browser flow; tokens live in ~/.cosmos-cli/openai-auth.json.
+# [providers.chatgpt]
+# kind = "chatgpt"
+# base_url = "https://chatgpt.com/backend-api/codex"
+#
+# [models.gpt5c]
+# provider = "chatgpt"
+# id = "gpt-5.1-codex"
+# context = 400000
+
+# Prices: USD per 1M tokens. source: models.dev/api.json + docs.x.ai, retrieved 2026-09-22
+[models.local]
+provider = "ollama"
+id = "<from ollama list>"
+context = 32768
+price = { input = 0, cache_read = 0, cache_write = 0, output = 0 }
+
+[models.gpt-5-6]
+provider = "openai"
+id = "gpt-5.6"
+context = 1050000
+price = { input = 4.0, cache_read = 0.4, cache_write = 5.0, output = 20.0 } # source: https://models.dev/api.json 2026-09-22
+
+[models.claude-sonnet-4-6]
+provider = "anthropic"
+id = "claude-sonnet-4-6"
+context = 1000000
+price = { input = 3.0, cache_read = 0.3, cache_write = 3.75, output = 15.0 } # source: https://models.dev/api.json 2026-09-22
+
+[models.gemini-2-5-pro]
+provider = "google"
+id = "gemini-2.5-pro"
+context = 1048576
+price = { input = 1.25, cache_read = 0.125, cache_write = 0, output = 10.0 } # source: https://models.dev/api.json 2026-09-22
+
+[models.grok-4-7]
+provider = "xai"
+id = "grok-4.7"
+context = 500000
+price = { input = 2.0, cache_read = 0.5, cache_write = 0, output = 6.0 } # source: https://docs.x.ai/docs/models 2026-09-22
+
+[permissions]
+allow = ["read", "grep", "glob", "ls", "memory_search"]
+ask = ["write", "edit", "bash", "memory_write", "task"]
+
+[subagents]
+max_parallel = 3
+
+[tools.bash]
+shell = "auto"   # auto = Git Bash bash.exe if found, else powershell.exe -NoProfile -NonInteractive -Command
+
+[bridge]
+large_read_lines = 200
+summarizer_model = ""   # empty = deterministic extractor
+
+# [[hooks]]
+# event = "pre_tool"
+# matcher = "edit|write"
+# command = "..."
