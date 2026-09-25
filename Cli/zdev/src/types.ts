@@ -2,6 +2,7 @@
 export type ToolStatus = "pending" | "completed" | "failed";
 
 export type Item =
+  | { kind: "header"; id: string }
   | { kind: "user"; id: string; text: string }
   | { kind: "assistant"; id: string; text: string }
   | {
@@ -15,9 +16,11 @@ export type Item =
       input?: Record<string, unknown>;
     }
   | { kind: "plan"; id: string; text: string }
-  | { kind: "note"; id: string; text: string }
+  | { kind: "note"; id: string; text: string; tone?: "ok" | "warn" | "error" }
+  // `!cmd` output, /diff and other command blocks
+  | { kind: "shell"; id: string; cmd: string; out: string; code: number | null; pending?: boolean }
   // turn-end footer (grok-turn-end): `◆ Turn completed in Ns`
-  | { kind: "turn"; id: string; secs: number; out?: number };
+  | { kind: "turn"; id: string; secs: number; out?: number; cancelled?: boolean };
 
 export type Usage = {
   input: number;
@@ -31,9 +34,15 @@ export type Usage = {
 export type Model = {
   alias: string;
   provider: string;
+  providerName: string;
   id: string;
+  name: string;
   context: number;
+  price: { input: number; output: number; cache_read: number; cache_write: number };
   free: boolean;
+  reasoning: boolean;
+  kind: string;
+  fromConfig: boolean;
 };
 
 export type PermissionReq = {

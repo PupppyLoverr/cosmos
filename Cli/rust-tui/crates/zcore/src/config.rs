@@ -50,12 +50,25 @@ fn default_context() -> u64 {
     128_000
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct Permissions {
     #[serde(default)]
     pub allow: Vec<String>,
     #[serde(default)]
     pub ask: Vec<String>,
+}
+
+/// Without a `[permissions]` table (a fresh install), read-only tools run and
+/// anything that changes files or runs commands asks first — the same table
+/// as config.example.toml. An explicit table replaces this entirely.
+impl Default for Permissions {
+    fn default() -> Self {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect();
+        Permissions {
+            allow: v(&["read", "grep", "glob", "ls", "memory_search", "tool_search"]),
+            ask: v(&["write", "edit", "bash", "memory_write", "task", "mcp_call"]),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

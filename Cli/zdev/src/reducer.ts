@@ -174,32 +174,87 @@ export function applyUpdate(state: State, u: any): State {
       items.push({ kind: "note", id: nid(), text: u.text ?? "" });
       return { ...state, items };
     }
+    case "error": {
+      items.push({ kind: "note", id: nid(), text: u.text ?? "error", tone: "error" });
+      return { ...state, items };
+    }
     default:
       return state;
   }
 }
 
-/** Commands for the slash palette; `q` is the typed prefix (no leading /). */
-export const SLASH_COMMANDS = [
-  { name: "/plan", desc: "Plan mode — read-only, ends in an approvable plan" },
-  { name: "/agent", desc: "Agent mode — tools on, ask before risky calls" },
-  { name: "/yolo", desc: "Yolo mode — never ask, just run" },
-  { name: "/approve", desc: "Approve the submitted plan and run it" },
-  { name: "/model", desc: "Pick a model alias for this session" },
-  { name: "/resume", desc: "Reopen a past session" },
-  { name: "/login", desc: "Sign in with ChatGPT (subscription)" },
-  { name: "/onboarding", desc: "Replay the first-run setup flow" },
-  { name: "/session", desc: "Show the session id" },
-  { name: "/usage", desc: "Show token usage and cost" },
-  { name: "/help", desc: "List commands and keys" },
-  { name: "/clear", desc: "Clear the transcript" },
-  { name: "/quit", desc: "Quit zdev" },
-];
+/**
+ * Split streaming markdown at the last paragraph break that isn't inside a
+ * code fence: [finished part, still-growing tail]. The finished part can go
+ * to scrollback (Ink <Static>) while the tail keeps streaming, so the live
+ * region stays small no matter how long the reply gets.
+ */
+export function splitStreaming(text: string): [string, string] {
+  const lines = text.split("\n");
+  let inFence = false;
+  let cut = -1; // line index of the last safe blank line
+  for (let i = 0; i < lines.length - 1; i++) {
+    if (/^\s*(```|~~~)/.test(lines[i])) inFence = !inFence;
+    else if (!inFence && lines[i].trim() === "" && i > 0) cut = i;
+  }
+  if (cut <= 0) return ["", text];
+  const head = lines.slice(0, cut).join("\n").replace(/\s+$/, "");
+  const tail = lines.slice(cut + 1).join("\n");
+  return head ? [head, tail] : ["", text];
+}
 
-export function filterSlash(
-  query: string,
-  commands = SLASH_COMMANDS,
-): { name: string; desc: string }[] {
-  const q = query.toLowerCase();
-  return commands.filter((c) => c.name.slice(1).toLowerCase().startsWith(q));
+let splitSeq = 0;
+
+/**
+ * Move the settled prefix of `live` into scrollback. Finished items settle;
+ * a pending tool call holds everything after it back; the reply still
+ * streaming (the last assistant item while `busy`) gives up its finished
+ * paragraphs and keeps only its tail live.
+ */
+export function settle(live: Item[], busy: boolean): { done: Item[]; live: Item[] } {
+  const done: Item[] = [];
+  let i = 0;
+  for (; i < live.length; i++) {
+    const it = live[i];
+    if (it.kind === "tool" && it.status === "pending") break;
+    if (it.kind === "shell" && it.pending) break;
+    if (it.kind === "assistant" && busy && i === live.length - 1) {
+      const [head, tail] = splitStreaming(it.text);
+      if (head) {
+        done.push({ kind: "assistant", id: `${it.id}.${++splitSeq}`, text: head });
+        return { done, live: [{ ...it, text: tail }] };
+      }
+      break;
+    }
+    done.push(it);
+  }
+  return { done, live: live.slice(i) };
+}
+
+/**
+ * What a still-streaming reply shows in the live region: its last `rows`
+ * terminal rows (wrapped at `width`), so the live region never outgrows the
+ * terminal — Ink can't erase what has scrolled off. When the cut lands
+ * inside a code fence, the fence is re-opened so highlighting stays right.
+ * The whole reply still commits to scrollback once it settles.
+ */
+export function tailView(text: string, rows: number, width: number): { hidden: number; text: string } {
+  const lines = text.split("\n");
+  const w = Math.max(10, width);
+  let used = 0;
+  let start = lines.length;
+  while (start > 0) {
+    const need = Math.max(1, Math.ceil(Bun.stringWidth(lines[start - 1]) / w));
+    if (used + need > rows) break;
+    used += need;
+    start--;
+  }
+  if (start === 0) return { hidden: 0, text };
+  let fence: string | null = null;
+  for (let i = 0; i < start; i++) {
+    const m = lines[i].match(/^\s*(```|~~~)\s*([\w+#.-]*)/);
+    if (m) fence = fence === null ? lines[i].trim() : null;
+  }
+  const shown = lines.slice(start);
+  return { hidden: start, text: (fence !== null ? fence + "\n" : "") + shown.join("\n") };
 }

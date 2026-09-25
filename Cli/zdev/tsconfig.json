@@ -24,7 +24,8 @@
       "react-devtools-core": [
         "./src/stubs/react-devtools-core.ts"
       ]
-    }
+    },
+    "resolveJsonModule": true
   },
   "include": [
     "src",

@@ -1,205 +1,201 @@
-// ChatGPT subscription login — the same PKCE flow Codex CLI uses:
-// browser → auth.openai.com → loopback :1455 → code exchange.
-// Tokens live in ~/.cosmos-cli/openai-auth.json (never in config.toml,
-// never on argv). The chatgpt provider kind refreshes on 401/expiry.
+// "Sign in with ChatGPT" — use a Plus/Pro plan instead of an API key.
+// The same PKCE flow as Codex CLI and zcli (rust-tui/crates/zcore/src/
+// chatgpt.rs): browser → auth.openai.com → loopback :1455 → code exchange.
+// The session is stored with zcli's in credentials.json (creds.ts), so one
+// sign-in serves both CLIs; the access token is refreshed before it expires.
 import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import fs from "node:fs";
 import http from "node:http";
-import path from "node:path";
 
-const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"; // Codex public client
+import * as creds from "./creds";
+import type { ChatgptTokens } from "./creds";
+
+export const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"; // Codex public client
 const ISSUER = "https://auth.openai.com";
-const REDIRECT_PATH = "/auth/callback";
 const PORT = 1455;
-const SCOPES = "openid profile email offline_access";
+const REDIRECT = `http://localhost:${PORT}/auth/callback`;
+const SCOPE = "openid profile email offline_access";
+const CLAIMS = "https://api.openai.com/auth";
 
-export type AuthFile = {
-  access_token: string;
-  refresh_token?: string;
-  expires_at?: number; // epoch ms
-  account_id?: string; // chatgpt account (JWT claim)
-  email?: string;
-};
+const b64url = (b: Buffer) => b.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const now = () => Math.floor(Date.now() / 1000);
 
-const b64url = (b: Buffer) =>
-  b.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-
-export function authPath(home: string): string {
-  return path.join(home, "openai-auth.json");
+export function pkce(): { verifier: string; challenge: string } {
+  const verifier = b64url(randomBytes(64));
+  return { verifier, challenge: b64url(createHash("sha256").update(verifier).digest()) };
 }
 
-export function loadAuth(home: string): AuthFile | null {
+export function authorizeUrl(challenge: string, state: string): string {
+  const q = new URLSearchParams({
+    response_type: "code",
+    client_id: CLIENT_ID,
+    redirect_uri: REDIRECT,
+    scope: SCOPE,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    state,
+    id_token_add_organizations: "true",
+    codex_cli_simplified_flow: "true",
+    originator: "zdev",
+  });
+  return `${ISSUER}/oauth/authorize?${q}`;
+}
+
+/** Decode a JWT payload (no signature check — read only for its claims). */
+export function jwtClaims(token: string): Record<string, any> | null {
   try {
-    return JSON.parse(fs.readFileSync(authPath(home), "utf8"));
+    return JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"));
   } catch {
     return null;
   }
 }
 
-export function saveAuth(home: string, a: AuthFile): void {
-  fs.mkdirSync(home, { recursive: true });
-  fs.writeFileSync(authPath(home), JSON.stringify(a, null, 2), "utf8");
-  try {
-    fs.chmodSync(authPath(home), 0o600);
-  } catch {}
+export function tokensFrom(v: Record<string, any>, prevRefresh?: string): ChatgptTokens {
+  const access = v.access_token;
+  if (!access) throw new Error("token response missing access_token");
+  const refresh = v.refresh_token ?? prevRefresh;
+  if (!refresh) throw new Error("token response missing refresh_token");
+  const claims = jwtClaims(access);
+  if (!claims) throw new Error("access token is not a JWT");
+  const auth = claims[CLAIMS] ?? {};
+  const account = auth.chatgpt_account_id;
+  if (!account) throw new Error("no ChatGPT account on this login");
+  const id = v.id_token ? jwtClaims(v.id_token) : null;
+  return {
+    access,
+    refresh,
+    expires_at: now() + (Number(v.expires_in) || 3600),
+    account_id: account,
+    email: id?.email ?? claims.email ?? null,
+    plan: auth.chatgpt_plan_type ?? id?.[CLAIMS]?.chatgpt_plan_type ?? null,
+  };
 }
 
-export function clearAuth(home: string): void {
+async function tokenRequest(form: Record<string, string>): Promise<Record<string, any>> {
+  let resp: Response;
   try {
-    fs.unlinkSync(authPath(home));
-  } catch {}
+    resp = await fetch(`${ISSUER}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(form).toString(),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (e: any) {
+    throw new Error(`could not reach auth.openai.com: ${e?.message ?? e}`);
+  }
+  const text = await resp.text();
+  if (!resp.ok) throw new Error(`ChatGPT sign-in failed (${resp.status}): ${text.slice(0, 300)}`);
+  return JSON.parse(text);
 }
 
-function accountFromJwt(jwt: string): { account?: string; email?: string } {
+export async function refresh(t: ChatgptTokens): Promise<ChatgptTokens> {
+  const v = await tokenRequest({ grant_type: "refresh_token", refresh_token: t.refresh, client_id: CLIENT_ID });
+  const n = tokensFrom(v, t.refresh);
+  n.email ??= t.email ?? null;
+  n.plan ??= t.plan ?? null;
+  return n;
+}
+
+/** The signed-in session, refreshed when it expires within five minutes. */
+export async function fresh(): Promise<ChatgptTokens | null> {
+  const t = creds.chatgpt();
+  if (!t) return null;
+  if (t.expires_at > now() + 300) return t;
   try {
-    const payload = JSON.parse(
-      Buffer.from(jwt.split(".")[1], "base64url").toString("utf8"),
-    );
-    return {
-      account:
-        payload["chatgpt_account_id"] ??
-        payload["https://api.openai.com/auth"]?.chatgpt_account_id,
-      email: payload.email,
-    };
+    const n = await refresh(t);
+    creds.saveChatgpt(n);
+    return n;
   } catch {
-    return {};
+    return t; // let the request fail with a clear 401
   }
 }
 
-async function tokenRequest(
-  body: Record<string, string>,
-): Promise<Record<string, any>> {
-  const resp = await fetch(`${ISSUER}/oauth/token`, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams(body).toString(),
-    signal: AbortSignal.timeout(30_000),
-  });
-  const v = (await resp.json().catch(() => ({}))) as Record<string, any>;
-  if (!resp.ok)
-    throw new Error(String(v?.error_description ?? `token ${resp.status}`));
-  return v;
+export function openBrowser(url: string): void {
+  const [cmd, args]: [string, string[]] =
+    process.platform === "win32"
+      ? ["rundll32", ["url.dll,FileProtocolHandler", url]]
+      : process.platform === "darwin"
+        ? ["open", [url]]
+        : ["xdg-open", [url]];
+  try {
+    spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true }).unref();
+  } catch {}
 }
 
-/** Refresh if the access token is expired (or within 60s of it). */
-export async function accessToken(home: string): Promise<AuthFile> {
-  const a = loadAuth(home);
-  if (!a) throw new Error("not signed in — run `zdev login`");
-  if (a.expires_at && a.expires_at - 60_000 > Date.now()) return a;
-  if (!a.refresh_token) return a; // no refresh path: use what we have
-  const v = await tokenRequest({
-    grant_type: "refresh_token",
-    refresh_token: a.refresh_token,
-    client_id: CLIENT_ID,
-  });
-  const next: AuthFile = {
-    access_token: v.access_token ?? a.access_token,
-    refresh_token: v.refresh_token ?? a.refresh_token,
-    expires_at: v.expires_in
-      ? Date.now() + v.expires_in * 1000
-      : a.expires_at,
-    account_id: a.account_id,
-    email: a.email,
-  };
-  saveAuth(home, next);
-  return next;
-}
+const PAGE =
+  "<!doctype html><meta charset=utf-8><title>zdev</title><body style=\"font:16px system-ui;background:#0b0b0c;color:#eee;display:grid;place-items:center;height:100vh;margin:0\"><div><h2 style=font-weight:600>Signed in to zdev</h2><p style=color:#8a8a8a>You can close this tab and return to the terminal.</p></div>";
 
 /**
- * Interactive login. Opens the system browser at the authorize URL and
- * listens on http://localhost:1455/auth/callback for the redirect.
- * `onOpen` lets the caller surface the URL (for terminals where `start`
- * fails, the user can paste it).
+ * Full browser sign-in. `onUrl` receives the authorize URL (show it; the
+ * browser is opened too). Resolves with the saved session; rejects on
+ * cancel (`signal`), error or a five-minute timeout.
  */
-export async function loginChatGPT(
-  home: string,
-  onOpen?: (url: string) => void,
-): Promise<AuthFile> {
-  const verifier = b64url(randomBytes(32));
-  const challenge = b64url(
-    createHash("sha256").update(verifier).digest(),
-  );
+export function login(onUrl: (url: string) => void, signal?: AbortSignal): Promise<ChatgptTokens> {
+  const p = pkce();
   const state = b64url(randomBytes(16));
-  const redirect = `http://localhost:${PORT}${REDIRECT_PATH}`;
-  const url =
-    `${ISSUER}/oauth/authorize?` +
-    new URLSearchParams({
-      response_type: "code",
-      client_id: CLIENT_ID,
-      redirect_uri: redirect,
-      scope: SCOPES,
-      code_challenge: challenge,
-      code_challenge_method: "S256",
-      state,
-      id_token_add_organizations: "true",
-      codex_cli_simplified_flow: "true",
-    }).toString();
-
-  const code = await new Promise<string>((resolve, reject) => {
-    const srv = http.createServer((req, res) => {
+  return new Promise<ChatgptTokens>((resolve, reject) => {
+    let settled = false;
+    const finish = (err: Error | null, t?: ChatgptTokens) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      srv.close();
+      err ? reject(err) : resolve(t!);
+    };
+    const onAbort = () => finish(new Error("sign-in cancelled"));
+    const timer = setTimeout(() => finish(new Error("sign-in timed out")), 300_000);
+    const srv = http.createServer(async (req, res) => {
       const u = new URL(req.url ?? "/", `http://localhost:${PORT}`);
-      if (u.pathname !== REDIRECT_PATH) {
+      if (u.pathname !== "/auth/callback") {
         res.writeHead(404).end();
         return;
       }
+      const page = (body: string) => res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(body);
       if (u.searchParams.get("state") !== state) {
-        res.writeHead(400).end("state mismatch");
-        return;
+        page("State mismatch — start the sign-in again from zdev.");
+        return finish(new Error("sign-in state mismatch"));
       }
-      const c = u.searchParams.get("code");
-      if (!c) {
-        res.writeHead(400).end("no code");
-        return;
+      const err = u.searchParams.get("error");
+      if (err) {
+        page(`Sign-in failed: ${err}`);
+        return finish(new Error(`sign-in failed: ${err}`));
       }
-      res
-        .writeHead(200, { "content-type": "text/html" })
-        .end(
-          "<html><body style='background:#000;color:#fff;font:16px monospace;" +
-            "display:flex;align-items:center;justify-content:center;height:100vh'>" +
-            "signed in — you can close this tab</body></html>",
-        );
-      srv.close();
-      resolve(c);
-    });
-    srv.on("error", reject);
-    srv.listen(PORT, "127.0.0.1", () => {
-      onOpen?.(url);
-      // best-effort browser open (Windows start / macOS open / xdg-open)
-      const opener: [string, string[]] =
-        process.platform === "win32"
-          ? ["cmd", ["/c", "start", "", url]]
-          : process.platform === "darwin"
-            ? ["open", [url]]
-            : ["xdg-open", [url]];
+      const code = u.searchParams.get("code");
+      if (!code) {
+        page("Sign-in failed: no code");
+        return finish(new Error("callback had no code"));
+      }
       try {
-        spawn(opener[0], opener[1], {
-          detached: true,
-          stdio: "ignore",
-        }).unref();
-      } catch {}
+        const v = await tokenRequest({
+          grant_type: "authorization_code",
+          code,
+          client_id: CLIENT_ID,
+          redirect_uri: REDIRECT,
+          code_verifier: p.verifier,
+        });
+        const t = tokensFrom(v);
+        creds.saveChatgpt(t);
+        page(PAGE);
+        finish(null, t);
+      } catch (e: any) {
+        page(`Sign-in failed: ${e?.message ?? e}`);
+        finish(e instanceof Error ? e : new Error(String(e)));
+      }
     });
-    setTimeout(() => {
-      srv.close();
-      reject(new Error("login timed out (2m)"));
-    }, 120_000);
+    srv.on("error", (e: any) =>
+      finish(new Error(e?.code === "EADDRINUSE" ? `port ${PORT} is busy — close other Codex/zcli sign-ins and retry` : String(e?.message ?? e))),
+    );
+    if (signal?.aborted) return onAbort();
+    signal?.addEventListener("abort", onAbort);
+    srv.listen(PORT, "127.0.0.1", () => {
+      const url = authorizeUrl(p.challenge, state);
+      onUrl(url);
+      openBrowser(url);
+    });
   });
+}
 
-  const v = await tokenRequest({
-    grant_type: "authorization_code",
-    code,
-    client_id: CLIENT_ID,
-    redirect_uri: redirect,
-    code_verifier: verifier,
-  });
-  const claims = accountFromJwt(v.id_token ?? v.access_token ?? "");
-  const auth: AuthFile = {
-    access_token: v.access_token,
-    refresh_token: v.refresh_token,
-    expires_at: v.expires_in ? Date.now() + v.expires_in * 1000 : undefined,
-    account_id: claims.account,
-    email: claims.email,
-  };
-  saveAuth(home, auth);
-  return auth;
+export function logout(): void {
+  creds.clearChatgpt();
 }

@@ -1,31 +1,26 @@
-// Composer — port of claude-prompt: dual rules around a `❯` input row,
-// model chip above-right, mode legend below. Multiline hand-rolled input.
+// Composer — port of claude-prompt: rules around a `❯` input, the mode
+// legend and model/context meter underneath. Multiline, hand-rolled input
+// (the cursor is drawn inverse; the terminal cursor stays hidden).
 import React from "react";
-import { Box, Text, useStdout } from "ink";
-import { DIM, MODE_COLOR, ROSE, RULE } from "../theme";
+import { Box, Text } from "ink";
 
-const PLACEHOLDER = "Ask zdev to build features, fix bugs, or work on your code";
+import { DIM, GRAY, MODE_COLOR, ROSE, RULE } from "../theme";
 
-const MODE_META: Record<string, { glyph: string; label: string }> = {
-  agent: { glyph: "⏵⏵", label: "agent" },
-  plan: { glyph: "⏸", label: "plan" },
-  yolo: { glyph: "⏵⏵", label: "yolo" },
+const PLACEHOLDER = "Ask zdev to build, fix or explain — @ adds files, ! runs a command";
+
+const MODE_META: Record<string, { glyph: string; label: string; hint: string }> = {
+  agent: { glyph: "⏵⏵", label: "agent", hint: "asks before risky tools" },
+  plan: { glyph: "⏸", label: "plan mode", hint: "read-only, ends in a plan" },
+  yolo: { glyph: "⏵⏵", label: "yolo", hint: "runs everything without asking" },
 };
 
-function rule(width: number) {
-  return "─".repeat(Math.max(4, width));
-}
-
-/** Render buffer lines with an inverse cursor at absolute index `cursor`. */
+/** Render one buffer line with an inverse cursor at `col`. */
 function CursorText({ line, col }: { line: string; col: number }) {
-  const before = line.slice(0, col);
-  const at = line[col] ?? " ";
-  const after = line.slice(col + 1);
   return (
-    <Text wrap="truncate-end">
-      {before}
-      <Text inverse>{at}</Text>
-      {after}
+    <Text wrap="truncate-start">
+      {line.slice(0, col)}
+      <Text inverse>{line[col] ?? " "}</Text>
+      {line.slice(col + 1)}
     </Text>
   );
 }
@@ -35,69 +30,71 @@ export function Composer({
   cursor,
   mode,
   model,
+  width,
   disabled,
   listening,
+  ctxPct,
+  hint,
 }: {
   value: string;
-  cursor: number; // absolute index into value
+  cursor: number;
   mode: string;
   model: string;
+  width: number;
   disabled?: boolean;
   listening?: boolean;
+  /** context window use 0..1, when known */
+  ctxPct?: number;
+  /** right-side status override (e.g. "press ctrl+c again to quit") */
+  hint?: string;
 }) {
-  const { stdout } = useStdout();
-  const width = (stdout?.columns ?? 80) - 1;
   const m = MODE_META[mode] ?? MODE_META.agent;
-  const modeColor = MODE_COLOR[mode] ?? "#ffffff";
-
-  // map absolute cursor → (row, col) over the split lines
   const lines = value.split("\n");
-  let curRow = 0;
+  let row = 0;
   let acc = 0;
   for (let i = 0; i < lines.length; i++) {
-    if (cursor <= acc + lines[i].length) {
-      curRow = i;
-      break;
-    }
+    row = i;
+    if (cursor <= acc + lines[i].length) break;
     acc += lines[i].length + 1;
-    curRow = i;
   }
-  const curCol = Math.min(cursor - acc, lines[curRow]?.length ?? 0);
-
+  const col = Math.max(0, Math.min(cursor - acc, lines[row]?.length ?? 0));
+  const rule = "─".repeat(Math.max(4, width));
+  const ctx = ctxPct !== undefined && ctxPct > 0 ? ` · ${Math.round(ctxPct * 100)}% context` : "";
   return (
-    <Box flexDirection="column" marginTop={0}>
-      <Text color={RULE}>{rule(width)}</Text>
-      {value === "" && !disabled ? (
-        <Box flexDirection="row">
-          <Text color={ROSE}>❯ </Text>
-          <Text>
-            <Text inverse> </Text>
-            <Text color={DIM}>{PLACEHOLDER}</Text>
-          </Text>
-        </Box>
-      ) : value === "" && disabled ? (
-        <Box flexDirection="row">
-          <Text color={DIM}>❯ </Text>
-          <Text color={DIM}> connecting to zdev…</Text>
-        </Box>
+    <Box flexDirection="column" marginTop={1}>
+      <Text color={RULE}>{rule}</Text>
+      {value === "" ? (
+        <Text>
+          <Text color={disabled ? DIM : ROSE}>❯ </Text>
+          {disabled ? (
+            <Text color={DIM}>starting…</Text>
+          ) : listening ? (
+            <Text color={ROSE}>◉ listening — speak, then pause</Text>
+          ) : (
+            <>
+              <Text inverse> </Text>
+              <Text color={DIM}>{PLACEHOLDER}</Text>
+            </>
+          )}
+        </Text>
       ) : (
         lines.map((l, i) => (
-          <Box key={i} flexDirection="row">
+          <Box key={i}>
             <Text color={i === 0 ? ROSE : DIM}>{i === 0 ? "❯ " : "  "}</Text>
-            {i === curRow ? <CursorText line={l} col={curCol} /> : <Text wrap="truncate-end">{l}</Text>}
+            {i === row ? <CursorText line={l} col={col} /> : <Text wrap="truncate-end">{l}</Text>}
           </Box>
         ))
       )}
-      <Text color={RULE}>{rule(width)}</Text>
-      <Box justifyContent="space-between">
+      <Text color={RULE}>{rule}</Text>
+      <Box justifyContent="space-between" width={width}>
         <Text wrap="truncate-end">
-          <Text color={modeColor}>{m.glyph} {m.label}</Text>
-          <Text color={DIM}>
-            {" "}· / cmds · @file · ctrl+m dictate
+          <Text color={MODE_COLOR[mode] ?? "#ffffff"} bold={mode !== "agent"}>
+            {m.glyph} {m.label}
           </Text>
+          <Text color={DIM}> · {m.hint} (shift+tab)</Text>
         </Text>
-        <Text color={DIM} wrap="truncate-end">
-          {listening ? "◉ listening… · " : ""}◉ {model} · esc · ctrl+c
+        <Text color={hint ? GRAY : DIM} wrap="truncate-start">
+          {hint ?? `${model}${ctx}`}
         </Text>
       </Box>
     </Box>

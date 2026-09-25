@@ -197,3 +197,17 @@ fn provider_errors_are_readable() {
     let err = complete(&cfg, &req, &mut |_| {}, &["127.0.0.1".into()]).unwrap_err().to_string();
     assert!(err.contains("401") && err.contains("Incorrect API key") && err.contains("zcli auth login"), "{err}");
 }
+
+#[test]
+fn chatgpt_dictation_round_trip() {
+    let (port, h) = mock("200 OK", "application/json", "", r#"{"text":"fix the parser","asset_ttl":"30d"}"#);
+    let base = format!("http://127.0.0.1:{port}/backend-api");
+    let text = zproviders::transcribe_chatgpt(&base, "tok", "acc_1", b"RIFFfake", &["127.0.0.1".to_string()]).unwrap();
+    assert_eq!(text, "fix the parser");
+    let req = h.join().unwrap();
+    assert!(req.starts_with("POST /backend-api/transcribe "), "{req}");
+    let low = req.to_ascii_lowercase();
+    assert!(low.contains("authorization: bearer tok") && low.contains("chatgpt-account-id: acc_1"));
+    assert!(req.contains("name=\"file\"; filename=\"dictation.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFFfake\r\n--"), "{req}");
+    assert!(req.trim_end().ends_with("--"), "closing boundary");
+}

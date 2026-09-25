@@ -1,5 +1,5 @@
 // Contract §2 tools — identical semantics to ztools (Rust) / zdev tools.py.
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -415,6 +415,60 @@ function bash(ctx: Ctx, inp: Record<string, any>): string {
   }
 }
 
+/** `bash` without blocking the event loop: the TUI keeps animating and esc
+ * kills the command. Same sandbox, timeout and output shape as `bash`. */
+function bashAsync(ctx: Ctx, inp: Record<string, any>, signal?: AbortSignal): Promise<string> {
+  const command = inp.command ?? "";
+  const timeout = Math.min(Math.floor(inp.timeout_s ?? 120), 600);
+  const argv = shellArgv(command);
+  let exe: string;
+  let args: string[];
+  let note = "";
+  if (ctx.noSandbox) {
+    [exe, ...args] = argv;
+  } else {
+    const zsb = findBin(["zsandbox.exe", "zsandbox"], "ZSANDBOX_BIN");
+    if (!zsb) return Promise.resolve("ERROR: zsandbox.exe not found (set ZSANDBOX_BIN)");
+    note = ctx.sandboxDegraded ? `[sandbox:degraded: ${ctx.sandboxDegraded}]\n` : "";
+    exe = zsb;
+    args = ["exec", "--workspace", ctx.workspace, "--net", ctx.netAllow ? "allow" : "deny", "--timeout", String(timeout), "--", ...argv];
+  }
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let why = "";
+    const child = spawn(exe, args, { cwd: ctx.workspace, windowsHide: true });
+    const take = (d: Buffer) => {
+      if (size < 64 * 1024 * 1024) chunks.push(d);
+      size += d.length;
+    };
+    child.stdout?.on("data", take);
+    child.stderr?.on("data", take);
+    const kill = (reason: string) => {
+      why = reason;
+      if (process.platform === "win32" && child.pid) {
+        // take the whole tree down (sandbox → shell → command)
+        spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true });
+      } else child.kill("SIGKILL");
+    };
+    const timer = setTimeout(() => kill("[timeout]"), (timeout + (ctx.noSandbox ? 0 : 30)) * 1000);
+    const onAbort = () => kill("[interrupted]");
+    signal?.addEventListener("abort", onAbort);
+    const done = (code: number | null, err?: Error) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      let s = note + Buffer.concat(chunks).toString("utf8");
+      if (err) s += `\nERROR: ${err.message}`;
+      if (why) s += (s.endsWith("\n") || !s ? "" : "\n") + why;
+      else if (code === 124 && !ctx.noSandbox) s += "\n[timeout]";
+      resolve(s);
+    };
+    child.on("error", (e) => done(null, e));
+    child.on("close", (code) => done(code));
+    if (signal?.aborted) onAbort();
+  });
+}
+
 function meridian(ctx: Ctx, args: string[]): string {
   const mer = findBin(["meridian.exe", "meridian"], "MERIDIAN_BIN");
   if (!mer) {
@@ -478,6 +532,26 @@ const DISPATCH: Record<
   memory_search: memorySearch,
   memory_write: memoryWrite,
 };
+
+/** Like `run`, but long-running tools (bash, MCP) don't block and honour
+ * the abort signal. The agent loop uses this one. */
+export async function runAsync(
+  ctx: Ctx,
+  name: string,
+  inp: Record<string, any>,
+  signal?: AbortSignal,
+): Promise<string> {
+  try {
+    if (name === "bash") return capResult(await bashAsync(ctx, inp, signal));
+    if (name === "tool_search" || name === "mcp_call") {
+      const { run: mcpRun } = await import("./mcp");
+      return capResult(await mcpRun(ctx.mcpServers, name, inp, signal));
+    }
+  } catch (e: any) {
+    return `ERROR: ${e?.message ?? e}`;
+  }
+  return run(ctx, name, inp);
+}
 
 export function run(ctx: Ctx, name: string, inp: Record<string, any>): string {
   try {

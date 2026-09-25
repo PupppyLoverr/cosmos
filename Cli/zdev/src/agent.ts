@@ -87,6 +87,7 @@ export function runHooks(
   tool: string,
   payload: Record<string, any>,
   session: string,
+  log: (s: string) => void = (s) => console.error(s),
 ): string | null {
   const ev = JSON.stringify({ event, tool, data: payload, session });
   for (const h of cfg.hooks ?? []) {
@@ -107,7 +108,7 @@ export function runHooks(
     }
     if (out.status === 2) return out.stderr ?? "";
     if (out.status !== 0) {
-      console.error(`hook '${h.command}' exited ${out.status} — continuing`);
+      log(`hook '${h.command}' exited ${out.status} — continuing`);
     }
   }
   return null;
@@ -151,6 +152,11 @@ export class Agent {
   asker: Asker | null = null;
   pendingPlan: string | null = null;
   worktrees: [string, string][] = [];
+  /** streamed assistant text, as it arrives (the TUI renders it live) */
+  onDelta: ((text: string) => void) | null = null;
+  /** diagnostics sink — stderr for headless runs, silent inside the TUI */
+  log: (s: string) => void = (s) => console.error(s);
+  private abort: AbortController | null = null;
 
   constructor(opts: proto.RunOpts, harness: string, cwd: string) {
     this.opts = opts;
@@ -194,11 +200,30 @@ export class Agent {
     this.system = boot.includes("You are Cosmos")
       ? [boot]
       : [systemSnippet(), boot];
+    // AGENTS.md / CLAUDE.md / .zcli/instructions.md from the repo
+    const project = store.projectInstructions(this.workspace);
+    if (project) this.system.push(project);
     this.tools = t.toolSpecs();
     this.allowed = store.allowedHosts(this.cfg);
   }
 
+  /** Stop the provider stream and any running tool right now. */
+  cancel(): void {
+    this.abort?.abort();
+  }
+
+  get cancelled(): boolean {
+    return !!this.abort?.signal.aborted;
+  }
+
+  /** Output budget per turn: the model's own limit when known, capped. */
+  maxTokens(): number {
+    const out = Number(this.provider.output) || 0;
+    return out > 0 ? Math.max(4096, Math.min(out, 32_000)) : 8192;
+  }
+
   cleanup(): void {
+    this.abort?.abort();
     // task{worktree:true} checkouts — removed only if clean (§10).
     for (const [wt, branch] of this.worktrees) {
       try {
@@ -267,8 +292,10 @@ export class Agent {
     const err: string[] = [];
 
     const sink = (c: Record<string, any>) => {
-      if (c.type === "text") text += c.text;
-      else if (c.type === "tool_use") calls.push(c);
+      if (c.type === "text") {
+        text += c.text;
+        this.onDelta?.(c.text);
+      } else if (c.type === "tool_use") calls.push(c);
       else if (c.type === "done") {
         for (const k of Object.keys(usage) as (keyof typeof usage)[]) {
           usage[k] += c.usage?.[k] ?? 0;
@@ -276,18 +303,32 @@ export class Agent {
       } else if (c.type === "err") err.push(c.text);
     };
 
-    await providers.complete(
-      this.provider,
-      {
-        system: this.system,
-        tools: this.tools,
-        messages: this.messages,
-        session_id: this.session.id,
-        max_tokens: 4096,
-      },
-      sink,
-      this.allowed,
-    );
+    this.abort = new AbortController();
+    try {
+      await providers.complete(
+        this.provider,
+        {
+          system: this.system,
+          tools: this.tools,
+          messages: this.messages,
+          session_id: this.session.id,
+          max_tokens: this.maxTokens(),
+        },
+        sink,
+        this.allowed,
+        this.abort.signal,
+      );
+    } catch (e) {
+      if (this.abort.signal.aborted) {
+        // keep what streamed so far — the transcript and the next turn see it
+        if (text) {
+          emit(this.session.append("assistant", { text, tool_calls: [], interrupted: true }));
+          this.messages.push({ role: "assistant", content: [{ type: "text", text }] });
+        }
+        throw new Error("interrupted");
+      }
+      throw e;
+    }
     if (err.length) throw new Error(`provider stream error: ${err[0]}`);
     this.lastUsage = usage;
     const c = cost(this.provider.prices ?? {}, usage);
@@ -312,7 +353,7 @@ export class Agent {
         cum_usd: this.cumUsd,
       }),
     );
-    console.error(
+    this.log(
       `turn · in ${usage.input} · cache_r ${usage.cache_read} ` +
         `· cache_w ${usage.cache_write} · out ${usage.output} · ` +
         `${c != null ? `$${c.toFixed(4)}` : "$?"} · ` +
@@ -333,7 +374,7 @@ export class Agent {
     emit: Emit,
   ): Promise<[string, boolean]> {
     emit(this.session.append("tool_call", { id: tid, name, input: inp }));
-    const blocked = runHooks(this.cfg, "pre_tool", name, inp, this.session.id);
+    const blocked = runHooks(this.cfg, "pre_tool", name, inp, this.session.id, this.log);
     let text: string;
     let isError: boolean;
     if (blocked !== null) {
@@ -375,13 +416,7 @@ export class Agent {
         is_error: isError,
       }),
     );
-    runHooks(
-      this.cfg,
-      "post_tool",
-      name,
-      { input: inp, is_error: isError },
-      this.session.id,
-    );
+    runHooks(this.cfg, "post_tool", name, { input: inp, is_error: isError }, this.session.id, this.log);
     this.messages.push({
       role: "user",
       content: [
@@ -429,7 +464,8 @@ export class Agent {
     if (name === "task") {
       return [await this.subagent(inp.prompt ?? "", !!inp.worktree, emit), false];
     }
-    const out = t.run(this.ctx, name, inp);
+    if (!this.abort || this.abort.signal.aborted) this.abort = new AbortController();
+    const out = await t.runAsync(this.ctx, name, inp, this.abort.signal);
     return [out, out.startsWith("ERROR")];
   }
 
@@ -509,13 +545,14 @@ export class Agent {
             tools: this.tools,
             messages: msgs,
             session_id: child.id,
-            max_tokens: 2048,
+            max_tokens: Math.min(this.maxTokens(), 8192),
           },
           sink,
           this.allowed,
+          this.abort?.signal,
         );
-      } catch {
-        result = "subagent provider error";
+      } catch (e: any) {
+        result = this.cancelled ? "subagent interrupted" : `subagent provider error: ${e?.message ?? e}`;
         break;
       }
       const blocks: Record<string, any>[] = text ? [{ type: "text", text }] : [];
@@ -530,7 +567,7 @@ export class Agent {
       for (const c of calls) {
         const tctx = childCtx ?? this.ctx;
         const out = t.PLAN_TOOLS.has(c.name)
-          ? t.run(tctx, c.name, c.input)
+          ? await t.runAsync(tctx, c.name, c.input, this.abort?.signal)
           : `subagent tool denied: ${c.name}`;
         msgs.push({
           role: "user",
@@ -575,13 +612,7 @@ export class Agent {
       },
       ...this.messages.slice(-tail),
     ];
-    runHooks(
-      this.cfg,
-      "pre_compact",
-      "",
-      { before_tokens: before },
-      this.session.id,
-    );
+    runHooks(this.cfg, "pre_compact", "", { before_tokens: before }, this.session.id, this.log);
     const after =
       this.messages.reduce((a, m) => a + est(m), 0) + this.bootTokens;
     emit(

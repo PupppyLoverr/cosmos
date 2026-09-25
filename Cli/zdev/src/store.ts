@@ -1,6 +1,9 @@
 // Config (TOML) + session store — same semantics as zcore (contract §1, §6).
 import fs from "node:fs";
 import path from "node:path";
+import * as catalog from "./catalog";
+import * as creds from "./creds";
+import * as live from "./live";
 import * as proto from "./proto";
 import * as toml from "./toml";
 
@@ -22,7 +25,12 @@ export function loadConfig(home: string): Config {
     default_model: null,
     providers: {},
     models: {},
-    permissions: { allow: [], ask: [] },
+    // a fresh install (no [permissions] table): read-only tools run, anything
+    // that changes files or runs commands asks first — like config.example.toml
+    permissions: {
+      allow: ["read", "grep", "glob", "ls", "memory_search", "tool_search"],
+      ask: ["write", "edit", "bash", "memory_write", "task", "mcp_call"],
+    },
     subagents: { max_parallel: 3 },
     bridge: { large_read_lines: 200, summarizer_model: "" },
     mcp: {},
@@ -35,7 +43,14 @@ export function loadConfig(home: string): Config {
       const loaded = toml.parse(fs.readFileSync(p, "utf8"));
       for (const [k, v] of Object.entries(loaded)) {
         const cur = (cfg as any)[k];
-        if (
+        if (k === "permissions" && v && typeof v === "object") {
+          // an explicit table replaces the fresh-install default entirely
+          const pv = v as Record<string, unknown>;
+          cfg.permissions = {
+            allow: Array.isArray(pv.allow) ? (pv.allow as string[]) : [],
+            ask: Array.isArray(pv.ask) ? (pv.ask as string[]) : [],
+          };
+        } else if (
           cur !== null &&
           typeof cur === "object" &&
           !Array.isArray(cur) &&
@@ -62,46 +77,228 @@ export function loadConfig(home: string): Config {
       context: 128000,
       price: { input: 0, cache_read: 0, cache_write: 0, output: 0 },
     };
-    cfg.default_model = "fixture";
+    // keep a configured default (e.g. a catalog ref like anthropic/claude-opus-5-5
+    // written without a [models] table)
+    if (!cfg.default_model) cfg.default_model = "fixture";
   }
   return cfg;
 }
 
+/** §12 outbound allowlist: configured provider hosts, the built-in catalog's
+ * hosts, and the ChatGPT backend + sign-in hosts. */
 export function allowedHosts(cfg: Config): string[] {
-  const out: string[] = [];
+  const out = new Set<string>();
+  const add = (url: string) => {
+    const h = catalog.hostOf(url);
+    if (h) out.add(h);
+  };
   for (const p of Object.values(cfg.providers)) {
-    const url = p?.base_url ?? "";
-    if (url.includes("://")) {
-      const host = url.split("://", 2)[1].split("/")[0].split(":")[0].split("?")[0];
-      if (host) out.push(host);
-    }
+    if (p?.base_url?.includes("://")) add(p.base_url);
     // subscription kind talks to the OAuth issuer for token refresh too
-    if (p?.kind === "chatgpt") out.push("auth.openai.com");
+    if (p?.kind === "chatgpt") out.add("auth.openai.com");
+  }
+  for (const p of catalog.providers()) add(p.base_url);
+  out.add("chatgpt.com");
+  out.add("auth.openai.com");
+  return [...out];
+}
+
+/** A catalog provider is usable once it has a key (or a ChatGPT sign-in). */
+export function providerReady(p: catalog.ProviderDef): boolean {
+  if (catalog.isSubscription(p)) return !!creds.chatgpt();
+  if (!p.env.length) return false; // local servers list their models via config.toml
+  return !!creds.keyFor(p.id, p.env);
+}
+
+const priceObj = (p?: number[]) => ({
+  input: p?.[0] ?? 0,
+  output: p?.[1] ?? 0,
+  cache_read: p?.[2] ?? 0,
+  cache_write: p?.[3] ?? 0,
+});
+
+/**
+ * Resolve a model alias → [provider cfg, model id]. Two forms: a [models]
+ * alias from config.toml (`r9`), or a catalog reference `provider/model`
+ * (`anthropic/claude-opus-5-5`, `chatgpt/gpt-5.5`, `openrouter/qwen/…`).
+ * Keys come from env vars, the credential store or credentials.json.
+ */
+export function providerFor(cfg: Config, alias: string): [Record<string, any>, string] | null {
+  const home = proto.cliHome();
+  const m = cfg.models[alias];
+  if (m) {
+    const p = cfg.providers[m.provider];
+    if (!p) return null;
+    const envOk = !!(p.api_key_env && process.env[p.api_key_env]);
+    return [
+      {
+        kind: p.kind ?? "fixture",
+        base_url: p.base_url ?? "",
+        api_key_env: p.api_key_env ?? "",
+        api_key: envOk || p.kind === "fixture" ? null : (creds.storedKey(m.provider)?.[0] ?? null),
+        model: m.id,
+        context: m.context ?? 128000,
+        output: m.output ?? 0,
+        prices: m.price ?? {},
+        effort: m.effort ?? null,
+        home,
+      },
+      m.id,
+    ];
+  }
+  const ref = catalog.splitRef(alias);
+  if (!ref) return null;
+  const [pid, mid] = ref;
+  const def = catalog.provider(pid);
+  const known = def ? (live.cached(pid)?.find((x) => x.id === mid) ?? catalog.model(def, mid)) : undefined;
+  // a config.toml provider of that name wins over the catalog entry
+  const p = cfg.providers[pid];
+  if (p) {
+    return [
+      {
+        kind: p.kind ?? "fixture",
+        base_url: p.base_url ?? "",
+        api_key_env: p.api_key_env ?? "",
+        api_key: creds.storedKey(pid)?.[0] ?? null,
+        model: mid,
+        context: known?.context ?? 128000,
+        output: known?.output ?? 0,
+        prices: priceObj(known?.price),
+        effort: null,
+        home,
+      },
+      mid,
+    ];
+  }
+  if (!def) return null;
+  return [
+    {
+      kind: def.kind,
+      base_url: def.base_url,
+      api_key_env: def.env[0] ?? "",
+      api_key: catalog.isSubscription(def) ? null : (creds.keyFor(pid, def.env)?.[0] ?? null),
+      model: mid,
+      context: known?.context ?? 128000,
+      output: known?.output ?? 0,
+      prices: priceObj(known?.price),
+      effort: null,
+      home,
+    },
+    mid,
+  ];
+}
+
+export type ModelChoice = {
+  /** what --model / session/set_model takes */
+  alias: string;
+  provider: string;
+  providerName: string;
+  id: string;
+  name: string;
+  context: number;
+  price: { input: number; output: number; cache_read: number; cache_write: number };
+  free: boolean;
+  reasoning: boolean;
+  kind: string;
+  fromConfig: boolean;
+};
+
+/** Everything usable right now: config.toml aliases first, then every
+ * catalog provider with a key — its live list when one was fetched. */
+export function availableModels(cfg: Config): ModelChoice[] {
+  const out: ModelChoice[] = Object.keys(cfg.models)
+    .sort()
+    .map((alias) => {
+      const m = cfg.models[alias];
+      const price = { ...priceObj(), ...(m.price ?? {}) };
+      return {
+        alias,
+        provider: m.provider ?? "",
+        providerName: m.provider ?? "",
+        id: m.id ?? "",
+        name: alias,
+        context: m.context ?? 0,
+        price,
+        free: !Object.values(price).some((v) => v),
+        reasoning: false,
+        kind: cfg.providers[m.provider]?.kind ?? "",
+        fromConfig: true,
+      };
+    });
+  for (const p of catalog.providers()) {
+    if (p.id in cfg.providers || !providerReady(p)) continue;
+    for (const md of live.cached(p.id) ?? p.models) {
+      const price = priceObj(md.price);
+      out.push({
+        alias: `${p.id}/${md.id}`,
+        provider: p.id,
+        providerName: p.name,
+        id: md.id,
+        name: md.name,
+        context: md.context,
+        price,
+        free: !md.price.some((v) => v),
+        reasoning: md.reasoning,
+        kind: p.kind,
+        fromConfig: false,
+      });
+    }
   }
   return out;
 }
 
-export function providerFor(
-  cfg: Config,
-  alias: string,
-): [Record<string, any>, string] | null {
-  const m = cfg.models[alias];
-  if (!m) return null;
-  const p = cfg.providers[m.provider];
-  if (!p) return null;
-  const price = m.price ?? {};
-  return [
-    {
-      kind: p.kind ?? "fixture",
-      base_url: p.base_url ?? "",
-      api_key_env: p.api_key_env ?? "",
-      model: m.id,
-      context: m.context ?? 128000,
-      prices: price,
-      home: proto.cliHome(),
-    },
-    m.id,
-  ];
+/** Write `default_model = "<alias>"` at the top level of config.toml —
+ * replacing the existing key if present, else inserting before any table. */
+export function setDefaultModel(alias: string, home = proto.cliHome()): void {
+  setTopLevel(home, "default_model", alias.replace(/["\\]/g, ""));
+}
+
+/** `user_name = "…"` — the greeting in the header. */
+export function setUserName(name: string, home = proto.cliHome()): void {
+  setTopLevel(home, "user_name", name);
+}
+
+function setTopLevel(home: string, key: string, value: string): void {
+  const file = path.join(home, "config.toml");
+  let text = "";
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {}
+  const line = `${key} = ${JSON.stringify(value)}`;
+  const out: string[] = [];
+  let done = false;
+  let inTable = false;
+  for (const l of text.split(/\r?\n/)) {
+    const t = l.trimStart();
+    if (t.startsWith("[")) inTable = true;
+    if (!inTable && !done && new RegExp(`^${key}\\s*=`).test(t)) {
+      out.push(line);
+      done = true;
+    } else out.push(l);
+  }
+  while (out.length && out[out.length - 1] === "") out.pop();
+  if (!done) out.unshift(line);
+  fs.mkdirSync(home, { recursive: true });
+  fs.writeFileSync(file, out.join("\n") + "\n", "utf8");
+}
+
+/** AGENTS.md (Codex, Devin, pi), CLAUDE.md (Claude Code) and
+ * .zcli/instructions.md from the workspace root, each capped at 32 KB. */
+export function projectInstructions(workspace: string): string | null {
+  const CAP = 32 * 1024;
+  const parts: string[] = [];
+  for (const name of ["AGENTS.md", "CLAUDE.md", ".zcli/instructions.md"]) {
+    let text: string;
+    try {
+      text = fs.readFileSync(path.join(workspace, name), "utf8").trim();
+    } catch {
+      continue;
+    }
+    if (!text) continue;
+    const body = text.length > CAP ? text.slice(0, CAP) : text;
+    parts.push(`<project-instructions file="${name}">\n${body}\n</project-instructions>`);
+  }
+  return parts.length ? `The repository provides these instructions; follow them.\n\n${parts.join("\n\n")}` : null;
 }
 
 export type Message = {

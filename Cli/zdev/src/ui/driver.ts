@@ -1,36 +1,40 @@
 // ZdevDriver — in-process backend with the AcpClient surface. The TUI talks
 // to the Agent directly (no stdio hop); same semantics as `zdev acp`:
 //   call(method, params) → {result} | {error}
-//   onUpdate(sid, update) fires for session/update-mapped events
+//   onUpdate(sid, update) fires for session/update-mapped events, plus
+//     `agent_message_chunk` deltas while the reply streams
 //   server→client session/request_permission → onRequest + reply(id, …)
-//   notify("session/cancel") → per-session cancel flag
-import { spawnSync } from "node:child_process";
+//   notify("session/cancel") → aborts the provider stream / running tool
 import fs from "node:fs";
 import path from "node:path";
 
 import { Agent } from "../agent";
 import { updateFor, type Json } from "../acp";
+import * as catalog from "../catalog";
+import * as creds from "../creds";
+import * as live from "../live";
 import * as proto from "../proto";
+import { lastRateLimits } from "../providers";
 import * as store from "../store";
 
 export type ServerRequest = { id: number; method: string; params: any };
 
 /** Bump when the onboarding flow changes — existing installs re-run once. */
-export const ONBOARDING_VERSION = "2";
+export const ONBOARDING_VERSION = "3";
 
 export class ZdevDriver {
   private opts: proto.RunOpts;
   private cwd: string;
-  private agent: Agent | null = null;
-  private cancelFlag = { set: false };
+  agent: Agent | null = null;
+  private cancelled = false;
   private askerCtx: Json = {};
   private reqSeq = 1000;
   private clientReplies = new Map<number, (result: any) => void>();
+  /** provider diagnostics (turn usage, hook failures) — never printed in the TUI */
   stderrTail: string[] = [];
 
   onUpdate: (sessionId: string, update: any) => void = () => {};
   onRequest: (req: ServerRequest) => void = () => {};
-  onExit: (code: number | null) => void = () => {};
 
   constructor(opts: proto.RunOpts, cwd: string) {
     this.opts = opts;
@@ -45,134 +49,84 @@ export class ZdevDriver {
     return this.agent?.session.id ?? "";
   }
 
-  // ── onboarding helpers ─────────────────────────────────────────────────
-  providersInfo(): {
-    name: string;
-    base_url: string;
-    api_key_env: string;
-    keySet: boolean;
-    kind: string;
-  }[] {
-    const cfg = store.loadConfig(this.home);
-    return Object.entries(cfg.providers).map(([name, p]) => ({
-      name,
-      base_url: p.base_url ?? "",
-      api_key_env: p.api_key_env ?? "",
-      keySet: !!(p.api_key_env && process.env[p.api_key_env]),
-      kind: p.kind ?? "fixture",
-    }));
-  }
+  // ── onboarding / identity ──────────────────────────────────────────────
 
-  /** Write default_model = "<alias>" into config.toml, preserving the rest. */
-  persistDefaultModel(alias: string): void {
-    const p = path.join(this.home, "config.toml");
-    let text = "";
+  static onboardingDone(home = proto.cliHome()): boolean {
     try {
-      text = fs.readFileSync(p, "utf8");
-    } catch {}
-    const line = `default_model = "${alias}"`;
-    if (/^default_model\s*=/m.test(text)) {
-      text = text.replace(/^default_model\s*=.*$/m, line);
-    } else {
-      text = line + "\n" + text;
-    }
-    fs.mkdirSync(this.home, { recursive: true });
-    fs.writeFileSync(p, text, "utf8");
-  }
-
-  onboardingDone(): boolean {
-    try {
-      return (
-        fs.readFileSync(path.join(this.home, ".zdev-onboarded"), "utf8").trim() ===
-        ONBOARDING_VERSION
-      );
+      return fs.readFileSync(path.join(home, ".zdev-onboarded"), "utf8").trim() === ONBOARDING_VERSION;
     } catch {
       return false;
     }
   }
 
-  markOnboarded(): void {
-    fs.mkdirSync(this.home, { recursive: true });
-    fs.writeFileSync(
-      path.join(this.home, ".zdev-onboarded"),
-      ONBOARDING_VERSION + "\n",
-      "utf8",
-    );
+  static markOnboarded(home = proto.cliHome()): void {
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, ".zdev-onboarded"), ONBOARDING_VERSION + "\n", "utf8");
   }
 
   /** `user_name = "…"` in config.toml — drives "Welcome back <name>". */
   userName(): string {
-    const cfg = store.loadConfig(this.home);
-    return (cfg.user_name as string) ?? "";
-  }
-
-  persistName(name: string): void {
-    const p = path.join(this.home, "config.toml");
-    let text = "";
-    try {
-      text = fs.readFileSync(p, "utf8");
-    } catch {}
-    const line = `user_name = ${JSON.stringify(name)}`;
-    text = /^user_name\s*=/m.test(text)
-      ? text.replace(/^user_name\s*=.*$/m, line)
-      : line + "\n" + text;
-    fs.mkdirSync(this.home, { recursive: true });
-    fs.writeFileSync(p, text, "utf8");
-  }
-
-  /** Append `[providers.X]` + `[models.alias]` blocks; skip what exists. */
-  persistProvider(p: {
-    name: string;
-    kind: string;
-    base_url: string;
-    api_key_env: string;
-    alias: string;
-    model_id: string;
-    context: number;
-  }): void {
-    const f = path.join(this.home, "config.toml");
-    let text = "";
-    try {
-      text = fs.readFileSync(f, "utf8");
-    } catch {}
-    let add = "";
-    if (!new RegExp(`^\\s*\\[providers\\.${p.name}\\]`, "m").test(text)) {
-      add += `\n[providers.${p.name}]\nkind = "${p.kind}"\n`;
-      if (p.base_url) add += `base_url = "${p.base_url}"\n`;
-      if (p.api_key_env) add += `api_key_env = "${p.api_key_env}"\n`;
-    }
-    if (!new RegExp(`^\\s*\\[models\\.${p.alias}\\]`, "m").test(text)) {
-      add +=
-        `\n[models.${p.alias}]\nprovider = "${p.name}"\n` +
-        `id = "${p.model_id}"\ncontext = ${p.context}\n`;
-    }
-    if (!add) return;
-    fs.mkdirSync(this.home, { recursive: true });
-    fs.writeFileSync(f, text + add, "utf8");
-  }
-
-  /** Persist a BYOK key as a User-scope env var (registry HKCU\Environment)
-   * + into this process — config.toml stays key-free per contract §12. */
-  persistEnvVar(name: string, value: string): void {
-    process.env[name] = value;
-    if (process.platform !== "win32") return;
-    spawnSync(
-      "reg",
-      ["add", "HKCU\\Environment", "/v", name, "/t", "REG_SZ", "/d", value, "/f"],
-      { windowsHide: true },
-    );
+    const v = store.loadConfig(this.home).user_name;
+    return typeof v === "string" ? v : "";
   }
 
   sessions(): Record<string, any>[] {
-    return store.Session.list(this.home).slice().reverse(); // newest first
+    return store.Session.list(this.home)
+      .slice()
+      .reverse()
+      .filter((s) => s.id !== this.sessionId && s.preview);
   }
 
-  async oauthLogin(onOpen: (url: string) => void): Promise<{
-    email?: string;
-  }> {
-    const { loginChatGPT } = await import("../oauth");
-    const a = await loginChatGPT(this.home, onOpen);
-    return { email: a.email };
+  // ── keys, sign-in, live models (/connect, /login, /logout, /model) ───────
+
+  /** Catalog providers that take an API key or sign-in, with status. */
+  providers(): { def: catalog.ProviderDef; ready: boolean; detail: string }[] {
+    return catalog
+      .providers()
+      .filter((p) => catalog.isSubscription(p) || p.env.length)
+      .map((p) => {
+        if (catalog.isSubscription(p)) {
+          const t = creds.chatgpt();
+          return { def: p, ready: !!t, detail: t ? `signed in${t.email ? ` as ${t.email}` : ""}` : "browser sign-in" };
+        }
+        const k = creds.keyFor(p.id, p.env);
+        return { def: p, ready: !!k, detail: k ? `${creds.mask(k[0])} · ${k[1]}` : p.env[0] };
+      });
+  }
+
+  storeKey(providerId: string, key: string): creds.Source {
+    return creds.storeKey(providerId, key);
+  }
+
+  deleteKey(providerId: string): void {
+    creds.deleteKey(providerId);
+  }
+
+  async fetchModels(providerId: string, signal?: AbortSignal): Promise<catalog.ModelDef[]> {
+    const def = catalog.provider(providerId);
+    if (!def) throw new Error(`unknown provider ${providerId}`);
+    const models = await live.fetchModels(def, signal);
+    live.store(providerId, models);
+    return models;
+  }
+
+  async login(onUrl: (url: string) => void, signal?: AbortSignal) {
+    const { login } = await import("../oauth");
+    return login(onUrl, signal);
+  }
+
+  async logout(providerId: string): Promise<string> {
+    if (providerId === "chatgpt") {
+      const { logout } = await import("../oauth");
+      logout();
+      return "Signed out of ChatGPT";
+    }
+    creds.deleteKey(providerId);
+    return `Removed the stored ${providerId} key (environment variables are untouched)`;
+  }
+
+  rateLimits() {
+    return lastRateLimits();
   }
 
   // ── AcpClient-shaped surface ───────────────────────────────────────────
@@ -184,8 +138,16 @@ export class ZdevDriver {
     }
   }
 
-  notify(method: string, params: any) {
-    if (method === "session/cancel") this.cancelFlag.set = true;
+  notify(method: string, _params: any) {
+    if (method === "session/cancel") {
+      this.cancelled = true;
+      this.agent?.cancel();
+      // a pending permission prompt counts as "deny" so the turn can unwind
+      for (const [id, r] of this.clientReplies) {
+        this.clientReplies.delete(id);
+        r({ outcome: { outcome: "cancelled" } });
+      }
+    }
   }
 
   reply(id: number, result: any) {
@@ -201,10 +163,28 @@ export class ZdevDriver {
     this.agent = null;
   }
 
+  /** Map session events to UI updates. Assistant text already streamed as
+   * deltas, so the final `assistant` event is not re-sent. */
   private emit = (sid: string) => (ev: proto.Event) => {
+    if (ev.kind === "assistant") return;
+    // you just approved it — only a denial is worth a line
+    if (ev.kind === "permission_decision" && ev.data?.granted) return;
     const n = updateFor(sid, ev);
     if (n) this.onUpdate(sid, n.params.update);
   };
+
+  private attach(a: Agent) {
+    this.agent = a;
+    this.cancelled = false;
+    this.askerCtx = {};
+    a.asker = this.makeAsker(a);
+    a.log = (s) => {
+      this.stderrTail.push(s);
+      if (this.stderrTail.length > 50) this.stderrTail.shift();
+    };
+    a.onDelta = (text) =>
+      this.onUpdate(a.session.id, { sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+  }
 
   private async dispatch(method: string, params: Json): Promise<Json> {
     switch (method) {
@@ -212,57 +192,49 @@ export class ZdevDriver {
         return {
           protocolVersion: 1,
           agentInfo: { name: "zdev", version: "0.1.0" },
-          agentCapabilities: {
-            loadSession: false,
-            promptCapabilities: { embeddedContext: true },
-          },
+          agentCapabilities: { loadSession: false, promptCapabilities: { embeddedContext: true } },
         };
       case "session/new": {
         const o = new proto.RunOpts();
         Object.assign(o, this.opts);
+        o.allow = [...this.opts.allow];
         o.cwd = params.cwd ?? this.opts.cwd ?? this.cwd;
         if (["plan", "agent", "yolo"].includes(params.mode)) {
           o.mode = params.mode;
           o.yolo = params.mode === "yolo";
         }
         if (params.model) o.model = params.model;
-        if (params.resume) o.resume = params.resume;
+        o.resume = params.resume ?? null;
+        this.agent?.cleanup();
         const a = new Agent(o, "zdev", o.cwd ?? this.cwd);
-        this.agent = a;
-        this.cancelFlag = { set: false };
-        this.askerCtx = {};
-        a.asker = this.makeAsker(a);
+        this.attach(a);
         return {
           sessionId: a.session.id,
           model: a.modelAlias,
           mode: a.mode,
+          context: a.provider.context ?? 0,
+          history: o.resume ? a.messages.length : 0,
         };
       }
       case "session/prompt": {
         const a = this.mustAgent();
-        this.cancelFlag.set = false;
-        const prompt = (params.prompt ?? [])
-          .map((b: Json) => b.text ?? "")
-          .join("\n");
+        this.cancelled = false;
+        const prompt = (params.prompt ?? []).map((b: Json) => b.text ?? "").join("\n");
         const emit = this.emit(a.session.id);
         a.sendUser(prompt, emit);
-        const reason = await this.runTurns(a, emit);
-        return { stopReason: reason };
+        return { stopReason: await this.runTurns(a, emit) };
       }
       case "session/approve": {
         const a = this.mustAgent();
-        this.cancelFlag.set = false;
+        this.cancelled = false;
         const emit = this.emit(a.session.id);
         a.approvePlan(emit);
-        const reason = await this.runTurns(a, emit);
-        return { stopReason: reason };
+        return { stopReason: await this.runTurns(a, emit) };
       }
       case "session/set_mode": {
         const a = this.mustAgent();
         const mode = params.mode ?? "";
-        if (!["plan", "agent", "yolo"].includes(mode)) {
-          throw new Error(`bad mode ${JSON.stringify(mode)} (plan|agent|yolo)`);
-        }
+        if (!["plan", "agent", "yolo"].includes(mode)) throw new Error(`bad mode ${JSON.stringify(mode)} (plan|agent|yolo)`);
         const old = a.mode;
         a.mode = mode;
         a.opts.yolo = mode === "yolo";
@@ -271,33 +243,23 @@ export class ZdevDriver {
       }
       case "session/set_model": {
         const a = this.mustAgent();
-        const alias = params.model ?? "";
-        // reload config — onboarding may have written providers since boot
+        const alias = String(params.model ?? "");
+        // reload config — onboarding or /connect may have changed it since boot
         a.cfg = store.loadConfig(this.home);
         const found = store.providerFor(a.cfg, alias);
-        if (!found) throw new Error(`unknown model ${JSON.stringify(alias)}`);
+        if (!found) throw new Error(`unknown model ${JSON.stringify(alias)} — try provider/model, e.g. anthropic/claude-opus-5-5`);
         const [provider, modelId] = found;
+        if (params.effort) provider.effort = params.effort;
         a.provider = provider;
         a.allowed = store.allowedHosts(a.cfg);
         a.modelAlias = `${alias} (${modelId})`;
         a.session.append("model_switch", { alias, id: modelId });
-        return { model: a.modelAlias };
+        if (params.remember) store.setDefaultModel(alias, this.home);
+        return { model: a.modelAlias, context: provider.context ?? 0 };
       }
       case "session/list_models": {
         const cfg = store.loadConfig(this.home);
-        const models = Object.keys(cfg.models)
-          .sort()
-          .map((k) => {
-            const m = cfg.models[k];
-            return {
-              alias: k,
-              provider: m.provider ?? "",
-              id: m.id ?? "",
-              context: m.context ?? 0,
-              free: !Object.values(m.price ?? {}).some((v) => v),
-            };
-          });
-        return { models, default: cfg.default_model };
+        return { models: store.availableModels(cfg), default: cfg.default_model };
       }
       default:
         throw new Error("method not found");
@@ -320,15 +282,16 @@ export class ZdevDriver {
 
   private makeAsker(a: Agent) {
     return async (tool: string): Promise<boolean> => {
+      if (this.cancelled) return false;
       const result = await this.requestFromClient("session/request_permission", {
         sessionId: a.session.id,
         toolCallId: this.askerCtx.tid ?? tool,
         tool,
         input: this.askerCtx.input ?? {},
         options: [
-          { id: "allow", name: "Allow once" },
-          { id: "allow_always", name: "Always allow" },
-          { id: "deny", name: "Deny" },
+          { id: "allow", name: "Yes" },
+          { id: "allow_always", name: `Yes, and don't ask again for ${tool} this session` },
+          { id: "deny", name: "No, tell zdev what to do differently" },
         ],
       });
       const outcome = result?.outcome ?? {};
@@ -337,35 +300,41 @@ export class ZdevDriver {
         if (!a.opts.allow.includes(tool)) a.opts.allow.push(tool);
         return true;
       }
-      return opt === "allow" || opt === "selected" || opt === "yes";
+      return opt === "allow" || opt === "yes";
     };
   }
 
-  private async runTurns(
-    a: Agent,
-    emit: (ev: proto.Event) => void,
-  ): Promise<string> {
-    for (let i = 0; i < (a.opts.max_turns ?? 16); i++) {
-      if (this.cancelFlag.set) return "cancelled";
+  private async runTurns(a: Agent, emit: (ev: proto.Event) => void): Promise<string> {
+    for (let i = 0; i < (a.opts.max_turns ?? 40); i++) {
+      if (this.cancelled) return "cancelled";
       let done: boolean;
       try {
         done = await a.turn(emit);
       } catch (e: any) {
-        this.stderrTail.push(String(e?.message ?? e));
+        if (this.cancelled || String(e?.message) === "interrupted") return "cancelled";
+        const msg = String(e?.message ?? e);
+        this.stderrTail.push(msg);
+        this.onUpdate(a.session.id, { sessionUpdate: "error", text: msg });
         return "refusal";
       }
       if (done) return "end_turn";
-      const calls = (a.messages[a.messages.length - 1].content ?? []).filter(
-        (b) => b.type === "tool_use",
-      );
+      const calls = (a.messages[a.messages.length - 1].content ?? []).filter((b) => b.type === "tool_use");
       if (!calls.length) return "end_turn";
       for (const c of calls) {
-        if (this.cancelFlag.set) return "cancelled";
+        if (this.cancelled) {
+          // answer every call so the transcript stays valid for the next turn
+          a.messages.push({
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: c.id, content: "interrupted by the operator", is_error: true }],
+          });
+          continue;
+        }
         this.askerCtx.tid = c.id;
         this.askerCtx.input = c.input;
         await a.execTool(c.id, c.name, c.input, emit);
         if (c.name === "submit_plan") return "end_turn";
       }
+      if (this.cancelled) return "cancelled";
     }
     return "max_turns";
   }

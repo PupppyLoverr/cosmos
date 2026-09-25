@@ -99,6 +99,33 @@ fn chatgpt() -> ProviderDef {
     }
 }
 
+/// 9Router — a local OpenAI-compatible gateway that routes the operator's
+/// existing subscriptions (Kiro, Kilo, Antigravity, …). Its key comes from
+/// the 9Router dashboard. The routes below are the verified defaults; the
+/// live list from its `/models` replaces them once it's running.
+fn router9() -> ProviderDef {
+    let m = |id: &str, name: &str, context: u64| ModelDef {
+        id: id.into(),
+        name: name.into(),
+        context,
+        output: 32_000,
+        reasoning: false,
+        price: [0.0; 4],
+    };
+    ProviderDef {
+        id: "router9".into(),
+        name: "9Router".into(),
+        kind: "openai".into(),
+        base_url: "http://localhost:20128/v1".into(),
+        env: vec!["ROUTER9_API_KEY".into()],
+        models: vec![
+            m("kr/claude-sonnet-4.5", "Claude Sonnet 4.5 (Kiro)", 200_000),
+            m("ag/gemini-3.8-flash", "Gemini 3.8 Flash (Antigravity)", 1_048_576),
+            m("kc/kilo-auto/free", "Kilo Auto (free)", 200_000),
+        ],
+    }
+}
+
 /// Local servers that need no key.
 fn local() -> Vec<ProviderDef> {
     vec![
@@ -126,7 +153,7 @@ pub fn providers() -> &'static [ProviderDef] {
     P.get_or_init(|| {
         let file: CatalogFile = serde_json::from_str(include_str!("../catalog/catalog.json"))
             .expect("catalog.json is generated and checked in");
-        let mut v = vec![chatgpt()];
+        let mut v = vec![chatgpt(), router9()];
         v.extend(file.providers);
         v.extend(local());
         v
@@ -150,7 +177,7 @@ mod tests {
 
     #[test]
     fn catalog_loads_with_requested_providers() {
-        for id in ["chatgpt", "openai", "anthropic", "google", "meta", "llama", "xiaomi", "alibaba", "bailing", "xai", "deepseek", "moonshotai", "zai", "minimax", "mistral", "groq", "openrouter", "ollama"] {
+        for id in ["chatgpt", "router9", "openai", "anthropic", "google", "meta", "llama", "xiaomi", "alibaba", "bailing", "xai", "deepseek", "moonshotai", "zai", "minimax", "mistral", "groq", "openrouter", "ollama"] {
             assert!(provider(id).is_some(), "{id} missing from catalog");
         }
         let xiaomi = provider("xiaomi").unwrap();

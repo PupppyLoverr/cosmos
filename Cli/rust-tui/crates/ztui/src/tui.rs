@@ -191,6 +191,10 @@ pub struct App {
     pub user: Option<String>,
     /// `/onboarding` asked the loop to hand the terminal to zcli-welcome
     pub replay_onboard: bool,
+    /// the dictation key is physically down (Windows reports releases), so
+    /// its auto-repeat can't stop a recording it just started
+    toggle_held: bool,
+    toggle_last: Option<Instant>,
 }
 
 fn model_rows() -> Vec<ModelRow> {
@@ -259,6 +263,8 @@ impl App {
             last_reply: String::new(),
             user: None,
             replay_onboard: false,
+            toggle_held: false,
+            toggle_last: None,
         }
     }
 
@@ -609,6 +615,29 @@ impl App {
         }
     }
 
+    /// True when this Ctrl+Space press is the key's auto-repeat. Windows
+    /// reports key releases, so "held" is exact there (with a timeout in case
+    /// a release goes missing); elsewhere a short debounce does the job.
+    fn toggle_repeat(&mut self) -> bool {
+        let now = Instant::now();
+        let since = self.toggle_last.map(|t| now.duration_since(t));
+        self.toggle_last = Some(now);
+        if cfg!(windows) {
+            let repeat = self.toggle_held && since.is_some_and(|d| d < Duration::from_secs(2));
+            self.toggle_held = true;
+            repeat
+        } else {
+            since.is_some_and(|d| d < Duration::from_millis(250))
+        }
+    }
+
+    /// A key came up (Windows only reports these).
+    pub fn on_release(&mut self, k: KeyEvent) {
+        if matches!(k.code, KeyCode::Char(' ') | KeyCode::Null) {
+            self.toggle_held = false;
+        }
+    }
+
     fn toggle_dictation(&mut self) {
         if let Some(rec) = &mut self.rec {
             if !rec.transcribing {
@@ -724,6 +753,22 @@ impl App {
             i += 1;
         }
         i
+    }
+
+    /// Pasted text from any source: into a popup's filter, or the composer.
+    pub fn paste_text(&mut self, s: &str) {
+        if self.quitting || self.rec.is_some() {
+            return;
+        }
+        match &mut self.popup {
+            Some(Popup::Model { filter, .. } | Popup::Connect { filter, .. }) => filter.extend(s.chars().filter(|c| !c.is_control())),
+            _ if self.perm.is_none() => {
+                self.paste(s);
+                self.refresh_popups();
+            }
+            _ => {}
+        }
+        self.dirty = true;
     }
 
     fn paste(&mut self, s: &str) {
@@ -1128,17 +1173,23 @@ impl App {
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
 
+        // Ctrl+Space toggles dictation: once to start, once more to stop
+        let toggle = (ctrl && k.code == KeyCode::Char(' ')) || k.code == KeyCode::Null;
+        if toggle && self.toggle_repeat() {
+            return; // the key is still held — auto-repeat, not a second press
+        }
         // dictation owns the keyboard while recording
         if let Some(rec) = &mut self.rec {
             match k.code {
                 KeyCode::Esc => rec.cancel(),
                 KeyCode::Char('c') if ctrl => rec.cancel(),
-                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Null if !rec.transcribing => rec.finish(),
+                KeyCode::Enter if !rec.transcribing => rec.finish(),
+                _ if toggle && !rec.transcribing => rec.finish(),
                 _ => {}
             }
             return;
         }
-        if (ctrl && k.code == KeyCode::Char(' ')) || k.code == KeyCode::Null {
+        if toggle {
             self.toggle_dictation();
             return;
         }
@@ -1534,6 +1585,56 @@ pub fn try_run(opts: &RunOpts, cwd: &Path) -> Result<Option<i32>> {
     r.map(Some)
 }
 
+/// The character a key press types, if it's plain text (Enter is a
+/// newline inside a paste). AltGr arrives as Ctrl+Alt and still types.
+fn typed_char(k: &KeyEvent) -> Option<char> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    match k.code {
+        KeyCode::Char(c) if !ctrl || alt => Some(c),
+        KeyCode::Enter if !ctrl && !alt => Some('\n'),
+        KeyCode::Tab if k.modifiers.is_empty() => Some('\t'),
+        _ => None,
+    }
+}
+
+/// Starting from `first`, gather keys that arrive back to back (`next`
+/// yields the next event only if one is already waiting). A burst of more
+/// than one typed character is a paste → `Some(text)`; otherwise `None` and
+/// `first` is handled as a normal key. Events that aren't text end the burst
+/// and come back in the second slot, in order.
+fn collect_burst(
+    first: KeyEvent,
+    next: &mut dyn FnMut() -> std::io::Result<Option<CEvent>>,
+) -> std::io::Result<(Option<String>, Vec<CEvent>)> {
+    let Some(c0) = typed_char(&first) else { return Ok((None, Vec::new())) };
+    let mut text = String::from(c0);
+    let mut rest = Vec::new();
+    while let Some(ev) = next()? {
+        match ev {
+            CEvent::Key(k) if k.kind == KeyEventKind::Release => rest.push(CEvent::Key(k)),
+            CEvent::Key(k) => match typed_char(&k) {
+                Some(c) => text.push(c),
+                _ => {
+                    rest.push(CEvent::Key(k));
+                    break;
+                }
+            },
+            other => {
+                rest.push(other);
+                break;
+            }
+        }
+    }
+    if text.chars().count() > 1 {
+        // key releases inside a paste carry nothing
+        rest.retain(|e| !matches!(e, CEvent::Key(k) if k.kind == KeyEventKind::Release));
+        Ok((Some(text), rest))
+    } else {
+        Ok((None, rest))
+    }
+}
+
 fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender<Cmd>, interrupt: &Arc<AtomicBool>) -> Result<i32> {
     let mut last_tick = Instant::now();
     loop {
@@ -1604,16 +1705,36 @@ fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender
             // drain everything queued so pastes and fast typing coalesce
             loop {
                 match event::read()? {
-                    CEvent::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k, cmd, interrupt),
-                    CEvent::Paste(s) if !app.quitting => {
-                        match &mut app.popup {
-                            Some(Popup::Model { filter, .. } | Popup::Connect { filter, .. }) => filter.extend(s.chars().filter(|c| !c.is_control())),
-                            _ if app.perm.is_none() => {
-                                app.paste(&s);
-                                app.refresh_popups();
-                            }
-                            _ => {}
+                    CEvent::Key(k) if k.kind == KeyEventKind::Release => app.on_release(k),
+                    CEvent::Key(k) => {
+                        // Windows consoles deliver a paste as a stream of key
+                        // presses (no bracketed paste there), so each Enter in it
+                        // would send a line. Keys arriving back to back faster
+                        // than hands can type are a paste: take them as one.
+                        let mut next = || -> std::io::Result<Option<CEvent>> {
+                            Ok(if event::poll(Duration::from_millis(4))? { Some(event::read()?) } else { None })
+                        };
+                        let (pasted, rest) = collect_burst(k, &mut next)?;
+                        match pasted {
+                            Some(s) => app.paste_text(&s),
+                            None => app.on_key(k, cmd, interrupt),
                         }
+                        for ev in rest {
+                            match ev {
+                                CEvent::Key(k) if k.kind == KeyEventKind::Release => app.on_release(k),
+                                CEvent::Key(k) => app.on_key(k, cmd, interrupt),
+                                CEvent::Paste(s) => app.paste_text(&s),
+                                CEvent::Resize(w, h) => {
+                                    screen.resized(w, h);
+                                    app.width = screen.text_width();
+                                }
+                                _ => {}
+                            }
+                            app.dirty = true;
+                        }
+                    }
+                    CEvent::Paste(s) if !app.quitting => {
+                        app.paste_text(&s);
                         app.dirty = true;
                     }
                     CEvent::Resize(w, h) => {
@@ -1728,6 +1849,79 @@ mod tests {
         let shown: String = a.input.iter().collect();
         assert_eq!(shown, "[Pasted text #1 +20 lines]");
         assert_eq!(a.expand_pastes(&shown), body);
+    }
+
+    /// A Windows console paste: press/release per character, Enter for newlines.
+    fn windows_paste(text: &str) -> Vec<CEvent> {
+        let mut v = Vec::new();
+        for c in text.chars() {
+            let code = if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) };
+            v.push(CEvent::Key(KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press)));
+            v.push(CEvent::Key(KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Release)));
+        }
+        v
+    }
+
+    fn burst(events: Vec<CEvent>) -> (Option<String>, Vec<CEvent>) {
+        let mut it = events.into_iter();
+        let first = match it.next() {
+            Some(CEvent::Key(k)) => k,
+            _ => panic!("needs a key first"),
+        };
+        let mut next = || -> std::io::Result<Option<CEvent>> { Ok(it.next()) };
+        collect_burst(first, &mut next).unwrap()
+    }
+
+    #[test]
+    fn a_multi_line_paste_arrives_as_one_text_not_as_enters() {
+        let (text, rest) = burst(windows_paste("fn main() {\n    println!(\"hi\");\n}\n"));
+        assert_eq!(text.as_deref(), Some("fn main() {\n    println!(\"hi\");\n}\n"));
+        assert!(rest.is_empty(), "releases inside the paste are dropped");
+    }
+
+    #[test]
+    fn a_single_typed_key_and_enter_stay_keys() {
+        let (text, rest) = burst(windows_paste("a"));
+        assert_eq!(text, None);
+        assert_eq!(rest.len(), 1); // its release, handled normally
+        let (text, _) = burst(vec![CEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))]);
+        assert_eq!(text, None, "a lone Enter still sends");
+    }
+
+    #[test]
+    fn a_burst_stops_at_a_non_text_key_and_hands_it_back() {
+        let mut ev = windows_paste("ab");
+        ev.push(CEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        ev.extend(windows_paste("cd"));
+        let (text, rest) = burst(ev);
+        assert_eq!(text.as_deref(), Some("ab"));
+        assert!(matches!(rest.first(), Some(CEvent::Key(k)) if k.code == KeyCode::Up));
+        // ctrl+c is a command, not text; AltGr (ctrl+alt) still types
+        assert_eq!(typed_char(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), None);
+        assert_eq!(typed_char(&KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT)), Some('@'));
+    }
+
+    #[test]
+    fn pasted_lines_land_in_the_composer_unsent() {
+        let _env = crate::env_lock();
+        let mut a = app();
+        a.paste_text("first line\nsecond line");
+        let shown: String = a.input.iter().collect();
+        assert_eq!(shown, "first line\nsecond line");
+    }
+
+    #[test]
+    fn a_held_ctrl_space_only_toggles_once() {
+        let _env = crate::env_lock();
+        let mut a = app();
+        assert!(!a.toggle_repeat(), "first press toggles");
+        if cfg!(windows) {
+            // auto-repeat while held — ignored however long it runs
+            assert!(a.toggle_repeat());
+            assert!(a.toggle_repeat());
+            a.on_release(KeyEvent::new_with_kind(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Release));
+            assert!(!a.toggle_repeat(), "a new press after release toggles again");
+        }
     }
 
     #[test]

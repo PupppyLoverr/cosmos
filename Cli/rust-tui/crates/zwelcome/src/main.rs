@@ -37,19 +37,20 @@ const SPIN: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', 
 /// where to get a key. The rest keep catalog order and show their env var.
 const PINNED: &[(&str, &str, &str)] = &[
     ("chatgpt", "use your Plus / Pro plan — no API key", ""),
-    ("openrouter", "one key, 300+ models from every lab", "openrouter.ai/keys"),
-    ("anthropic", "Claude", "console.anthropic.com/settings/keys"),
-    ("openai", "GPT and o-series", "platform.openai.com/api-keys"),
-    ("google", "Gemini", "aistudio.google.com/apikey"),
-    ("xai", "Grok", "console.x.ai"),
+    ("openrouter", "one key, 300+ models from every lab", "https://openrouter.ai/keys"),
+    ("router9", "your local 9Router — routes the subscriptions you have", "http://localhost:20128 → API keys"),
+    ("anthropic", "Claude", "https://console.anthropic.com/settings/keys"),
+    ("openai", "GPT and o-series", "https://platform.openai.com/api-keys"),
+    ("google", "Gemini", "https://aistudio.google.com/apikey"),
+    ("xai", "Grok", "https://console.x.ai"),
     ("meta", "Muse", ""),
-    ("groq", "very fast open models", "console.groq.com/keys"),
-    ("deepseek", "DeepSeek V and R", "platform.deepseek.com/api_keys"),
-    ("mistral", "Mistral and Codestral", "console.mistral.ai/api-keys"),
+    ("groq", "very fast open models", "https://console.groq.com/keys"),
+    ("deepseek", "DeepSeek V and R", "https://platform.deepseek.com/api_keys"),
+    ("mistral", "Mistral and Codestral", "https://console.mistral.ai/api-keys"),
     ("xiaomi", "MiMo", ""),
-    ("moonshotai", "Kimi", "platform.moonshot.ai"),
-    ("zai", "GLM", "z.ai/manage-apikey"),
-    ("cerebras", "fastest inference", "cloud.cerebras.ai"),
+    ("moonshotai", "Kimi", "https://platform.moonshot.ai"),
+    ("zai", "GLM", "https://z.ai/manage-apikey"),
+    ("cerebras", "fastest inference", "https://cloud.cerebras.ai"),
     ("minimax", "MiniMax", ""),
 ];
 
@@ -806,6 +807,8 @@ struct Ob {
     fetcher: Fetcher,
     /// model chosen per provider in this run
     chosen: HashMap<String, String>,
+    /// providers connected in this run, in order — preferred for the default
+    connected: Vec<String>,
     /// the default zcli will open with: (alias, set in this run)
     model: Option<(String, bool)>,
 
@@ -845,6 +848,7 @@ impl Ob {
             pick: None,
             fetcher: zcore::live::fetch,
             chosen: HashMap::new(),
+            connected: Vec::new(),
             model: None,
             status: None,
             done: false,
@@ -1203,7 +1207,7 @@ impl Ob {
             c.text(x, y + 4, &"─".repeat(cw.min(64)), RULE);
             let mut yy = y + 6;
             if !p.key_url.is_empty() {
-                c.spans(x, yy, &[Span::styled("get one at ", DIM), Span::styled(format!("https://{}", p.key_url), kit::fg(ACCENT))]);
+                c.spans(x, yy, &[Span::styled("get one at ", DIM), Span::styled(p.key_url, kit::fg(ACCENT))]);
                 yy += 1;
             }
             if let Some(e) = p.def.env.first() {
@@ -1292,6 +1296,7 @@ impl Ob {
                     self.refresh_keyed();
                     let who = t.email.map(|e| format!(" as {e}")).unwrap_or_default();
                     self.flash(format!("✓ signed in{who}"), true);
+                    self.connected.push("chatgpt".into());
                     if let Some(i) = self.provs.iter().position(|p| p.sub()) {
                         self.open_models(i);
                     }
@@ -1480,9 +1485,15 @@ impl Ob {
             // `fixture` is the offline placeholder Config falls back to — not a choice
             if let Some(d) = cfg.default_model.clone().filter(|d| d != "fixture") {
                 self.model = Some((d, false));
-            } else if let Some(a) =
-                cfg.available_models().into_iter().find(|m| !m.from_config && self.keyed.contains(&m.provider)).map(|m| m.alias)
-            {
+            } else if let Some(a) = {
+                // best model of the first provider connected now, else of any keyed one
+                let models = cfg.available_models();
+                self.connected
+                    .iter()
+                    .find_map(|pid| models.iter().find(|m| !m.from_config && &m.provider == pid))
+                    .or_else(|| models.iter().find(|m| !m.from_config && self.keyed.contains(&m.provider)))
+                    .map(|m| m.alias.clone())
+            } {
                 match remember_model(&a) {
                     Ok(()) => self.model = Some((a, true)),
                     Err(e) => self.flash(format!("✗ couldn't write config.toml: {e:#}"), false),
@@ -1573,6 +1584,7 @@ impl Ob {
             Ok(src) => {
                 self.flash(format!("✓ {pname} key saved to the {} — checking it…", src.label()), true);
                 self.unverified = Some(i);
+                self.connected.push(pid.clone());
                 self.refresh_keyed();
                 self.open_models(i);
             }
@@ -1985,7 +1997,9 @@ mod tests {
         assert_eq!(p[0].def.id, "chatgpt");
         assert_eq!(p[0].name, "ChatGPT");
         assert_eq!(p[1].def.id, "openrouter");
-        assert_eq!(p[1].key_url, "openrouter.ai/keys");
+        assert_eq!(p[1].key_url, "https://openrouter.ai/keys");
+        assert_eq!(p[2].def.id, "router9");
+        assert_eq!(p[2].name, "9Router");
     }
 
     #[test]
@@ -2092,11 +2106,19 @@ mod tests {
     #[test]
     fn continue_without_choosing_picks_a_real_model() {
         let (_g, _dir) = home();
-        zcore::creds::store_key("anthropic", "sk-ant-x").unwrap();
         let mut ob = Ob::sized(100, 30);
+        ob.fetcher = fake_ok;
         to_keys(&mut ob);
+        // connect Anthropic, then back out of its model list without choosing
+        select(&mut ob, "anthropic");
+        ob.on_paste("sk-ant-x");
+        ob.on_key(key(KeyCode::Enter));
+        settle(&mut ob);
         ob.on_key(key(KeyCode::Esc));
+        assert_eq!(ob.phase, Phase::Keys);
+        ob.on_key(key(KeyCode::Esc));
+        // the provider connected in this run wins over keys already in the environment
         let (m, fresh) = ob.model.clone().expect("default picked");
-        assert!(fresh && m.starts_with("anthropic/"), "{m}");
+        assert_eq!((m.as_str(), fresh), ("anthropic/anthropic-live-best", true));
     }
 }

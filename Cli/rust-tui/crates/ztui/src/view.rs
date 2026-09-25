@@ -751,15 +751,22 @@ fn recorder_row(app: &App, tick: usize) -> Line<'static> {
             Span::styled(format!("Transcribing with {}…", rec.backend.label()), theme::fg(ACCENT)),
         ]);
     }
+    if !rec.live {
+        return Line::from(vec![
+            Span::styled(format!("{} ", SPINNER[tick % SPINNER.len()]), theme::fg(ACCENT)),
+            Span::styled("Starting the microphone…", theme::bold(Style::new())),
+            dim("   esc cancel"),
+        ]);
+    }
     const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let meter: String = rec.meter.iter().map(|v| LEVELS[((v * 7.0).round() as usize).min(7)]).collect();
     let secs = rec.started.elapsed().as_secs();
     let blink = (rec.started.elapsed().as_millis() / 500) % 2 == 0;
     Line::from(vec![
         Span::styled(if blink { "● " } else { "○ " }, theme::fg(RED)),
-        Span::styled("Listening ", theme::bold(Style::new())),
+        Span::styled("Recording ", theme::bold(Style::new())),
         Span::styled(format!("{meter:<24}"), theme::fg(ACCENT)),
-        dim(format!(" {}:{:02}   ↵ done · esc cancel", secs / 60, secs % 60)),
+        dim(format!(" {}:{:02}   ctrl+space again to stop and transcribe · esc cancel", secs / 60, secs % 60)),
     ])
 }
 

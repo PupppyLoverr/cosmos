@@ -44,19 +44,29 @@ zcli memory search|add [--type t]
 zcli tools dump                       # canonical contracts/tools.json
 zcli acp                              # stdio JSON-RPC (ACP) server
 zdev -p "ping" --model r9             # headless bun harness
-zdev                                  # Ink/React TUI (monochrome brainless, galaxy logo)
-zdev login                            # ChatGPT subscription sign-in (PKCE browser flow)
-zdev logout                           # drop stored ChatGPT tokens
+zdev                                  # Ink/React TUI (monochrome, zcli's galaxy)
+zdev login | logout                   # ChatGPT Plus/Pro sign-in (shared with zcli)
+zdev models [provider]                # models you can use now
 zagy                                  # interactive TUI (bubbletea)
 ```
 
 Live models route through 9Router (`ROUTER9_API_KEY` is set at User scope):
 `--model r9` = kr/claude-sonnet-4.5, `r9free` = kc/kilo-auto/free,
-`r9gem` = ag/gemini-3.8-flash. `fixture` needs no key. First `zdev` run
-plays a warp → welcome → name → BYOK-provider flow (self-disables via
-`~/.cosmos-cli/.zdev-onboarded`; replay with `/onboarding`). TUI extras:
-`ctrl+m` mic dictation, `@file` mentions, `/resume` session picker,
-`/login` for ChatGPT subscription.
+`r9gem` = ag/gemini-3.8-flash. `fixture` needs no key. 9Router is also in
+both CLIs' BYOK lists as `router9/<route>`.
+
+zdev and zcli share one setup. Keys live in the Windows Credential Manager
+(or `credentials.json`), the ChatGPT sign-in is in `credentials.json`, and
+both read the same models.dev catalog and `live_models.json`. A key added in
+either CLI works in the other. zdev's TUI streams replies into scrollback
+paragraph by paragraph, so long answers never tear the screen. It supports
+`/model` (live lists, effort), `/connect`, `/login`, `/logout`, `/usage`,
+`/context`, `/resume`, `/init`, `/review`, `/diff`, `/copy`, custom commands
+(`.zcli/commands`, `.claude/commands`), `@file` fuzzy mentions, `!cmd`,
+`#note`, `ctrl+space` dictation, `ctrl+o` full tool output, and `shift+tab`
+modes. The first `zdev` run plays the same full-screen onboarding as zcli
+(galaxy fly-through, "welcome to cosmos", name, keys with live model lists,
+how-to). Replay it with `zdev onboarding` or `/onboarding`.
 
 `zdev` and `zagy` accept the same commands and flags
 (`--output text|json|json-stream`, `--mode plan|agent`, `--allow`, `--yolo`,
@@ -122,7 +132,9 @@ searched over BM25 — never touches Meridian's app vault.
 Job-object limits, workspace path confinement, network deny by default
 (`--net allow` opts in). File edits require hashline anchors from `read`;
 stale-file and escape attempts are rejected. Outbound HTTP is limited to
-configured provider/MCP hosts.
+configured provider/MCP hosts. Tools follow `[permissions]` in config.toml; without
+that table (a fresh install), read-only tools run and anything that edits files
+or runs commands asks first.
 
 ## Verify
 

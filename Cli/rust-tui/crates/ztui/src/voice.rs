@@ -1,11 +1,14 @@
 //! Dictation: speak the task instead of typing it.
 //!
-//! Ctrl+Space (or /voice) starts recording from the default microphone
-//! (cpal → WASAPI on Windows, CoreAudio on macOS); the live region shows a
-//! level meter. Ctrl+Space / Enter stops and transcribes, Esc cancels. The
-//! text lands in the composer for review — nothing is sent on its own.
+//! Press Ctrl+Space (or /voice) once to start recording from the default
+//! microphone (cpal → WASAPI on Windows, CoreAudio on macOS); it keeps
+//! recording — the live region shows a level meter and the time — until you
+//! press Ctrl+Space (or Enter) again, which stops and transcribes. Esc
+//! cancels. The text lands in the composer for review; nothing is sent on
+//! its own.
 //!
 //! Transcription, first available wins (override with `ZCLI_STT`):
+//!   chatgpt  — your ChatGPT Plus/Pro sign-in (the ChatGPT apps' dictation)
 //!   openai   — `gpt-4o-mini-transcribe` (falls back to `whisper-1`)
 //!   groq     — `whisper-large-v3-turbo`
 //!   windows  — the built-in System.Speech recogniser, offline, no key
@@ -23,6 +26,7 @@ const MAX_SECS: u64 = 300;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Backend {
+    ChatGpt,
     OpenAI { key: String },
     Groq { key: String },
     Windows,
@@ -31,6 +35,7 @@ pub enum Backend {
 impl Backend {
     pub fn label(&self) -> &'static str {
         match self {
+            Backend::ChatGpt => "ChatGPT",
             Backend::OpenAI { .. } => "OpenAI",
             Backend::Groq { .. } => "Groq",
             Backend::Windows => "Windows speech",
@@ -45,14 +50,16 @@ pub fn pick_backend() -> Option<Backend> {
         let env = zcore::catalog::provider(id).map(|p| p.env.clone()).unwrap_or_default();
         zcore::creds::key_for(id, &env).map(|(k, _)| k)
     };
+    let chatgpt = || zcore::chatgpt::load().map(|_| Backend::ChatGpt);
     let openai = || key("openai").map(|key| Backend::OpenAI { key });
     let groq = || key("groq").map(|key| Backend::Groq { key });
     let windows = || cfg!(windows).then_some(Backend::Windows);
     match want.as_str() {
+        "chatgpt" => chatgpt(),
         "openai" => openai(),
         "groq" => groq(),
         "windows" => windows(),
-        _ => openai().or_else(groq).or_else(windows),
+        _ => chatgpt().or_else(openai).or_else(groq).or_else(windows),
     }
 }
 
@@ -64,12 +71,18 @@ pub struct Recorder {
     pub started: Instant,
     pub backend: Backend,
     rx: Receiver<Result<String>>,
+    ready: Receiver<Result<()>>,
+    /// the microphone is open and recording (false while it starts up)
+    pub live: bool,
+    created: Instant,
     /// recent levels for the meter (0..1)
     pub meter: Vec<f32>,
     pub transcribing: bool,
 }
 
 impl Recorder {
+    /// Open the microphone on a background thread and return at once — the
+    /// UI shows "starting" until the device is live (see `tick`).
     pub fn start(backend: Backend) -> Result<Recorder> {
         let stop = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -89,17 +102,31 @@ impl Recorder {
             });
             let _ = tx.send(r);
         });
-        // surface "no microphone" immediately instead of after stopping
-        match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => bail!("the microphone didn't start"),
-        }
-        Ok(Recorder { stop, cancel, level, started: Instant::now(), backend, rx, meter: Vec::new(), transcribing: false })
+        let now = Instant::now();
+        Ok(Recorder {
+            stop,
+            cancel,
+            level,
+            started: now,
+            backend,
+            rx,
+            ready: ready_rx,
+            live: false,
+            created: now,
+            meter: Vec::new(),
+            transcribing: false,
+        })
     }
 
     /// Sample the current input level into the meter (call once per frame).
     pub fn tick(&mut self) {
+        if !self.live {
+            if let Ok(Ok(())) = self.ready.try_recv() {
+                self.live = true;
+                self.started = Instant::now(); // the clock starts when the mic does
+            }
+            return;
+        }
         let v = f32::from_bits(self.level.load(Ordering::Relaxed));
         self.meter.push(v);
         if self.meter.len() > 24 {
@@ -117,9 +144,16 @@ impl Recorder {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// The transcript, once ready.
+    /// The transcript, once ready (or why there isn't one).
     pub fn poll(&self) -> Option<Result<String>> {
-        self.rx.try_recv().ok()
+        if let Ok(r) = self.rx.try_recv() {
+            return Some(r);
+        }
+        if !self.live && !self.transcribing && self.created.elapsed() > Duration::from_secs(8) {
+            self.cancel();
+            return Some(Err(anyhow::anyhow!("the microphone didn't start — check Windows' microphone privacy settings")));
+        }
+        None
     }
 }
 
@@ -266,6 +300,10 @@ pub fn wav(pcm: &[i16]) -> Vec<u8> {
 fn transcribe(b: &Backend, wav: &[u8]) -> Result<String> {
     let allowed = zcore::config::Config::load(&zcore::cli_home()).allowed_hosts();
     let text = match b {
+        Backend::ChatGpt => {
+            let t = zcore::chatgpt::fresh().context("not signed in to ChatGPT — /login, or set ZCLI_STT")?;
+            zproviders::transcribe_chatgpt("https://chatgpt.com/backend-api", &t.access, &t.account_id, wav, &allowed)?
+        }
         Backend::OpenAI { key } => zproviders::transcribe("https://api.openai.com/v1", key, "gpt-4o-mini-transcribe", wav, &allowed)
             .or_else(|_| zproviders::transcribe("https://api.openai.com/v1", key, "whisper-1", wav, &allowed))?,
         Backend::Groq { key } => zproviders::transcribe("https://api.groq.com/openai/v1", key, "whisper-large-v3-turbo", wav, &allowed)?,
@@ -354,15 +392,33 @@ mod hardware {
 
     #[test]
     #[ignore]
+    fn chatgpt_transcribes_speech() {
+        // needs a ChatGPT sign-in: speak with Windows TTS, transcribe via ChatGPT
+        let path = std::env::temp_dir().join("zcli-tts-chatgpt.wav");
+        let script = format!(
+            "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
+             $f = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono); \
+             $s.SetOutputToWaveFile('{}', $f); $s.Speak('please fix the failing test in the parser'); $s.Dispose()",
+            path.display()
+        );
+        assert!(std::process::Command::new("powershell").args(["-NoProfile", "-Command", &script]).status().unwrap().success());
+        let text = transcribe(&Backend::ChatGpt, &std::fs::read(&path).unwrap()).unwrap().to_lowercase();
+        println!("recognised: {text:?}");
+        assert!(text.contains("failing test") && text.contains("parser"), "{text}");
+    }
+
+    #[test]
+    #[ignore]
     fn mic_smoke() {
         let mut r = match Recorder::start(Backend::Windows) {
             Ok(r) => r,
             Err(e) => panic!("mic failed to start: {e:#}"),
         };
-        for _ in 0..30 {
+        for _ in 0..60 {
             std::thread::sleep(Duration::from_millis(50));
             r.tick();
         }
+        assert!(r.live, "microphone never went live");
         println!("meter: {:?}", r.meter.iter().map(|v| (v * 100.0).round() as i32).collect::<Vec<_>>());
         r.finish();
         let t0 = Instant::now();

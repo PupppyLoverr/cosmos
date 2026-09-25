@@ -1,10 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-  applyUpdate,
-  filterSlash,
-  SLASH_COMMANDS,
-  summarizeArg,
-} from "./reducer";
+import { applyUpdate, settle, splitStreaming, summarizeArg } from "./reducer";
 import { emptyState } from "./types";
 
 describe("applyUpdate", () => {
@@ -92,12 +87,39 @@ describe("summarizeArg", () => {
   });
 });
 
-describe("filterSlash", () => {
-  test("prefix filter on the name without the slash", () => {
-    expect(filterSlash("").length).toBe(SLASH_COMMANDS.length);
-    expect(filterSlash("m").map((c) => c.name)).toEqual(["/model"]);
-    expect(filterSlash("p").map((c) => c.name)).toEqual(["/plan"]);
-    expect(filterSlash("zz")).toEqual([]);
-    expect(filterSlash("MO").map((c) => c.name)).toEqual(["/model"]);
+describe("streaming commits", () => {
+  test("splits at the last paragraph break outside code fences", () => {
+    expect(splitStreaming("one line, still going")).toEqual(["", "one line, still going"]);
+    expect(splitStreaming("para one\n\npara two grows")).toEqual(["para one", "para two grows"]);
+    // a blank line inside an open fence is not a safe cut
+    const t = "intro\n\n```ts\nconst a = 1;\n\nconst b = 2;";
+    expect(splitStreaming(t)).toEqual(["intro", "```ts\nconst a = 1;\n\nconst b = 2;"]);
+    // after the fence closes, a later break is fine again
+    const u = "```\nx\n\ny\n```\n\ntail";
+    expect(splitStreaming(u)[0]).toBe("```\nx\n\ny\n```");
+  });
+
+  test("settle commits a prefix: pending tools hold back, streaming text gives up finished paragraphs", () => {
+    const user = { kind: "user" as const, id: "u", text: "hi" };
+    const pending = { kind: "tool" as const, id: "t", toolCallId: "c", name: "bash", status: "pending" as const };
+    const after = { kind: "note" as const, id: "n", text: "later" };
+    let r = settle([user, pending, after], true);
+    expect(r.done.map((i) => i.id)).toEqual(["u"]);
+    expect(r.live.map((i) => i.id)).toEqual(["t", "n"]);
+    r = settle([{ ...pending, status: "completed" }, after], true);
+    expect(r.live).toHaveLength(0);
+    const reply = { kind: "assistant" as const, id: "a", text: "done para\n\nstill typ" };
+    r = settle([reply], true);
+    expect(r.done).toHaveLength(1);
+    expect((r.done[0] as any).text).toBe("done para");
+    expect(r.live).toEqual([{ ...reply, text: "still typ" }]);
+    // once the turn ends the tail settles too
+    r = settle(r.live, false);
+    expect(r.live).toHaveLength(0);
+  });
+
+  test("errors land as error notes", () => {
+    const s = applyUpdate(emptyState(), { sessionUpdate: "error", text: "provider 401: nope" });
+    expect(s.items[0]).toMatchObject({ kind: "note", tone: "error", text: "provider 401: nope" });
   });
 });

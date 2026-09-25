@@ -23,8 +23,10 @@ usage:
   zdev session tree <id>
   zdev memory search <q>      search the shared Meridian vault
   zdev memory add <text>      append to the vault (scope: zdev)
-  zdev login                  sign in with ChatGPT (subscription, PKCE)
-  zdev logout                 remove stored ChatGPT tokens
+  zdev login                  sign in with ChatGPT (Plus/Pro plan) — shared with zcli
+  zdev logout                 remove the ChatGPT sign-in
+  zdev models [provider]      models you can use now (catalog + live lists)
+  zdev onboarding             replay the first-run setup
 
 flags: --output text|json|json-stream · --mode plan|agent · --allow a,b ·
 --yolo · --no-sandbox · --model <alias> · --max-turns N · --max-usd F ·
@@ -353,12 +355,10 @@ async function main(): Promise<number> {
   if (args[0] === "session") return sessionCmd(args.slice(1));
   if (args[0] === "memory") return memoryCmd(args.slice(1));
   if (args[0] === "login") {
-    const { loginChatGPT } = await import("./oauth");
+    const { login } = await import("./oauth");
     try {
-      const a = await loginChatGPT(proto.cliHome(), (u) =>
-        console.error(`open this URL to sign in:\n${u}`),
-      );
-      console.error(`signed in${a.email ? ` as ${a.email}` : ""}`);
+      const t = await login((u) => console.error(`opening your browser — or visit:\n${u}`));
+      console.error(`signed in${t.email ? ` as ${t.email}` : ""}${t.plan ? ` · ${t.plan}` : ""}`);
       return proto.EXIT_DONE;
     } catch (e: any) {
       console.error(`login failed: ${e?.message ?? e}`);
@@ -366,10 +366,29 @@ async function main(): Promise<number> {
     }
   }
   if (args[0] === "logout") {
-    const { clearAuth } = await import("./oauth");
-    clearAuth(proto.cliHome());
-    console.error("signed out");
+    const { logout } = await import("./oauth");
+    logout();
+    console.error("signed out of ChatGPT");
     return proto.EXIT_DONE;
+  }
+  if (args[0] === "models") {
+    const cfg = store.loadConfig(proto.cliHome());
+    const want = args[1];
+    const list = store.availableModels(cfg).filter((m) => !want || m.provider === want);
+    if (!list.length) {
+      console.error(want ? `no usable models for ${want} — connect it with /connect in zdev` : "no models yet — run zdev and /connect a provider");
+      return proto.EXIT_USAGE;
+    }
+    for (const m of list) console.log(`${m.alias.padEnd(48)} ${String(m.context || "").padStart(8)}  ${m.providerName}`);
+    return proto.EXIT_DONE;
+  }
+  if (args[0] === "onboarding" || args[0] === "onboard") {
+    if (!(process.stdin.isTTY && process.stdout.isTTY)) {
+      console.error("zdev onboarding needs a terminal");
+      return proto.EXIT_USAGE;
+    }
+    const { runOnboarding } = await import("./ui/index");
+    return runOnboarding();
   }
   if (args[0] === "acp") {
     const { acpServer } = await import("./acp");
@@ -387,7 +406,7 @@ async function main(): Promise<number> {
     if (opts.prompt !== null) {
       return await agent.runHeadless(opts, "zdev", process.cwd());
     }
-    if (process.stdin.isTTY) {
+    if (process.stdin.isTTY && process.stdout.isTTY) {
       const { runTui } = await import("./ui/index");
       return await runTui(opts);
     }

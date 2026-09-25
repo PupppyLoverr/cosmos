@@ -1,753 +1,1184 @@
-// App — wires ZdevDriver → transcript reducer, routes keys by focus
-// (permission > model picker > transcript-nav > composer).
-// The agent runs in-process; the driver mirrors the ACP surface exactly.
+// App — the zdev TUI. History is committed to the terminal's own scrollback
+// through Ink's <Static> (the welcome box first, then every settled row —
+// finished paragraphs of a streaming reply included), so the live region
+// under it stays small: the growing tail of the reply, running tools, the
+// composer and whatever menu is open. The agent runs in-process behind
+// ZdevDriver, which mirrors the ACP surface.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import fs from "node:fs";
-import nodePath from "node:path";
-import { Box, Static, Text, useApp, useInput } from "ink";
-import { ZdevDriver } from "./driver";
-import { applyUpdate, filterSlash, SLASH_COMMANDS } from "../reducer";
-import { DIM } from "../theme";
-import { emptyState } from "../types";
-import type { Item, Model, PermissionReq, State } from "../types";
-import { Header } from "../components/Header";
-import { TranscriptItem, type ReadCache } from "../components/Transcript";
-import { parseReadDetail } from "../diff";
-import { Thinking } from "../components/Thinking";
+import { spawn } from "node:child_process";
+import { Box, Static, Text, useApp, useStdin, useStdout } from "ink";
+
+import type { ModelDef, ProviderDef } from "../catalog";
 import { Composer } from "../components/Composer";
-import { SlashMenu } from "../components/SlashMenu";
 import { Permission } from "../components/Permission";
-import { ModelPicker } from "../components/ModelPicker";
-import { SessionPicker } from "../components/SessionPicker";
-import { Footer } from "../components/Footer";
+import { Picker, type Row } from "../components/Picker";
+import { Thinking } from "../components/Thinking";
+import { HeaderBox, TranscriptItem, type ReadCache } from "../components/Transcript";
+import { parseReadDetail } from "../diff";
+import { RejectedKey } from "../live";
+import { PINNED, pitchFor } from "../pinned";
 import type { RunOpts } from "../proto";
+import { applyUpdate, settle, summarizeArg } from "../reducer";
+import { DIM, GRAY, GREEN, ROSE } from "../theme";
+import * as t from "../tools";
+import type { Item, Model, PermissionReq, Usage } from "../types";
+import { emptyState } from "../types";
+import { ZdevDriver } from "./driver";
+import { KeyParser, lineEnd, lineStart, verticalMove, wordLeft, wordRight, type Key } from "./keys";
+import {
+  appendHistory,
+  copyText,
+  expandMentions,
+  fileIndex,
+  loadCommands,
+  loadHistory,
+  mentionAt,
+  parseSlash,
+  rank,
+  type Slash,
+} from "./menus";
 
 let nid = 0;
-const nextId = () => `u${++nid}`;
-const note = (text: string): Item => ({ kind: "note", id: nextId(), text });
-const asst = (text: string): Item => ({ kind: "assistant", id: nextId(), text });
+const nextId = () => `a${++nid}`;
+const note = (text: string, tone?: "ok" | "warn" | "error"): Item => ({ kind: "note", id: nextId(), text, tone });
 
 export type Boot = { cwd: string; model?: string; mode?: string; opts: RunOpts };
+export type ExitReason = "quit" | "onboarding";
 
-export function App({ boot }: { boot: Boot }) {
+const MODES = ["agent", "plan", "yolo"];
+const EFFORTS = ["", "low", "medium", "high"];
+const INIT_PROMPT =
+  "Explore this repository and write an AGENTS.md at its root for coding agents: what the project is, how the code is laid out, how to build, run, test and lint it, the conventions to follow, and anything surprising. Read the files you describe; keep it short and accurate. If AGENTS.md exists, improve it instead of replacing it.";
+const REVIEW_PROMPT =
+  "Review the uncommitted changes in this repository (use `git status` and `git diff`, plus `git diff --staged`). Report real problems first — bugs, security issues, broken edge cases, missing tests — each with file:line and a concrete fix. Skip praise and style nits. Don't modify files.";
+
+type Connect =
+  | { step: "provider"; query: string; sel: number }
+  | { step: "key"; provider: ProviderDef; key: string; error?: string }
+  | { step: "wait"; provider: ProviderDef; message: string; url?: string }
+  | { step: "models"; provider: ProviderDef; models: ModelDef[]; query: string; sel: number; source: string };
+
+type Popup =
+  | { kind: "model"; models: Model[]; query: string; sel: number; effort: string; loading?: string }
+  | { kind: "connect"; c: Connect }
+  | { kind: "resume"; sessions: Record<string, any>[]; sel: number }
+  | { kind: "help"; scroll: number };
+
+type Transcript = { done: Item[]; live: Item[]; usage: Usage; key: number };
+
+const fmtK = (n: number) => (n >= 1_000_000 ? `${(n / 1_048_576).toFixed(n % 1_048_576 ? 1 : 0)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
+const money = (x: number) => `$${x.toFixed(2).replace(/\.?0+$/, "")}`;
+
+function priceText(m: { price: Model["price"]; free: boolean; kind: string }): string {
+  if (m.kind === "chatgpt") return "plan";
+  if (m.free) return "free";
+  return `${money(m.price.input)}/${money(m.price.output)}`;
+}
+
+/** Rebuild transcript rows from a resumed session's provider messages. */
+function replayItems(messages: { role: string; content: Record<string, any>[] }[]): Item[] {
+  const items: Item[] = [];
+  const tools = new Map<string, Extract<Item, { kind: "tool" }>>();
+  for (const m of messages) {
+    for (const b of m.content) {
+      if (b.type === "text" && b.text) {
+        items.push(m.role === "assistant" ? { kind: "assistant", id: nextId(), text: b.text } : { kind: "user", id: nextId(), text: b.text });
+      } else if (b.type === "tool_use") {
+        const it = {
+          kind: "tool" as const,
+          id: nextId(),
+          toolCallId: b.id,
+          name: b.name,
+          arg: summarizeArg(b.name, b.input),
+          status: "completed" as const,
+          input: b.input,
+        };
+        tools.set(b.id, it);
+        items.push(it);
+      } else if (b.type === "tool_result") {
+        const it = tools.get(b.tool_use_id);
+        if (it) {
+          it.detail = String(b.content ?? "");
+          if (b.is_error) (it as any).status = "failed";
+        }
+      }
+    }
+  }
+  return items;
+}
+
+export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitReason) => void; onDriver?: (d: ZdevDriver) => void }) {
   const { exit } = useApp();
-  const [state, setState] = useState<State>(emptyState());
+  const { stdout } = useStdout();
+  const { internal_eventEmitter: stdinEvents, setRawMode, isRawModeSupported } = useStdin() as any;
+  const [cols, setCols] = useState(stdout?.columns ?? 100);
+  const width = Math.max(40, cols - 1);
+
+  const driver = useMemo(() => new ZdevDriver(boot.opts, boot.cwd), [boot]);
+  onDriver?.(driver); // tests reach the backend through this
+  const [tr, setTr] = useState<Transcript>({ done: [], live: [], usage: emptyState().usage, key: 0 });
   const [sessionId, setSessionId] = useState("");
-  const [version, setVersion] = useState("0.1.0");
-  const [mode, setMode] = useState(boot.mode ?? "agent");
   const [model, setModel] = useState(boot.model ?? "…");
+  const [mode, setMode] = useState(boot.mode ?? "agent");
+  const [ctxLimit, setCtxLimit] = useState(0);
   const [busy, setBusy] = useState(false);
   const [buf, setBuf] = useState("");
   const [cur, setCur] = useState(0);
-  const [slashSel, setSlashSel] = useState(0);
+  const [menuSel, setMenuSel] = useState(0);
   const [perm, setPerm] = useState<PermissionReq | null>(null);
   const [permSel, setPermSel] = useState(0);
-  const [picker, setPicker] = useState<{
-    open: boolean;
-    loading: boolean;
-    models: Model[];
-    sel: number;
-  }>({ open: false, loading: false, models: [], sel: 0 });
-  const [nav, setNav] = useState(false); // transcript-nav focus mode
-  const [navIdx, setNavIdx] = useState(0);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const [status, setStatus] = useState("connecting…");
-  const [onboarding, setOnboarding] = useState(false);
-  const [Onb, setOnb] = useState<React.ComponentType<{
-    driver: ZdevDriver;
-    currentModel: string;
-    onDone: (m?: string) => void;
-    onQuit: () => void;
-  }> | null>(null);
-  const [ctxLimit, setCtxLimit] = useState(0);
+  const [popup, setPopup] = useState<Popup | null>(null);
+  const [verbose, setVerbose] = useState(false);
   const [listening, setListening] = useState(false);
-  const [resumePicker, setResumePicker] = useState<{
-    open: boolean;
-    sessions: Record<string, any>[];
-    sel: number;
-  }>({ open: false, sessions: [], sel: 0 });
+  const [flash, setFlash] = useState<{ text: string; tone?: "ok" | "error"; at: number } | null>(null);
+  const [quitArmed, setQuitArmed] = useState(0);
+  const [files, setFiles] = useState<string[] | null>(null);
 
-  // The backend is in-process — one driver for the app lifetime.
-  const driver = useMemo(() => new ZdevDriver(boot.opts, boot.cwd), [boot]);
-  const clientRef = useRef<ZdevDriver>(driver);
-  const dropRef = useRef(false); // ignore updates after esc-cancel
-  const histRef = useRef<string[]>([]);
-  const histIdxRef = useRef(-1);
-  const draftRef = useRef("");
-  const usageRef = useRef(state.usage);
+  const busyRef = useRef(false);
+  const history = useRef<string[]>(loadHistory());
+  const histIdx = useRef(-1);
+  const draft = useRef("");
+  const pastes = useRef<string[]>([]);
+  const pendingCtx = useRef<string[]>([]);
+  const lastReply = useRef("");
+  const turnReply = useRef("");
+  const connectAbort = useRef<AbortController | null>(null);
+  const commands = useMemo<Slash[]>(() => loadCommands(boot.cwd), [boot.cwd]);
+  const user = driver.userName() || process.env.USERNAME || process.env.USER || "";
 
-  const pushItems = useCallback((...items: Item[]) => {
-    setState((s) => ({ ...s, items: [...s.items, ...items] }));
+  // ── transcript plumbing ───────────────────────────────────────────────
+  /** Apply `f` to the live rows, then commit whatever settled. */
+  const update = useCallback((f: (live: Item[], usage: Usage) => { live: Item[]; usage?: Usage }) => {
+    setTr((s) => {
+      const r = f(s.live, s.usage);
+      const st = settle(r.live, busyRef.current);
+      return { ...s, done: st.done.length ? [...s.done, ...st.done] : s.done, live: st.live, usage: r.usage ?? s.usage };
+    });
   }, []);
+  const push = useCallback((...items: Item[]) => update((live) => ({ live: [...live, ...items] })), [update]);
+  const say = useCallback((text: string, tone?: "ok" | "error") => setFlash({ text, tone, at: Date.now() }), []);
 
-  // ── boot: initialize → session/new → (first run) onboarding ────────────
   useEffect(() => {
-    const client = driver;
-    clientRef.current = client;
-    client.onUpdate = (_sid, u) => {
-      if (dropRef.current) return;
-      setState((s) => {
-        const ns = applyUpdate(s, u);
-        usageRef.current = ns.usage;
-        return ns;
+    if (!flash) return;
+    const id = setTimeout(() => setFlash(null), 6000);
+    return () => clearTimeout(id);
+  }, [flash]);
+
+  useEffect(() => {
+    const onResize = () => setCols(stdout?.columns ?? 100);
+    stdout?.on("resize", onResize);
+    return () => {
+      stdout?.off("resize", onResize);
+    };
+  }, [stdout]);
+
+  // ── boot ──────────────────────────────────────────────────────────────
+  const startSession = useCallback(
+    async (params: Record<string, any> = {}) => {
+      const sn: any = await driver.call("session/new", {
+        cwd: boot.cwd,
+        ...(boot.model && !params.resume ? { model: boot.model } : {}),
+        ...(boot.mode ? { mode: boot.mode } : {}),
+        ...params,
+      });
+      if (sn.error) throw new Error(sn.error.message);
+      setSessionId(sn.result.sessionId);
+      setModel(sn.result.model ?? "?");
+      setMode(sn.result.mode ?? "agent");
+      setCtxLimit(sn.result.context ?? 0);
+      return sn.result;
+    },
+    [boot, driver],
+  );
+
+  useEffect(() => {
+    driver.onUpdate = (_sid, u) => {
+      if (u?.sessionUpdate === "agent_message_chunk") turnReply.current += u.content?.text ?? "";
+      update((live, usage) => {
+        const s = applyUpdate({ items: live, usage }, u);
+        return { live: s.items, usage: s.usage };
       });
     };
-    client.onRequest = (req) => {
+    driver.onRequest = (req) => {
       if (req.method === "session/request_permission") {
         setPermSel(0);
         setPerm({
           id: req.id,
           toolCallId: req.params?.toolCallId ?? "",
-          tool: req.params?.tool ?? req.params?.toolCallId ?? "tool",
+          tool: req.params?.tool ?? "tool",
           input: req.params?.input ?? {},
-          options: req.params?.options ?? [
-            { id: "allow", name: "Allow once" },
-            { id: "allow_always", name: "Always allow" },
-            { id: "deny", name: "Deny" },
-          ],
+          options: req.params?.options ?? [],
         });
-      } else {
-        client.reply(req.id, undefined); // unknown server→client call: empty
-      }
+      } else driver.reply(req.id, undefined);
     };
     (async () => {
       try {
-        const init: any = await client.call("initialize", {});
-        const v = init.result?.agentInfo?.version;
-        if (v) setVersion(v);
-        const sn: any = await client.call("session/new", {
-          cwd: boot.cwd,
-          ...(boot.model ? { model: boot.model } : {}),
-          ...(boot.mode ? { mode: boot.mode } : {}),
-        });
-        if (sn.error) throw new Error(sn.error.message);
-        setSessionId(sn.result.sessionId);
-        setModel(sn.result.model ?? boot.model ?? "?");
-        setMode(sn.result.mode ?? boot.mode ?? "agent");
-        setStatus("");
-        // context window for the footer meter (grok-status grammar)
-        const lm: any = await client.call("session/list_models", {});
-        const cur = (lm?.result?.models ?? []).find((m: Model) =>
-          String(sn.result.model ?? "").startsWith(m.alias),
-        );
-        if (cur?.context) setCtxLimit(cur.context);
-        // onboarding self-loads only when the marker is absent — the module
-        // never enters the runtime again after first run.
-        if (!client.onboardingDone()) {
-          const m = await import("./Onboarding");
-          setOnb(() => m.Onboarding);
-          setOnboarding(true);
+        const r = await startSession();
+        setTr((s) => ({ ...s, done: [{ kind: "header", id: "header" }, ...s.done] }));
+        if (/^fixture\b/.test(r.model ?? "")) {
+          push(note("No model connected yet — /connect adds an API key, /login signs in with ChatGPT, /model picks one.", "warn"));
         }
       } catch (e: any) {
-        setStatus("session failed");
-        pushItems(note(`session/new failed: ${e?.message ?? e}`));
+        setTr((s) => ({ ...s, done: [{ kind: "header", id: "header" }] }));
+        push(note(`Couldn't start a session: ${e?.message ?? e}`, "error"));
       }
     })();
-    return () => client.kill();
+    // the @file index builds in the background
+    setTimeout(() => setFiles(fileIndex(boot.cwd)), 50);
+    return () => driver.kill();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const quit = useCallback(() => {
-    clientRef.current?.kill();
-    exit();
-    setTimeout(() => process.exit(0), 50);
-  }, [exit]);
+  const quit = useCallback(
+    (reason: ExitReason = "quit") => {
+      connectAbort.current?.abort();
+      driver.kill();
+      onExit(reason);
+      exit();
+    },
+    [driver, exit, onExit],
+  );
 
-  // ── prompt / approve ────────────────────────────────────────────────────
+  // ── prompts ───────────────────────────────────────────────────────────
   const runPrompt = useCallback(
     async (method: "session/prompt" | "session/approve", text?: string) => {
-      const client = clientRef.current;
-      if (!client || !sessionId || busy) return;
+      if (!sessionId || busyRef.current) return;
+      busyRef.current = true;
       setBusy(true);
-      dropRef.current = false;
+      turnReply.current = "";
       const t0 = Date.now();
+      let cancelled = false;
       try {
-        const params =
-          method === "session/prompt"
-            ? { sessionId, prompt: [{ type: "text", text }] }
-            : { sessionId };
-        const res: any = await client.call(method, params);
+        const res: any = await driver.call(method, method === "session/prompt" ? { sessionId, prompt: [{ type: "text", text }] } : { sessionId });
         const reason = res?.result?.stopReason;
-        if (res?.error) pushItems(note(`error: ${res.error.message}`));
-        else if (reason === "cancelled") pushItems(note("interrupted (esc)"));
-        else {
-          // grok-turn-end footer after every completed turn
-          pushItems({
-            kind: "turn",
-            id: nextId(),
-            secs: (Date.now() - t0) / 1000,
-            out: usageRef.current.output || undefined,
-          });
-          if (reason === "refusal")
-            pushItems(note("turn failed — provider error (see zdev stderr)"));
-          else if (reason === "max_turns")
-            pushItems(note("stopped: max turns"));
-        }
+        if (res?.error) push(note(res.error.message, "error"));
+        cancelled = reason === "cancelled";
+        if (reason === "max_turns") push(note("Stopped after the turn limit — say “continue” to keep going.", "warn"));
       } catch (e: any) {
-        pushItems(note(`backend: ${e?.message ?? e}`));
+        push(note(`backend: ${e?.message ?? e}`, "error"));
       } finally {
-        dropRef.current = false;
+        if (turnReply.current.trim()) lastReply.current = turnReply.current;
+        busyRef.current = false;
         setBusy(false);
+        setPerm(null);
+        setTr((s) => {
+          const out = (s.usage.output || 0) as number;
+          const live = [...s.live, { kind: "turn" as const, id: nextId(), secs: (Date.now() - t0) / 1000, out: out || undefined, cancelled }];
+          const st = settle(live, false);
+          return { ...s, done: [...s.done, ...st.done], live: st.live };
+        });
       }
     },
-    [busy, pushItems, sessionId],
+    [driver, push, sessionId],
   );
 
   const sendPrompt = useCallback(
-    (text: string) => {
-      pushItems({ kind: "user", id: nextId(), text });
-      histRef.current.push(text);
-      histIdxRef.current = -1;
-      // @file mentions — inline each existing file as a context block
-      const mentions = [...text.matchAll(/@([A-Za-z0-9_.\-\\/]+)/g)];
-      let embedded = "";
-      for (const m of mentions) {
-        const rel = m[1];
-        try {
-          const p = nodePath.resolve(boot.cwd, rel);
-          if (!p.startsWith(nodePath.resolve(boot.cwd))) continue;
-          if (!fs.existsSync(p) || !fs.statSync(p).isFile()) continue;
-          const body = fs.readFileSync(p, "utf8").split("\n").slice(0, 300);
-          embedded +=
-            `\n\n<file path="${rel}">\n` + body.join("\n") + `\n</file>`;
-        } catch {}
+    (shown: string, full?: string) => {
+      let text = expandMentions(full ?? shown, boot.cwd);
+      if (pendingCtx.current.length) {
+        text = `${pendingCtx.current.join("\n\n")}\n\n${text}`;
+        pendingCtx.current = [];
       }
-      void runPrompt("session/prompt", text + embedded);
+      push({ kind: "user", id: nextId(), text: shown });
+      void runPrompt("session/prompt", text);
     },
-    [boot.cwd, pushItems, runPrompt],
+    [boot.cwd, push, runPrompt],
   );
 
   const cancel = useCallback(() => {
-    if (!busy) return;
-    dropRef.current = true;
-    clientRef.current?.notify("session/cancel", { sessionId });
-    pushItems(note("interrupt requested…"));
-  }, [busy, pushItems, sessionId]);
+    if (!busyRef.current) return;
+    driver.notify("session/cancel", { sessionId });
+    setPerm(null);
+  }, [driver, sessionId]);
 
-  // ── slash commands ──────────────────────────────────────────────────────
-  const slashOpen = /^\/\S*$/.test(buf);
-  const slashQuery = slashOpen ? buf.slice(1) : "";
-  const slashList = useMemo(
-    () => (slashOpen ? filterSlash(slashQuery) : []),
-    [slashOpen, slashQuery],
+  const setModeTo = useCallback(
+    async (m: string) => {
+      const res: any = await driver.call("session/set_mode", { sessionId, mode: m });
+      if (res?.error) say(res.error.message, "error");
+      else setMode(m);
+    },
+    [driver, say, sessionId],
   );
 
-  const openPicker = useCallback(async () => {
-    const client = clientRef.current;
-    setPicker({ open: true, loading: true, models: [], sel: 0 });
-    try {
-      const res: any = await client!.call("session/list_models", {});
-      const models: Model[] = res.result?.models ?? [];
-      const curAlias = model.split(" ")[0];
-      const sel = Math.max(0, models.findIndex((m) => m.alias === curAlias));
-      setPicker({ open: true, loading: false, models, sel });
-    } catch (e: any) {
-      setPicker({ open: false, loading: false, models: [], sel: 0 });
-      pushItems(note(`list_models failed: ${e?.message ?? e}`));
-    }
-  }, [model, pushItems]);
+  const setModelTo = useCallback(
+    async (alias: string, effort = "") => {
+      const res: any = await driver.call("session/set_model", { sessionId, model: alias, remember: true, ...(effort ? { effort } : {}) });
+      if (res?.error) return say(res.error.message, "error");
+      setModel(res.result.model);
+      if (res.result.context) setCtxLimit(res.result.context);
+      say(`Model → ${alias}${effort ? ` · ${effort} effort` : ""} (saved as your default)`, "ok");
+    },
+    [driver, say, sessionId],
+  );
+
+  // ── pickers ───────────────────────────────────────────────────────────
+  const openModelPicker = useCallback(async () => {
+    const res: any = await driver.call("session/list_models", {});
+    const models: Model[] = res?.result?.models ?? [];
+    const curAlias = model.split(" ")[0];
+    setPopup({ kind: "model", models, query: "", sel: Math.max(0, models.findIndex((m) => m.alias === curAlias)), effort: "" });
+  }, [driver, model]);
+
+  const fetchForConnect = useCallback(
+    async (p: ProviderDef, justStored: boolean) => {
+      const ac = new AbortController();
+      connectAbort.current = ac;
+      setPopup({ kind: "connect", c: { step: "wait", provider: p, message: `Checking your key and fetching live models from ${p.base_url.split("/")[2]}…` } });
+      try {
+        const models = await driver.fetchModels(p.id, ac.signal);
+        setPopup({ kind: "connect", c: { step: "models", provider: p, models, query: "", sel: 0, source: `${models.length} models live from ${p.base_url.split("/")[2]}` } });
+      } catch (e: any) {
+        if (ac.signal.aborted) return;
+        if (e instanceof RejectedKey && justStored) {
+          driver.deleteKey(p.id);
+          setPopup({ kind: "connect", c: { step: "key", provider: p, key: "", error: `${e.message} — check it and paste again` } });
+          return;
+        }
+        setPopup({
+          kind: "connect",
+          c: { step: "models", provider: p, models: p.models, query: "", sel: 0, source: `couldn't fetch the live list (${e?.message ?? e}) — showing known models` },
+        });
+      }
+    },
+    [driver],
+  );
+
+  const connectProvider = useCallback(
+    (p: ProviderDef) => {
+      if (p.kind === "chatgpt") {
+        const ac = new AbortController();
+        connectAbort.current = ac;
+        setPopup({ kind: "connect", c: { step: "wait", provider: p, message: "Signing in with ChatGPT — finish in your browser" } });
+        driver
+          .login((url) => setPopup({ kind: "connect", c: { step: "wait", provider: p, message: "Signing in with ChatGPT — finish in your browser", url } }), ac.signal)
+          .then((tok) => {
+            say(`Signed in${tok.email ? ` as ${tok.email}` : ""}${tok.plan ? ` · ${tok.plan}` : ""}`, "ok");
+            void fetchForConnect(p, false);
+          })
+          .catch((e) => {
+            if (ac.signal.aborted) return;
+            setPopup(null);
+            say(`Sign-in failed: ${e?.message ?? e}`, "error");
+          });
+        return;
+      }
+      const ready = driver.providers().find((x) => x.def.id === p.id)?.ready;
+      if (ready) void fetchForConnect(p, false);
+      else setPopup({ kind: "connect", c: { step: "key", provider: p, key: "" } });
+    },
+    [driver, fetchForConnect, say],
+  );
+
+  const providerRows = useCallback(
+    (query: string) => {
+      const list = driver.providers();
+      const pinRank = (id: string) => {
+        const i = PINNED.findIndex((x) => x.id === id);
+        return i < 0 ? PINNED.length : i;
+      };
+      list.sort((a, b) => pinRank(a.def.id) - pinRank(b.def.id));
+      const order = rank(list, query, (x) => `${x.def.id} ${x.def.name} ${pitchFor(x.def)}`);
+      return order.map((i) => list[i]);
+    },
+    [driver],
+  );
+
+  // ── slash commands ────────────────────────────────────────────────────
+  const runShell = useCallback(
+    (cmd: string) => {
+      const id = nextId();
+      push({ kind: "shell", id, cmd, out: "", code: null, pending: true });
+      const bash = (process.env.PATH ?? "").split(process.platform === "win32" ? ";" : ":").some((d) => {
+        try {
+          return require("node:fs").existsSync(`${d}\\bash.exe`);
+        } catch {
+          return false;
+        }
+      });
+      const child =
+        process.platform === "win32" && !bash
+          ? spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", cmd], { cwd: boot.cwd, windowsHide: true })
+          : spawn(process.platform === "win32" ? "bash.exe" : "bash", ["-lc", cmd], { cwd: boot.cwd, windowsHide: true });
+      let out = "";
+      child.stdout?.on("data", (d) => (out += d.toString()));
+      child.stderr?.on("data", (d) => (out += d.toString()));
+      const done = (code: number | null) => {
+        update((live) => ({
+          live: live.map((it) => (it.id === id && it.kind === "shell" ? { ...it, out, code, pending: false } : it)),
+        }));
+        // the output rides along with the next prompt, like Claude Code's `!`
+        pendingCtx.current.push(`<shell-output command=${JSON.stringify(cmd)} exit=${code}>\n${out.slice(0, 8000)}\n</shell-output>`);
+      };
+      child.on("error", (e) => {
+        out += String(e.message);
+        done(127);
+      });
+      child.on("close", (code) => done(code));
+    },
+    [boot.cwd, push, update],
+  );
+
+  const gitBlock = useCallback(() => {
+    const run = (args: string[]) => {
+      const r = require("node:child_process").spawnSync("git", args, { cwd: boot.cwd, encoding: "utf8", windowsHide: true });
+      return r.status === 0 ? String(r.stdout ?? "") : "";
+    };
+    const status = run(["status", "--short"]);
+    const stat = run(["diff", "--stat", "HEAD"]);
+    if (!status.trim() && !stat.trim()) return say("Working tree is clean (or not a git repository)");
+    push({ kind: "shell", id: nextId(), cmd: "git status --short && git diff --stat HEAD", out: `${status}${stat}`, code: 0 });
+  }, [boot.cwd, push, say]);
 
   const runSlash = useCallback(
-    async (cmd: string) => {
-      const client = clientRef.current;
-      const name = cmd.split(/\s/)[0];
+    async (name: string, args: string) => {
       switch (name) {
-        case "/plan":
-        case "/agent":
-        case "/yolo": {
-          const m = name.slice(1);
-          const res: any = await client?.call("session/set_mode", {
-            sessionId,
-            mode: m,
-          });
-          if (res?.error) pushItems(note(`set_mode: ${res.error.message}`));
-          else {
-            setMode(m);
-            pushItems(note(`mode: → ${m}`));
+        case "model":
+          if (args) void setModelTo(args);
+          else void openModelPicker();
+          return;
+        case "connect": {
+          if (args) {
+            const p = driver.providers().find((x) => x.def.id === args || x.def.name.toLowerCase() === args.toLowerCase());
+            if (p) return connectProvider(p.def);
+            say(`Unknown provider: ${args}`, "error");
           }
-          break;
-        }
-        case "/approve":
-          void runPrompt("session/approve");
-          break;
-        case "/model":
-          void openPicker();
-          break;
-        case "/onboarding": {
-          if (!Onb) {
-            const m = await import("./Onboarding");
-            setOnb(() => m.Onboarding);
-          }
-          setOnboarding(true);
-          break;
-        }
-        case "/login": {
-          pushItems(note("opening browser — sign in with ChatGPT…"));
-          void driver
-            .oauthLogin(() => {})
-            .then((r) =>
-              pushItems(
-                note(`signed in${r.email ? ` as ${r.email}` : ""} — pick the chatgpt model via /model`),
-              ),
-            )
-            .catch((e) => pushItems(note(`sign-in failed: ${e?.message ?? e}`)));
-          break;
-        }
-        case "/resume": {
-          const list = driver.sessions();
-          if (!list.length) {
-            pushItems(note("no past sessions"));
-            break;
-          }
-          setResumePicker({ open: true, sessions: list.slice(0, 12), sel: 0 });
-          break;
-        }
-        case "/session":
-          pushItems(note(`session ${sessionId}`));
-          break;
-        case "/usage":
-          pushItems(
-            asst(
-              `**usage** — in ${state.usage.input} · out ${state.usage.output}` +
-                ` · cache r/w ${state.usage.cache_read}/${state.usage.cache_write}` +
-                (state.usage.cum_usd != null
-                  ? ` · Σ $${state.usage.cum_usd.toFixed(4)}`
-                  : ""),
-            ),
-          );
-          break;
-        case "/help":
-          pushItems(
-            asst(
-              [
-                "**commands**",
-                ...SLASH_COMMANDS.map((c) => `- \`${c.name}\` — ${c.desc}`),
-                "",
-                "**keys** — enter send · shift/alt+enter newline · ↑/↓ history",
-                "ctrl+o transcript select → enter/o expands · esc interrupt · ctrl+c quit",
-              ].join("\n"),
-            ),
-          );
-          break;
-        case "/clear":
-          setState((s) => ({ ...s, items: [] }));
-          break;
-        case "/quit":
-          quit();
-          break;
-        default:
-          sendPrompt(cmd);
-      }
-    },
-    [model, openPicker, pushItems, quit, runPrompt, sendPrompt, sessionId, state.usage],
-  );
-
-  const submit = useCallback(
-    (override?: string) => {
-      const text = override ?? buf;
-      if (!text.trim() || !sessionId || busy) return;
-      // recompute from `text` — `buf`/`slashList` can be stale on atomic input
-      const list = /^\/\S*$/.test(text) ? filterSlash(text.slice(1)) : [];
-      if (list.length) {
-        const hit = list[Math.min(slashSel, list.length - 1)];
-        if (text === "/") {
-          // "/" alone completes to the highlighted command
-          setBuf(hit.name);
-          setCur(hit.name.length);
+          setPopup({ kind: "connect", c: { step: "provider", query: "", sel: 0 } });
           return;
         }
-        const exact = list.find((c) => c.name === text);
-        setBuf("");
-        setCur(0);
-        setSlashSel(0);
-        void runSlash((exact ?? hit).name);
-        return;
+        case "login": {
+          const p = driver.providers().find((x) => x.def.kind === "chatgpt");
+          if (p) connectProvider(p.def);
+          return;
+        }
+        case "logout": {
+          const id = args || "chatgpt";
+          say(await driver.logout(id), "ok");
+          return;
+        }
+        case "mode":
+          if (!args) return say(`Mode: ${mode} — /mode plan|agent|yolo, or shift+tab to cycle`);
+          if (!MODES.includes(args)) return say(`Unknown mode ${args} — plan, agent or yolo`, "error");
+          return void setModeTo(args);
+        case "plan":
+        case "agent":
+        case "yolo":
+          return void setModeTo(name);
+        case "approve":
+          return void runPrompt("session/approve");
+        case "usage": {
+          const u = tr.usage;
+          const rl = driver.rateLimits();
+          const lines = [
+            `**Session usage** — ${model}`,
+            "",
+            `- last turn: ${u.input.toLocaleString()} in · ${u.output.toLocaleString()} out · ${u.cache_read.toLocaleString()} cached`,
+            `- cost so far: ${u.cum_usd != null && u.cum_usd > 0 ? `$${u.cum_usd.toFixed(4)}` : "—"}`,
+          ];
+          if (rl) {
+            lines.push(`- ChatGPT${rl.plan ? ` ${rl.plan}` : ""} plan: ${rl.primaryUsed != null ? `${Math.round(100 - rl.primaryUsed)}% of the 5-hour window left` : ""}${rl.secondaryUsed != null ? ` · ${Math.round(100 - rl.secondaryUsed)}% of the week left` : ""}`);
+          }
+          return push({ kind: "assistant", id: nextId(), text: lines.join("\n") });
+        }
+        case "context": {
+          const used = tr.usage.input + tr.usage.cache_read + tr.usage.cache_write;
+          if (!ctxLimit) return say(`~${used.toLocaleString()} tokens in context (window size unknown for this model)`);
+          const pct = used / ctxLimit;
+          const bar = "■".repeat(Math.round(pct * 30)) + "□".repeat(30 - Math.round(pct * 30));
+          return push({ kind: "assistant", id: nextId(), text: `**Context** \`${bar}\` ${Math.round(pct * 100)}%\n\n${used.toLocaleString()} of ${ctxLimit.toLocaleString()} tokens used. Compaction kicks in at 80%.` });
+        }
+        case "resume": {
+          const sessions = driver.sessions().slice(0, 50);
+          if (!sessions.length) return say("No earlier sessions to resume");
+          return setPopup({ kind: "resume", sessions, sel: 0 });
+        }
+        case "init":
+          return sendPrompt("/init", INIT_PROMPT);
+        case "review":
+          return sendPrompt(args ? `/review ${args}` : "/review", REVIEW_PROMPT + (args ? ` Focus: ${args}` : ""));
+        case "diff":
+          return gitBlock();
+        case "copy":
+          if (!lastReply.current) return say("Nothing to copy yet");
+          copyText(lastReply.current);
+          return say(`Copied the last reply (${lastReply.current.length} chars)`, "ok");
+        case "voice":
+          return dictate();
+        case "session":
+          return say(`Session ${sessionId} · resume with  zdev --resume ${sessionId}`);
+        case "clear": {
+          stdout.write("\x1b[2J\x1b[3J\x1b[H");
+          try {
+            await startSession();
+          } catch (e: any) {
+            say(String(e?.message ?? e), "error");
+          }
+          setTr((s) => ({ done: [{ kind: "header", id: "header" }], live: [], usage: emptyState().usage, key: s.key + 1 }));
+          return;
+        }
+        case "onboarding":
+          return quit("onboarding");
+        case "help":
+          return setPopup({ kind: "help", scroll: 0 });
+        case "quit":
+        case "exit":
+        case "q":
+          return quit();
+        default: {
+          const c = commands.find((x) => x.name === name && x.body);
+          if (c) return sendPrompt(args ? `/${name} ${args}` : `/${name}`, c.body!.replace(/\$ARGUMENTS/g, args));
+          say(`Unknown command: /${name}`, "error");
+        }
       }
-      setBuf("");
-      setCur(0);
-      setSlashSel(0);
-      if (text.startsWith("/")) void runSlash(text); // unknown /cmd → sent as prompt
-      else sendPrompt(text);
     },
-    [buf, busy, runSlash, sendPrompt, sessionId, slashSel],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [commands, connectProvider, ctxLimit, driver, gitBlock, mode, model, openModelPicker, push, quit, runPrompt, say, sendPrompt, sessionId, setModeTo, setModelTo, tr.usage],
   );
 
-  // ── transcript expand/nav ───────────────────────────────────────────────
-  // Read cache: prior `read` results carry `n:sha|line` anchors — they are
-  // the old side of every edit diff (claude-diff needs real removed rows).
+  const dictate = useCallback(() => {
+    if (listening) return;
+    setListening(true);
+    void import("../voice")
+      .then((v) => v.dictate())
+      .then((r) => {
+        setListening(false);
+        if (r.error) return say(`Mic: ${r.error}`, "error");
+        if (r.text) insertText((buf && !buf.endsWith(" ") ? " " : "") + r.text);
+        else say("Didn't catch anything — try again");
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listening, buf]);
+
+  // ── menus under the composer ──────────────────────────────────────────
+  const slashMenu = useMemo(() => {
+    const m = buf.match(/^\/(\S*)$/);
+    if (!m || popup || perm) return null;
+    const order = rank(commands, m[1], (c) => c.name);
+    return order.map((i) => commands[i]);
+  }, [buf, commands, perm, popup]);
+
+  const fileMenu = useMemo(() => {
+    if (slashMenu || popup || perm || !files) return null;
+    const at = mentionAt(buf, cur);
+    if (!at) return null;
+    const order = rank(files, at.query, (f) => f).slice(0, 50);
+    return { at, list: order.map((i) => files[i]) };
+  }, [buf, cur, files, perm, popup, slashMenu]);
+
+  useEffect(() => setMenuSel(0), [slashMenu?.length, fileMenu?.at.query]);
+
+  // ── editing ───────────────────────────────────────────────────────────
+  const setInput = (b: string, c: number) => {
+    setBuf(b);
+    setCur(Math.max(0, Math.min(c, b.length)));
+  };
+  function insertText(s: string) {
+    setBuf((b) => {
+      const nb = b.slice(0, cur) + s + b.slice(cur);
+      return nb;
+    });
+    setCur((c) => c + s.length);
+  }
+
+  const onPaste = (raw: string) => {
+    const s = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (popup?.kind === "connect" && popup.c.step === "key") {
+      const c = popup.c;
+      return setPopup({ ...popup, c: { ...c, key: c.key + s.trim(), error: undefined } });
+    }
+    if (popup) return;
+    const lines = s.split("\n").length;
+    if (lines > 8 || s.length > 2000) {
+      pastes.current.push(s);
+      insertText(`[Pasted text #${pastes.current.length} +${lines} lines]`);
+    } else insertText(s);
+  };
+
+  const expandPastes = (text: string) =>
+    pastes.current.reduce((out, p, i) => out.replace(`[Pasted text #${i + 1} +${p.split("\n").length} lines]`, p), text);
+
+  const submit = () => {
+    const raw = buf.trim();
+    if (!raw) return;
+    if (busyRef.current && !raw.startsWith("/")) {
+      return say("zdev is working — esc interrupts, then send your message");
+    }
+    setInput("", 0);
+    histIdx.current = -1;
+    if (history.current[history.current.length - 1] !== raw) {
+      history.current.push(raw);
+      appendHistory(raw);
+    }
+    const sl = parseSlash(raw);
+    if (sl) return void runSlash(sl[0], sl[1]);
+    if (raw.startsWith("!")) {
+      const cmd = raw.slice(1).trim();
+      if (cmd) runShell(cmd);
+      return;
+    }
+    if (raw.startsWith("#")) {
+      const text = raw.slice(1).trim();
+      if (!text) return;
+      const r = t.run(new t.Ctx(boot.cwd), "memory_write", { type: "preference", text, scope: "zdev" });
+      return r.startsWith("ERROR") ? say(`Memory: ${r.replace(/^ERROR:\s*/, "")}`, "error") : say(`Remembered — “${text.slice(0, 80)}”`, "ok");
+    }
+    const full = expandPastes(raw);
+    pastes.current = [];
+    sendPrompt(raw, full);
+  };
+
+  // ── keys ──────────────────────────────────────────────────────────────
+  const onPopupKey = (k: Key): boolean => {
+    if (!popup) return false;
+    const typing = (q: string) => (k.name === "text" && k.text ? q + k.text : k.name === "backspace" ? q.slice(0, -1) : null);
+    const move = (sel: number, n: number) =>
+      k.name === "up" ? (sel - 1 + n) % Math.max(1, n) : k.name === "down" ? (sel + 1) % Math.max(1, n) : k.name === "pageup" ? Math.max(0, sel - 8) : k.name === "pagedown" ? Math.min(n - 1, sel + 8) : null;
+
+    if (popup.kind === "help") {
+      const step = k.name === "up" ? -1 : k.name === "down" ? 1 : k.name === "pageup" ? -10 : k.name === "pagedown" ? 10 : 0;
+      if (step) setPopup({ kind: "help", scroll: Math.max(0, popup.scroll + step) });
+      else setPopup(null); // any other key closes
+      return true;
+    }
+    if (popup.kind === "resume") {
+      const n = popup.sessions.length;
+      if (k.name === "escape") setPopup(null);
+      const m = move(popup.sel, n);
+      if (m !== null) setPopup({ ...popup, sel: m });
+      if (k.name === "return" && n) {
+        const s = popup.sessions[popup.sel];
+        setPopup(null);
+        void (async () => {
+          try {
+            await startSession({ resume: s.id });
+            const msgs = driver.agent?.messages ?? [];
+            stdout.write("\x1b[2J\x1b[3J\x1b[H");
+            setTr((st) => ({
+              done: [{ kind: "header", id: "header" }, ...replayItems(msgs), note(`Resumed session ${s.id.slice(0, 8)} — ${msgs.length} messages of context restored`, "ok")],
+              live: [],
+              usage: emptyState().usage,
+              key: st.key + 1,
+            }));
+          } catch (e: any) {
+            say(`Resume failed: ${e?.message ?? e}`, "error");
+          }
+        })();
+      }
+      return true;
+    }
+    if (popup.kind === "model") {
+      const order = rank(popup.models, popup.query, (m) => `${m.alias} ${m.name} ${m.providerName}`);
+      const n = order.length;
+      if (k.name === "escape") return setPopup(null), true;
+      const m = move(popup.sel, n);
+      if (m !== null) return setPopup({ ...popup, sel: m }), true;
+      if (k.name === "left" || k.name === "right") {
+        const i = EFFORTS.indexOf(popup.effort);
+        const j = (i + (k.name === "right" ? 1 : EFFORTS.length - 1)) % EFFORTS.length;
+        return setPopup({ ...popup, effort: EFFORTS[j] }), true;
+      }
+      if (k.ctrl && k.name === "r" && n) {
+        const pick = popup.models[order[popup.sel]];
+        if (pick.fromConfig) return say("That model is defined in config.toml — no live list"), true;
+        setPopup({ ...popup, loading: `Fetching live models from ${pick.providerName}…` });
+        driver
+          .fetchModels(pick.provider)
+          .then(async () => {
+            const res: any = await driver.call("session/list_models", {});
+            setPopup((p) => (p?.kind === "model" ? { ...p, models: res?.result?.models ?? p.models, loading: undefined } : p));
+            say(`Refreshed ${pick.providerName}'s live model list`, "ok");
+          })
+          .catch((e) => {
+            setPopup((p) => (p?.kind === "model" ? { ...p, loading: undefined } : p));
+            say(String(e?.message ?? e), "error");
+          });
+        return true;
+      }
+      if (k.name === "return" && n) {
+        const pick = popup.models[order[Math.min(popup.sel, n - 1)]];
+        setPopup(null);
+        void setModelTo(pick.alias, popup.effort);
+        return true;
+      }
+      const q = typing(popup.query);
+      if (q !== null) setPopup({ ...popup, query: q, sel: 0 });
+      return true;
+    }
+    // connect
+    const c = popup.c;
+    if (c.step === "provider") {
+      const list = providerRows(c.query);
+      if (k.name === "escape") return setPopup(null), true;
+      const m = move(c.sel, list.length);
+      if (m !== null) return setPopup({ kind: "connect", c: { ...c, sel: m } }), true;
+      if (k.name === "return" && list.length) return connectProvider(list[Math.min(c.sel, list.length - 1)].def), true;
+      const q = typing(c.query);
+      if (q !== null) setPopup({ kind: "connect", c: { ...c, query: q, sel: 0 } });
+      return true;
+    }
+    if (c.step === "key") {
+      if (k.name === "escape") return setPopup({ kind: "connect", c: { step: "provider", query: "", sel: 0 } }), true;
+      if (k.name === "return") {
+        const key = c.key.trim();
+        if (!key) return true;
+        try {
+          const where = driver.storeKey(c.provider.id, key);
+          say(`${c.provider.name} key saved to the ${where}`, "ok");
+          void fetchForConnect(c.provider, true);
+        } catch (e: any) {
+          setPopup({ kind: "connect", c: { ...c, error: String(e?.message ?? e) } });
+        }
+        return true;
+      }
+      if (k.name === "backspace") return setPopup({ kind: "connect", c: { ...c, key: c.key.slice(0, -1) } }), true;
+      if (k.name === "text" && k.text) setPopup({ kind: "connect", c: { ...c, key: c.key + k.text, error: undefined } });
+      return true;
+    }
+    if (c.step === "wait") {
+      if (k.name === "escape") {
+        connectAbort.current?.abort();
+        setPopup({ kind: "connect", c: { step: "provider", query: "", sel: 0 } });
+      }
+      return true;
+    }
+    // models
+    const order = rank(c.models, c.query, (m) => `${m.id} ${m.name}`);
+    if (k.name === "escape") return setPopup({ kind: "connect", c: { step: "provider", query: "", sel: 0 } }), true;
+    const m = move(c.sel, order.length);
+    if (m !== null) return setPopup({ kind: "connect", c: { ...c, sel: m } }), true;
+    if (k.name === "return" && order.length) {
+      const pick = c.models[order[Math.min(c.sel, order.length - 1)]];
+      setPopup(null);
+      void setModelTo(`${c.provider.id}/${pick.id}`);
+      return true;
+    }
+    const q = typing(c.query);
+    if (q !== null) setPopup({ kind: "connect", c: { ...c, query: q, sel: 0 } });
+    return true;
+  };
+
+  const onKey = (k: Key) => {
+    // ctrl+c: clear the input, else interrupt, else quit on a second press
+    if (k.ctrl && k.name === "c") {
+      if (popup) return setPopup(null);
+      if (buf) return setInput("", 0);
+      if (busyRef.current) return cancel();
+      if (Date.now() - quitArmed < 2000) return quit();
+      setQuitArmed(Date.now());
+      return;
+    }
+    if (k.ctrl && k.name === "d" && !buf && !popup) return quit();
+    if (k.name === "paste") return onPaste(k.text ?? "");
+
+    if (perm) {
+      const n = perm.options.length;
+      const answer = (i: number) => {
+        driver.reply(perm.id, { outcome: { outcome: "selected", optionId: perm.options[i].id } });
+        setPerm(null);
+      };
+      if (k.name === "up" || k.name === "left") setPermSel((s) => (s - 1 + n) % n);
+      else if (k.name === "down" || k.name === "right" || k.name === "tab") setPermSel((s) => (s + 1) % n);
+      else if (k.name === "text" && /^[1-9]$/.test(k.text ?? "") && +k.text! <= n) answer(+k.text! - 1);
+      else if (k.name === "text" && /^[yY]$/.test(k.text ?? "")) answer(0);
+      else if (k.name === "text" && /^[nN]$/.test(k.text ?? "")) answer(n - 1);
+      else if (k.name === "return") answer(permSel);
+      else if (k.name === "escape") {
+        answer(n - 1);
+        cancel();
+      }
+      return;
+    }
+    if (onPopupKey(k)) return;
+
+    if (k.name === "tab" && k.shift) {
+      const next = MODES[(MODES.indexOf(mode) + 1) % MODES.length];
+      return void setModeTo(next);
+    }
+    if (k.ctrl && k.name === "o") {
+      setVerbose((v) => !v);
+      return say(verbose ? "Compact results" : "Full results for tool output from here on (ctrl+o toggles)");
+    }
+    if (k.ctrl && (k.name === "space" || k.name === "`")) return dictate();
+    if (k.ctrl && k.name === "l") {
+      stdout.write("\x1b[2J\x1b[H");
+      return setTr((s) => ({ ...s, key: s.key + 1 }));
+    }
+    if (k.name === "escape") {
+      if (busyRef.current) return cancel();
+      if (buf) {
+        histIdx.current = -1;
+        return setInput("", 0);
+      }
+      return;
+    }
+
+    // menus under the composer
+    const menu = slashMenu ?? fileMenu?.list ?? null;
+    if (menu && menu.length) {
+      const n = Math.min(menu.length, 50);
+      if (k.name === "up") return setMenuSel((s) => (s - 1 + n) % n);
+      if (k.name === "down") return setMenuSel((s) => (s + 1) % n);
+      if (k.name === "tab" || (k.name === "return" && fileMenu)) {
+        if (slashMenu) {
+          const c = slashMenu[Math.min(menuSel, slashMenu.length - 1)];
+          return setInput(`/${c.name} `, c.name.length + 2);
+        }
+        const f = fileMenu!.list[Math.min(menuSel, fileMenu!.list.length - 1)];
+        const nb = buf.slice(0, fileMenu!.at.start) + `@${f} ` + buf.slice(cur);
+        return setInput(nb, fileMenu!.at.start + f.length + 2);
+      }
+      if (k.name === "return" && slashMenu) {
+        const c = slashMenu[Math.min(menuSel, slashMenu.length - 1)];
+        setInput("", 0);
+        history.current.push(`/${c.name}`);
+        appendHistory(`/${c.name}`);
+        return void runSlash(c.name, "");
+      }
+    }
+
+    // editing
+    switch (k.name) {
+      case "return":
+        if (k.meta || k.shift) return insertText("\n");
+        if (cur > 0 && buf[cur - 1] === "\\") return setInput(buf.slice(0, cur - 1) + "\n" + buf.slice(cur), cur);
+        return submit();
+      case "j":
+        if (k.ctrl) return insertText("\n");
+        break;
+      case "backspace":
+        if (k.meta || k.ctrl) {
+          const w = wordLeft(buf, cur);
+          return setInput(buf.slice(0, w) + buf.slice(cur), w);
+        }
+        if (cur > 0) setInput(buf.slice(0, cur - 1) + buf.slice(cur), cur - 1);
+        return;
+      case "delete":
+        if (cur < buf.length) setInput(buf.slice(0, cur) + buf.slice(cur + 1), cur);
+        return;
+      case "left":
+        return setCur(k.ctrl || k.meta ? wordLeft(buf, cur) : Math.max(0, cur - 1));
+      case "right":
+        return setCur(k.ctrl || k.meta ? wordRight(buf, cur) : Math.min(buf.length, cur + 1));
+      case "home":
+      case "a":
+        if (k.name === "a" && !k.ctrl) break;
+        return setCur(lineStart(buf, cur));
+      case "end":
+      case "e":
+        if (k.name === "e" && !k.ctrl) break;
+        return setCur(lineEnd(buf, cur));
+      case "u":
+        if (!k.ctrl) break;
+        return setInput(buf.slice(0, lineStart(buf, cur)) + buf.slice(cur), lineStart(buf, cur));
+      case "k":
+        if (!k.ctrl) break;
+        return setInput(buf.slice(0, cur) + buf.slice(lineEnd(buf, cur)), cur);
+      case "w":
+        if (!k.ctrl) break;
+        return setInput(buf.slice(0, wordLeft(buf, cur)) + buf.slice(cur), wordLeft(buf, cur));
+      case "up": {
+        const v = verticalMove(buf, cur, -1);
+        if (v !== null) return setCur(v);
+        const h = history.current;
+        if (!h.length) return;
+        if (histIdx.current === -1) {
+          draft.current = buf;
+          histIdx.current = h.length - 1;
+        } else if (histIdx.current > 0) histIdx.current--;
+        return setInput(h[histIdx.current], h[histIdx.current].length);
+      }
+      case "down": {
+        const v = verticalMove(buf, cur, 1);
+        if (v !== null) return setCur(v);
+        if (histIdx.current === -1) return;
+        const h = history.current;
+        if (histIdx.current < h.length - 1) {
+          histIdx.current++;
+          return setInput(h[histIdx.current], h[histIdx.current].length);
+        }
+        histIdx.current = -1;
+        return setInput(draft.current, draft.current.length);
+      }
+      case "text":
+        if (k.text && !k.ctrl) {
+          // a lone "?" on an empty prompt opens help, like Claude Code
+          if (k.text === "?" && !buf) return setPopup({ kind: "help", scroll: 0 });
+          return insertText(k.text);
+        }
+        return;
+    }
+  };
+
+  // raw input → keys (see keys.ts for why not useInput)
+  const onKeyRef = useRef(onKey);
+  onKeyRef.current = onKey;
+  useEffect(() => {
+    if (!isRawModeSupported) return;
+    setRawMode(true);
+    stdout.write("\x1b[?2004h"); // bracketed paste
+    const parser = new KeyParser();
+    const onData = (chunk: string | Buffer) => {
+      for (const k of parser.feed(String(chunk))) onKeyRef.current(k);
+    };
+    stdinEvents.on("input", onData);
+    return () => {
+      stdinEvents.removeListener("input", onData);
+      stdout.write("\x1b[?2004l");
+      setRawMode(false);
+    };
+  }, [isRawModeSupported, setRawMode, stdinEvents]);
+
+  // ── render ────────────────────────────────────────────────────────────
   const reads = useMemo<ReadCache>(() => {
     const m: ReadCache = new Map();
-    for (const it of state.items) {
+    for (const it of [...tr.done, ...tr.live]) {
       if (it.kind !== "tool" || it.name !== "read" || !it.detail) continue;
-      const path = String(it.input?.path ?? it.arg ?? "");
-      if (!path) continue;
-      const lines = parseReadDetail(it.detail);
-      const cur = m.get(path) ?? new Map<number, string>();
-      for (const [n, t] of lines) cur.set(n, t);
-      m.set(path, cur);
+      const p = String(it.input?.path ?? it.arg ?? "");
+      if (!p) continue;
+      const cur2 = m.get(p) ?? new Map<number, string>();
+      for (const [n, text] of parseReadDetail(it.detail)) cur2.set(n, text);
+      m.set(p, cur2);
     }
     return m;
-  }, [state.items]);
+  }, [tr.done, tr.live]);
 
-  const lastAssistantId = useMemo(() => {
-    for (let i = state.items.length - 1; i >= 0; i--)
-      if (state.items[i].kind === "assistant") return state.items[i].id;
-    return null;
-  }, [state.items]);
-
-  const toolItems = useMemo(
-    () => state.items.filter((i): i is Extract<Item, { kind: "tool" }> => i.kind === "tool"),
-    [state.items],
+  const header = (
+    <HeaderBox version="0.1.0" user={user} model={model} cwd={boot.cwd} width={Math.min(width, 110)} />
   );
-  const navTarget = toolItems[Math.min(navIdx, toolItems.length - 1)];
-
-  const toggleExpand = useCallback(
-    (toolCallId: string) =>
-      setExpanded((e) => ({ ...e, [toolCallId]: !e[toolCallId] })),
-    [],
-  );
-
-  // ── key routing ─────────────────────────────────────────────────────────
-  const onKey = useCallback(
-    (input: string, key: any) => {
-      if (key.ctrl && (input === "c" || input === "\x03")) return quit();
-      if (key.ctrl && input === "d" && !buf) return quit();
-
-      // permission radiogroup
-      if (perm) {
-        const n = perm.options.length;
-        const digit = /^[1-9][\r\n]*$/.test(input) ? +input.trim()[0] : 0;
-        if (key.downArrow || key.rightArrow) setPermSel((s) => (s + 1) % n);
-        else if (key.upArrow || key.leftArrow)
-          setPermSel((s) => (s - 1 + n) % n);
-        else if (digit) {
-          if (digit <= n) answerPerm(digit - 1);
-        } else if (key.return || /^[\r\n]+$/.test(input)) answerPerm(permSel);
-        else if (key.escape) {
-          answerPerm(n - 1); // esc = deny
-          cancel();          // …and interrupt the turn, like Claude Code
-        }
-        return;
-        function answerPerm(i: number) {
-          const opt = perm!.options[i];
-          clientRef.current?.reply(perm!.id, {
-            outcome: { outcome: "selected", optionId: opt.id },
-          });
-          setPerm(null);
-        }
-      }
-
-      // session resume picker
-      if (resumePicker.open) {
-        const n = resumePicker.sessions.length;
-        if (key.escape) setResumePicker((p) => ({ ...p, open: false }));
-        else if (key.downArrow)
-          setResumePicker((p) => ({ ...p, sel: (p.sel + 1) % Math.max(1, n) }));
-        else if (key.upArrow)
-          setResumePicker((p) => ({
-            ...p,
-            sel: (p.sel - 1 + n) % Math.max(1, n),
-          }));
-        else if ((key.return || /^[\r\n]+$/.test(input)) && n) {
-          const s = resumePicker.sessions[resumePicker.sel];
-          setResumePicker((p) => ({ ...p, open: false }));
-          void (async () => {
-            const res: any = await clientRef.current?.call("session/new", {
-              cwd: boot.cwd,
-              resume: s.id,
-            });
-            if (res?.error) {
-              pushItems(note(`resume failed: ${res.error.message}`));
-            } else {
-              setSessionId(res.result.sessionId ?? s.id);
-              setState((st) => ({ ...st, items: [] }));
-              pushItems(
-                note(`resumed session ${s.id} — context restored`),
-              );
-            }
-          })();
-        }
-        return;
-      }
-
-      // model picker
-      if (picker.open) {
-        const n = picker.models.length;
-        if (key.escape) setPicker((p) => ({ ...p, open: false }));
-        else if (key.downArrow) setPicker((p) => ({ ...p, sel: (p.sel + 1) % Math.max(1, n) }));
-        else if (key.upArrow) setPicker((p) => ({ ...p, sel: (p.sel - 1 + n) % Math.max(1, n) }));
-        else if ((key.return || /^[\r\n]+$/.test(input)) && n) {
-          const m = picker.models[picker.sel];
-          setPicker((p) => ({ ...p, open: false }));
-          void (async () => {
-            const res: any = await clientRef.current?.call("session/set_model", {
-              sessionId,
-              model: m.alias,
-            });
-            if (res?.error) pushItems(note(`set_model: ${res.error.message}`));
-            else {
-              setModel(res.result.model);
-              if (m.context) setCtxLimit(m.context);
-              pushItems(note(`model: ${res.result.model}`));
-            }
-          })();
-        }
-        return;
-      }
-
-      // transcript-nav mode: ↑/↓ pick a tool call, enter/o toggles detail
-      if (nav) {
-        const n = toolItems.length;
-        if (key.escape || (key.ctrl && input === "o")) {
-          setNav(false);
-          setStatus("");
-        } else if (key.downArrow) setNavIdx((i) => Math.min(i + 1, n - 1));
-        else if (key.upArrow) setNavIdx((i) => Math.max(i - 1, 0));
-        else if (
-          key.return ||
-          /^[\r\n]+$/.test(input) ||
-          input.replace(/[\r\n]+$/, "") === "o"
-        ) {
-          if (navTarget) toggleExpand(navTarget.toolCallId);
-        }
-        return;
-      }
-      if (key.ctrl && input === "o") {
-        if (toolItems.length) {
-          setNav(true);
-          setNavIdx(toolItems.length - 1);
-          setStatus("transcript — ↑/↓ select · enter/o expand · esc back");
-        }
-        return;
-      }
-
-      // composer
-      if (key.ctrl && input === "m") {
-        // mic dictation — one utterance, lands in the composer buffer
-        if (listening) return;
-        setListening(true);
-        void import("../voice")
-          .then((v) => v.dictate())
-          .then((r) => {
-            setListening(false);
-            if (r.error) return pushItems(note(`mic: ${r.error}`));
-            if (r.text) insert(" " + r.text);
-          });
-        return;
-      }
-      if (key.escape) {
-        if (busy) return cancel();
-        if (buf) {
-          setBuf("");
-          setCur(0);
-        }
-        return;
-      }
-      if (slashOpen && slashList.length) {
-        if (key.downArrow) return setSlashSel((s) => (s + 1) % slashList.length);
-        if (key.upArrow)
-          return setSlashSel((s) => (s - 1 + slashList.length) % slashList.length);
-        if (key.tab) {
-          const c = slashList[Math.min(slashSel, slashList.length - 1)];
-          setBuf(c.name);
-          setCur(c.name.length);
-          return;
-        }
-      }
-      // Enter may arrive as \r, \n or \r\n (winpty sends the pair as one
-      // keypress); treat any pure CR/LF input as return, not literal text.
-      if (key.return || /^[\r\n]+$/.test(input)) {
-        if (key.shift || key.meta) return insert("\n");
-        return submit();
-      }
-      if (key.tab) return insert("  ");
-      if (key.backspace || input === "\x7f") {
-        if (cur > 0) {
-          setBuf((b) => b.slice(0, cur - 1) + b.slice(cur));
-          setCur(cur - 1);
-        }
-        return;
-      }
-      if (key.delete) {
-        setBuf((b) => b.slice(0, cur) + b.slice(cur + 1));
-        return;
-      }
-      if (key.leftArrow) return setCur((c) => Math.max(0, c - 1));
-      if (key.rightArrow) return setCur((c) => Math.min(buf.length, c + 1));
-      if (key.home) return setCur(0);
-      if (key.end) return setCur(buf.length);
-      if (key.upArrow) {
-        // history when cursor sits on the first line
-        const h = histRef.current;
-        if (!h.length || buf.includes("\n")) return;
-        if (histIdxRef.current === -1) {
-          draftRef.current = buf;
-          histIdxRef.current = h.length - 1;
-        } else if (histIdxRef.current > 0) histIdxRef.current--;
-        setBuf(h[histIdxRef.current]);
-        setCur(h[histIdxRef.current].length);
-        return;
-      }
-      if (key.downArrow) {
-        const h = histRef.current;
-        if (histIdxRef.current === -1) return;
-        if (histIdxRef.current < h.length - 1) {
-          histIdxRef.current++;
-          setBuf(h[histIdxRef.current]);
-          setCur(h[histIdxRef.current].length);
-        } else {
-          histIdxRef.current = -1;
-          setBuf(draftRef.current);
-          setCur(draftRef.current.length);
-        }
-        return;
-      }
-      if (input && !key.ctrl && !key.meta) {
-        // A chunk may carry a trailing newline (one write = one keypress, or a
-        // paste ending in ⏎): insert the text and submit what remains.
-        const tail = input.match(/[\r\n]+$/);
-        if (tail) {
-          const typed = input.slice(0, input.length - tail[0].length);
-          const nb = buf.slice(0, cur) + typed.replace(/\r\n?/g, "\n") + buf.slice(cur);
-          setBuf(nb);
-          setCur(cur + typed.length);
-          return submit(nb);
-        }
-        return insert(input);
-      }
-
-      function insert(s: string) {
-        const text = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-        setBuf((b) => b.slice(0, cur) + text + b.slice(cur));
-        setCur(cur + text.length);
-        setSlashSel(0);
-      }
-    },
-    [buf, busy, cancel, cur, listening, nav, navTarget, perm, picker, pushItems, quit, resumePicker, sessionId, slashList, slashOpen, submit, toggleExpand, toolItems],
-  );
-
-  // input is only meaningful on a TTY; keep rendering headless for smoke runs
-  const keyRouter =
-    process.stdin.isTTY && !onboarding ? <KeyRouter onKey={onKey} /> : null;
-
-  const user = driver.userName() || process.env.USERNAME || process.env.USER || "operator";
-
-  // <Static> renders each item once — mutated rows (pending tool → done,
-  // expand toggles) must live in the normal flow until they settle.
-  // Boundary: the last user item. Its whole turn (assistant text, tool rows,
-  // notes) stays live + expandable; everything older commits to scrollback.
-  let liveStart = state.items.length;
-  for (let i = state.items.length - 1; i >= 0; i--) {
-    if (state.items[i].kind === "user") {
-      liveStart = i;
-      break;
-    }
-    const it = state.items[i];
-    if (it.kind === "tool" && it.status === "pending") liveStart = i; // safety
-  }
-  const doneItems = state.items.slice(0, liveStart);
-  const liveItems = state.items.slice(liveStart);
-  const renderItem = (item: Item) => (
-    <TranscriptItem
-      key={item.id}
-      item={item}
-      expanded={!!expanded[item.kind === "tool" ? item.toolCallId : item.id]}
-      focused={nav && item === navTarget}
-      streaming={busy && item.id === lastAssistantId}
-      reads={reads}
-    />
-  );
-
-  // onboarding owns the whole screen — no header, no footer, no transcript
-  if (onboarding) {
-    return (
-      <Box flexDirection="column">
-        {Onb ? (
-          <Onb
-            driver={driver}
-            currentModel={model}
-            onDone={(picked) => {
-              setOnboarding(false);
-              setOnb(null); // module unloads — onboarding is gone for good
-              if (!picked) return;
-              void (async () => {
-                const res: any = await clientRef.current?.call(
-                  "session/set_model",
-                  { sessionId: clientRef.current?.sessionId, model: picked },
-                );
-                if (!res?.error && res?.result?.model) {
-                  setModel(res.result.model);
-                } else {
-                  setModel(picked);
-                }
-                const lm: any = await clientRef.current?.call(
-                  "session/list_models",
-                  {},
-                );
-                const cur = (lm?.result?.models ?? []).find(
-                  (m: Model) => m.alias === picked,
-                );
-                if (cur?.context) setCtxLimit(cur.context);
-              })();
-            }}
-            onQuit={quit}
-          />
-        ) : (
-          <Text color={DIM}>loading…</Text>
-        )}
-      </Box>
+  const renderItem = (item: Item) => <TranscriptItem key={item.id} item={item} verbose={verbose} reads={reads} header={header} />;
+  const rowsNow = stdout?.rows ?? 30;
+  // the growing reply may only use what the terminal has left under it
+  const liveCap = { rows: Math.max(4, rowsNow - 14), width: width - 4 };
+  const renderLive = (item: Item, i: number, arr: Item[]) =>
+    item.kind === "assistant" && busy && i === arr.length - 1 ? (
+      <TranscriptItem key={item.id} item={item} verbose={verbose} reads={reads} cap={liveCap} />
+    ) : (
+      renderItem(item)
     );
+  const used = tr.usage.input + tr.usage.cache_read + tr.usage.cache_write;
+  const rows = stdout?.rows ?? 30;
+  const menuH = Math.max(4, Math.min(10, rows - 14));
+
+  let overlay: React.ReactNode = null;
+  if (popup?.kind === "help") {
+    const keys: Row[] = [
+      ["enter", "send · \\+enter or ctrl+j for a new line"],
+      ["esc", "interrupt the agent · close menus"],
+      ["shift+tab", "cycle agent → plan → yolo"],
+      ["↑ ↓", "prompt history · move between lines"],
+      ["@", "attach a file (fuzzy search)"],
+      ["!cmd", "run a shell command; its output rides with your next message"],
+      ["#text", "remember something in the shared memory vault"],
+      ["ctrl+o", "full / compact tool results"],
+      ["ctrl+space", "dictate"],
+      ["ctrl+l", "redraw the screen"],
+      ["ctrl+c", "clear input · interrupt · twice to quit"],
+    ].map(([a, b]) => ({ key: a, label: a, detail: b }));
+    const cmds: Row[] = commands.map((c) => ({ key: `/${c.name}`, label: `/${c.name}${c.hint ? ` ${c.hint}` : ""}`, detail: c.desc }));
+    const h = Math.max(6, rows - 15);
+    const all = [...keys, ...cmds];
+    overlay = (
+      <Picker
+        title="zdev — keys and commands"
+        rows={all}
+        sel={-1}
+        scroll={Math.min(popup.scroll, Math.max(0, all.length - h))}
+        height={h}
+        width={width}
+        footer="↑↓ scroll · any other key closes"
+      />
+    );
+  } else if (popup?.kind === "resume") {
+    overlay = (
+      <Picker
+        title="Resume a session"
+        rows={popup.sessions.map((s) => ({
+          key: s.id,
+          label: String(s.started ?? "").slice(5, 16).replace("T", " "),
+          detail: String(s.preview ?? "").replace(/\s+/g, " ").slice(0, width - 30),
+          right: s.harness,
+        }))}
+        sel={popup.sel}
+        height={menuH}
+        width={width}
+        footer="↑↓ choose · enter resume · esc cancel"
+      />
+    );
+  } else if (popup?.kind === "model") {
+    const order = rank(popup.models, popup.query, (m) => `${m.alias} ${m.name} ${m.providerName}`);
+    const curAlias = model.split(" ")[0];
+    let lastProv = "";
+    const list: Row[] = order.map((i) => {
+      const m = popup.models[i];
+      const section = !popup.query && m.providerName !== lastProv ? m.providerName : undefined;
+      lastProv = m.providerName;
+      return {
+        key: m.alias,
+        label: m.fromConfig ? m.alias : m.id,
+        detail: m.fromConfig ? ` ${m.id}` : m.name !== m.id ? ` ${m.name}` : undefined,
+        tag: m.alias === curAlias ? "● current" : undefined,
+        right: `${m.context ? fmtK(m.context) : ""}  ${priceText(m)}`,
+        section,
+      };
+    });
+    const sel = popup.models[order[Math.min(popup.sel, order.length - 1)]];
+    overlay = (
+      <Picker
+        title="Model"
+        subtitle={
+          <Text color={DIM}>
+            {sel?.reasoning || popup.effort ? (
+              <>
+                effort <Text color={ROSE}>{"← "}{popup.effort || "default"}{" →"}</Text> ·{" "}
+              </>
+            ) : null}
+            {popup.models.length} models from your connected providers · /connect adds more
+          </Text>
+        }
+        query={popup.query}
+        rows={list}
+        sel={popup.sel}
+        height={menuH}
+        width={width}
+        loading={popup.loading}
+        footer="↑↓ choose · enter use & save as default · ←→ effort · ctrl+r refresh live list · esc"
+      />
+    );
+  } else if (popup?.kind === "connect") {
+    const c = popup.c;
+    if (c.step === "provider") {
+      overlay = (
+        <Picker
+          title="Connect a provider"
+          subtitle="Keys stay on this machine (Windows Credential Manager) and work in zcli too."
+          query={c.query}
+          placeholder="Type to search providers"
+          rows={providerRows(c.query).map((x) => ({
+            key: x.def.id,
+            label: x.def.kind === "chatgpt" ? "ChatGPT" : x.def.name,
+            detail: ` ${pitchFor(x.def)}`,
+            tag: x.ready ? `✓ ${x.detail}` : undefined,
+          }))}
+          sel={c.sel}
+          height={menuH}
+          width={width}
+          footer="↑↓ choose · enter connect (connected → pick a model) · esc"
+        />
+      );
+    } else if (c.step === "key") {
+      const pin = PINNED.find((x) => x.id === c.provider.id);
+      overlay = (
+        <Box flexDirection="column" borderStyle="round" borderColor="#5a5a5a" paddingX={1} marginTop={1} width={width}>
+          <Text bold color={ROSE}>
+            {c.provider.name} API key
+          </Text>
+          <Text color={DIM}>Paste or type it — hidden as you type. It's checked against the provider before it's used.</Text>
+          <Box marginTop={1}>
+            <Text>
+              <Text color={ROSE}>❯ </Text>
+              {"•".repeat(Math.min(c.key.length, width - 8))}
+              <Text inverse> </Text>
+            </Text>
+          </Box>
+          {c.error ? <Text color="#d0d0d0">✗ {c.error}</Text> : null}
+          {pin?.url ? (
+            <Text color={DIM}>
+              get one at <Text color={GRAY}>{pin.url}</Text>
+            </Text>
+          ) : null}
+          {c.provider.env[0] ? <Text color={DIM}>or set {c.provider.env[0]} in your environment</Text> : null}
+          <Text color={DIM}>enter save · esc back</Text>
+        </Box>
+      );
+    } else if (c.step === "wait") {
+      overlay = (
+        <Box flexDirection="column" borderStyle="round" borderColor="#5a5a5a" paddingX={1} marginTop={1} width={width}>
+          <Thinking running verb={c.message} />
+          {c.url ? (
+            <>
+              <Text color={DIM}>If the browser didn't open, visit:</Text>
+              <Text color={GRAY} wrap="truncate-middle">
+                {c.url}
+              </Text>
+            </>
+          ) : null}
+          <Text color={DIM}>esc cancel</Text>
+        </Box>
+      );
+    } else {
+      const order = rank(c.models, c.query, (m) => `${m.id} ${m.name}`);
+      overlay = (
+        <Picker
+          title={`Choose a model — ${c.provider.kind === "chatgpt" ? "ChatGPT" : c.provider.name}`}
+          subtitle={c.source}
+          query={c.query}
+          rows={order.map((i) => {
+            const m = c.models[i];
+            return {
+              key: m.id,
+              label: m.id,
+              detail: m.name !== m.id ? ` ${m.name}` : undefined,
+              right: `${fmtK(m.context)}  ${c.provider.kind === "chatgpt" ? "plan" : m.price[0] || m.price[1] ? `${money(m.price[0])}/${money(m.price[1])}` : c.provider.id === "openrouter" ? "free" : ""}`,
+            };
+          })}
+          sel={c.sel}
+          height={menuH}
+          width={width}
+          footer="↑↓ choose · enter use & save as default · esc back"
+        />
+      );
+    }
   }
+
+  let menu: React.ReactNode = null;
+  if (slashMenu && slashMenu.length) {
+    menu = (
+      <Picker
+        boxed={false}
+        rows={slashMenu.map((c) => ({ key: c.name, label: `/${c.name}`, detail: `${c.hint ? `${c.hint}  ` : ""}${c.desc}` }))}
+        sel={menuSel}
+        height={Math.min(8, menuH)}
+        width={width}
+      />
+    );
+  } else if (fileMenu && fileMenu.list.length) {
+    menu = <Picker boxed={false} rows={fileMenu.list.map((f) => ({ key: f, label: f }))} sel={menuSel} height={Math.min(8, menuH)} width={width} />;
+  }
+
+  const hint = quitArmed && Date.now() - quitArmed < 2000 ? "press ctrl+c again to quit" : undefined;
 
   return (
     <Box flexDirection="column">
-      {keyRouter}
-      <Header
-        version={version}
-        user={user}
-        model={model}
-        cwd={boot.cwd}
-        width={(process.stdout.columns ?? 80) - 2}
-      />
-      <Static items={doneItems}>{renderItem}</Static>
-      {liveItems.map(renderItem)}
-      <Thinking running={busy && !perm} tokens={state.usage.output || undefined} />
+      <Static key={tr.key} items={tr.done}>
+        {renderItem}
+      </Static>
+      {tr.live.map(renderLive)}
+      {busy && !perm ? (
+        <Box marginTop={1}>
+          <Thinking running tokens={tr.usage.output || undefined} />
+        </Box>
+      ) : null}
       {perm ? <Permission req={perm} sel={permSel} reads={reads} /> : null}
-      {picker.open ? (
-        <ModelPicker
-          models={picker.models}
-          sel={picker.sel}
-          current={model.split(" ")[0]}
-          loading={picker.loading}
-        />
+      {overlay}
+      {flash ? (
+        <Box marginTop={1}>
+          <Text color={flash.tone === "error" ? "#d6d6d6" : flash.tone === "ok" ? GREEN : GRAY} wrap="truncate-end">
+            {flash.tone === "error" ? "✗ " : flash.tone === "ok" ? "✓ " : "· "}
+            {flash.text}
+          </Text>
+        </Box>
       ) : null}
-      {resumePicker.open ? (
-        <SessionPicker
-          sessions={resumePicker.sessions}
-          sel={resumePicker.sel}
-          current={sessionId}
-        />
-      ) : null}
-      {slashOpen && !busy ? <SlashMenu list={slashList} active={slashSel} /> : null}
       <Composer
         value={buf}
         cursor={cur}
         mode={mode}
         model={model}
+        width={width}
         disabled={!sessionId}
         listening={listening}
+        ctxPct={ctxLimit ? used / ctxLimit : undefined}
+        hint={hint}
       />
-      <Footer
-        usage={state.usage}
-        sessionId={sessionId}
-        status={status}
-        ctxLimit={ctxLimit || undefined}
-      />
+      {menu}
     </Box>
   );
-}
-
-function KeyRouter({ onKey }: { onKey: (i: string, k: any) => void }) {
-  useInput(onKey);
-  return null;
 }

@@ -1,48 +1,32 @@
-// Working line — port of claude-thinking: cycling ✶ sparkle, rotating
-// verb, elapsed seconds + "esc to interrupt".
+// Working line — port of claude-thinking: cycling ✶ sparkle, a rotating
+// verb (or a fixed label), elapsed time, tokens so far, "esc to interrupt".
 import React, { useEffect, useState } from "react";
 import { Text } from "ink";
+
 import { DIM, GLYPHS, ROSE, VERBS } from "../theme";
 
-export function Thinking({
-  running,
-  tokens,
-}: {
-  running: boolean;
-  tokens?: number;
-}) {
-  const [glyph, setGlyph] = useState(0);
-  const [verbIdx, setVerbIdx] = useState(0);
-  const [secs, setSecs] = useState(0);
-
+export function Thinking({ running, tokens, verb }: { running: boolean; tokens?: number; verb?: string }) {
+  const [tick, setTick] = useState(0);
+  const [start] = useState(() => Date.now());
   useEffect(() => {
     if (!running) return;
-    const id = setInterval(() => setGlyph((g) => (g + 1) % GLYPHS.length), 110);
+    const id = setInterval(() => setTick((n) => n + 1), 120);
     return () => clearInterval(id);
   }, [running]);
-
-  useEffect(() => {
-    if (!running) return;
-    setSecs(0);
-    const id = setInterval(() => setSecs((s) => s + 1), 1000);
-    return () => clearInterval(id);
-  }, [running]);
-
-  useEffect(() => {
-    if (!running) return;
-    const id = setInterval(() => setVerbIdx((v) => (v + 1) % VERBS.length), 5200);
-    return () => clearInterval(id);
-  }, [running]);
-
   if (!running) return null;
+  const secs = Math.floor((Date.now() - start) / 1000);
+  const label = verb ?? `${VERBS[Math.floor((tick * 120) / 5200) % VERBS.length]}…`;
+  const time = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
   return (
-    <Text>
-      <Text color={ROSE}>{GLYPHS[glyph]} </Text>
+    <Text wrap="truncate-end">
+      <Text color={ROSE}>{GLYPHS[tick % GLYPHS.length]} </Text>
       <Text bold color={ROSE}>
-        {VERBS[verbIdx]}…{" "}
+        {label}{" "}
       </Text>
       <Text color={DIM}>
-        ({secs}s{tokens ? ` · ↑ ${tokens} tokens` : ""} · esc to interrupt)
+        ({time}
+        {tokens ? ` · ↓ ${tokens.toLocaleString()} tokens` : ""}
+        {verb ? "" : " · esc to interrupt"})
       </Text>
     </Text>
   );

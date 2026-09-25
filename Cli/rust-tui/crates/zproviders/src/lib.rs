@@ -969,6 +969,41 @@ pub fn transcribe(base_url: &str, key: &str, model: &str, wav: &[u8], allowed: &
     Ok(v["text"].as_str().unwrap_or("").trim().to_string())
 }
 
+/// Transcribe with a ChatGPT Plus/Pro sign-in — the backend the ChatGPT apps
+/// use for dictation (`POST {base}/transcribe`, multipart `file`). No API
+/// key needed; the audio is kept by ChatGPT like any app dictation.
+pub fn transcribe_chatgpt(base_url: &str, access: &str, account_id: &str, wav: &[u8], allowed: &[String]) -> Result<String> {
+    let url = format!("{}/transcribe", base_url.trim_end_matches('/'));
+    host_allowed(&url, allowed)?;
+    let boundary = format!("zcli{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let mut body: Vec<u8> = Vec::with_capacity(wav.len() + 256);
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"dictation.wav\"\r\nContent-Type: audio/wav\r\n\r\n").as_bytes(),
+    );
+    body.extend_from_slice(wav);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let mut req = ureq::post(&url)
+        .header("authorization", &format!("Bearer {access}"))
+        .header("content-type", &format!("multipart/form-data; boundary={boundary}"))
+        .header("originator", "zcli");
+    if !account_id.is_empty() {
+        req = req.header("chatgpt-account-id", account_id);
+    }
+    let mut resp = req
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send(&body[..])
+        .context("transcription request failed")?;
+    let status = resp.status().as_u16();
+    let text = resp.body_mut().read_to_string().unwrap_or_default();
+    if status >= 400 {
+        return Err(http_error(status, &text));
+    }
+    let v: Value = serde_json::from_str(&text).context("transcription reply wasn't JSON")?;
+    Ok(v["text"].as_str().unwrap_or("").trim().to_string())
+}
+
 /// Run one completion. `allowed` = §12 host allowlist.
 pub fn complete(
     cfg: &ProviderCfg,

@@ -30,3 +30,4 @@ export const VERBS = [
   "Noodling",
   "Conjuring",
 ];
+export const GHOST = "#5c5c5c"; // placeholder / ghost text
