@@ -49,7 +49,11 @@ enum Command {
     #[cfg(target_os = "linux")]
     /// Trigger an Appshot in the running headed instance (desktop shortcut fallback).
     Appshot,
-    /// Manage `zeron headless` as a background service (launchd / systemd --user / Task Scheduler).
+    /// Serve the Cosmos MCP (Model Context Protocol) server on stdin/stdout,
+    /// proxying to the running engine's IPC. Agents use it to create, read,
+    /// and message chats. Logs go to stderr; stdout is the protocol.
+    Mcp,
+    /// Manage `cosmos headless` as a background service (launchd / systemd --user / Task Scheduler).
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -130,13 +134,13 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
     }
 }
 
-/// mimalloc, macOS only: libmalloc never returns the streaming churn's
-/// high-water pages, so transient allocation became permanent RSS
+/// mimalloc v2 on macOS and Windows: libmalloc and the NT heap both keep the
+/// streaming/render churn's high-water pages as permanent RSS
 /// (docs/memory-plan.md §1). Pinned to mimalloc v2 in the workspace manifest —
 /// the crate's default v3 has the same pathology (churn retained as permanent
 /// RSS, ~6x glibc's growth on identical workloads, no idle recovery). Linux
 /// measured flat on glibc, so it keeps the system allocator.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -191,18 +195,31 @@ fn main() -> anyhow::Result<()> {
     {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
-        let registry = tracing_subscriber::registry()
-            .with(filter)
-            .with(tracing_subscriber::fmt::layer());
-        match log_file {
-            Some(file) => registry
+        // `zeron mcp` owns stdout for the protocol: a single log line on it
+        // would corrupt the JSON-RPC stream, so its diagnostics go to stderr.
+        if matches!(&cli.command, Some(Command::Mcp)) {
+            tracing_subscriber::registry()
+                .with(filter)
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_ansi(false)
-                        .with_writer(std::sync::Arc::new(file)),
+                        .with_writer(std::io::stderr),
                 )
-                .init(),
-            None => registry.init(),
+                .init();
+        } else {
+            let registry = tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer());
+            match log_file {
+                Some(file) => registry
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(std::sync::Arc::new(file)),
+                    )
+                    .init(),
+                None => registry.init(),
+            }
         }
     }
 
@@ -241,6 +258,10 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Sync) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
+        }
+        Some(Command::Mcp) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(zeron_mcp::run(zeron_mcp::McpConfig::from_env()))
         }
         #[cfg(target_os = "linux")]
         Some(Command::Appshot) => {

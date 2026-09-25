@@ -21,6 +21,7 @@ zeron-tools.workspace = true
 zeron-rpc.workspace = true
 zeron-ui.workspace = true
 zeron-update.workspace = true
+zeron-mcp.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
@@ -29,9 +30,9 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# The custom allocator is macOS-only (see main.rs): glibc measured flat on the
-# same streaming/scroll workloads, so Linux keeps the system allocator.
-[target.'cfg(target_os = "macos")'.dependencies]
+# The custom allocator is mimalloc v2 on macOS (libmalloc watermark) and
+# Windows (NT heap high-water). Linux stays on glibc, which measured flat.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 mimalloc.workspace = true
 
 [target.'cfg(windows)'.dependencies]

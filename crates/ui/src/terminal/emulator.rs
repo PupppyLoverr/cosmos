@@ -41,7 +41,9 @@ pub use alacritty_terminal::selection::SelectionType;
 
 /// Scrollback history kept client-side (lines). The engine's replay window is
 /// bounded separately (1 MiB); this only caps what stays scrollable in the UI.
-pub const SCROLLBACK_LINES: usize = 10_000;
+/// 2k lines is enough for interactive work and cuts ~5× RAM vs the previous
+/// 10k-line cap (~24B/cell ⇒ tens of MB per busy terminal).
+pub const SCROLLBACK_LINES: usize = 2_000;
 
 /// Viewport dimensions in cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

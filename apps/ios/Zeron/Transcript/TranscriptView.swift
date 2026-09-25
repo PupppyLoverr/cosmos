@@ -35,9 +35,10 @@ struct TranscriptView: View {
             }
             .modifier(TranscriptViewportProbe(chatId: chatId))
             .background(Theme.bg)
-            .overlay(alignment: .bottomTrailing) {
+            .overlay(alignment: .bottom) {
                 if scroll.showJump {
                     Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         scroll.arm()
                         scroll.jumpToLatest?(!reduceMotion)
                     } label: {
@@ -51,7 +52,7 @@ struct TranscriptView: View {
                     .accessibilityLabel("Jump to latest")
                     .accessibilityIdentifier("jump-to-latest")
                     .padding(12)
-                    .transition(.opacity)
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
                 }
             }
             .motionAnimation(Motion.fadeQuick, value: scroll.showJump)

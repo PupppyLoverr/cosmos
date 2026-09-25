@@ -278,7 +278,7 @@ impl TokenSource for StaticToken {
 
 /// Called with the chat id of every nudge frame ("this chat's doc has pending commands —
 /// open it and drain"); the engine warms/opens the chat doc.
-pub type NudgeHandler = Arc<dyn Fn(String) + Send + Sync>;
+pub type NudgeHandler = Arc<dyn Fn(String) -> bool + Send + Sync>;
 
 /// Per-conn service decorator applied to each client conn (conn_id) before it
 /// enters the dispatch loop — the engine's pairing gate hooks in here.
@@ -348,6 +348,7 @@ impl HostRelay {
                             None,
                             &token,
                         );
+                        let url = format!("{url}&nudgeAck=1");
                         let started = tokio::time::Instant::now();
                         let outcome = {
                             let session =
@@ -562,18 +563,28 @@ async fn handle_host_frame(
         }
         return;
     }
-    if header.k == NUDGE_KIND {
-        // Durable command nudge (§7): open the chat doc so drain fires.
-        #[derive(Deserialize)]
+    if header.k == NUDGE_KIND && header.from.is_none() {
+        #[derive(Deserialize, Serialize)]
+        #[serde(rename_all = "camelCase")]
         struct Nudge {
-            #[serde(rename = "chatId")]
-            chat_id: Option<String>,
+            chat_id: String,
+            #[serde(default)]
+            token: Option<String>,
         }
         match serde_json::from_slice::<Nudge>(&payload) {
-            Ok(Nudge {
-                chat_id: Some(chat_id),
-            }) => on_nudge(chat_id),
-            _ => tracing::warn!("device-room: malformed nudge — ignoring"),
+            Ok(nudge) => {
+                // Acknowledge local durable admission, never mere receipt or
+                // successful socket send. Old edges omit token and need no ACK.
+                if on_nudge(nudge.chat_id.clone()) && nudge.token.is_some() {
+                    if let Ok(frame) = encode_device_frame(
+                        &DeviceFrameHeader::new(&nudge.chat_id, "nudgeAck"),
+                        &payload,
+                    ) {
+                        let _ = out_tx.send(frame).await;
+                    }
+                }
+            }
+            Err(_) => tracing::warn!("device-room: malformed nudge — ignoring"),
         }
         return;
     }

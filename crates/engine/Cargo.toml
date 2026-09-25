@@ -30,6 +30,7 @@ chrono.workspace = true
 notify.workspace = true
 portable-pty.workspace = true
 base64 = "0.22"
+toml = "0.8"
 libc.workspace = true
 gethostname.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
@@ -41,9 +42,11 @@ nucleo-matcher.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [dev-dependencies]
+zeron-harness = { workspace = true, features = ["installer-fixture"] }
+zip.workspace = true
 tokio-tungstenite.workspace = true
 tracing-subscriber.workspace = true
 # In-process registry server for the two-engine workspace integration tests.

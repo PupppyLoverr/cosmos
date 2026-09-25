@@ -34,6 +34,7 @@
 //! dispatches — see [`CheckoutDiffSync::note_turn_start`]).
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
@@ -50,6 +51,8 @@ use crate::EngineError;
 use crate::doc_host::EdgeConfig;
 use crate::repos::{CheckoutIdentity, Repos};
 use crate::workspace_host::WorkspaceHost;
+
+mod git_status;
 
 /// Hard cap on the unified patch (plus untracked hunks) — "Partial snapshot".
 pub const MAX_PATCH_BYTES: usize = 3 * 1024 * 1024;
@@ -91,6 +94,7 @@ pub struct DiffSidecar {
 /// One bounded atomic snapshot of a checkout's working tree.
 #[derive(Debug, Clone)]
 pub struct DiffSnapshot {
+    pub git_status: Option<(Vec<zeron_proto::GitFileStatus>, bool)>,
     pub branch: String,
     pub head_sha: Option<String>,
     pub patch: String,
@@ -125,6 +129,9 @@ struct CheckoutEntry {
     orphaned_since: Mutex<Option<std::time::Instant>>,
     /// Kick channel into the entry's debounce/sync task.
     kick_tx: mpsc::UnboundedSender<()>,
+    /// Destructive mutations are serialized per checkout. File-system
+    /// watchers and read-only captures may still run concurrently.
+    discard_lock: tokio::sync::Mutex<()>,
     /// Keeps the recursive fs watchers alive; dropped on entry close. Filled
     /// asynchronously — watcher setup (budget walk + FSEvents registration) can
     /// block for seconds, so [`add_entry`] does it off the runtime and attaches
@@ -161,6 +168,7 @@ struct DiffSyncInner {
     /// How long an entry may sit chat-less before reconcile removes it.
     orphan_grace: Duration,
     diffs_tx: watch::Sender<Vec<CheckoutDiff>>,
+    statuses_tx: watch::Sender<Vec<zeron_proto::CheckoutGitStatus>>,
     /// chat_id → turn-start tree (see [`TurnSnapshot`]).
     turn_trees: Mutex<HashMap<String, TurnSnapshot>>,
     /// The tasks hold `Weak` refs, but an in-flight iteration holds an
@@ -215,6 +223,7 @@ impl CheckoutDiffSync {
                 identities: Mutex::new(HashMap::new()),
                 orphan_grace,
                 diffs_tx,
+                statuses_tx: watch::channel(Vec::new()).0,
                 turn_trees: Mutex::new(HashMap::new()),
                 cancel: CancellationToken::new(),
                 supervisor: Mutex::new(None),
@@ -244,6 +253,11 @@ impl CheckoutDiffSync {
     /// `WatchCheckoutDiffs` source: every tracked checkout's latest diff.
     pub fn watch_diffs(&self) -> watch::Receiver<Vec<CheckoutDiff>> {
         self.inner.diffs_tx.subscribe()
+    }
+
+    /// Consumers filter this shared cache; subscribing never starts another Git scan.
+    pub fn watch_git_statuses(&self) -> watch::Receiver<Vec<zeron_proto::CheckoutGitStatus>> {
+        self.inner.statuses_tx.subscribe()
     }
 
     /// Regroup this device's chats by checkout identity, then (re)build watchers.
@@ -305,6 +319,39 @@ impl CheckoutDiffSync {
     /// since boot.
     pub fn turn_snapshot(&self, chat_id: &str) -> Option<TurnSnapshot> {
         lock(&self.inner.turn_trees).get(chat_id).cloned()
+    }
+
+    /// Discard the complete uncommitted state for a tracked checkout after
+    /// verifying that the UI acted on the latest full snapshot.
+    pub async fn discard_working_tree(
+        &self,
+        checkout_id: &str,
+        expected_checksum: &str,
+    ) -> Result<DiffSnapshot, EngineError> {
+        let entry = lock(&self.inner.entries)
+            .get(checkout_id)
+            .cloned()
+            .ok_or_else(|| EngineError::Other("checkout is no longer available".into()))?;
+        let inner = self.inner.clone();
+        let expected_checksum = expected_checksum.to_owned();
+        // Own task: a started discard always runs to completion even if the
+        // RPC caller goes away, and the nested git captures start from a fresh
+        // worker stack instead of stacking on the RPC dispatcher's frames
+        // (which overflowed the 2 MiB worker stack in debug builds).
+        tokio::spawn(async move {
+            let _guard = entry.discard_lock.lock().await;
+            let result =
+                discard_working_tree(&inner.repos, &entry.identity.root, &expected_checksum).await;
+
+            // Publish immediately instead of waiting for the watcher debounce.
+            // The watcher kick remains useful if an external writer races this
+            // operation after the final capture.
+            sync_entry(&inner, &entry).await;
+            let _ = entry.kick_tx.send(());
+            result
+        })
+        .await
+        .map_err(|error| EngineError::Other(format!("discard task failed: {error}")))?
     }
 }
 
@@ -521,6 +568,7 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         checksum: Mutex::new(None),
         orphaned_since: Mutex::new(None),
         kick_tx: kick_tx.clone(),
+        discard_lock: tokio::sync::Mutex::new(()),
         watchers: Mutex::new(Vec::new()),
     });
     lock(&inner.entries).insert(entry.identity.id.clone(), entry.clone());
@@ -622,10 +670,14 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
         Err(err) => {
             tracing::debug!(checkout = %entry.identity.root.display(), error = %err,
                 "diff-sync: capture failed");
+            git_status::publish(inner, entry, Vec::new(), false);
             return;
         }
     };
 
+    if let Some((files, complete)) = &snapshot.git_status {
+        git_status::publish(inner, entry, files.clone(), *complete);
+    }
     if lock(&entry.checksum).as_deref() == Some(snapshot.checksum.as_str()) {
         return; // unchanged — publish nothing
     }
@@ -716,6 +768,12 @@ fn publish_watch_with(inner: &Arc<DiffSyncInner>, updated: Option<CheckoutDiff>)
 
 fn publish_watch(inner: &Arc<DiffSyncInner>) {
     publish_watch_with(inner, None);
+    let live: HashSet<String> = lock(&inner.entries).keys().cloned().collect();
+    inner.statuses_tx.send_if_modified(|statuses| {
+        let before = statuses.len();
+        statuses.retain(|status| live.contains(&status.checkout_id));
+        before != statuses.len()
+    });
 }
 
 /// Chat-watch follower + repair tick. Holds only weak handles so dropping the
@@ -828,6 +886,35 @@ fn split_z(value: &[u8]) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(|part| String::from_utf8_lossy(part).to_string())
         .collect()
+}
+
+/// Git paths are arbitrary bytes on Unix, while the diff protocol exposes
+/// paths as UTF-8 strings. Treat an unrepresentable path as a partial snapshot
+/// so destructive actions cannot operate on a file the UI could not faithfully
+/// display or checksum.
+fn has_non_utf8_status_path(value: &[u8]) -> bool {
+    let records: Vec<&[u8]> = value
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .collect();
+    let mut i = 0usize;
+    while i < records.len() {
+        let record = records[i];
+        i += 1;
+        if record.len() < 3 || record[2] != b' ' {
+            continue;
+        }
+        if std::str::from_utf8(&record[3..]).is_err() {
+            return true;
+        }
+        if (record.starts_with(b"R") || record.starts_with(b"C")) && i < records.len() {
+            if std::str::from_utf8(records[i]).is_err() {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
 }
 
 fn parse_name_status(value: &[u8]) -> Vec<DiffFileSummary> {
@@ -1155,7 +1242,13 @@ pub async fn capture_diff_against(
     // read-only (a status-triggered index refresh would re-kick our own watcher).
     let status = capture_git(
         root,
-        &["--no-optional-locks", "status", "--porcelain", "-z"],
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
         2 * 1024 * 1024,
     )
     .await?;
@@ -1164,6 +1257,9 @@ pub async fn capture_diff_against(
     apply_numstat(&mut files, &nums.stdout);
     let mut patch = String::from_utf8_lossy(&tracked.stdout).to_string();
     let mut truncated = tracked.truncated || names.truncated || nums.truncated || status.truncated;
+    if has_non_utf8_status_path(&status.stdout) {
+        truncated = true;
+    }
 
     if tracked.truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
@@ -1191,20 +1287,54 @@ pub async fn capture_diff_against(
     }
     untracked.sort();
 
+    // Status now enumerates new directories as individual paths. Keep content
+    // work bounded even when thousands of those files are binary or too large
+    // to fit in the patch; their Git statuses remain complete independently.
+    let mut untracked_budget = MAX_PATCH_BYTES;
     for path in untracked {
+        if untracked_budget == 0 {
+            truncated = true;
+            break;
+        }
         let full = root.join(&path);
         let binary;
         let mut additions = 0u32;
-        let size = tokio::fs::metadata(&full)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if size > MAX_PATCH_BYTES as u64 {
+        let Ok(metadata) = tokio::fs::symlink_metadata(&full).await else {
+            continue;
+        };
+        let size = metadata.len();
+        if metadata.is_dir() {
+            // Git keeps nested repositories atomic even with
+            // `--untracked-files=all`. Surface the directory in the snapshot,
+            // but never read through or clean it recursively.
+            binary = true;
+        } else if size > MAX_PATCH_BYTES as u64 {
             binary = true;
             truncated = true;
         } else {
-            match tokio::fs::read(&full).await {
+            let content = if metadata.file_type().is_symlink() {
+                // A Git symlink's content is its target path, never the target file.
+                tokio::fs::read_link(&full)
+                    .await
+                    .map(|path| path.to_string_lossy().into_owned().into_bytes())
+            } else {
+                async {
+                    let file = tokio::fs::File::open(&full).await?;
+                    let mut bytes = Vec::new();
+                    file.take(untracked_budget as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .await?;
+                    Ok::<_, std::io::Error>(bytes)
+                }
+                .await
+            };
+            match content {
                 Ok(bytes) => {
+                    if bytes.len() > untracked_budget {
+                        truncated = true;
+                        break;
+                    }
+                    untracked_budget = untracked_budget.saturating_sub(bytes.len().max(1));
                     binary = bytes.contains(&0);
                     if !binary {
                         let text = String::from_utf8_lossy(&bytes).to_string();
@@ -1253,6 +1383,7 @@ pub async fn capture_diff_against(
     let checksum = crate::repos::hex(&hasher.finalize());
 
     Ok(DiffSnapshot {
+        git_status: Some(git_status::parse(&status.stdout, status.truncated)),
         branch,
         head_sha: (!head.is_empty()).then_some(head),
         patch,
@@ -1262,6 +1393,221 @@ pub async fn capture_diff_against(
         truncated,
         checksum,
     })
+}
+
+fn status_paths(status: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let records: Vec<&[u8]> = status
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .collect();
+    let mut tracked = Vec::new();
+    let mut untracked = Vec::new();
+    let mut i = 0usize;
+    while i < records.len() {
+        let record = records[i];
+        i += 1;
+        if record.len() < 4 || record[2] != b' ' {
+            continue;
+        }
+        let code = &record[..2];
+        let path = record[3..].to_vec();
+        if code == b"??" {
+            untracked.push(path);
+            continue;
+        }
+        if code == b"!!" {
+            continue;
+        }
+        tracked.push(path);
+        if (code.contains(&b'R') || code.contains(&b'C')) && i < records.len() {
+            tracked.push(records[i].to_vec());
+            i += 1;
+        }
+    }
+    tracked.sort();
+    tracked.dedup();
+    untracked.sort();
+    untracked.dedup();
+    (tracked, untracked)
+}
+
+#[cfg(unix)]
+fn path_argument(path: &[u8]) -> OsString {
+    use std::os::unix::ffi::OsStringExt as _;
+    OsString::from_vec(path.to_vec())
+}
+
+#[cfg(not(unix))]
+fn path_argument(path: &[u8]) -> OsString {
+    OsString::from(String::from_utf8_lossy(path).into_owned())
+}
+
+/// Path bytes per git invocation. Windows caps a whole command line at 32,767
+/// UTF-16 units (macOS/Linux at 1-2 MiB including the environment); a change
+/// set past that must not fail to spawn halfway through a discard.
+const MAX_PATH_ARGUMENT_BYTES: usize = 16 * 1024;
+
+/// Split `paths` into consecutive batches of at most `budget` bytes (one NUL
+/// per path included). A single path over budget still forms its own batch.
+fn path_batches(paths: &[Vec<u8>], budget: usize) -> Vec<&[Vec<u8>]> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (index, path) in paths.iter().enumerate() {
+        let cost = path.len() + 1;
+        if index > start && bytes + cost > budget {
+            batches.push(&paths[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes += cost;
+    }
+    if start < paths.len() {
+        batches.push(&paths[start..]);
+    }
+    batches
+}
+
+async fn run_git_for_paths(
+    root: &Path,
+    fixed_args: &[OsString],
+    paths: &[Vec<u8>],
+) -> Result<(), EngineError> {
+    for batch in path_batches(paths, MAX_PATH_ARGUMENT_BYTES) {
+        run_git_for_path_batch(root, fixed_args, batch).await?;
+    }
+    Ok(())
+}
+
+async fn run_git_for_path_batch(
+    root: &Path,
+    fixed_args: &[OsString],
+    paths: &[Vec<u8>],
+) -> Result<(), EngineError> {
+    let mut command = tokio::process::Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(0x08000000);
+    }
+    command
+        .arg("-C")
+        .arg(root)
+        .arg("--literal-pathspecs")
+        .args(fixed_args)
+        .arg("--");
+    for path in paths {
+        command.arg(path_argument(path));
+    }
+    command.stdin(std::process::Stdio::null());
+    let output = command
+        .output()
+        .await
+        .map_err(|error| EngineError::Other(format!("git spawn failed: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = stderr.trim();
+    Err(EngineError::Other(if message.is_empty() {
+        format!("git discard failed ({})", output.status)
+    } else {
+        format!("git: {message}")
+    }))
+}
+
+/// Restore staged and unstaged tracked paths to the snapshot's HEAD, then ask
+/// Git to remove only the exact untracked paths it reported. Ignored files are
+/// excluded by porcelain status and `git clean` intentionally omits `-x`;
+/// nested repositories and submodule contents are never recursively cleaned.
+pub async fn discard_working_tree(
+    repos: &Repos,
+    root: &Path,
+    expected_checksum: &str,
+) -> Result<DiffSnapshot, EngineError> {
+    let snapshot = capture_diff(repos, root).await?;
+    let head = snapshot.head_sha.as_deref().ok_or_else(|| {
+        EngineError::Other("cannot discard changes before the first commit".into())
+    })?;
+    if snapshot.truncated {
+        return Err(EngineError::Other(
+            "cannot safely discard a partial diff snapshot".into(),
+        ));
+    }
+    if snapshot.checksum != expected_checksum {
+        return Err(EngineError::Other(
+            "working tree changed since the confirmation was opened".into(),
+        ));
+    }
+
+    let status = capture_git(
+        root,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    if status.truncated {
+        return Err(EngineError::Other(
+            "cannot safely discard a truncated working-tree status".into(),
+        ));
+    }
+    let (tracked, untracked) = status_paths(&status.stdout);
+    let is_directory = |path: &Vec<u8>| {
+        std::fs::symlink_metadata(root.join(PathBuf::from(path_argument(path))))
+            .is_ok_and(|metadata| metadata.is_dir())
+    };
+    if untracked.iter().any(is_directory) {
+        return Err(EngineError::Other(
+            "cannot discard an untracked nested repository safely".into(),
+        ));
+    }
+    // Git tracks files and symlinks, so a tracked path that is a directory on
+    // disk is a submodule or a file replaced by a directory. `git restore`
+    // leaves submodule contents in place (the final check would then fail
+    // after everything else was already discarded) and removes a replacing
+    // directory wholesale, ignored files included. Refuse before mutating.
+    if tracked.iter().any(is_directory) {
+        return Err(EngineError::Other(
+            "cannot discard submodule or directory changes safely".into(),
+        ));
+    }
+
+    let restore_args = [
+        OsString::from("restore"),
+        OsString::from(format!("--source={head}")),
+        OsString::from("--staged"),
+        OsString::from("--worktree"),
+    ];
+    run_git_for_paths(root, &restore_args, &tracked).await?;
+    let clean_args = [OsString::from("clean"), OsString::from("-fd")];
+    run_git_for_paths(root, &clean_args, &untracked).await?;
+    // `--untracked-files=all` gives exact files, so `git clean` can leave
+    // their now-empty parent directories behind. Remove only empty ancestors;
+    // ignored files or any concurrent writer make `remove_dir` stop safely.
+    for path in &untracked {
+        let full = root.join(PathBuf::from(path_argument(path)));
+        let mut parent = full.parent();
+        while let Some(directory) = parent {
+            if directory == root || std::fs::remove_dir(directory).is_err() {
+                break;
+            }
+            parent = directory.parent();
+        }
+    }
+
+    let final_snapshot = capture_diff(repos, root).await?;
+    if !final_snapshot.files.is_empty() || !final_snapshot.patch.trim().is_empty() {
+        return Err(EngineError::Other(
+            "some changes could not be discarded safely".into(),
+        ));
+    }
+    Ok(final_snapshot)
 }
 
 /// Snapshot of one COMMIT's changes: first-parent (or the empty tree for a
@@ -1347,6 +1693,7 @@ pub async fn capture_commit_diff(
     Ok(DiffSnapshot {
         branch,
         head_sha: Some(sha.to_string()),
+        git_status: None,
         patch,
         files,
         additions,
@@ -1507,6 +1854,7 @@ pub async fn capture_turn_diff(
     Ok(DiffSnapshot {
         branch,
         head_sha: (!head.is_empty()).then_some(head),
+        git_status: None,
         patch,
         files,
         additions,
@@ -1518,7 +1866,30 @@ pub async fn capture_turn_diff(
 
 #[cfg(test)]
 mod watch_budget_tests {
-    use super::{CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, watch_targets};
+    use super::{
+        CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, has_non_utf8_status_path,
+        path_batches, watch_targets,
+    };
+
+    #[test]
+    fn path_batches_split_on_budget_and_keep_every_path() {
+        let paths: Vec<Vec<u8>> = ["aaa", "bbb", "cc", "dddddddddd", "e"]
+            .iter()
+            .map(|path| path.as_bytes().to_vec())
+            .collect();
+        let batches = path_batches(&paths, 8);
+        let sizes: Vec<usize> = batches.iter().map(|batch| batch.len()).collect();
+        // "aaa\0bbb\0" fills 8; "cc\0" alone; the oversized path stands alone.
+        assert_eq!(sizes, vec![2, 1, 1, 1]);
+        assert_eq!(batches.concat(), paths);
+        assert!(path_batches(&[], 8).is_empty());
+    }
+
+    #[test]
+    fn non_utf8_status_paths_are_marked_unsafe_for_destructive_actions() {
+        assert!(has_non_utf8_status_path(b"?? invalid-\xff.txt\0"));
+        assert!(!has_non_utf8_status_path(b"?? valid.txt\0"));
+    }
 
     #[test]
     fn small_tree_is_watchable() {

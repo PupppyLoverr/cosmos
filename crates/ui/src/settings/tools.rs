@@ -1237,7 +1237,7 @@ impl ToolsPage {
                     },
                 };
                 let enabled = provider.enabled;
-                let toggle = widgets::toggle_switch(theme, enabled)
+                let toggle = widgets::toggle_switch(theme, enabled, "tools-composio-enabled")
                     .id("tools-composio-enabled")
                     .role(gpui::Role::Switch)
                     .aria_label("Composio")
@@ -1806,7 +1806,11 @@ impl ToolsPage {
             }
             _ => String::new(),
         };
-        let toggle = widgets::toggle_switch(theme, enabled)
+        let toggle = widgets::toggle_switch(
+            theme,
+            enabled,
+            format!("tools-provider-toggle-{}", provider.id),
+        )
             .id(format!("tools-provider-toggle-{}", provider.id))
             .role(gpui::Role::Switch)
             .aria_label(provider.name.clone())
@@ -2093,7 +2097,7 @@ impl ToolsPage {
                 } else {
                     widgets::badge(theme, state_label)
                 };
-                let toggle = widgets::toggle_switch(theme, enabled)
+                let toggle = widgets::toggle_switch(theme, enabled, "tools-computer-enabled")
                     .id("tools-computer-enabled")
                     .role(gpui::Role::Switch)
                     .aria_label("Screen Context")
@@ -2208,7 +2212,7 @@ impl Render for ToolsPage {
                         widgets::ghost_action(&theme)
                             .id("tools-retry")
                             .mt(px(8.0))
-                            .hover(|s| widgets::ghost_hover(&theme, s))
+                            .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                             .on_click(cx.listener(|page, _, _, cx| {
                                 page.load(cx);
                                 cx.notify();

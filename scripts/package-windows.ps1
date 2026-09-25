@@ -14,6 +14,28 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not $ReleasesUrl.StartsWith('https://')) { throw 'Release feed must use HTTPS' }
 $root = Split-Path $PSScriptRoot -Parent
+
+function Get-WindowsPackageArch([string]$Path) {
+    # Match zeron-update's `std::env::consts::ARCH` so the standalone .exe
+    # name agrees with crates/update/src/windows.rs::artifact. Read the built
+    # executable's PE machine type rather than this PowerShell process's
+    # architecture: x64 PowerShell under ARM64 emulation reports X64 no matter
+    # which toolchain rustc used.
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $reader = [IO.BinaryReader]::new($stream)
+        $stream.Position = 0x3C
+        $stream.Position = $reader.ReadUInt32()
+        if ($reader.ReadUInt32() -ne 0x4550) { throw "Not a PE executable: $Path" }
+        $machine = $reader.ReadUInt16()
+    } finally { $stream.Dispose() }
+    switch ($machine) {
+        0x8664 { 'x86_64' }
+        0xAA64 { 'aarch64' }
+        default { throw ('Unsupported Windows executable machine type: 0x{0:X4}' -f $machine) }
+    }
+}
+
 Push-Location $root
 try {
     cargo build --release --locked -p zeron --bin cosmos
@@ -42,7 +64,8 @@ try {
         $version = $versionMatch.Groups[1].Value
     } finally { $process.Dispose() }
     $out = Join-Path $root 'target/package'
-    $stage = Join-Path $out "cosmos-$version-windows-x86_64"
+    $arch = Get-WindowsPackageArch $probe.FileName
+    $stage = Join-Path $out "cosmos-$version-windows-$arch"
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
     Copy-Item -LiteralPath './target/release/cosmos.exe' -Destination (Join-Path $stage 'cosmos.exe')
     # BOM-free UTF-8: serde_json rejects a BOM, and -Encoding utf8NoBOM only

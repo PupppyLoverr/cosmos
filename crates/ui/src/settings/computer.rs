@@ -581,7 +581,7 @@ impl Render for ComputerPage {
                         widgets::ghost_action(&theme)
                             .id("computer-retry")
                             .mt(px(8.0))
-                            .hover(|s| widgets::ghost_hover(&theme, s))
+                            .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                             .on_click(cx.listener(|page, _, _, cx| {
                                 page.load(cx);
                                 cx.notify();
@@ -595,7 +595,7 @@ impl Render for ComputerPage {
                 let enabled = status.settings.enabled;
                 let component_ready = status.state == "ready" || status.state == "error";
                 let toggle = |id: &'static str, label: &'static str, on: bool| {
-                    widgets::toggle_switch(&theme, on)
+                    widgets::toggle_switch(&theme, on, id)
                         .id(id)
                         .role(gpui::Role::Switch)
                         .aria_label(label)
