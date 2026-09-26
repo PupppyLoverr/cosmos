@@ -9,6 +9,7 @@ members = [
     "crates/ztui",
     "crates/zcli",
     "crates/zwelcome",
+    "crates/zgpui",
 ]
 
 [workspace.package]

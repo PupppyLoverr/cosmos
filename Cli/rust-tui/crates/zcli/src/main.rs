@@ -35,7 +35,16 @@ flags:
   --resume <session-id>
   --approve-plan                   headless: auto-approve a submitted plan
   --allow-escalation <cap[,…]>     e.g. network
+  --sandbox read-only|workspace-write|full
+  --ask on-request|never|untrusted
+  --autonomous · --autonomous-gate \"<cmd>\"
+  --allow-self-mutate · --arena 1
   --version | --help
+
+commands:
+  zcli compact --session <id> [--focus …]
+  zcli undo --session <id>
+  zcli checkpoint restore --last [--session <id>]
 ";
 
 fn split_list(s: &str) -> Vec<String> {
@@ -78,6 +87,17 @@ fn parse(args: &[String]) -> Result<RunOpts, String> {
             "--resume" => o.resume = Some(val("--resume")?),
             "--approve-plan" => o.approve_plan = true,
             "--allow-escalation" => o.allow_escalation = split_list(&val("--allow-escalation")?),
+            "--sandbox" => o.sandbox = Some(val("--sandbox")?),
+            "--ask" => o.ask = Some(val("--ask")?),
+            "--autonomous" => o.autonomous = true,
+            "--autonomous-gate" => o.autonomous_gate = Some(val("--autonomous-gate")?),
+            "--allow-self-mutate" => o.allow_self_mutate = true,
+            "--arena" => {
+                let _ = val("--arena")?;
+                o.arena = true;
+            }
+            "--self-improve" => o.self_improve = Some(true),
+            "--no-self-improve" => o.self_improve = Some(false),
             "--version" | "--help" | "-h" | "-V" => {
                 println!(
                     "zcli {} (contract v{})\n{HELP}",
@@ -111,6 +131,9 @@ fn main() {
             }
         }
         Some("session") => session_cmd(&args[1..]),
+        Some("compact") => compact_cmd(&args[1..]),
+        Some("undo") => undo_cmd(&args[1..]),
+        Some("checkpoint") => checkpoint_cmd(&args[1..]),
         Some("memory") => memory_cmd(&args[1..]),
         Some("auth") | Some("login") => auth_cmd::auth_cmd(if args[0] == "login" { &args[..] } else { &args[1..] }),
         Some("logout") => auth_cmd::auth_cmd(&args[..]),
@@ -256,6 +279,74 @@ fn session_cmd(args: &[String]) -> i32 {
 
 mod acp;
 mod auth_cmd;
+
+fn flag_val(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+fn compact_cmd(args: &[String]) -> i32 {
+    let id = flag_val(args, "--session").unwrap_or_default();
+    if id.is_empty() {
+        eprintln!("usage: zcli compact --session <id> [--focus …]");
+        return exit::USAGE;
+    }
+    let focus = flag_val(args, "--focus");
+    let mut opts = RunOpts {
+        resume: Some(id),
+        prompt: Some("/compact".into()),
+        model: Some("fixture".into()),
+        ..Default::default()
+    };
+    if let Some(f) = &focus {
+        opts.prompt = Some(format!("/compact focus: {f}"));
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match run_headless(&opts, "zcli", &cwd, &mut emitter(OutputMode::Text)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e:#}");
+            exit::FAILED
+        }
+    }
+}
+
+fn undo_cmd(args: &[String]) -> i32 {
+    let id = flag_val(args, "--session").unwrap_or_default();
+    let home = zcore::cli_home();
+    let sid = if id.is_empty() {
+        Session::list(&home)
+            .last()
+            .and_then(|v| v.get("id").and_then(|x| x.as_str()).map(String::from))
+            .unwrap_or_default()
+    } else {
+        id
+    };
+    if sid.is_empty() {
+        eprintln!("usage: zcli undo --session <id>");
+        return exit::USAGE;
+    }
+    match ztools::ckpt::restore_last(&home, &sid) {
+        Ok(p) => {
+            println!("restored {}", p.display());
+            exit::DONE
+        }
+        Err(e) => {
+            eprintln!("{e:#}");
+            exit::FAILED
+        }
+    }
+}
+
+fn checkpoint_cmd(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("restore") {
+        return undo_cmd(args);
+    }
+    eprintln!("usage: zcli checkpoint restore --last [--session <id>]");
+    exit::USAGE
+}
 
 fn memory_cmd(args: &[String]) -> i32 {
     let home = zcore::cli_home();

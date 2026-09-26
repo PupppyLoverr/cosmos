@@ -10,6 +10,10 @@ import * as store from "../src/store";
 import * as t from "../src/tools";
 import { Agent } from "../src/agent";
 import { hostAllowed } from "../src/providers";
+import * as repair from "../src/repair";
+import * as compact from "../src/compact";
+import * as ckpt from "../src/ckpt";
+import * as world from "../src/world";
 
 const tmps: string[] = [];
 function tmpdir(): string {
@@ -164,3 +168,92 @@ test("fixture tool call terminates", async () => {
     ag.cleanup();
   }
 });
+
+test("repair remaps Read → read", () => {
+  const r = repair.repair("Read", { path: "a.txt" });
+  expect(r.name).toBe("read");
+  expect(r.repairs.some((x) => x.reason === "alias")).toBe(true);
+  expect(r.reject).toBeUndefined();
+});
+
+test("repair remaps memory.search and coerces start", () => {
+  const a = repair.repair("memory.search", { query: "x" });
+  expect(a.name).toBe("memory_search");
+  const b = repair.repair("read", { path: "a.txt", start: "12" });
+  expect(b.input.start).toBe(12);
+  expect(b.repairs.some((x) => x.reason === "coerce")).toBe(true);
+  const c = repair.repair("READ", { path: "a.txt" });
+  expect(c.name).toBe("read");
+});
+
+test("sandbox read-only and sensitive paths", () => {
+  const dir = tmpdir();
+  const ctx = new t.Ctx(dir);
+  ctx.sandboxMode = "read-only";
+  expect(t.run(ctx, "write", { path: "a.txt", content: "x" })).toMatch(/read-only/);
+  ctx.sandboxMode = "workspace-write";
+  expect(t.run(ctx, "write", { path: ".env", content: "SECRET=1" })).toMatch(/sandbox deny/);
+  expect(t.run(ctx, "bash", { command: "type ~/.ssh/id_rsa" })).toMatch(/sandbox deny/);
+});
+
+test("repair rejects missing required", () => {
+  const r = repair.repair("read", {});
+  expect(r.reject).toMatch(/missing field path/);
+});
+
+test("compact L1 persists large tool results", () => {
+  const home = tmpdir();
+  const big = "x".repeat(9000) + "\n".repeat(50);
+  const messages: store.Message[] = [
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: big }] },
+  ];
+  compact.layer1(messages, home, 200);
+  const c = String(messages[0].content[0].content);
+  expect(c).toContain("[tool_result persisted");
+  expect(c).toContain("sha256=");
+});
+
+test("checkpoint restore last file", () => {
+  const home = tmpdir();
+  const f = path.join(tmpdir(), "w.txt");
+  fs.writeFileSync(f, "v1");
+  ckpt.save("s1", f, home);
+  fs.writeFileSync(f, "v2");
+  const restored = ckpt.restoreLast("s1", home);
+  expect(restored).toBe(f);
+  expect(fs.readFileSync(f, "utf8")).toBe("v1");
+});
+
+test("world.md round-trip + goal", () => {
+  const home = tmpdir();
+  const w = world.empty();
+  world.setGoalIfEmpty(w, "ship the login form");
+  world.touchFile(w, "a.ts", "abc");
+  world.save("sess", w, home);
+  const loaded = world.load("sess", home);
+  expect(loaded.goal).toBe("ship the login form");
+  expect(world.render(loaded)).toContain("a.ts");
+});
+
+test("headless /compact writes world.md", async () => {
+  const home = tmpdir();
+  process.env.COSMOS_CLI_HOME = home;
+  const ws = tmpdir();
+  const o = new proto.RunOpts();
+  o.cwd = ws;
+  o.model = "fixture";
+  o.prompt = "ship the login form";
+  o.max_turns = 1;
+  o.self_improve = false;
+  await (await import("../src/agent")).runHeadless(o, "zdev", ws);
+  const o2 = new proto.RunOpts();
+  o2.cwd = ws;
+  o2.model = "fixture";
+  o2.prompt = "/compact";
+  o2.resume = store.Session.list(home).at(-1)?.id;
+  o2.self_improve = false;
+  const code = await (await import("../src/agent")).runHeadless(o2, "zdev", ws);
+  expect(code).toBe(proto.EXIT_DONE);
+  const worlds = fs.existsSync(path.join(home, "world")) ? fs.readdirSync(path.join(home, "world")) : [];
+  expect(worlds.some((f) => f.endsWith(".md"))).toBe(true);
+}, { timeout: 20_000 });

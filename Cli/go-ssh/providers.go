@@ -15,9 +15,9 @@ import (
 )
 
 type ProviderCfg struct {
-	Kind, BaseURL, APIKeyEnv, Model string
-	Context                         uint64
-	Prices                          map[string]float64
+	Kind, BaseURL, APIKeyEnv, Model, Provider string
+	Context                                   uint64
+	Prices                                    map[string]float64
 }
 
 type Usage struct {
@@ -46,10 +46,17 @@ func hostAllowed(url string, allowed []string) error {
 }
 
 func apiKey(cfg ProviderCfg) string {
-	if cfg.APIKeyEnv == "" {
-		return ""
+	if cfg.APIKeyEnv != "" {
+		if v := strings.TrimSpace(os.Getenv(cfg.APIKeyEnv)); v != "" {
+			return v
+		}
 	}
-	return os.Getenv(cfg.APIKeyEnv)
+	if cfg.Provider != "" {
+		if k := credStored(cfg.Provider); k != "" {
+			return k
+		}
+	}
+	return ""
 }
 
 var httpClient = &http.Client{Timeout: 300 * time.Second}
@@ -377,12 +384,10 @@ func completeGoogle(cfg ProviderCfg, req map[string]any, sink Sink, allowed []st
 			case "text":
 				parts = append(parts, map[string]any{"text": bm["text"]})
 			case "tool_use":
-				parts = append(parts, map[string]any{"functionCall":
-					map[string]any{"name": bm["name"], "args": bm["input"]}})
+				parts = append(parts, map[string]any{"functionCall": map[string]any{"name": bm["name"], "args": bm["input"]}})
 			case "tool_result":
-				parts = append(parts, map[string]any{"functionResponse":
-					map[string]any{"name": "tool",
-						"response": map[string]any{"output": bm["content"]}}})
+				parts = append(parts, map[string]any{"functionResponse": map[string]any{"name": "tool",
+					"response": map[string]any{"output": bm["content"]}}})
 			}
 		}
 		if len(parts) > 0 {
@@ -508,6 +513,8 @@ func complete(cfg ProviderCfg, req map[string]any, sink Sink, allowed []string) 
 		return completeAnthropic(cfg, req, sink, allowed)
 	case "google":
 		return completeGoogle(cfg, req, sink, allowed)
+	case "devin":
+		return completeDevin(cfg, req, sink)
 	}
 	return fmt.Errorf("unknown provider kind: %s", cfg.Kind)
 }

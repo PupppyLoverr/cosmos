@@ -24,6 +24,8 @@ pub enum ProviderKind {
     Anthropic,
     Google,
     Fixture,
+    /// Devin subscription models — handled by zcore::devin over GetChatMessage.
+    Devin,
 }
 
 impl ProviderKind {
@@ -35,6 +37,7 @@ impl ProviderKind {
             "anthropic" => Some(Self::Anthropic),
             "google" => Some(Self::Google),
             "fixture" => Some(Self::Fixture),
+            "devin" => Some(Self::Devin),
             _ => None,
         }
     }
@@ -1017,5 +1020,6 @@ pub fn complete(
         ProviderKind::Responses | ProviderKind::ChatGpt => responses_complete(cfg, req, sink, allowed),
         ProviderKind::Anthropic => anthropic_complete(cfg, req, sink, allowed),
         ProviderKind::Google => google_complete(cfg, req, sink, allowed),
+        ProviderKind::Devin => bail!("Devin turns run through the local `devin` CLI (zcore::devin)"),
     }
 }

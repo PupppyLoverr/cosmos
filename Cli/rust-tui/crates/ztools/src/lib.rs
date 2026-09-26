@@ -1,10 +1,14 @@
 //! ztools — contract §2 tools. Schemas are the canonical `contracts/tools.json`
 //! bytes so `tools dump` is byte-identical across harnesses.
 
+pub mod ckpt;
 mod files;
+pub mod jobs;
 mod mcp;
 mod memory;
+pub mod repair;
 mod shell;
+pub mod verify;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,6 +59,16 @@ pub struct ToolContext {
     pub large_read_lines: usize,
     /// MCP server name → config (spawned lazily)
     pub mcp_servers: HashMap<String, McpServerCfg>,
+    /// session id (logs / checkpoints / jobs)
+    pub session_id: String,
+    /// COSMOS_CLI_HOME
+    pub home: PathBuf,
+    /// sandbox dial: read-only | workspace-write | full
+    pub sandbox_mode: String,
+    /// current tool_use id (for bash logs)
+    pub current_tool_id: String,
+    /// deny-write globs even inside workspace (default ~/.ssh, .env)
+    pub deny_write: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -81,8 +95,29 @@ impl ToolContext {
             no_sandbox: false,
             large_read_lines: LARGE_READ_LINES,
             mcp_servers: HashMap::new(),
+            session_id: String::new(),
+            home: crate_home(),
+            sandbox_mode: "workspace-write".into(),
+            current_tool_id: String::new(),
+            deny_write: vec![
+                "~/.ssh".into(),
+                "~/.gnupg".into(),
+                "**/.env".into(),
+                "**/.env.*".into(),
+            ],
         }
     }
+}
+
+fn crate_home() -> PathBuf {
+    if let Some(p) = std::env::var_os("COSMOS_CLI_HOME") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".cosmos-cli")
 }
 
 /// Truncate to RESULT_CAP with an explicit notice (contract §2).
@@ -148,7 +183,23 @@ pub const PLAN_TOOLS: &[&str] = &[
     "memory_search",
     "submit_plan",
     "tool_search",
+    "context_remaining",
 ];
+
+/// Read-only tools that may run concurrently.
+pub const READONLY_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "glob",
+    "ls",
+    "memory_search",
+    "tool_search",
+    "context_remaining",
+];
+
+pub fn is_readonly(name: &str) -> bool {
+    READONLY_TOOLS.contains(&name)
+}
 
 /// Execute a tool by name. Permission decisions happen in zcore — this assumes
 /// the call was allowed.

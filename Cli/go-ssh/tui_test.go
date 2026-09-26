@@ -34,7 +34,7 @@ func TestSlashFilter(t *testing.T) {
 	for _, r := range rows {
 		names = append(names, r.name)
 	}
-	if len(names) != 2 || names[0] != "/agent" || names[1] != "/approve" {
+	if len(names) != 3 || names[0] != "/agent" || names[1] != "/accept-edits" || names[2] != "/approve" {
 		t.Fatalf("/a → %v", names)
 	}
 	if got := filterSlash(slashCmds, "/zz"); len(got) != 0 {
@@ -121,19 +121,68 @@ func TestTUISmoke(t *testing.T) {
 	if !strings.Contains(v, "zagy") || !strings.Contains(v, "fixture (fixture)") {
 		t.Fatalf("banner missing: %q", v)
 	}
+	if !strings.Contains(v, "Welcome back") {
+		t.Fatalf("welcome-back header missing: %q", v)
+	}
 	if !strings.Contains(v, "? for shortcuts") {
 		t.Fatalf("footer missing: %q", v)
+	}
+	// family galaxy (12×4 at this width)
+	if !strings.Contains(v, "⢀⣄⣤⣤⣥⣥⣄⡀") && !strings.Contains(v, "⣾⣿⣿⣿") {
+		t.Fatalf("galaxy mark missing: %q", v)
 	}
 	// "/" opens the dropdown, "?" opens the shortcuts overlay
 	m.ta.SetValue("/")
 	if !m.slashVisible() || len(m.slashRows()) != len(slashCmds) {
 		t.Fatal("slash menu did not open")
 	}
+	foundProviders := false
+	for _, c := range slashCmds {
+		if c.name == "/providers" {
+			foundProviders = true
+		}
+	}
+	if !foundProviders {
+		t.Fatal("/providers missing from slash list")
+	}
 	m.ta.Reset()
 	tm, _ = m.onKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
 	m = tm.(tuiModel)
 	if m.overlay != overlayHelp || !strings.Contains(m.View(), "Keyboard Shortcuts") {
 		t.Fatalf("help overlay did not open")
+	}
+}
+
+func TestProvidersOverlay(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("COSMOS_CLI_HOME", home)
+	t.Setenv("COSMOS_CLI_KEYRING", "0")
+	cfg := &Config{
+		Providers: map[string]map[string]string{"fixture": {"kind": "fixture"}},
+		Models: map[string]ModelEntry{"fixture": {
+			Provider: "fixture", ID: "fixture", Context: 128000,
+			Price: map[string]float64{}}},
+		DefaultModel: "fixture",
+	}
+	a := &Agent{
+		Opts: &RunOpts{MaxTurns: 4}, Cfg: cfg,
+		Mode: "agent", ModelAlias: "fixture (fixture)",
+		Ctx:     NewToolCtx(home),
+		Session: &Session{ID: "0123456789abcdefghjkmnpqrs", Harness: "zagy"},
+	}
+	br := &tuiBridge{done: make(chan struct{})}
+	m := newTUIModel(a, a.Opts, home, br)
+	tm, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m = tm.(tuiModel)
+	m.openProviders()
+	v := m.View()
+	if m.overlay != overlayProviders {
+		t.Fatalf("overlay %v", m.overlay)
+	}
+	for _, want := range []string{"Providers", "ChatGPT", "Devin", "OpenRouter"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("providers overlay missing %q: %q", want, v)
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ const USAGE: &str = "\
 usage:
   zcli auth                          show connected providers
   zcli auth login chatgpt            sign in with a ChatGPT Plus/Pro plan (browser)
+  zcli auth login devin              use the Devin subscription already signed in on this machine
   zcli auth login <provider> [--key K]   store an API key (prompted, hidden)
   zcli auth logout <provider|chatgpt>
   zcli models [provider]             models you can use now (or one provider's list)";
@@ -66,6 +67,12 @@ fn status() -> i32 {
         ),
         None => println!("  · chatgpt        not signed in — zcli auth login chatgpt"),
     }
+    zcore::devin::invalidate();
+    if zcore::devin::ready() {
+        println!("  ✓ {:<14} {}", "devin", zcore::devin::detail());
+    } else {
+        println!("  · {:<14} {}", "devin", zcore::devin::detail());
+    }
     for p in catalog::providers().iter().filter(|p| !p.is_subscription() && !p.env.is_empty()) {
         match creds::key_for(&p.id, &p.env) {
             Some((k, src)) => println!("  ✓ {:<14} {} ({}) · {} models", p.id, creds::mask(&k), src.label(), p.models.len()),
@@ -102,6 +109,25 @@ fn login(args: &[String]) -> i32 {
                 eprintln!("✗ {e:#}");
                 exit::FAILED
             }
+        };
+    }
+    if id == "devin" {
+        zcore::devin::invalidate();
+        return if zcore::devin::ready() {
+            match zcore::live::fetch(catalog::provider("devin").unwrap()) {
+                Ok(models) => {
+                    let _ = zcore::live::store("devin", &models);
+                    println!("✓ Devin · {} · try: zcli --model devin/{}", zcore::devin::detail(), models.iter().find(|m| m.id == "swe-2-max").map(|m| m.id.as_str()).or_else(|| models.first().map(|m| m.id.as_str())).unwrap_or("swe-2-max"));
+                    exit::DONE
+                }
+                Err(e) => {
+                    eprintln!("✗ {e:#}");
+                    exit::FAILED
+                }
+            }
+        } else {
+            eprintln!("✗ {}", zcore::devin::hint());
+            exit::FAILED
         };
     }
     let known = catalog::provider(id).is_some() || Config::load(&zcore::cli_home()).providers.contains_key(id.as_str());
@@ -178,19 +204,28 @@ fn price(p: &zproto::Prices) -> String {
 }
 
 pub fn models_cmd(args: &[String]) -> i32 {
-    if let Some(id) = args.first() {
-        let Some(p) = catalog::provider(id) else {
+    let cfg = Config::load(&zcore::cli_home());
+    let want = args.first().map(|s| s.as_str());
+    if let Some(id) = want {
+        if catalog::provider(id).is_none() && !cfg.providers.contains_key(id) {
             eprintln!("unknown provider {id:?}");
             return exit::USAGE;
-        };
-        println!("{} ({}) — {}\n", p.name, p.kind, p.base_url);
-        for m in &p.models {
-            println!("  {}/{:<40} {:>6}k ctx  {}", p.id, m.id, m.context / 1000, price(&m.prices()));
         }
-        return exit::DONE;
     }
-    let cfg = Config::load(&zcore::cli_home());
-    for m in cfg.available_models() {
+    let list: Vec<_> = cfg
+        .available_models()
+        .into_iter()
+        .filter(|m| want.is_none_or(|id| m.provider == id))
+        .collect();
+    if list.is_empty() {
+        if want == Some("devin") {
+            eprintln!("no Devin models yet — zcli auth login devin  (subscription models; Cosmos runs the tools)");
+        } else {
+            eprintln!("no models yet — zcli auth login <provider>");
+        }
+        return exit::USAGE;
+    }
+    for m in list {
         println!("  {:<48} {:>6}k ctx  {}", m.alias, m.context / 1000, price(&m.price));
     }
     exit::DONE

@@ -286,3 +286,60 @@ Revamp pass (same day) — monochrome + product-grade onboarding:
 - MCP servers: `tool_search`/`mcp_call` dispatch exists and returns
   "no MCP servers configured" when none are set (contract-correct); no MCP
   server was configured on this machine to exercise further.
+
+## 2026-09-26 — three-harness kernel (compact / repair / world / undo)
+
+Date lock from `COSMOS_CLI_MASTER_PROMPT.md`. Windows 11, same machine.
+No live model keys. All numbers below are fixture or unit-test.
+
+### Tests
+
+| Suite | Result |
+|---|---|
+| `cargo test --workspace` in `Cli/rust-tui` | 118 passed, 4 ignored (live lists / mic) |
+| `bun test` in `Cli/zdev` | **74/74** |
+| `go test ./...` in `Cli/go-ssh` | ok |
+| `cargo test` in `Cli/meridian-bridge` | 15 passed (6 lib + 9 integration) |
+| `powershell -File Cli/eval/conformance.ps1` | **19/19 PASS** (was 15) |
+| `powershell -File Cli/eval/run.ps1` | **9/9 PASS** (t01 + t02-compact-resume + t03-repair × 3 harnesses) |
+
+New conformance rows: `/compact` writes `world/<id>.md` with the goal;
+`tool:Read` emits `tool_repair` and a hashline `read`; `/undo` restores the
+pre-write bytes after a resumed read→write; fixture `ping` with `--self-improve`
+writes a draft skill.
+
+### Compaction (40-turn synthetic, zdev `compact.ts`, boot 400)
+
+Naive full-replay estimate: **327,526** tokens (40 read results × ~80 fat lines).
+After L1 persist + L2 snip + forced L5: **10,220** tokens (**3.1%** of naive,
+target ≤55%). `world.md` written. Prefix hash unchanged → cache-warm rule holds.
+
+A one-turn fixture `/compact` can *grow* slightly (t02: 403 → 471) because the
+structured world snapshot is larger than a single short user line. That is not
+a 40-turn regression; the 55% bar is the long-session number above.
+
+### Binary sizes (2026-09-26)
+
+| Binary | Size | Bar |
+|---|---|---|
+| `rust-tui/target/release/zcli.exe` (fat LTO, strip) | **17.6 MB** | ~18 MB class |
+| `go-ssh/zagy.exe` | **11.4 MB** | < 15 MB |
+| `zdev/dist/zdev.exe` (`bun build --compile`) | **86.1 MB** | bun compile floor; idle RSS not re-measured this shot |
+
+`zgpui` is in the workspace and has **zero** GPUI crate dependency; daily
+`zcli` does not link it.
+
+### What shipped in all three
+
+- Shared `contracts/tools.json` (byte-identical dumps): bash `wait` /
+  `from_offset`, `memory_search.scope`, `context_remaining`, `new_context`.
+- Five-layer compact + `COSMOS_CLI_HOME/world/<session>.md`.
+- Tool-call repair (`Read`→`read`) + doom-loop + hashline STALE ±5.
+- Shell fence + middle-out + log persist + `wait=now|next_write|exit`.
+- Checkpoints + `/undo` (not git). Read-state restored on `--resume`.
+- Shift+Tab: plan → agent → accept-edits → yolo. `--sandbox` × `--ask`.
+- `/skillify`, meridian `refine.*`, `--allow-self-mutate` fence.
+- Parallel read-only tools (cap 8). `task.write` defaults `worktree`.
+- LSP-lite `verify` after write/edit (best-effort `cargo check` / `tsc` / `go build`).
+
+`python-cloud/` is reference-only (`Cli/python-cloud/README.md`).

@@ -37,6 +37,7 @@ const SPIN: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', 
 /// where to get a key. The rest keep catalog order and show their env var.
 const PINNED: &[(&str, &str, &str)] = &[
     ("chatgpt", "use your Plus / Pro plan — no API key", ""),
+    ("devin", "your Devin subscription — Cosmos runs the tools", ""),
     ("openrouter", "one key, 300+ models from every lab", "https://openrouter.ai/keys"),
     ("router9", "your local 9Router — routes the subscriptions you have", "http://localhost:20128 → API keys"),
     ("anthropic", "Claude", "https://console.anthropic.com/settings/keys"),
@@ -890,10 +891,10 @@ impl Ob {
             .provs
             .iter()
             .filter(|p| {
-                if p.sub() {
-                    zcore::chatgpt::load().is_some()
-                } else {
-                    zcore::creds::key_for(&p.def.id, &p.def.env).is_some()
+                match p.def.kind.as_str() {
+                    "chatgpt" => zcore::chatgpt::load().is_some(),
+                    "devin" => zcore::devin::known_ready(),
+                    _ => zcore::creds::key_for(&p.def.id, &p.def.env).is_some(),
                 }
             })
             .map(|p| p.def.id.clone())
@@ -1252,8 +1253,12 @@ impl Ob {
                 let star = if self.model.as_ref().map(|d| &d.0) == Some(&alias) { " ★" } else { "" };
                 format!("✓ {m}{star}")
             } else if self.keyed.contains(&p.def.id) {
-                match (p.sub(), &self.oauth_email) {
-                    (true, Some(e)) => format!("✓ {e}"),
+                match (p.def.kind.as_str(), &self.oauth_email) {
+                    ("chatgpt", Some(e)) => format!("✓ {e}"),
+                    ("devin", _) => match zcore::devin::peek() {
+                        Some((true, d)) => format!("✓ {d}"),
+                        _ => "✓ connected".into(),
+                    },
                     _ => "✓ connected".into(),
                 }
             } else {
@@ -1297,7 +1302,7 @@ impl Ob {
                     let who = t.email.map(|e| format!(" as {e}")).unwrap_or_default();
                     self.flash(format!("✓ signed in{who}"), true);
                     self.connected.push("chatgpt".into());
-                    if let Some(i) = self.provs.iter().position(|p| p.sub()) {
+                    if let Some(i) = self.provs.iter().position(|p| p.def.kind == "chatgpt") {
                         self.open_models(i);
                     }
                 }
@@ -1595,6 +1600,18 @@ impl Ob {
         }
     }
 
+    fn connect_devin(&mut self, i: usize) {
+        zcore::devin::invalidate();
+        if zcore::devin::ready() {
+            self.connected.push("devin".into());
+            self.refresh_keyed();
+            self.flash(format!("✓ Devin · {}", zcore::devin::detail()), true);
+            self.open_models(i);
+        } else {
+            self.flash(zcore::devin::hint(), false);
+        }
+    }
+
     fn start_oauth(&mut self) {
         let (tx, rx) = channel::<OauthMsg>();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1725,8 +1742,10 @@ impl Ob {
                             if self.keyed.contains(&self.provs[i].def.id) {
                                 // already connected — straight to its live models
                                 self.open_models(i);
-                            } else if self.provs[i].sub() {
+                            } else if self.provs[i].def.kind == "chatgpt" {
                                 self.start_oauth();
+                            } else if self.provs[i].def.kind == "devin" {
+                                self.connect_devin(i);
                             } else {
                                 self.key_buf.clear();
                                 self.phase = Phase::KeyEntry(i);
@@ -1996,10 +2015,11 @@ mod tests {
         let p = provider_list();
         assert_eq!(p[0].def.id, "chatgpt");
         assert_eq!(p[0].name, "ChatGPT");
-        assert_eq!(p[1].def.id, "openrouter");
-        assert_eq!(p[1].key_url, "https://openrouter.ai/keys");
-        assert_eq!(p[2].def.id, "router9");
-        assert_eq!(p[2].name, "9Router");
+        assert_eq!(p[1].def.id, "devin");
+        assert_eq!(p[2].def.id, "openrouter");
+        assert_eq!(p[2].key_url, "https://openrouter.ai/keys");
+        assert_eq!(p[3].def.id, "router9");
+        assert_eq!(p[3].name, "9Router");
     }
 
     #[test]

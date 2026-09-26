@@ -45,9 +45,9 @@ pub struct ProviderDef {
 }
 
 impl ProviderDef {
-    /// Signs in with an account rather than an API key.
+    /// Signs in with an account rather than an API key (ChatGPT Plus/Pro or Devin).
     pub fn is_subscription(&self) -> bool {
-        self.kind == "chatgpt"
+        matches!(self.kind.as_str(), "chatgpt" | "devin")
     }
 
     pub fn model(&self, id: &str) -> Option<&ModelDef> {
@@ -126,6 +126,33 @@ fn router9() -> ProviderDef {
     }
 }
 
+/// Devin subscription — models from the signed-in plan; Cosmos runs the tools.
+fn devin() -> ProviderDef {
+    let m = |id: &str, name: &str, context: u64| ModelDef {
+        id: id.into(),
+        name: name.into(),
+        context,
+        output: 32_000,
+        reasoning: true,
+        price: [0.0; 4],
+    };
+    ProviderDef {
+        id: "devin".into(),
+        name: "Devin (subscription)".into(),
+        kind: "devin".into(),
+        base_url: "https://server.codeium.com".into(),
+        env: Vec::new(),
+        models: vec![
+            m("swe-2-max", "SWE-2 Max", 200_000),
+            m("swe-2-high", "SWE-2 High", 200_000),
+            m("swe-2-medium", "SWE-2 Medium", 200_000),
+            m("swe-1-7-medium", "SWE-1.7 Medium", 200_000),
+            m("claude-fable-5-1-high", "Claude Fable 5.1 High", 200_000),
+            m("adaptive", "Adaptive", 200_000),
+        ],
+    }
+}
+
 /// Local servers that need no key.
 fn local() -> Vec<ProviderDef> {
     vec![
@@ -153,7 +180,7 @@ pub fn providers() -> &'static [ProviderDef] {
     P.get_or_init(|| {
         let file: CatalogFile = serde_json::from_str(include_str!("../catalog/catalog.json"))
             .expect("catalog.json is generated and checked in");
-        let mut v = vec![chatgpt(), router9()];
+        let mut v = vec![chatgpt(), devin(), router9()];
         v.extend(file.providers);
         v.extend(local());
         v
@@ -177,13 +204,17 @@ mod tests {
 
     #[test]
     fn catalog_loads_with_requested_providers() {
-        for id in ["chatgpt", "router9", "openai", "anthropic", "google", "meta", "llama", "xiaomi", "alibaba", "bailing", "xai", "deepseek", "moonshotai", "zai", "minimax", "mistral", "groq", "openrouter", "ollama"] {
+        for id in ["chatgpt", "devin", "router9", "openai", "anthropic", "google", "meta", "llama", "xiaomi", "alibaba", "bailing", "xai", "deepseek", "moonshotai", "zai", "minimax", "mistral", "groq", "openrouter", "ollama"] {
             assert!(provider(id).is_some(), "{id} missing from catalog");
         }
         let xiaomi = provider("xiaomi").unwrap();
         assert!(!xiaomi.models.is_empty());
         assert_eq!(xiaomi.kind, "openai");
         assert!(provider("chatgpt").unwrap().is_subscription());
+        assert!(provider("devin").unwrap().is_subscription());
+        assert_eq!(provider("devin").unwrap().kind, "devin");
+        assert_eq!(provider("devin").unwrap().base_url, "https://server.codeium.com");
+        assert_eq!(provider("devin").unwrap().models[0].id, "swe-2-max");
     }
 
     #[test]

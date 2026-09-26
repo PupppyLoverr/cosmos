@@ -25,19 +25,28 @@ pub struct Slash {
 
 const BUILTIN: &[(&str, &str, &str)] = &[
     ("model", "", "Interactively choose a model, or specify one directly"),
+    ("providers", "", "Configure providers — API keys, ChatGPT, Devin subscription"),
     ("connect", "[provider]", "Add an API key for OpenAI, Anthropic, Google, Meta, MiMo, Qwen, …"),
     ("login", "", "Sign in with your ChatGPT Plus/Pro plan"),
     ("logout", "[provider]", "Remove a stored key or the ChatGPT sign-in"),
     ("voice", "", "Dictate your task (ctrl+space)"),
     ("usage", "", "Show session usage of tokens, cost and plan limits"),
     ("context", "", "Show context window usage"),
-    ("mode", "[plan|agent|yolo]", "Show or switch mode"),
+    ("mode", "[plan|agent|accept-edits|yolo]", "Show or switch mode"),
+    ("plan", "", "Switch to plan mode (read-only)"),
+    ("agent", "", "Switch to agent mode"),
+    ("accept-edits", "", "Writes and edits run without asking"),
     ("resume", "", "Continue an earlier session"),
     ("init", "", "Write an AGENTS.md that explains this repo to agents"),
     ("review", "", "Review the uncommitted changes"),
     ("diff", "", "Show what changed in the working tree"),
     ("copy", "", "Copy the last reply to the clipboard"),
     ("approve", "", "Approve the pending plan and run it"),
+    ("compact", "[focus: …]", "Five-layer compact; optional focus steers the summary"),
+    ("undo", "", "Restore the last file checkpoint"),
+    ("skillify", "[name]", "Distill this session into a skill"),
+    ("refine", "<id|skill>", "Propose or apply a bounded skill/playbook edit"),
+    ("yolo", "", "Switch to yolo mode"),
     ("session", "", "Show the session id and how to resume it"),
     ("clear", "", "Clear the screen"),
     ("onboarding", "", "Replay the first-run setup (until it retires itself)"),
@@ -151,6 +160,7 @@ mod tests {
     fn fuzzy_finds_commands() {
         let all = builtins();
         assert_eq!(filter(&all, "mdl")[0].name, "model");
+        assert_eq!(filter(&all, "prov")[0].name, "providers");
         assert_eq!(filter(&all, "ctx")[0].name, "context");
         assert_eq!(filter(&all, "res")[0].name, "resume");
         assert!(filter(&all, "zzzz").is_empty());

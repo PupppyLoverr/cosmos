@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import * as catalog from "./catalog";
 import * as creds from "./creds";
+import * as devin from "./devin";
 import * as live from "./live";
 import * as proto from "./proto";
 import * as toml from "./toml";
@@ -20,6 +21,15 @@ export type Config = {
   [k: string]: any;
 };
 
+export function sanitizeTomlText(s: string): string {
+  return s.replace(/\0/g, "").replace(/\\x[0-9a-fA-F]{2}/g, "");
+}
+
+export function tomlQuote(value: string): string {
+  const clean = [...value].filter((c) => c !== "\0" && (c >= " " || c === "\t")).join("");
+  return JSON.stringify(clean);
+}
+
 export function loadConfig(home: string): Config {
   const cfg: Config = {
     default_model: null,
@@ -28,7 +38,7 @@ export function loadConfig(home: string): Config {
     // a fresh install (no [permissions] table): read-only tools run, anything
     // that changes files or runs commands asks first — like config.example.toml
     permissions: {
-      allow: ["read", "grep", "glob", "ls", "memory_search", "tool_search"],
+      allow: ["read", "grep", "glob", "ls", "memory_search", "tool_search", "context_remaining"],
       ask: ["write", "edit", "bash", "memory_write", "task", "mcp_call"],
     },
     subagents: { max_parallel: 3 },
@@ -40,7 +50,7 @@ export function loadConfig(home: string): Config {
   const p = path.join(home, "config.toml");
   if (fs.existsSync(p) && fs.statSync(p).isFile()) {
     try {
-      const loaded = toml.parse(fs.readFileSync(p, "utf8"));
+      const loaded = toml.parse(sanitizeTomlText(fs.readFileSync(p, "utf8")));
       for (const [k, v] of Object.entries(loaded)) {
         const cur = (cfg as any)[k];
         if (k === "permissions" && v && typeof v === "object") {
@@ -100,12 +110,16 @@ export function allowedHosts(cfg: Config): string[] {
   for (const p of catalog.providers()) add(p.base_url);
   out.add("chatgpt.com");
   out.add("auth.openai.com");
+  out.add("server.codeium.com");
+  out.add("inference.codeium.com");
+  out.add("api.devin.ai");
   return [...out];
 }
 
-/** A catalog provider is usable once it has a key (or a ChatGPT sign-in). */
+/** A catalog provider is usable once it has a key (or a ChatGPT / Devin sign-in). */
 export function providerReady(p: catalog.ProviderDef): boolean {
-  if (catalog.isSubscription(p)) return !!creds.chatgpt();
+  if (p.kind === "chatgpt") return !!creds.chatgpt();
+  if (p.kind === "devin") return devin.knownReady() || (live.cached("devin")?.length ?? 0) > 0;
   if (!p.env.length) return false; // local servers list their models via config.toml
   return !!creds.keyFor(p.id, p.env);
 }
@@ -226,8 +240,10 @@ export function availableModels(cfg: Config): ModelChoice[] {
       };
     });
   for (const p of catalog.providers()) {
-    if (p.id in cfg.providers || !providerReady(p)) continue;
+    if (!providerReady(p)) continue;
     for (const md of live.cached(p.id) ?? p.models) {
+      const alias = `${p.id}/${md.id}`;
+      if (out.some((m) => m.alias === alias)) continue;
       const price = priceObj(md.price);
       out.push({
         alias: `${p.id}/${md.id}`,
@@ -255,7 +271,9 @@ export function setDefaultModel(alias: string, home = proto.cliHome()): void {
 
 /** `user_name = "…"` — the greeting in the header. */
 export function setUserName(name: string, home = proto.cliHome()): void {
-  setTopLevel(home, "user_name", name);
+  const clean = [...name].filter((c) => c !== "\0" && c >= " ").join("").trim();
+  if (!clean) return;
+  setTopLevel(home, "user_name", clean);
 }
 
 function setTopLevel(home: string, key: string, value: string): void {
@@ -264,7 +282,7 @@ function setTopLevel(home: string, key: string, value: string): void {
   try {
     text = fs.readFileSync(file, "utf8");
   } catch {}
-  const line = `${key} = ${JSON.stringify(value)}`;
+  const line = `${key} = ${tomlQuote(value)}`;
   const out: string[] = [];
   let done = false;
   let inTable = false;

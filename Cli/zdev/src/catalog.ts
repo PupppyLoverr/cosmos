@@ -27,7 +27,7 @@ export type ProviderDef = {
   models: ModelDef[];
 };
 
-export const isSubscription = (p: ProviderDef) => p.kind === "chatgpt";
+export const isSubscription = (p: ProviderDef) => p.kind === "chatgpt" || p.kind === "devin";
 
 export function hostOf(url: string): string {
   const rest = url.split("://")[1] ?? "";
@@ -60,6 +60,23 @@ const CHATGPT: ProviderDef = {
   ],
 };
 
+/** Devin subscription — models from the signed-in plan; Cosmos runs the tools. */
+const DEVIN: ProviderDef = {
+  id: "devin",
+  name: "Devin (subscription)",
+  kind: "devin",
+  base_url: "https://server.codeium.com",
+  env: [],
+  models: [
+    m("swe-2-max", "SWE-2 Max", 200_000, 32_000, true),
+    m("swe-2-high", "SWE-2 High", 200_000, 32_000, true),
+    m("swe-2-medium", "SWE-2 Medium", 200_000, 32_000, true),
+    m("swe-1-7-medium", "SWE-1.7 Medium", 200_000, 32_000, true),
+    m("claude-fable-5-1-high", "Claude Fable 5.1 High", 200_000, 32_000, true),
+    m("adaptive", "Adaptive", 200_000, 32_000, true),
+  ],
+};
+
 /** 9Router — a local OpenAI-compatible gateway over existing subscriptions. */
 const ROUTER9: ProviderDef = {
   id: "router9",
@@ -84,7 +101,7 @@ let all: ProviderDef[] | null = null;
 export function providers(): ProviderDef[] {
   if (!all) {
     const file = (CATALOG as any).providers as ProviderDef[];
-    all = [CHATGPT, ROUTER9, ...file.map((p) => ({ ...p, env: p.env ?? [], models: p.models ?? [] })), ...LOCAL];
+    all = [CHATGPT, DEVIN, ROUTER9, ...file.map((p) => ({ ...p, env: p.env ?? [], models: p.models ?? [] })), ...LOCAL];
   }
   return all;
 }

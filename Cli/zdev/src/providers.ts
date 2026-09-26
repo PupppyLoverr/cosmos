@@ -514,6 +514,7 @@ export async function complete(
 ): Promise<void> {
   const kind = cfg.kind ?? "fixture";
   if (kind === "fixture") return fixture(cfg, req, sink);
+  if (kind === "devin") return (await import("./devin")).complete(cfg, req, sink, signal);
   if (kind === "openai") return openai(cfg, req, sink, allowed, signal);
   if (kind === "responses" || kind === "openai-responses" || kind === "chatgpt") return responses(cfg, req, sink, allowed, signal);
   if (kind === "anthropic") return anthropic(cfg, req, sink, allowed, signal);

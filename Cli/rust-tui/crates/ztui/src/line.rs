@@ -122,6 +122,13 @@ pub fn repl(opts: &RunOpts, cwd: &Path) -> Result<i32> {
                 agent.mode = Mode::Yolo;
                 eprintln!("mode: yolo (sandbox still on unless --no-sandbox)");
             }
+            s if s.starts_with("/compact") => {
+                let focus = s.strip_prefix("/compact").unwrap_or("").trim();
+                agent.compact_now(if focus.is_empty() { None } else { Some(focus) }, &mut emit);
+            }
+            "/undo" => {
+                eprintln!("{}", agent.undo_last(&mut emit));
+            }
             "/approve" => {
                 agent.approve_plan(&mut emit);
                 run_turns(&mut agent, &mut emit);

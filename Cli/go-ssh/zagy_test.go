@@ -153,3 +153,125 @@ func TestFixturePingPong(t *testing.T) {
 		t.Fatalf("usage zero: %+v", usage)
 	}
 }
+
+func TestRepairReadAlias(t *testing.T) {
+	r := repairTool("Read", map[string]any{"path": "a.txt"})
+	if r.Name != "read" {
+		t.Fatalf("name %s", r.Name)
+	}
+	if r.Reject != "" {
+		t.Fatalf("reject %s", r.Reject)
+	}
+	found := false
+	for _, x := range r.Repairs {
+		if x.Reason == "alias" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected alias repair")
+	}
+}
+
+func TestRepairMissingRequired(t *testing.T) {
+	r := repairTool("read", map[string]any{})
+	if !strings.Contains(r.Reject, "missing field path") {
+		t.Fatalf("reject %s", r.Reject)
+	}
+}
+
+func TestCompactL1Persist(t *testing.T) {
+	home := t.TempDir()
+	big := strings.Repeat("x", 9000) + strings.Repeat("\n", 50)
+	msgs := []map[string]any{{"role": "user", "content": []any{
+		map[string]any{"type": "tool_result", "tool_use_id": "t1", "content": big},
+	}}}
+	layer1(msgs, home, 200)
+	c := strv(msgs[0]["content"].([]any)[0].(map[string]any), "content")
+	if !strings.Contains(c, "[tool_result persisted") {
+		t.Fatalf("no persist: %s", c[:80])
+	}
+}
+
+func TestCkptRestore(t *testing.T) {
+	home := t.TempDir()
+	f := filepath.Join(t.TempDir(), "w.txt")
+	os.WriteFile(f, []byte("v1"), 0o644)
+	if ckptSave(home, "s1", f) == "" {
+		t.Fatal("save failed")
+	}
+	os.WriteFile(f, []byte("v2"), 0o644)
+	got, err := ckptRestoreLast(home, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != f {
+		t.Fatalf("path %s", got)
+	}
+	body, _ := os.ReadFile(f)
+	if string(body) != "v1" {
+		t.Fatalf("body %q", body)
+	}
+}
+
+func TestWorldRoundTrip(t *testing.T) {
+	home := t.TempDir()
+	w := emptyWorld()
+	w.SetGoalIfEmpty("ship the login form")
+	w.TouchFile("a.ts", []byte("abc"))
+	saveWorld(home, "sess", w)
+	loaded := loadWorld(home, "sess")
+	if loaded.Goal != "ship the login form" {
+		t.Fatalf("goal %q", loaded.Goal)
+	}
+	if !strings.Contains(loaded.Render(), "a.ts") {
+		t.Fatal(loaded.Render())
+	}
+}
+
+func TestRepairLockstep(t *testing.T) {
+	r := repairTool("Read", map[string]any{"path": "a.txt"})
+	if r.Name != "read" || r.Reject != "" {
+		t.Fatalf("%+v", r)
+	}
+	r = repairTool("memory.search", map[string]any{"query": "x"})
+	if r.Name != "memory_search" {
+		t.Fatalf("alias %s", r.Name)
+	}
+	r = repairTool("read", map[string]any{"path": "a.txt", "start": "12"})
+	if r.Input["start"] != 12 {
+		t.Fatalf("coerce %#v", r.Input["start"])
+	}
+	r = repairTool("READ", map[string]any{"path": "a.txt"})
+	if r.Name != "read" {
+		t.Fatalf("case %s", r.Name)
+	}
+}
+
+func TestSandboxDeny(t *testing.T) {
+	dir := t.TempDir()
+	ctx := NewToolCtx(dir)
+	ctx.SandboxMode = "read-only"
+	if out := runTool(ctx, "write", map[string]any{"path": "a.txt", "content": "x"}); !strings.Contains(out, "read-only") {
+		t.Fatalf("read-only: %s", out)
+	}
+	ctx.SandboxMode = "workspace-write"
+	if out := runTool(ctx, "write", map[string]any{"path": ".env", "content": "SECRET=1"}); !strings.Contains(out, "sandbox deny") {
+		t.Fatalf("env: %s", out)
+	}
+	if out := runTool(ctx, "bash", map[string]any{"command": "type ~/.ssh/id_rsa"}); !strings.Contains(out, "sandbox deny") {
+		t.Fatalf("ssh: %s", out)
+	}
+}
+
+func TestExpandMentions(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello\n"), 0o644)
+	got := expandMentions("read @a.txt please", dir)
+	if !strings.Contains(got, `<file path="a.txt">`) || !strings.Contains(got, "hello") {
+		t.Fatalf("got %q", got)
+	}
+	if got := expandMentions("escape @../x", dir); strings.Contains(got, "<file") {
+		t.Fatalf("escaped: %q", got)
+	}
+}

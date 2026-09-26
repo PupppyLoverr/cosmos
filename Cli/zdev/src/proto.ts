@@ -81,6 +81,13 @@ export class RunOpts {
   resume: string | null = null;
   approve_plan = false;
   allow_escalation: string[] = [];
+  sandbox: string | null = null;
+  ask: string | null = null;
+  autonomous = false;
+  autonomous_gate: string | null = null;
+  allow_self_mutate = false;
+  arena = false;
+  self_improve: boolean | null = null;
 }
 
 export function cliHome(): string {

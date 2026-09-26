@@ -25,6 +25,12 @@ pub struct Config {
     pub mcp: HashMap<String, McpEntry>,
     #[serde(default)]
     pub hooks: Vec<HookCfg>,
+    #[serde(default)]
+    pub compact: CompactCfgFile,
+    #[serde(default)]
+    pub sandbox: SandboxCfg,
+    #[serde(default)]
+    pub self_improve: SelfImproveFile,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,13 +81,100 @@ impl Default for Permissions {
 pub struct Subagents {
     #[serde(default = "default_parallel")]
     pub max_parallel: usize,
+    #[serde(default)]
+    pub model: String,
 }
 impl Default for Subagents {
     fn default() -> Self {
         Self {
             max_parallel: default_parallel(),
+            model: String::new(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompactCfgFile {
+    #[serde(default = "default_reserved")]
+    pub reserved_output_tokens: u64,
+    #[serde(default = "default_keep_tail")]
+    pub keep_tail: usize,
+    #[serde(default = "default_ratio")]
+    pub trigger_ratio: f64,
+    #[serde(default = "default_warm")]
+    pub cache_warm_secs: u64,
+}
+impl Default for CompactCfgFile {
+    fn default() -> Self {
+        Self {
+            reserved_output_tokens: default_reserved(),
+            keep_tail: default_keep_tail(),
+            trigger_ratio: default_ratio(),
+            cache_warm_secs: default_warm(),
+        }
+    }
+}
+fn default_reserved() -> u64 {
+    8000
+}
+fn default_keep_tail() -> usize {
+    6
+}
+fn default_ratio() -> f64 {
+    0.80
+}
+fn default_warm() -> u64 {
+    240
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SandboxCfg {
+    #[serde(default = "default_sandbox_mode")]
+    pub mode: String,
+    #[serde(default = "default_ask")]
+    pub ask: String,
+}
+impl Default for SandboxCfg {
+    fn default() -> Self {
+        Self {
+            mode: default_sandbox_mode(),
+            ask: default_ask(),
+        }
+    }
+}
+fn default_sandbox_mode() -> String {
+    "workspace-write".into()
+}
+fn default_ask() -> String {
+    "on-request".into()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SelfImproveFile {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub write_skills: bool,
+    #[serde(default = "default_true")]
+    pub write_preferences: bool,
+    #[serde(default = "default_true")]
+    pub write_corrections: bool,
+    #[serde(default)]
+    pub require_gate: bool,
+}
+impl Default for SelfImproveFile {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            write_skills: true,
+            write_preferences: true,
+            write_corrections: true,
+            require_gate: false,
+        }
+    }
+}
+fn default_true() -> bool {
+    true
 }
 fn default_parallel() -> usize {
     3
@@ -125,13 +218,12 @@ pub struct ModelChoice {
 
 /// A catalog provider is usable when signed in, keyed, or local.
 pub fn provider_ready(p: &crate::catalog::ProviderDef) -> bool {
-    if p.is_subscription() {
-        return crate::chatgpt::load().is_some();
+    match p.kind.as_str() {
+        "chatgpt" => crate::chatgpt::load().is_some(),
+        "devin" => crate::devin::known_ready(),
+        _ if p.env.is_empty() => false, // local servers list their models via config.toml
+        _ => crate::creds::key_for(&p.id, &p.env).is_some(),
     }
-    if p.env.is_empty() {
-        return false; // local servers list their models via config.toml
-    }
-    crate::creds::key_for(&p.id, &p.env).is_some()
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,14 +241,57 @@ pub struct HookCfg {
     pub command: String,
 }
 
+/// Strip NULs and Go `%q` `\xHH` sequences that aren't valid TOML escapes.
+pub fn sanitize_toml_text(s: &str) -> String {
+    let s = s.replace('\0', "");
+    let ch: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < ch.len() {
+        if ch[i] == '\\'
+            && i + 3 < ch.len()
+            && ch[i + 1] == 'x'
+            && ch[i + 2].is_ascii_hexdigit()
+            && ch[i + 3].is_ascii_hexdigit()
+        {
+            i += 4;
+            continue;
+        }
+        out.push(ch[i]);
+        i += 1;
+    }
+    out
+}
+
+fn parse_config_text(text: &str) -> Result<Config, String> {
+    match toml::from_str(text) {
+        Ok(c) => Ok(c),
+        Err(e) => {
+            let cleaned = sanitize_toml_text(text);
+            if cleaned != text {
+                toml::from_str(&cleaned).map_err(|e2| e2.to_string())
+            } else {
+                Err(e.to_string())
+            }
+        }
+    }
+}
+
+fn short_err(e: &str) -> String {
+    e.chars()
+        .map(|c| if c < ' ' && c != '\n' { ' ' } else { c })
+        .take(180)
+        .collect()
+}
+
 impl Config {
     /// Load `home/config.toml`; missing file → defaults with a fixture model
     /// so the harness works offline out of the box.
     pub fn load(home: &Path) -> Config {
         let file = home.join("config.toml");
         let mut cfg: Config = match std::fs::read_to_string(&file) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-                eprintln!("config.toml parse error: {e} — using defaults");
+            Ok(text) => parse_config_text(&text).unwrap_or_else(|e| {
+                eprintln!("config.toml parse error: {} — using defaults", short_err(&e));
                 Config::default()
             }),
             Err(_) => Config::default(),
@@ -240,14 +375,16 @@ impl Config {
         }
         let def = crate::catalog::provider(pid)?;
         let kind = ProviderKind::parse(&def.kind)?;
-        let model = def.model(mid);
-        let (api_key, account_id) = if def.is_subscription() {
-            match crate::chatgpt::fresh() {
+        let model = def.model(mid).cloned().or_else(|| {
+            crate::live::cached(pid).and_then(|ms| ms.into_iter().find(|m| m.id == mid))
+        });
+        let (api_key, account_id) = match def.kind.as_str() {
+            "chatgpt" => match crate::chatgpt::fresh() {
                 Some(t) => (Some(t.access), Some(t.account_id)),
                 None => (None, None),
-            }
-        } else {
-            (crate::creds::key_for(pid, &def.env).map(|(k, _)| k), None)
+            },
+            "devin" => (None, None),
+            _ => (crate::creds::key_for(pid, &def.env).map(|(k, _)| k), None),
         };
         Some((
             ProviderCfg {
@@ -255,8 +392,8 @@ impl Config {
                 base_url: def.base_url.clone(),
                 api_key_env: def.env.first().cloned().unwrap_or_default(),
                 model: mid.to_string(),
-                context: model.map(|m| m.context).unwrap_or(128_000),
-                prices: model.map(|m| m.prices()).unwrap_or_default(),
+                context: model.as_ref().map(|m| m.context).unwrap_or(128_000),
+                prices: model.as_ref().map(|m| m.prices()).unwrap_or_default(),
                 effort: None,
                 api_key,
                 account_id,
@@ -274,7 +411,12 @@ impl Config {
             .filter(|p| !p.base_url.is_empty())
             .map(|p| crate::catalog::host_of(&p.base_url))
             .chain(crate::catalog::providers().iter().map(|p| p.host()))
-            .chain(["auth.openai.com".to_string()])
+            .chain([
+                "auth.openai.com".to_string(),
+                "server.codeium.com".to_string(),
+                "inference.codeium.com".to_string(),
+                "api.devin.ai".to_string(),
+            ])
             .filter(|h| !h.is_empty())
             .collect();
         hosts.sort();
@@ -302,15 +444,20 @@ impl Config {
             })
             .collect();
         out.sort_by(|a, b| a.alias.cmp(&b.alias));
+        let mut seen: std::collections::HashSet<String> = out.iter().map(|m| m.alias.clone()).collect();
         for p in crate::catalog::providers() {
-            if self.providers.contains_key(&p.id) || !provider_ready(p) {
+            if !provider_ready(p) {
                 continue;
             }
-            // the live list from the provider (onboarding / refresh) beats the snapshot
+            // the live list from the provider (onboarding / /providers) beats the snapshot
             let live = crate::live::cached(&p.id);
             for m in live.as_deref().unwrap_or(&p.models) {
+                let alias = format!("{}/{}", p.id, m.id);
+                if !seen.insert(alias.clone()) {
+                    continue;
+                }
                 out.push(ModelChoice {
-                    alias: format!("{}/{}", p.id, m.id),
+                    alias,
                     provider: p.id.clone(),
                     provider_name: p.name.clone(),
                     model: m.id.clone(),
@@ -326,6 +473,16 @@ impl Config {
         out
     }
 
+    pub fn compact_cfg(&self) -> crate::compact::CompactCfg {
+        crate::compact::CompactCfg {
+            large_read_lines: self.bridge.large_read_lines,
+            reserved_output_tokens: self.compact.reserved_output_tokens,
+            keep_tail: self.compact.keep_tail,
+            cache_warm_secs: self.compact.cache_warm_secs,
+            trigger_ratio: self.compact.trigger_ratio,
+        }
+    }
+
     pub fn mcp_servers(&self) -> HashMap<String, McpServerCfg> {
         self.mcp
             .iter()
@@ -339,5 +496,51 @@ impl Config {
                 )
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_models_show_even_when_provider_is_in_config() {
+        let _env = crate::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COSMOS_CLI_HOME", dir.path());
+        std::env::set_var("COSMOS_CLI_KEYRING", "0");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[providers.openai]\nkind = \"responses\"\nbase_url = \"https://api.openai.com/v1\"\napi_key_env = \"OPENAI_API_KEY\"\n",
+        )
+        .unwrap();
+        crate::creds::store_key("openai", "sk-test").unwrap();
+        let cfg = Config::load(dir.path());
+        let models = cfg.available_models();
+        assert!(
+            models.iter().any(|m| m.alias.starts_with("openai/")),
+            "catalog openai models missing when [providers.openai] exists: {:?}",
+            models.iter().map(|m| &m.alias).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn recovers_go_percent_q_nul_escapes() {
+        let _env = crate::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COSMOS_CLI_HOME", dir.path());
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "user_name = \"Rav\\x00\\x00\"\ndefault_model = \"devin/swe-2-max\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(dir.path());
+        assert_eq!(cfg.default_model.as_deref(), Some("devin/swe-2-max"));
+        assert!(cfg.provider_for("devin/swe-2-max").is_some());
+    }
+
+    #[test]
+    fn sanitize_drops_x_escapes() {
+        assert_eq!(sanitize_toml_text("user_name = \"Rav\\x00\\x00\""), "user_name = \"Rav\"");
     }
 }

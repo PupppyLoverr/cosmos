@@ -9,6 +9,18 @@ import path from "node:path";
 // (`with { type: "text" }` gives the raw string at runtime; tsc still types
 // the .json specifier as parsed JSON — hence the cast.)
 import TOOLS_JSON_TEXT from "../tools.json" with { type: "text" };
+import { cliHome as protoHome } from "./proto";
+import * as ckpt from "./ckpt";
+
+function fence(raw: string, exit: number, logPath: string, omitted: number): string {
+  const lines = raw.split("\n");
+  const body =
+    lines.length <= 48
+      ? raw
+      : `${lines.slice(0, 24).join("\n")}\n… ${omitted} chars omitted …\n${lines.slice(-24).join("\n")}`;
+  const note = exit === 1 && !raw.trim() ? "no matches" : "";
+  return `exit_code=${exit} log_path=${logPath.replace(/\\/g, "/")} omitted_chars=${omitted} ${note}\n<<<UNTRUSTED_SHELL\n${body}\n>>>`;
+}
 
 const TOOLS_RAW = TOOLS_JSON_TEXT as unknown as string;
 
@@ -23,6 +35,11 @@ export const PLAN_TOOLS = new Set([
   "memory_search",
   "submit_plan",
   "tool_search",
+  "context_remaining",
+]);
+
+export const READONLY = new Set([
+  "read", "grep", "glob", "ls", "memory_search", "tool_search", "context_remaining",
 ]);
 
 export function toolsDump(): string {
@@ -42,6 +59,10 @@ export class Ctx {
   sandboxDegraded: string | null = null;
   largeReadLines = LARGE_READ_LINES;
   mcpServers: Record<string, any> = {};
+  sessionId = "";
+  home = "";
+  sandboxMode = "workspace-write";
+  currentToolId = "";
 
   constructor(workspace: string) {
     this.workspace = fs.realpathSync(workspace);
@@ -56,6 +77,29 @@ export function capResult(s: string): string {
 // pathlib-Windows semantics: absolute needs a drive (C:\) or UNC (\\share).
 function isAbsolute(p: string): boolean {
   return /^[a-zA-Z]:[\\/]/.test(p) || p.startsWith("\\\\") || p.startsWith("//");
+}
+
+function denyWritePath(ctx: Ctx, p: string): boolean {
+  if (ctx.sandboxMode === "full") return false;
+  const s = p.replace(/\\/g, "/").toLowerCase();
+  return (
+    s.includes("/.ssh/") ||
+    s.endsWith("/.ssh") ||
+    s.includes("/.gnupg/") ||
+    s.includes("/.env/") ||
+    s.endsWith("/.env") ||
+    s.includes(".env.")
+  );
+}
+
+function denyEnvCommand(command: string): boolean {
+  const c = command.replace(/\\/g, "/").toLowerCase();
+  return c.includes("/.ssh") || c.includes("/.gnupg") || c.includes(".env");
+}
+
+function assertWritable(ctx: Ctx, p: string, verb: string): void {
+  if (denyWritePath(ctx, p)) throw new Error(`sandbox deny: write to ${p} blocked`);
+  if (ctx.sandboxMode === "read-only") throw new Error(`sandbox read-only: ${verb} denied`);
 }
 
 export function resolve(ctx: Ctx, p: string): string {
@@ -121,6 +165,7 @@ function fresh(lines: string[], around: number, n: number): string {
 
 function edit(ctx: Ctx, inp: Record<string, any>): string {
   const p = resolve(ctx, inp.path ?? "");
+  assertWritable(ctx, p, "edit");
   const [text, sha] = readFile(p);
   const want = inp.file_sha256;
   if (want && want !== sha) {
@@ -147,6 +192,7 @@ function edit(ctx: Ctx, inp: Record<string, any>): string {
     }
   }
   if (stale) throw new Error(`STALE\n${stale}`);
+  ckpt.save(ctx.sessionId || "adhoc", p, ctx.home || protoHome());
   const owned = [...lines];
   for (const [sN, eN, newText] of pending.sort((a, b) => b[0] - a[0])) {
     const repl = newText.split("\n");
@@ -161,6 +207,7 @@ function edit(ctx: Ctx, inp: Record<string, any>): string {
 
 function write(ctx: Ctx, inp: Record<string, any>): string {
   const p = resolve(ctx, inp.path ?? "");
+  assertWritable(ctx, p, "write");
   const content = inp.content ?? "";
   if (fs.existsSync(p)) {
     const [, sha] = readFile(p);
@@ -170,6 +217,7 @@ function write(ctx: Ctx, inp: Record<string, any>): string {
       );
     }
   }
+  if (fs.existsSync(p)) ckpt.save(ctx.sessionId || "adhoc", p, ctx.home || protoHome());
   fs.mkdirSync(path.dirname(p), { recursive: true });
   atomicWrite(p, Buffer.from(content, "utf8"));
   const [, sha] = readFile(p);
@@ -365,7 +413,40 @@ function shellArgv(command: string): string[] {
 
 function bash(ctx: Ctx, inp: Record<string, any>): string {
   const command = inp.command ?? "";
-  const timeout = Math.min(Math.floor(inp.timeout_s ?? 120), 600);
+  if (denyEnvCommand(command) && ctx.sandboxMode !== "full") {
+    throw new Error("sandbox deny: command touches ~/.ssh, ~/.gnupg, or .env");
+  }
+  if (ctx.sandboxMode === "read-only") {
+    throw new Error("sandbox read-only: bash writes denied");
+  }
+  const wait = inp.wait ?? "exit";
+  const timeout = Math.min(Math.floor(inp.timeout_s ?? 30), 600);
+  const logDir = path.join(ctx.home || protoHome(), "logs", ctx.sessionId || "adhoc");
+  const logPath = path.join(logDir, `${ctx.currentToolId || "bash"}.log`);
+  if (inp.from_offset != null && fs.existsSync(logPath)) {
+    const buf = fs.readFileSync(logPath);
+    const slice = buf.subarray(Number(inp.from_offset));
+    return fence(slice.toString("utf8"), 0, logPath, 0);
+  }
+  if (wait === "now" || wait === "next_write") {
+    fs.mkdirSync(logDir, { recursive: true });
+    const argv = shellArgv(command);
+    const child = spawn(argv[0], argv.slice(1), { cwd: ctx.workspace, windowsHide: true, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const pid = child.pid ?? 0;
+    child.stdout?.on("data", (d) => fs.appendFileSync(logPath, d));
+    child.stderr?.on("data", (d) => fs.appendFileSync(logPath, d));
+    child.unref();
+    if (wait === "next_write") {
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        if (fs.existsSync(logPath) && fs.statSync(logPath).size > 0) break;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      }
+      const n = fs.existsSync(logPath) ? fs.statSync(logPath).size : 0;
+      return JSON.stringify({ task_id: `job-${pid}`, pid, log_path: logPath.replace(/\\/g, "/"), offset: n });
+    }
+    return JSON.stringify({ task_id: `job-${pid}`, pid, log_path: logPath.replace(/\\/g, "/"), offset: 0 });
+  }
   const argv = shellArgv(command);
   if (ctx.noSandbox) {
     const out = spawnSync(argv[0], argv.slice(1), {
@@ -375,7 +456,10 @@ function bash(ctx: Ctx, inp: Record<string, any>): string {
       maxBuffer: 64 * 1024 * 1024,
       windowsHide: true,
     });
-    return (out.stdout ?? "") + (out.stderr ?? "");
+    const raw = (out.stdout ?? "") + (out.stderr ?? "");
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(logPath, raw);
+    return fence(raw, out.status ?? 1, logPath, Math.max(0, raw.length - 8000));
   }
   const zsb = findBin(["zsandbox.exe", "zsandbox"], "ZSANDBOX_BIN");
   if (!zsb) return "ERROR: zsandbox.exe not found (set ZSANDBOX_BIN)";
@@ -405,21 +489,32 @@ function bash(ctx: Ctx, inp: Record<string, any>): string {
       },
     );
     if (out.error && (out.error as any).code === "ETIMEDOUT") {
-      return note + "[timeout]";
+      return note + fence("[timeout]", 124, logPath, 0);
     }
     let s = note + (out.stdout ?? "") + (out.stderr ?? "");
     if (out.status === 124) s += "\n[timeout]";
-    return s;
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(logPath, s);
+    return fence(s, out.status ?? 1, logPath, Math.max(0, s.length - 8000));
   } catch {
-    return note + "[timeout]";
+    return note + fence("[timeout]", 124, logPath, 0);
   }
 }
 
 /** `bash` without blocking the event loop: the TUI keeps animating and esc
  * kills the command. Same sandbox, timeout and output shape as `bash`. */
 function bashAsync(ctx: Ctx, inp: Record<string, any>, signal?: AbortSignal): Promise<string> {
+  if (inp.from_offset != null || inp.wait === "now" || inp.wait === "next_write") {
+    return Promise.resolve(bash(ctx, inp));
+  }
   const command = inp.command ?? "";
-  const timeout = Math.min(Math.floor(inp.timeout_s ?? 120), 600);
+  if (denyEnvCommand(command) && ctx.sandboxMode !== "full") {
+    return Promise.reject(new Error("sandbox deny: command touches ~/.ssh, ~/.gnupg, or .env"));
+  }
+  if (ctx.sandboxMode === "read-only") {
+    return Promise.reject(new Error("sandbox read-only: bash writes denied"));
+  }
+  const timeout = Math.min(Math.floor(inp.timeout_s ?? 30), 600);
   const argv = shellArgv(command);
   let exe: string;
   let args: string[];
@@ -461,7 +556,13 @@ function bashAsync(ctx: Ctx, inp: Record<string, any>, signal?: AbortSignal): Pr
       if (err) s += `\nERROR: ${err.message}`;
       if (why) s += (s.endsWith("\n") || !s ? "" : "\n") + why;
       else if (code === 124 && !ctx.noSandbox) s += "\n[timeout]";
-      resolve(s);
+      const logDir = path.join(ctx.home || protoHome(), "logs", ctx.sessionId || "adhoc");
+      const logPath = path.join(logDir, `${ctx.currentToolId || "bash"}.log`);
+      try {
+        fs.mkdirSync(logDir, { recursive: true });
+        fs.writeFileSync(logPath, s);
+      } catch {}
+      resolve(fence(s, code ?? 1, logPath, Math.max(0, s.length - 8000)));
     };
     child.on("error", (e) => done(null, e));
     child.on("close", (code) => done(code));
@@ -486,13 +587,15 @@ function meridian(ctx: Ctx, args: string[]): string {
 }
 
 function memorySearch(ctx: Ctx, inp: Record<string, any>): string {
-  return meridian(ctx, [
+  const args = [
     "search",
     "--query",
     inp.query ?? "",
     "--k",
     String(inp.k ?? 5),
-  ]);
+  ];
+  if (inp.scope) args.push("--scope", String(inp.scope));
+  return meridian(ctx, args);
 }
 
 function memoryWrite(ctx: Ctx, inp: Record<string, any>): string {

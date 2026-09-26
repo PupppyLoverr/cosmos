@@ -16,11 +16,12 @@ import * as live from "../live";
 import * as proto from "../proto";
 import { lastRateLimits } from "../providers";
 import * as store from "../store";
+import * as devin from "../devin";
 
 export type ServerRequest = { id: number; method: string; params: any };
 
 /** Bump when the onboarding flow changes — existing installs re-run once. */
-export const ONBOARDING_VERSION = "3";
+export const ONBOARDING_VERSION = "4";
 
 export class ZdevDriver {
   private opts: proto.RunOpts;
@@ -85,9 +86,17 @@ export class ZdevDriver {
       .providers()
       .filter((p) => catalog.isSubscription(p) || p.env.length)
       .map((p) => {
-        if (catalog.isSubscription(p)) {
+        if (p.kind === "chatgpt") {
           const t = creds.chatgpt();
           return { def: p, ready: !!t, detail: t ? `signed in${t.email ? ` as ${t.email}` : ""}` : "browser sign-in" };
+        }
+        if (p.kind === "devin") {
+          const snap = devin.peek();
+          if (snap) return { def: p, ready: snap.ready, detail: snap.detail };
+          const n = live.cached("devin")?.length ?? 0;
+          if (n) return { def: p, ready: true, detail: `cached · ${n} models` };
+          if (devin.signedIn()) return { def: p, ready: true, detail: "enter to connect" };
+          return { def: p, ready: false, detail: devin.executable() ? "enter to connect" : "devin auth login" };
         }
         const k = creds.keyFor(p.id, p.env);
         return { def: p, ready: !!k, detail: k ? `${creds.mask(k[0])} · ${k[1]}` : p.env[0] };
@@ -159,6 +168,9 @@ export class ZdevDriver {
   }
 
   kill() {
+    try {
+      this.agent?.session.append("session_end", { reason: "quit" });
+    } catch {}
     this.agent?.cleanup();
     this.agent = null;
   }
@@ -199,15 +211,26 @@ export class ZdevDriver {
         Object.assign(o, this.opts);
         o.allow = [...this.opts.allow];
         o.cwd = params.cwd ?? this.opts.cwd ?? this.cwd;
-        if (["plan", "agent", "yolo"].includes(params.mode)) {
+        if (["plan", "agent", "accept-edits", "yolo"].includes(params.mode)) {
           o.mode = params.mode;
           o.yolo = params.mode === "yolo";
         }
         if (params.model) o.model = params.model;
         o.resume = params.resume ?? null;
+        try {
+          this.agent?.session.append("session_end", { reason: "replaced" });
+        } catch {}
         this.agent?.cleanup();
         const a = new Agent(o, "zdev", o.cwd ?? this.cwd);
         this.attach(a);
+        if (!o.resume) {
+          a.session.append("session_start", {
+            model: a.modelAlias,
+            mode: a.mode,
+            sandbox: a.ctx.noSandbox ? "off" : a.sandboxMode || "appcontainer",
+            boot_tokens: a.bootTokens,
+          });
+        }
         return {
           sessionId: a.session.id,
           model: a.modelAlias,
@@ -234,7 +257,7 @@ export class ZdevDriver {
       case "session/set_mode": {
         const a = this.mustAgent();
         const mode = params.mode ?? "";
-        if (!["plan", "agent", "yolo"].includes(mode)) throw new Error(`bad mode ${JSON.stringify(mode)} (plan|agent|yolo)`);
+        if (!["plan", "agent", "accept-edits", "yolo"].includes(mode)) throw new Error(`bad mode ${JSON.stringify(mode)} (plan|agent|accept-edits|yolo)`);
         const old = a.mode;
         a.mode = mode;
         a.opts.yolo = mode === "yolo";

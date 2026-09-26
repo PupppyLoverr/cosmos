@@ -55,12 +55,14 @@
   },
   {
     "name": "bash",
-    "description": "Run a shell command inside the sandbox (zsandbox exec --workspace <ws> --net deny). Output capped at 30000 chars.",
+    "description": "Run a shell command inside the sandbox (zsandbox exec --workspace <ws> --net deny). Output capped at 30000 chars. Optional wait=now|next_write|exit (default exit); from_offset reads only new log bytes.",
     "input_schema": {
       "type": "object",
       "properties": {
         "command": {"type": "string"},
-        "timeout_s": {"type": "integer"}
+        "timeout_s": {"type": "integer"},
+        "wait": {"type": "string"},
+        "from_offset": {"type": "integer"}
       },
       "required": ["command"],
       "additionalProperties": false
@@ -102,12 +104,13 @@
   },
   {
     "name": "memory_search",
-    "description": "Search the shared Meridian memory vault (BM25 over memory and playbook headings).",
+    "description": "Search the shared Meridian memory vault (BM25 over memory and playbook headings). Optional scope: memory|sessions|playbook (default memory).",
     "input_schema": {
       "type": "object",
       "properties": {
         "query": {"type": "string"},
-        "k": {"type": "integer"}
+        "k": {"type": "integer"},
+        "scope": {"type": "string"}
       },
       "required": ["query"],
       "additionalProperties": false
@@ -185,6 +188,24 @@
         "arguments": {"type": "object"}
       },
       "required": ["server", "tool"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "context_remaining",
+    "description": "Report current context budget: tokens_in, tokens_budget, percent, cache_warm.",
+    "input_schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "new_context",
+    "description": "Force L5 compact and reseed the conversation from world.md.",
+    "input_schema": {
+      "type": "object",
+      "properties": {},
       "additionalProperties": false
     }
   }

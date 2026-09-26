@@ -8,7 +8,27 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{resolve, ToolContext};
+use crate::{ckpt, resolve, ToolContext};
+
+fn deny_write_path(ctx: &ToolContext, path: &std::path::Path) -> bool {
+    let s = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    if ctx.sandbox_mode == "full" {
+        return false;
+    }
+    s.contains("/.ssh/")
+        || s.ends_with("/.ssh")
+        || s.contains("/.gnupg/")
+        || s.contains("/.env/")
+        || s.ends_with("/.env")
+        || s.contains(".env.")
+}
+
+fn checkpoint(ctx: &ToolContext, path: &std::path::Path) {
+    if ctx.session_id.is_empty() {
+        return;
+    }
+    let _ = ckpt::save(&ctx.home, &ctx.session_id, path);
+}
 
 fn sha6(line: &str) -> String {
     let mut h = Sha256::new();
@@ -91,6 +111,12 @@ fn fresh_anchors(lines: &[&str], around: usize, n: usize) -> String {
 
 pub fn edit(ctx: &mut ToolContext, input: &Value) -> Result<String> {
     let path = resolve(ctx, input["path"].as_str().unwrap_or(""))?;
+    if deny_write_path(ctx, &path) {
+        bail!("sandbox deny: write to {} blocked", path.display());
+    }
+    if ctx.sandbox_mode == "read-only" {
+        bail!("sandbox read-only: edit denied");
+    }
     let (text, hash) = read_file(&path)?;
     if let Some(want) = input["file_sha256"].as_str() {
         if want != hash {
@@ -137,6 +163,8 @@ pub fn edit(ctx: &mut ToolContext, input: &Value) -> Result<String> {
         bail!("STALE\n{stale}");
     }
 
+    checkpoint(ctx, &path);
+
     // apply bottom-up so earlier line numbers stay valid
     let mut owned: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
     pending.sort_by_key(|p| std::cmp::Reverse(p.start));
@@ -157,6 +185,12 @@ pub fn edit(ctx: &mut ToolContext, input: &Value) -> Result<String> {
 
 pub fn write(ctx: &mut ToolContext, input: &Value) -> Result<String> {
     let path = resolve(ctx, input["path"].as_str().unwrap_or(""))?;
+    if deny_write_path(ctx, &path) {
+        bail!("sandbox deny: write to {} blocked", path.display());
+    }
+    if ctx.sandbox_mode == "read-only" {
+        bail!("sandbox read-only: write denied");
+    }
     let content = input["content"].as_str().unwrap_or("");
     if path.exists() {
         let (_, hash) = read_file(&path)?;
@@ -168,6 +202,9 @@ pub fn write(ctx: &mut ToolContext, input: &Value) -> Result<String> {
                 path.display()
             ),
         }
+    }
+    if path.exists() {
+        checkpoint(ctx, &path);
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

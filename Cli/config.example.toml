@@ -87,6 +87,25 @@ ask = ["write", "edit", "bash", "memory_write", "task"]
 
 [subagents]
 max_parallel = 3
+model = ""                 # cheaper sibling when set; else same model
+
+[compact]
+reserved_output_tokens = 8000
+keep_tail = 6
+trigger_ratio = 0.80
+cache_warm_secs = 240
+
+[sandbox]
+mode = "workspace-write"   # read-only | workspace-write | full
+ask = "on-request"         # on-request | never | untrusted
+
+[self_improve]
+enabled = true             # interactive default; false in --output json unless flag
+min_confidence = "high"
+write_skills = true
+write_preferences = true
+write_corrections = true
+require_gate = false
 
 [tools.bash]
 shell = "auto"   # auto = Git Bash bash.exe if found, else powershell.exe -NoProfile -NonInteractive -Command

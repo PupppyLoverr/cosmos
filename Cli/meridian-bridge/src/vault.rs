@@ -69,7 +69,7 @@ impl Vault {
     /// Open (and initialize if needed) the vault at `root`.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        for d in ["index", "index\\by-area", "memory", "cache", "playbooks", "sessions"] {
+        for d in ["index", "index\\by-area", "memory", "cache", "playbooks", "sessions", "world", "refine"] {
             fs::create_dir_all(root.join(d))
                 .with_context(|| format!("creating vault dir {d}"))?;
         }

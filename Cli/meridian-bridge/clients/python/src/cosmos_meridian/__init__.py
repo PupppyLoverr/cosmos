@@ -101,6 +101,24 @@ class Meridian:
     def playbook_get(self, name: str) -> str:
         return self.call("playbook.get", name=name)["body"]
 
+    def world_upsert(self, session_id: str, markdown: str) -> str:
+        return self.call("world.upsert", session_id=session_id, markdown=markdown)["path"]
+
+    def world_get(self, session_id: str) -> dict:
+        return self.call("world.get", session_id=session_id)
+
+    def refine_propose(self, target: str, diff: str, evidence: str = "") -> str:
+        return self.call("refine.propose", target=target, diff=diff, evidence=evidence)["id"]
+
+    def refine_apply(self, id: str) -> dict:
+        return self.call("refine.apply", id=id)
+
+    def refine_rollback(self, id: str) -> dict:
+        return self.call("refine.rollback", id=id)
+
+    def session_search(self, query: str, k: int = 5) -> list:
+        return self.call("session.search", query=query, k=k)["results"]
+
     def session_register(
         self, session_id: str, harness: str, log_path: str, title: str
     ) -> str:

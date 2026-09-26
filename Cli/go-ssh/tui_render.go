@@ -8,25 +8,30 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
-// palette — Antigravity-ish: cyan accents, gray dim text, red errors.
+// palette — Cosmos family (zcli theme.rs / zdev welcome): near-white body,
+// soft grey secondary, darker rules, one cyan accent, galaxy shades.
 var (
 	stBase   = lipgloss.NewStyle()
-	stPrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
-	stSel    = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
-	stSelB   = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
-	stDim    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	stDimmer = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	stPrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("#5cd0ff")).Bold(true)
+	stSel    = lipgloss.NewStyle().Foreground(lipgloss.Color("#5cd0ff"))
+	stSelB   = lipgloss.NewStyle().Foreground(lipgloss.Color("#5cd0ff")).Bold(true)
+	stDim    = lipgloss.NewStyle().Foreground(lipgloss.Color("#8a8a8a"))
+	stDimmer = lipgloss.NewStyle().Foreground(lipgloss.Color("#4a4a4a"))
+	stGhost  = lipgloss.NewStyle().Foreground(lipgloss.Color("#6c6c6c"))
 	stBold   = lipgloss.NewStyle().Bold(true)
-	stErr    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	stWarn   = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	stGreen  = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	stCode   = lipgloss.NewStyle().Foreground(lipgloss.Color("215"))
-	stKey    = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+	stErr    = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff6b6b"))
+	stWarn   = lipgloss.NewStyle().Foreground(lipgloss.Color("#e5d892"))
+	stGreen  = lipgloss.NewStyle().Foreground(lipgloss.Color("#5fd787"))
+	stCode   = lipgloss.NewStyle().Foreground(lipgloss.Color("#e6b473"))
+	stKey    = lipgloss.NewStyle().Foreground(lipgloss.Color("#5cd0ff")).Bold(true)
+	stRose   = lipgloss.NewStyle().Foreground(lipgloss.Color("#e8e8e8"))
+	stWhite  = lipgloss.NewStyle().Foreground(lipgloss.Color("#f4f4f4")).Bold(true)
 )
 
 func rule(w int) string {
@@ -34,6 +39,19 @@ func rule(w int) string {
 		w = 1
 	}
 	return stDimmer.Render(strings.Repeat("─", w))
+}
+
+func logoRowStyled(row []logoCell) string {
+	var b strings.Builder
+	for _, c := range row {
+		sh := logoShade(c.lum)
+		st := lipgloss.NewStyle().Foreground(lipgloss.Color(sh.color))
+		if sh.bold {
+			st = st.Bold(true)
+		}
+		b.WriteString(st.Render(string(c.ch)))
+	}
+	return b.String()
 }
 
 func tilde(p string) string {
@@ -86,6 +104,9 @@ func (m tuiModel) View() string {
 	if m.width == 0 {
 		return ""
 	}
+	if m.overlay == overlayWelcome && m.welcome != nil {
+		return m.welcome.View()
+	}
 	var b strings.Builder
 	b.WriteString(m.vp.View())
 	b.WriteByte('\n')
@@ -109,6 +130,12 @@ func (m tuiModel) View() string {
 		b.WriteByte('\n')
 	case overlayModels:
 		b.WriteString(m.modelView())
+		b.WriteByte('\n')
+	case overlayProviders:
+		b.WriteString(m.providersView())
+		b.WriteByte('\n')
+	case overlayKey:
+		b.WriteString(m.keyEntryView())
 		b.WriteByte('\n')
 	}
 	b.WriteString(m.footer())
@@ -148,6 +175,13 @@ func (m tuiModel) footer() string {
 		return stKey.Render("↑/↓") + stDim.Render(" Navigate   ") +
 			stKey.Render("enter") + stDim.Render(" Select   ") +
 			stKey.Render("esc") + stDim.Render(" Cancel")
+	case m.overlay == overlayProviders:
+		return stKey.Render("↑/↓") + stDim.Render(" Navigate   ") +
+			stKey.Render("enter") + stDim.Render(" Connect   ") +
+			stKey.Render("esc") + stDim.Render(" Cancel")
+	case m.overlay == overlayKey:
+		return stKey.Render("enter") + stDim.Render(" Save   ") +
+			stKey.Render("esc") + stDim.Render(" Back")
 	case m.slashVisible():
 		return stKey.Render("↑/↓") + stDim.Render(" Navigate · ") +
 			stKey.Render("enter") + stDim.Render(" Select · ") +
@@ -157,8 +191,15 @@ func (m tuiModel) footer() string {
 		left := stDim.Render("? for shortcuts")
 		right := stDim.Render(m.modelLabel() + " · " + m.agent.Mode)
 		if m.totIn+m.totOut > 0 {
+			ctx := ""
+			if r := m.agent.contextReport(); r != "" {
+				var mm map[string]any
+				if json.Unmarshal([]byte(r), &mm) == nil {
+					ctx = fmt.Sprintf(" · ctx %.0f%%", numv(mm, "percent"))
+				}
+			}
 			right = stDim.Render(m.modelLabel()+" · "+m.agent.Mode+" · ") +
-				stDimmer.Render(fmt.Sprintf("↑%s ↓%s", humanTok(m.totIn), humanTok(m.totOut)))
+				stDimmer.Render(fmt.Sprintf("↑%s ↓%s%s", humanTok(m.totIn), humanTok(m.totOut), ctx))
 		}
 		pad := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 		if pad < 1 {
@@ -347,35 +388,61 @@ func (m tuiModel) renderPerm(it tItem, w int) []string {
 
 // ---- banner ----------------------------------------------------------------
 
-var logoArt = []struct{ art, color string }{
-	{"    ██    ", "#FFD75F"},
-	{"   ████   ", "#FF9E64"},
-	{"  ██  ██  ", "#FF7A93"},
-	{" ██    ██ ", "#9ECE6A"},
-	{" ████████ ", "#7DCFFF"},
-	{"███    ███", "#7AA2F7"},
-}
-
 func (m tuiModel) renderBanner(w int) []string {
-	a := m.agent
-	info := []string{
-		stSelB.Render("zagy") + " " + tuiVersion,
-		a.ModelAlias,
-		stDim.Render(a.Mode + " · session " + a.Session.ID[:8]),
-		stDim.Render(tilde(m.cwd)),
+	// zdev HeaderBox: boxed galaxy on the left, "Welcome back" + facts on the right.
+	wide := w >= 72
+	cols, rows := 12, 4
+	if wide {
+		cols, rows = 24, 8
 	}
-	if a.Ctx.SandboxDegraded != "" {
-		info = append(info, stWarn.Render("sandbox degraded: "+a.Ctx.SandboxDegraded))
+	grid := logoGrid(cols, rows)
+	title := " zagy " + tuiVersion + " "
+	inner := maxI(20, w-2)
+	topRule := maxI(2, inner-len(title)-1)
+	top := stRose.Render("╭─") + stWhite.Render(title) + stRose.Render(strings.Repeat("─", topRule)+"╮")
+
+	greet := "Welcome back."
+	if u := strings.TrimSpace(m.user); u != "" {
+		greet = "Welcome back, " + u + "."
 	}
+	facts := []string{
+		stWhite.Render(greet),
+		stDim.Render(truncANSI(m.agent.ModelAlias, maxI(8, w-cols-10))),
+		stGhost.Render(truncANSI(tilde(m.cwd), maxI(8, w-cols-10))),
+	}
+	if wide {
+		facts = append(facts, "",
+			stDim.Render("/ commands · @ files · ! shell · # remember"),
+			stDim.Render("shift+tab mode · ? shortcuts · esc interrupt"),
+		)
+	}
+	if m.agent.Ctx.SandboxDegraded != "" {
+		facts = append(facts, stWarn.Render("sandbox degraded: "+m.agent.Ctx.SandboxDegraded))
+	}
+
 	var out []string
-	for i, l := range logoArt {
-		row := lipgloss.NewStyle().Foreground(lipgloss.Color(l.color)).Render(l.art)
-		if i < len(info) {
-			row += "   " + truncANSI(info[i], w-14)
+	out = append(out, top)
+	bodyH := maxI(len(grid), len(facts))
+	for i := 0; i < bodyH; i++ {
+		left := ""
+		if i < len(grid) {
+			left = logoRowStyled(grid[i])
+		} else {
+			left = strings.Repeat(" ", cols)
 		}
+		right := ""
+		if i < len(facts) {
+			right = facts[i]
+		}
+		row := stRose.Render("│ ") + left + "   " + truncANSI(right, maxI(8, w-cols-8))
+		pad := w - lipgloss.Width(row) - 1
+		if pad < 0 {
+			pad = 0
+		}
+		row += strings.Repeat(" ", pad) + stRose.Render("│")
 		out = append(out, row)
 	}
-	out = append(out, rule(w))
+	out = append(out, stRose.Render("╰"+strings.Repeat("─", maxI(2, w-2))+"╯"))
 	return out
 }
 
@@ -626,6 +693,93 @@ func (m tuiModel) modelView() string {
 		}
 		b.WriteString(truncANSI(line.String(), m.width))
 		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m tuiModel) providersView() string {
+	rows := filterProviders(m.provFilter)
+	var b strings.Builder
+	b.WriteString(stBold.Render("Providers"))
+	b.WriteByte('\n')
+	b.WriteString(stDim.Render("Keys stay on this machine and work in zcli and zdev too. Devin uses your subscription."))
+	b.WriteByte('\n')
+	b.WriteString(stDim.Render("/ "))
+	if m.provFilter == "" {
+		b.WriteString(stGhost.Render(fmt.Sprintf("Type to search %d providers", len(connectableProviders()))))
+	} else {
+		b.WriteString(m.provFilter)
+	}
+	b.WriteByte('\n')
+	if len(rows) == 0 {
+		b.WriteString(stDim.Render("  No providers match"))
+		return b.String()
+	}
+	page := 12
+	if m.provSel >= len(rows) {
+		m.provSel = len(rows) - 1
+	}
+	top := m.provSel - (page - 1)
+	if top < 0 {
+		top = 0
+	}
+	for vi := top; vi < len(rows) && vi < top+page; vi++ {
+		p := rows[vi]
+		on := vi == m.provSel
+		ready, detail := providerStatus(p)
+		mark := "· "
+		name := catalogDisplayName(p)
+		if on {
+			mark = "❯ "
+			b.WriteString(stSelB.Render(mark + padRunes(name, 28)))
+		} else {
+			b.WriteString(mark + padRunes(name, 28))
+		}
+		if ready {
+			b.WriteString("  " + stGreen.Render("✓ "+detail))
+		} else {
+			b.WriteString("  " + stDim.Render(detail))
+		}
+		b.WriteByte('\n')
+	}
+	if sel := m.provSel; sel >= 0 && sel < len(rows) {
+		p := rows[sel]
+		how := pitchFor(p)
+		switch p.Kind {
+		case "chatgpt":
+			how = "Opens in zcli/zdev — use your ChatGPT Plus/Pro plan instead of an API key"
+		case "devin":
+			how = "Uses your Devin subscription models. Cosmos runs the tools — not Devin's agent."
+		}
+		b.WriteString(stDim.Render("  " + how))
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m tuiModel) keyEntryView() string {
+	p := catalogProvider(m.keyProvID)
+	name := m.keyProvID
+	env, url := "", ""
+	if p != nil {
+		name = p.Name
+		if len(p.Env) > 0 {
+			env = p.Env[0]
+		}
+		url = pinURL(p.ID)
+	}
+	var b strings.Builder
+	b.WriteString(stBold.Render(name + " API key"))
+	b.WriteByte('\n')
+	b.WriteString(stDim.Render("Paste or type it — hidden as you type."))
+	b.WriteByte('\n')
+	b.WriteString(stPrompt.Render("❯ ") + strings.Repeat("•", minI(utf8.RuneCountInString(m.keyBuf), 48)))
+	b.WriteByte('\n')
+	if url != "" {
+		b.WriteString(stDim.Render("get one at " + url))
+		b.WriteByte('\n')
+	}
+	if env != "" {
+		b.WriteString(stDim.Render("or set " + env + " in your environment"))
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

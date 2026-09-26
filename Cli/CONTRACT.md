@@ -1,6 +1,6 @@
 # CONTRACT.md — Cosmos CLI family wire contract
 
-Version 0. All three harnesses — `zcli` (Rust), `zdev` (Python), `zagy` (Go) — conform to
+Version 0. All three harnesses — `zcli` (Rust), `zdev` (TypeScript/bun), `zagy` (Go) — conform to
 this document byte-for-byte on every surface it names. Where a behavior is not listed, the
 harness is free to choose; where it is listed, deviating is a bug.
 
@@ -52,13 +52,20 @@ File tools:
   line endings, writes atomically (temp + rename).
 - `write {path, content}` — new files allowed; overwriting requires the file was `read` this
   session and `file_sha256` still matches, else `STALE`.
-- `bash {command, timeout_s=120}` — always through the sandbox (§5).
+- `bash {command, timeout_s=30, wait?: now|next_write|exit, from_offset?}` — always
+  through the sandbox (§5). `wait=now` returns `{task_id,pid,log_path,offset}` immediately.
+  `from_offset` reads only new bytes from the persisted log. Output is middle-out truncated
+  (head 24 + tail 24 lines), fenced as `<<<UNTRUSTED_SHELL … >>>`, and always includes
+  `exit_code`, `log_path`, `omitted_chars`. Grep-style exit 1 with empty stdout is
+  `no matches`, not a harness failure.
 - `grep {pattern, path?, glob?}` — respects `.gitignore`, output `path:line:text`, cap 200.
 - `glob {pattern}`; `ls {path}`.
 
 Harness tools:
 
-- `memory_search {query, k=5}`, `memory_write {type, text, scope}` — via the bridge.
+- `memory_search {query, k=5, scope?}`, `memory_write {type, text, scope}` — via the bridge.
+- `context_remaining {}` — JSON `{tokens_in, tokens_budget, percent, cache_warm}`.
+- `new_context {}` — force L5 compact and reseed from `world.md`.
 - `task {prompt, write:false, worktree:false}` — subagents (§10).
 - `request_escalation {capability: "network"|"write_outside_workspace"|"unsandboxed", reason}`.
 - `submit_plan {plan}` — only in plan mode.
@@ -74,7 +81,11 @@ when capped. Nothing else ships in v0.
   message.
 - `agent`: follows `[permissions]`; in headless mode an `ask` counts as deny unless the tool
   is in `--allow`.
+- `accept-edits`: writes and edits auto-allow; other tools follow `[permissions]`.
 - `yolo`: only via `--yolo`; auto-allows every tool; sandbox stays on unless `--no-sandbox`.
+  Shift+Tab cycles `plan → agent → accept-edits → yolo`. Sandbox policy (`--sandbox
+  read-only|workspace-write|full`) and approval policy (`--ask on-request|never|untrusted`)
+  are independent dials.
 
 ## 4. Cache-stable prompt layout
 
@@ -119,7 +130,8 @@ Kinds: `session_start` (model, mode, sandbox, boot_tokens), `session_end`, `chec
 `user`, `assistant`, `tool_call`, `tool_result`, `plan`, `permission_request`,
 `permission_decision`, `usage` (`{input, cache_read, cache_write, output, usd, cum_usd}`),
 `model_switch`, `cache_break`, `compaction`, `subagent_start`, `subagent_end`, `handoff`,
-`error`.
+`error`, `mode`, `snip`, `compact`, `compact_thrash`, `tool_repair`, `checkpoint`,
+`verify`, `self_improve`, `job_start`, `job_end`, `doom_loop`, `aside`.
 
 Branching: `session branch <session> --at <event_id>` appends a `checkout` event; replay
 follows `parent` from the current leaf. `session tree` prints the tree. Every harness supports
@@ -128,10 +140,12 @@ follows `parent` from the current leaf. `session tree` prints the tree. Every ha
 
 ## 7. Headless and exit codes
 
-Flags: `-p "<prompt>"` (`-` = stdin), `--output text|json-stream`, `--mode plan|agent`,
+Flags: `-p "<prompt>"` (`-` = stdin), `--output text|json|json-stream`, `--mode plan|agent`,
 `--allow <tools,...>`, `--yolo`, `--model <alias>`, `--max-turns N`, `--max-usd X`,
-`--cwd <dir>`, `--resume <id>`. `json-stream` writes exactly §6 events, one per line, nothing
-else.
+`--cwd <dir>`, `--resume <id>`, `--sandbox …`, `--ask …`, `--autonomous`,
+`--autonomous-gate "<cmd>"`, `--allow-self-mutate`, `--arena 1`. `json-stream` writes
+exactly §6 events, one per line, nothing else. Headless `/compact`, `/undo`, `/skillify`
+short-circuit without a model turn.
 
 Exit codes: 0 done · 1 task failed · 2 usage error · 3 permission denied · 4 provider/network
 error · 5 budget exceeded.
@@ -154,7 +168,13 @@ Compact only when: (a) projected next-turn input > 0.80 × context window, or (b
 cache is presumed cold (idle longer than the provider TTL — Anthropic default 300 s, others
 600 s) AND context > 0.50 × window. Never compact while the cache is warm and context < 80%.
 Compaction replaces conversation only — layers 1–3 are untouched. Logs
-`compaction {before_tokens, after_tokens, reason}`.
+`compaction {before_tokens, after_tokens, reason}`. Five layers, cheapest first: L1 persist
+large tool results under `cache/tool/<sha>.txt` + middle-out preview; L2 snip after 48
+messages (keep 3 head + 40 newest); L3 microcompact older `tool_result`s when the cache is
+warm; L4 collapse consecutive `read`s for the *next* request only (conversation JSONL is
+untouched); L5 write `COSMOS_CLI_HOME/world/<session>.md` and keep a tail. Cache-warm =
+last model call < 4 minutes AND prefix hash unchanged. `/compact focus: …` forces L5.
+Thrash (context refills immediately) logs `compact_thrash` and aborts further auto-L5.
 
 ## 10. Subagents
 
@@ -188,3 +208,20 @@ removal happens on `session_end` only if the worktree is clean. Parallel tasks b
 Outbound hosts = configured provider `base_url`s + configured MCP endpoints. No telemetry, no
 crash upload, no git-history upload. Every HTTP client goes through a transport wrapper that
 rejects any host not on the allowlist; a test proves the rejection.
+
+## 13. Repair, checkpoints, self-improve
+
+- Tool-call repair (in order): unwrap fences → alias remap (`Read`→`read`) → drop unknown
+  keys → coerce types → reject missing required. Logs `tool_repair`. Same hash+args three
+  times with no file change is `doom_loop` and the turn stops.
+- Checkpoints: every `write`/`edit` copies the prior file to
+  `COSMOS_CLI_HOME/ckpt/<session>/<n>-<basename>`. `/undo` restores the last one (not git).
+- Self-improve is bounded: skills, preferences, corrections, playbooks. Default on for
+  interactive text, off for CI/`json-stream`. The agent may not rewrite its binary,
+  `CONTRACT.md`, or sandbox policy without `--allow-self-mutate` plus a worktree plus a
+  green conformance gate. `/skillify <name>` writes `skills/<name>/SKILL.md`. `/refine`
+  goes through Meridian `refine.propose|apply|rollback`.
+- `task.write` defaults `worktree` to true. Subagent returns ≤4000 chars; parent never
+  ingests child tool traces.
+- Read-only tools may run in parallel (cap 8). Writes, bash, mcp, and `task` stay serial.
+- GPUI: `zgpui` is a typed ACP client crate. Daily `zcli` does not link GPUI.

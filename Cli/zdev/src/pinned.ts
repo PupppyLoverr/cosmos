@@ -4,6 +4,7 @@ import type { ProviderDef } from "./catalog";
 
 export const PINNED: { id: string; pitch: string; url: string }[] = [
   { id: "chatgpt", pitch: "use your Plus / Pro plan — no API key", url: "" },
+  { id: "devin", pitch: "your Devin subscription — Cosmos runs the tools", url: "" },
   { id: "openrouter", pitch: "one key, 300+ models from every lab", url: "https://openrouter.ai/keys" },
   { id: "router9", pitch: "your local 9Router — routes the subscriptions you have", url: "http://localhost:20128 → API keys" },
   { id: "anthropic", pitch: "Claude", url: "https://console.anthropic.com/settings/keys" },

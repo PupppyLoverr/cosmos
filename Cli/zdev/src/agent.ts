@@ -8,6 +8,12 @@ import * as proto from "./proto";
 import * as providers from "./providers";
 import * as store from "./store";
 import * as t from "./tools";
+import * as compact from "./compact";
+import * as repair from "./repair";
+import * as world from "./world";
+import * as improve from "./improve";
+import * as verify from "./verify";
+import * as ckpt from "./ckpt";
 
 // CONTRACT.md next to the harness (Cli/CONTRACT.md from src/, repo checkout
 // layout); embedded copy keeps the compiled binary honest when the file
@@ -157,6 +163,18 @@ export class Agent {
   /** diagnostics sink — stderr for headless runs, silent inside the TUI */
   log: (s: string) => void = (s) => console.error(s);
   private abort: AbortController | null = null;
+  world: world.World = world.empty();
+  lastModelAt: number | null = null;
+  prefixHash = "";
+  doom: string[] = [];
+  sandboxMode = "workspace-write";
+  askMode = "on-request";
+  improveEnabled = true;
+  forceCompact = false;
+  compactFocus: string | null = null;
+  staleHits = 0;
+  lastL5Before: number | null = null;
+  lastL5After: number | null = null;
 
   constructor(opts: proto.RunOpts, harness: string, cwd: string) {
     this.opts = opts;
@@ -205,6 +223,34 @@ export class Agent {
     if (project) this.system.push(project);
     this.tools = t.toolSpecs();
     this.allowed = store.allowedHosts(this.cfg);
+    this.ctx.home = this.home;
+    this.ctx.sessionId = this.session.id;
+    {
+      const paths = new Map<string, string>();
+      for (const m of this.messages) {
+        for (const b of m.content as any[]) {
+          if (b.type === "tool_use" && b.name === "read" && b.input?.path) {
+            paths.set(b.id, b.input.path);
+          }
+          if (b.type === "tool_result" && !b.is_error) {
+            const sha = String(b.content ?? "").match(/file_sha256=([0-9a-f]{64})/)?.[1];
+            const rel = paths.get(b.tool_use_id);
+            if (sha && rel) {
+              try {
+                this.ctx.readState.set(t.resolve(this.ctx, rel), sha);
+              } catch {}
+            }
+          }
+        }
+      }
+    }
+    this.sandboxMode = opts.sandbox ?? this.cfg.sandbox?.mode ?? "workspace-write";
+    this.askMode = opts.ask ?? this.cfg.sandbox?.ask ?? "on-request";
+    this.ctx.sandboxMode = this.sandboxMode;
+    this.world = world.load(this.session.id, this.home);
+    this.prefixHash = compact.prefixHash(this.system, t.TOOLS_JSON);
+    this.improveEnabled =
+      opts.self_improve ?? (opts.output === "text" && (this.cfg.self_improve?.enabled ?? true));
   }
 
   /** Stop the provider stream and any running tool right now. */
@@ -252,18 +298,61 @@ export class Agent {
   permitted(name: string): string {
     if (this.mode === "yolo") return "allow";
     if (this.mode === "plan" && !t.PLAN_TOOLS.has(name)) return "deny";
+    if (this.mode === "accept-edits" && (name === "write" || name === "edit")) return "allow";
     if (
       this.opts.allow.includes(name) ||
       (this.cfg.permissions.allow ?? []).includes(name)
     ) {
       return "allow";
     }
-    if ((this.cfg.permissions.ask ?? []).includes(name)) return "ask";
+    if ((this.cfg.permissions.ask ?? []).includes(name)) {
+      if (this.askMode === "never") return "deny";
+      return "ask";
+    }
     return "deny";
+  }
+
+  compactNow(focus: string | undefined, emit: Emit): void {
+    this.forceCompact = true;
+    this.compactFocus = focus ?? null;
+    this.maybeCompact(emit);
+    this.forceCompact = false;
+    this.compactFocus = null;
+  }
+
+  undoLast(emit: Emit): string {
+    try {
+      const p = ckpt.restoreLast(this.session.id, this.home);
+      emit(this.session.append("checkpoint", { op: "restore", path: p }));
+      return `restored ${p}`;
+    } catch (e: any) {
+      return `undo failed: ${e?.message ?? e}`;
+    }
+  }
+
+  skillify(name: string, emit: Emit): string {
+    if (!this.improveEnabled && !this.opts.yolo) return "self_improve disabled";
+    try {
+      const dest = improve.skillify(name, this.world, false, this.home, !!this.opts.allow_self_mutate);
+      emit(this.session.append("self_improve", improve.eventData("skillify", { kind: "skill", name })));
+      return `wrote ${dest}`;
+    } catch (e: any) {
+      return String(e?.message ?? e);
+    }
+  }
+
+  contextReport(): string {
+    const tokens = compact.estimateTokens(this.messages, this.bootTokens);
+    const budget = this.provider.context ?? 128000;
+    const pct = budget ? Math.floor((tokens * 100) / budget) : 0;
+    const warm = compact.cacheWarm(this.lastModelAt, this.prefixHash, this.prefixHash, Date.now());
+    return JSON.stringify({ tokens_in: tokens, tokens_budget: budget, percent: pct, cache_warm: warm });
   }
 
   sendUser(text: string, emit: Emit): void {
     emit(this.session.append("user", { text }));
+    world.setGoalIfEmpty(this.world, text);
+    world.save(this.session.id, this.world, this.home);
     this.messages.push({
       role: "user",
       content: [{ type: "text", text }],
@@ -310,7 +399,7 @@ export class Agent {
         {
           system: this.system,
           tools: this.tools,
-          messages: this.messages,
+          messages: compact.layer4(this.messages),
           session_id: this.session.id,
           max_tokens: this.maxTokens(),
         },
@@ -357,13 +446,14 @@ export class Agent {
       `turn · in ${usage.input} · cache_r ${usage.cache_read} ` +
         `· cache_w ${usage.cache_write} · out ${usage.output} · ` +
         `${c != null ? `$${c.toFixed(4)}` : "$?"} · ` +
-        `Σ $${this.cumUsd.toFixed(4)} · ctx n/a`,
+        `Σ $${this.cumUsd.toFixed(4)} · ctx ${JSON.parse(this.contextReport()).percent}%`,
     );
     const blocks: Record<string, any>[] = text ? [{ type: "text", text }] : [];
     for (const c2 of calls) {
       blocks.push({ type: "tool_use", id: c2.id, name: c2.name, input: c2.input });
     }
     this.messages.push({ role: "assistant", content: blocks });
+    this.lastModelAt = Date.now();
     return calls.length === 0;
   }
 
@@ -373,6 +463,34 @@ export class Agent {
     inp: Record<string, any>,
     emit: Emit,
   ): Promise<[string, boolean]> {
+    const repaired = repair.repair(name, inp);
+    for (const r of repaired.repairs) {
+      emit(this.session.append("tool_repair", { from: r.from, to: r.to, reason: r.reason }));
+    }
+    if (repaired.reject) {
+      emit(this.session.append("tool_call", { id: tid, name, input: inp }));
+      emit(this.session.append("tool_result", { tool_use_id: tid, name, content: repaired.reject, is_error: true }));
+      this.messages.push({
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: tid, content: repaired.reject, is_error: true }],
+      });
+      return [repaired.reject, true];
+    }
+    name = repaired.name;
+    inp = repaired.input;
+    const h = compact.callHash(name, inp);
+    this.doom.push(h);
+    if (this.doom.length > 3) this.doom.shift();
+    if (this.doom.length === 3 && this.doom[0] === this.doom[1] && this.doom[1] === this.doom[2]) {
+      const msg = "doom_loop: same tool+args fired 3 times with no file change — stop and ask";
+      emit(this.session.append("doom_loop", { tool: name, input: inp }));
+      this.messages.push({
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: tid, content: msg, is_error: true }],
+      });
+      return [msg, true];
+    }
+    this.ctx.currentToolId = tid;
     emit(this.session.append("tool_call", { id: tid, name, input: inp }));
     const blocked = runHooks(this.cfg, "pre_tool", name, inp, this.session.id, this.log);
     let text: string;
@@ -462,11 +580,35 @@ export class Agent {
       ];
     }
     if (name === "task") {
-      return [await this.subagent(inp.prompt ?? "", !!inp.worktree, emit), false];
+      const write = !!inp.write;
+      const worktree = inp.worktree ?? write;
+      return [await this.subagent(inp.prompt ?? "", !!worktree, emit), false];
+    }
+    if (name === "context_remaining") return [this.contextReport(), false];
+    if (name === "new_context") {
+      this.compactNow(undefined, emit);
+      return [`reseeding from world.md\n${world.render(this.world)}`, false];
     }
     if (!this.abort || this.abort.signal.aborted) this.abort = new AbortController();
     const out = await t.runAsync(this.ctx, name, inp, this.abort.signal);
-    return [out, out.startsWith("ERROR")];
+    const err = out.startsWith("ERROR") || out.includes("STALE");
+    if (err && out.includes("STALE")) {
+      this.staleHits += 1;
+      if (this.staleHits >= 2 && this.improveEnabled) {
+        emit(this.session.append("self_improve", improve.eventData("correction", { text: improve.correctionRow(name, "re-read then edit") })));
+      }
+    }
+    if (!err && (name === "write" || name === "edit") && inp.path) {
+      try {
+        const abs = t.resolve(this.ctx, inp.path);
+        const bytes = fs.readFileSync(abs);
+        world.touchFile(this.world, inp.path, bytes);
+        world.save(this.session.id, this.world, this.home);
+      } catch {}
+      const diag = verify.afterWrite(this.workspace, inp.path);
+      if (diag) emit(this.session.append("verify", { path: inp.path, text: diag }));
+    }
+    return [out, err];
   }
 
   private addWorktree(childId: string): string {
@@ -489,6 +631,9 @@ export class Agent {
     c.noSandbox = this.ctx.noSandbox;
     c.largeReadLines = this.ctx.largeReadLines;
     c.mcpServers = { ...this.ctx.mcpServers };
+    c.home = this.ctx.home;
+    c.sessionId = this.ctx.sessionId;
+    c.sandboxMode = this.ctx.sandboxMode;
     return c;
   }
 
@@ -586,42 +731,78 @@ export class Agent {
     return result + wtNote;
   }
 
-  private async maybeCompact(emit: Emit): Promise<void> {
-    const est = (m: store.Message) =>
-      m.content.reduce(
-        (a, b) => a + Math.floor(String(b.text ?? b.content ?? "").length / 4),
-        0,
+  maybeCompact(emit: Emit): void {
+    const prefixNow = compact.prefixHash(this.system, t.TOOLS_JSON);
+    const warm = compact.cacheWarm(this.lastModelAt, prefixNow, this.prefixHash, Date.now());
+    runHooks(this.cfg, "pre_compact", "", {}, this.session.id, this.log);
+    const outcome = compact.compact(this.messages, this.session.id, {
+      home: this.home,
+      largeReadLines: this.ctx.largeReadLines,
+      context: this.provider.context ?? 128000,
+      boot: this.bootTokens,
+      warm,
+      force: this.forceCompact,
+      focus: this.compactFocus ?? undefined,
+      lastL5Before: this.lastL5Before,
+      lastL5After: this.lastL5After,
+    });
+    if (outcome.world) {
+      world.applyCompactMd(this.world, outcome.world);
+      world.save(this.session.id, this.world, this.home);
+      this.lastL5Before = outcome.before;
+      this.lastL5After = outcome.after;
+    }
+    for (const ev of outcome.events) {
+      emit(this.session.append(ev.kind, ev.data));
+    }
+    this.prefixHash = prefixNow;
+  }
+
+  async execToolsBatch(
+    calls: [string, string, any][],
+    emit: Emit,
+  ): Promise<[string, string, boolean][]> {
+    const ro = calls.filter((c) => t.READONLY.has(c[1]));
+    const wr = calls.filter((c) => !t.READONLY.has(c[1]));
+    const out: [string, string, boolean][] = [];
+    if (ro.length > 1) {
+      const slice = ro.slice(0, 8);
+      const rest = ro.slice(8);
+      const results = await Promise.all(
+        slice.map(async ([tid, name, inp]) => {
+          const ctx = this.childCtx(this.ctx.workspace);
+          ctx.currentToolId = tid;
+          ctx.readState = new Map(this.ctx.readState);
+          const text = await t.runAsync(ctx, name, inp);
+          return { tid, name, inp, text, state: ctx.readState };
+        }),
       );
-    const total = this.messages.reduce((a, m) => a + est(m), 0) + this.bootTokens;
-    if (total <= Math.floor((this.provider.context ?? 128000) * 0.8)) return;
-    const before = total;
-    const head = 2;
-    const tail = 6;
-    if (this.messages.length <= head + tail) return;
-    const dropped = this.messages.length - head - tail;
-    this.messages = [
-      ...this.messages.slice(0, head),
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: `[compaction: ${dropped} earlier messages elided — see session log]`,
-          },
-        ],
-      },
-      ...this.messages.slice(-tail),
-    ];
-    runHooks(this.cfg, "pre_compact", "", { before_tokens: before }, this.session.id, this.log);
-    const after =
-      this.messages.reduce((a, m) => a + est(m), 0) + this.bootTokens;
-    emit(
-      this.session.append("compaction", {
-        before_tokens: before,
-        after_tokens: after,
-        reason: "context>80%",
-      }),
-    );
+      for (const r of results) {
+        for (const [k, v] of r.state) this.ctx.readState.set(k, v);
+        emit(this.session.append("tool_call", { id: r.tid, name: r.name, input: r.inp }));
+        const err = r.text.startsWith("ERROR");
+        emit(this.session.append("tool_result", { tool_use_id: r.tid, name: r.name, content: r.text, is_error: err }));
+        this.messages.push({
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: r.tid, content: r.text, is_error: err }],
+        });
+        out.push([r.name, r.text, err]);
+      }
+      for (const c of rest) {
+        const [text, err] = await this.execTool(c[0], c[1], c[2], emit);
+        out.push([c[1], text, err]);
+      }
+    } else {
+      for (const c of ro) {
+        const [text, err] = await this.execTool(c[0], c[1], c[2], emit);
+        out.push([c[1], text, err]);
+      }
+    }
+    for (const c of wr) {
+      const [text, err] = await this.execTool(c[0], c[1], c[2], emit);
+      out.push([c[1], text, err]);
+    }
+    return out;
   }
 }
 
@@ -673,12 +854,29 @@ export async function runHeadless(
       }),
     );
     runHooks(agent.cfg, "session_start", "", {}, agent.session.id);
-    emit(agent.session.append("user", { text: prompt }));
+    if (prompt.startsWith("/compact")) {
+      let focus = prompt.slice("/compact".length).trim();
+      if (focus.startsWith("focus:")) focus = focus.slice(6).trim();
+      else if (focus.startsWith("focus")) focus = focus.slice(5).trim();
+      agent.compactNow(focus || undefined, emit);
+      emit(agent.session.append("session_end", { reason: "compact" }));
+      return proto.EXIT_DONE;
+    }
+    if (prompt.trim() === "/undo") {
+      const msg = agent.undoLast(emit);
+      if (opts.output === "text") console.error(msg);
+      emit(agent.session.append("session_end", { reason: "undo" }));
+      return proto.EXIT_DONE;
+    }
+    if (prompt.startsWith("/skillify")) {
+      const name = prompt.slice("/skillify".length).trim() || "session";
+      const msg = agent.skillify(name, emit);
+      if (opts.output === "text") console.error(msg);
+      emit(agent.session.append("session_end", { reason: "skillify" }));
+      return proto.EXIT_DONE;
+    }
+    agent.sendUser(prompt, emit);
     runHooks(agent.cfg, "user_prompt", "", { text: prompt }, agent.session.id);
-    agent.messages.push({
-      role: "user",
-      content: [{ type: "text", text: prompt }],
-    });
 
     for (let i = 0; i < (opts.max_turns ?? 16); i++) {
       if (opts.max_usd !== null && agent.cumUsd >= opts.max_usd) {
@@ -686,6 +884,29 @@ export async function runHeadless(
       }
       const done = await agent.turn(emit);
       if (done) {
+        if (opts.autonomous_gate) {
+          const gate = opts.autonomous_gate;
+          const out = spawnSync(
+            process.platform === "win32" ? "cmd" : "sh",
+            process.platform === "win32" ? ["/C", gate] : ["-lc", gate],
+            { cwd: agent.workspace, encoding: "utf8", windowsHide: true },
+          );
+          if (out.status !== 0) {
+            const body = `${out.stdout ?? ""}${out.stderr ?? ""}`;
+            agent.messages.push({
+              role: "user",
+              content: [{ type: "text", text: `[autonomous-gate failed]\n${body}` }],
+            });
+            continue;
+          }
+        }
+        if (agent.improveEnabled) {
+          try {
+            const draft = `draft-${agent.session.id.slice(0, 8)}`;
+            improve.skillify(draft, agent.world, true, agent.home, !!opts.allow_self_mutate);
+            emit(agent.session.append("self_improve", improve.eventData("draft_skill", { name: draft, draft: true })));
+          } catch {}
+        }
         emit(agent.session.append("session_end", { reason: "done" }));
         return proto.EXIT_DONE;
       }
@@ -693,8 +914,8 @@ export async function runHeadless(
         .filter((b) => b.type === "tool_use")
         .map((b) => [b.id, b.name, b.input] as [string, string, any]);
       let denied = false;
-      for (const [tid, name, inp] of calls) {
-        const [text, isError] = await agent.execTool(tid, name, inp, emit);
+      const results = await agent.execToolsBatch(calls, emit);
+      for (const [i2, [name, text, isError]] of results.entries()) {
         if (name === "submit_plan" && !isError) {
           if (opts.approve_plan) {
             agent.approvePlan(emit);
@@ -704,6 +925,7 @@ export async function runHeadless(
           }
         }
         if (isError && text.startsWith("permission denied")) denied = true;
+        void i2;
       }
       if (denied) {
         emit(agent.session.append("session_end", { reason: "permission_denied" }));

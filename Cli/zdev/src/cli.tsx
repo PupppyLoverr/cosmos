@@ -28,9 +28,11 @@ usage:
   zdev models [provider]      models you can use now (catalog + live lists)
   zdev onboarding             replay the first-run setup
 
-flags: --output text|json|json-stream · --mode plan|agent · --allow a,b ·
+flags: --output text|json|json-stream · --mode plan|agent|accept-edits · --allow a,b ·
 --yolo · --no-sandbox · --model <alias> · --max-turns N · --max-usd F ·
---cwd <dir> · --resume <id> · --approve-plan · --allow-escalation cap,...
+--cwd <dir> · --resume <id> · --approve-plan · --allow-escalation cap,... ·
+--sandbox read-only|workspace-write|full · --ask on-request|never|untrusted ·
+--autonomous · --autonomous-gate "<cmd>" · --allow-self-mutate · --arena 1
 `;
 
 // argv: `bun run src/cli.tsx` → [bun, cli.tsx, ...]; compiled exe → [exe, ...]
@@ -87,6 +89,23 @@ function parse(args: string[]): proto.RunOpts {
         .split(",")
         .map((x) => x.trim())
         .filter(Boolean);
+    } else if (a === "--sandbox") {
+      o.sandbox = val();
+    } else if (a === "--ask") {
+      o.ask = val();
+    } else if (a === "--autonomous") {
+      o.autonomous = true;
+    } else if (a === "--autonomous-gate") {
+      o.autonomous_gate = val();
+    } else if (a === "--allow-self-mutate") {
+      o.allow_self_mutate = true;
+    } else if (a === "--arena") {
+      val();
+      o.arena = true;
+    } else if (a === "--self-improve") {
+      o.self_improve = true;
+    } else if (a === "--no-self-improve") {
+      o.self_improve = false;
     } else if (["--version", "--help", "-h", "-V"].includes(a)) {
       process.stdout.write(`zdev ${proto.CONTRACT_VERSION} (contract v1)\n${HELP}`);
       process.exit(proto.EXIT_DONE);
@@ -354,6 +373,40 @@ async function main(): Promise<number> {
   }
   if (args[0] === "session") return sessionCmd(args.slice(1));
   if (args[0] === "memory") return memoryCmd(args.slice(1));
+  if (args[0] === "compact" || args[0] === "undo" || args[0] === "skillify" || args[0] === "checkpoint") {
+    const flag = (n: string) => {
+      const i = args.indexOf(n);
+      return i >= 0 ? args[i + 1] : "";
+    };
+    const sid = flag("--session");
+    const o = new proto.RunOpts();
+    o.model = "fixture";
+    o.output = "text";
+    if (args[0] === "compact") {
+      const focus = flag("--focus");
+      o.resume = sid || null;
+      o.prompt = focus ? `/compact focus: ${focus}` : "/compact";
+      if (!sid) {
+        console.error("usage: zdev compact --session <id> [--focus …]");
+        return proto.EXIT_USAGE;
+      }
+      return agent.runHeadless(o, "zdev", process.cwd());
+    }
+    if (args[0] === "undo" || (args[0] === "checkpoint" && args[1] === "restore")) {
+      o.resume = sid || store.Session.list(proto.cliHome()).at(-1)?.id || null;
+      o.prompt = "/undo";
+      if (!o.resume) {
+        console.error("usage: zdev undo --session <id>");
+        return proto.EXIT_USAGE;
+      }
+      return agent.runHeadless(o, "zdev", process.cwd());
+    }
+    if (args[0] === "skillify") {
+      o.resume = sid || null;
+      o.prompt = `/skillify ${args[1] && !args[1].startsWith("-") ? args[1] : "session"}`;
+      return agent.runHeadless(o, "zdev", process.cwd());
+    }
+  }
   if (args[0] === "login") {
     const { login } = await import("./oauth");
     try {

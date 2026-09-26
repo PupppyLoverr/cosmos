@@ -13,6 +13,7 @@ import path from "node:path";
 import * as catalog from "../catalog";
 import type { ModelDef, ProviderDef } from "../catalog";
 import * as creds from "../creds";
+import * as devin from "../devin";
 import * as live from "../live";
 import { PINNED, pinRank } from "../pinned";
 import { cliHome } from "../proto";
@@ -202,7 +203,12 @@ function providerList(): Prov[] {
     .filter((p) => catalog.isSubscription(p) || p.env.length)
     .map((p) => {
       const pin = PINNED.find((x) => x.id === p.id);
-      return { def: p, name: catalog.isSubscription(p) ? "ChatGPT" : p.name, pitch: pin?.pitch ?? p.env[0] ?? "", url: pin?.url ?? "" };
+      return {
+        def: p,
+        name: p.kind === "chatgpt" ? "ChatGPT" : p.kind === "devin" ? "Devin" : p.name,
+        pitch: pin?.pitch ?? p.env[0] ?? "",
+        url: pin?.url ?? "",
+      };
     })
     .sort((a, b) => pinRank(a.def.id) - pinRank(b.def.id));
 }
@@ -298,7 +304,15 @@ export class Flow {
 
   refreshKeyed() {
     this.keyed = new Set(
-      this.provs.filter((p) => (catalog.isSubscription(p.def) ? !!creds.chatgpt() : !!creds.keyFor(p.def.id, p.def.env))).map((p) => p.def.id),
+      this.provs
+        .filter((p) =>
+          p.def.kind === "chatgpt"
+            ? !!creds.chatgpt()
+            : p.def.kind === "devin"
+              ? devin.knownReady()
+              : !!creds.keyFor(p.def.id, p.def.env),
+        )
+        .map((p) => p.def.id),
     );
     this.email = creds.chatgpt()?.email ?? null;
   }
@@ -566,9 +580,11 @@ export class Flow {
       const right = m
         ? `✓ ${m}${this.model?.[0] === `${p.def.id}/${m}` ? " ★" : ""}`
         : this.keyed.has(p.def.id)
-          ? catalog.isSubscription(p.def) && this.email
+          ? p.def.kind === "chatgpt" && this.email
             ? `✓ ${this.email}`
-            : "✓ connected"
+            : p.def.kind === "devin"
+              ? `✓ ${devin.detail()}`
+              : "✓ connected"
           : "";
       const rw = Math.min(sw(right), Math.floor(cw / 2));
       c.text(x + 2 + nameW, y, ell(p.pitch, cw - 2 - nameW - rw - 2), DIM);
@@ -743,7 +759,7 @@ export class Flow {
   drawReady(c: Canvas) {
     const ROWS: [string, string][] = [
       ["type a task, enter", "zdev reads, edits and runs code with you"],
-      ["/", "commands — /model /connect /usage /context /help"],
+      ["/", "commands — /model /providers /connect /usage /context /help"],
       ["@path", "attach a file · !cmd runs a shell command"],
       ["ctrl+space", "dictate instead of typing"],
       ["shift+tab", "cycle agent → plan → yolo"],
@@ -823,6 +839,18 @@ export class Flow {
     }
   }
 
+  connectDevin(i: number) {
+    devin.invalidate();
+    if (devin.ready()) {
+      this.connected.push("devin");
+      this.refreshKeyed();
+      this.flash(`✓ Devin · ${devin.detail()}`, true);
+      this.openModels(i);
+    } else {
+      this.flash(devin.hint(), false);
+    }
+  }
+
   startOauth() {
     const ac = new AbortController();
     this.oauth = { ac };
@@ -835,7 +863,7 @@ export class Flow {
           this.refreshKeyed();
           this.connected.push("chatgpt");
           this.flash(`✓ signed in${t.email ? ` as ${t.email}` : ""}`, true);
-          const i = this.provs.findIndex((p) => catalog.isSubscription(p.def));
+          const i = this.provs.findIndex((p) => p.def.kind === "chatgpt");
           if (i >= 0) this.openModels(i);
         },
         (e) => {
@@ -919,7 +947,8 @@ export class Flow {
           const i = order[sel];
           this.status = null;
           if (this.keyed.has(this.provs[i].def.id)) this.openModels(i);
-          else if (catalog.isSubscription(this.provs[i].def)) this.startOauth();
+          else if (this.provs[i].def.kind === "chatgpt") this.startOauth();
+          else if (this.provs[i].def.kind === "devin") this.connectDevin(i);
           else {
             this.keyBuf = "";
             this.keyIdx = i;

@@ -72,6 +72,29 @@ foreach ($taskDir in Get-ChildItem (Join-Path $root "eval\tasks") -Directory) {
       if ($ok -and $LASTEXITCODE -ne 0) { $ok=$false; $why="session events invalid" }
     }
 
+    if ($task -eq "t02-compact-resume") {
+      $o = RunHarness $h "ship the login form" $ws
+      if ($LASTEXITCODE -ne 0) { $ok=$false; $why="seed exit $LASTEXITCODE" }
+      $list = switch ($h) { "zcli" { & $cli session list 2>$null } "zagy" { & $zagy session list 2>$null } default { & $zdev session list 2>$null } }
+      $id = ($list | Select-String -Pattern '01[0-9a-z]{24}').Matches[0].Value
+      $argv = @("-p","/compact","--model","fixture","--resume",$id,"--output","json-stream")
+      $ErrorActionPreference = "Continue"
+      switch ($h) { "zcli" { & $cli @argv 2>$null } "zagy" { & $zagy @argv 2>$null } default { & $zdev @argv 2>$null } }
+      $ErrorActionPreference = "Stop"
+      $world = Join-Path $env:COSMOS_CLI_HOME "world\$id.md"
+      if ($ok -and -not (Test-Path $world)) { $ok=$false; $why="world.md missing" }
+      if ($ok -and ((Get-Content $world -Raw) -notmatch "ship the login form")) { $ok=$false; $why="goal lost after compact" }
+    }
+
+    if ($task -eq "t03-repair") {
+      $o = RunHarness $h 'tool:Read {\"path\":\"a.txt\"}' $ws
+      if ($LASTEXITCODE -ne 0) { $ok=$false; $why="repair exit $LASTEXITCODE" }
+      $evs = @($o | Where-Object { $_ -match '^\{' } | ConvertFrom-Json)
+      if ($ok -and -not ($evs | Where-Object { $_.kind -eq "tool_repair" })) { $ok=$false; $why="no tool_repair event" }
+      $r = LastToolResult $o
+      if ($ok -and $r.data.content -notmatch "file_sha256=") { $ok=$false; $why="read after repair failed: $($r.data.content)" }
+    }
+
     $results += @{ task=$task; harness=$h; ok=$ok; why=$why }
     Write-Host ("{0}  {1}/{2} {3}" -f $(if ($ok) {"PASS"} else {"FAIL"}), $task, $h, $why)
     Remove-Item Env:\COSMOS_CLI_HOME -ErrorAction SilentlyContinue

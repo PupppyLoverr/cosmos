@@ -5,12 +5,16 @@
 pub mod agent;
 pub mod catalog;
 pub mod chatgpt;
+pub mod compact;
 pub mod config;
 pub mod creds;
+pub mod devin;
 pub mod hooks;
+pub mod improve;
 pub mod live;
 pub mod session;
 pub mod welcome;
+pub mod world;
 
 use std::path::PathBuf;
 

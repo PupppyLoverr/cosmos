@@ -18,6 +18,8 @@ use anyhow::Result;
 mod linux;
 #[cfg(windows)]
 mod win;
+#[cfg(target_os = "macos")]
+pub mod seatbelt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetPolicy {

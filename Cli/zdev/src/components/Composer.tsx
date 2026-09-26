@@ -11,6 +11,7 @@ const PLACEHOLDER = "Ask zdev to build, fix or explain — @ adds files, ! runs 
 const MODE_META: Record<string, { glyph: string; label: string; hint: string }> = {
   agent: { glyph: "⏵⏵", label: "agent", hint: "asks before risky tools" },
   plan: { glyph: "⏸", label: "plan mode", hint: "read-only, ends in a plan" },
+  "accept-edits": { glyph: "⏵⏵", label: "accept edits", hint: "writes and edits run without asking" },
   yolo: { glyph: "⏵⏵", label: "yolo", hint: "runs everything without asking" },
 };
 

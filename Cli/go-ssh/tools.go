@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,6 +26,12 @@ const LargeReadLines = 200
 var PlanTools = map[string]bool{
 	"read": true, "grep": true, "glob": true, "ls": true,
 	"memory_search": true, "submit_plan": true, "tool_search": true,
+	"context_remaining": true,
+}
+
+var ReadOnlyTools = map[string]bool{
+	"read": true, "grep": true, "glob": true, "ls": true,
+	"memory_search": true, "tool_search": true, "context_remaining": true,
 }
 
 type ToolCtx struct {
@@ -36,6 +43,10 @@ type ToolCtx struct {
 	SandboxDegraded string
 	LargeReadLines  int
 	MCPServers      map[string]any
+	SessionID       string
+	Home            string
+	SandboxMode     string
+	CurrentToolID   string
 }
 
 func NewToolCtx(workspace string) *ToolCtx {
@@ -146,9 +157,37 @@ func freshAnchors(lines []string, around, n int) string {
 	return b.String()
 }
 
+func denyWritePath(ctx *ToolCtx, p string) bool {
+	if ctx.SandboxMode == "full" {
+		return false
+	}
+	s := strings.ToLower(strings.ReplaceAll(p, "\\", "/"))
+	return strings.Contains(s, "/.ssh/") || strings.HasSuffix(s, "/.ssh") ||
+		strings.Contains(s, "/.gnupg/") || strings.Contains(s, "/.env/") ||
+		strings.HasSuffix(s, "/.env") || strings.Contains(s, ".env.")
+}
+
+func denyEnvCommand(command string) bool {
+	c := strings.ToLower(strings.ReplaceAll(command, "\\", "/"))
+	return strings.Contains(c, "/.ssh") || strings.Contains(c, "/.gnupg") || strings.Contains(c, ".env")
+}
+
+func assertWritable(ctx *ToolCtx, p, verb string) error {
+	if denyWritePath(ctx, p) {
+		return fmt.Errorf("sandbox deny: write to %s blocked", p)
+	}
+	if ctx.SandboxMode == "read-only" {
+		return fmt.Errorf("sandbox read-only: %s denied", verb)
+	}
+	return nil
+}
+
 func toolEdit(ctx *ToolCtx, inp map[string]any) (string, error) {
 	path, err := resolve(ctx, strv(inp, "path"))
 	if err != nil {
+		return "", err
+	}
+	if err := assertWritable(ctx, path, "edit"); err != nil {
 		return "", err
 	}
 	data, err := os.ReadFile(path)
@@ -188,6 +227,7 @@ func toolEdit(ctx *ToolCtx, inp map[string]any) (string, error) {
 	if stale.Len() > 0 {
 		return "", fmt.Errorf("STALE\n%s", stale.String())
 	}
+	ckptSave(ctx.Home, ctx.SessionID, path)
 	owned := append([]string{}, lines...)
 	sort.Slice(pending, func(i, j int) bool { return pending[i].s > pending[j].s })
 	for _, p := range pending {
@@ -216,12 +256,18 @@ func toolWrite(ctx *ToolCtx, inp map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := assertWritable(ctx, path, "write"); err != nil {
+		return "", err
+	}
 	content := strv(inp, "content")
 	if _, err := os.Stat(path); err == nil {
 		data, _ := os.ReadFile(path)
 		if ctx.ReadState[path] != fileSHA(data) {
 			return "", fmt.Errorf("STALE: %s exists and was not read this session (or changed)", path)
 		}
+	}
+	if _, err := os.Stat(path); err == nil {
+		ckptSave(ctx.Home, ctx.SessionID, path)
 	}
 	os.MkdirAll(filepath.Dir(path), 0o755)
 	if err := atomicWrite(path, []byte(content)); err != nil {
@@ -430,21 +476,123 @@ func shellArgv(command string) []string {
 	return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command}
 }
 
+func fenceShell(raw string, exit int, logPath string, omitted int) string {
+	lines := strings.Split(raw, "\n")
+	body := raw
+	if len(lines) > 48 {
+		om := omitted
+		if om == 0 {
+			om = len(raw) - len(strings.Join(lines[:24], "\n")) - len(strings.Join(lines[len(lines)-24:], "\n"))
+		}
+		body = strings.Join(lines[:24], "\n") + fmt.Sprintf("\n… %d chars omitted …\n", om) + strings.Join(lines[len(lines)-24:], "\n")
+	}
+	note := ""
+	if exit == 1 && strings.TrimSpace(raw) == "" {
+		note = "no matches"
+	}
+	return fmt.Sprintf("exit_code=%d log_path=%s omitted_chars=%d %s\n<<<UNTRUSTED_SHELL\n%s\n>>>",
+		exit, filepath.ToSlash(logPath), omitted, note, body)
+}
+
 func toolBash(ctx *ToolCtx, inp map[string]any) (string, error) {
 	command := strv(inp, "command")
+	if denyEnvCommand(command) && ctx.SandboxMode != "full" {
+		return "", fmt.Errorf("sandbox deny: command touches ~/.ssh, ~/.gnupg, or .env")
+	}
+	if ctx.SandboxMode == "read-only" {
+		return "", fmt.Errorf("sandbox read-only: bash writes denied")
+	}
+	wait := strv(inp, "wait")
+	if wait == "" {
+		wait = "exit"
+	}
 	timeout := int(numv(inp, "timeout_s"))
 	if timeout <= 0 {
-		timeout = 120
+		timeout = 30
 	}
 	if timeout > 600 {
 		timeout = 600
+	}
+	home := ctx.Home
+	if home == "" {
+		home = cliHome()
+	}
+	sid := ctx.SessionID
+	if sid == "" {
+		sid = "adhoc"
+	}
+	logDir := filepath.Join(home, "logs", sid)
+	logPath := filepath.Join(logDir, ctx.CurrentToolID+".log")
+	if ctx.CurrentToolID == "" {
+		logPath = filepath.Join(logDir, "bash.log")
+	}
+	if inp["from_offset"] != nil {
+		if data, err := os.ReadFile(logPath); err == nil {
+			off := int(numv(inp, "from_offset"))
+			if off < 0 {
+				off = 0
+			}
+			if off > len(data) {
+				off = len(data)
+			}
+			return fenceShell(string(data[off:]), 0, logPath, 0), nil
+		}
+	}
+	if wait == "now" || wait == "next_write" {
+		os.MkdirAll(logDir, 0o755)
+		argv := shellArgv(command)
+		c := exec.Command(argv[0], argv[1:]...)
+		c.Dir = ctx.Workspace
+		f, _ := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if f != nil {
+			c.Stdout = f
+			c.Stderr = f
+		}
+		if err := c.Start(); err != nil {
+			return "", err
+		}
+		pid := 0
+		if c.Process != nil {
+			pid = c.Process.Pid
+		}
+		go func() {
+			c.Wait()
+			if f != nil {
+				f.Close()
+			}
+		}()
+		if wait == "next_write" {
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				if st, err := os.Stat(logPath); err == nil && st.Size() > 0 {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+		off := 0
+		if st, err := os.Stat(logPath); err == nil {
+			off = int(st.Size())
+		}
+		b, _ := json.Marshal(map[string]any{"task_id": fmt.Sprintf("job-%d", pid), "pid": pid, "log_path": filepath.ToSlash(logPath), "offset": off})
+		return string(b), nil
 	}
 	argv := shellArgv(command)
 	if ctx.NoSandbox {
 		c := exec.Command(argv[0], argv[1:]...)
 		c.Dir = ctx.Workspace
-		out, _ := c.CombinedOutput()
-		return string(out), nil
+		out, err := c.CombinedOutput()
+		os.MkdirAll(logDir, 0o755)
+		os.WriteFile(logPath, out, 0o644)
+		code := 0
+		if err != nil {
+			code = 1
+		}
+		om := len(out) - 8000
+		if om < 0 {
+			om = 0
+		}
+		return fenceShell(string(out), code, logPath, om), nil
 	}
 	zsb := findBin([]string{"zsandbox.exe", "zsandbox"}, "ZSANDBOX_BIN")
 	if zsb == "" {
@@ -474,13 +622,23 @@ func toolBash(ctx *ToolCtx, inp map[string]any) (string, error) {
 	select {
 	case r := <-ch:
 		s := note + string(r.out)
-		if ee, ok := r.err.(*exec.ExitError); ok && ee.ExitCode() == 124 {
-			s += "\n[timeout]"
+		code := 0
+		if ee, ok := r.err.(*exec.ExitError); ok {
+			code = ee.ExitCode()
+			if code == 124 {
+				s += "\n[timeout]"
+			}
 		}
-		return s, nil
+		os.MkdirAll(logDir, 0o755)
+		os.WriteFile(logPath, []byte(s), 0o644)
+		om := len(s) - 8000
+		if om < 0 {
+			om = 0
+		}
+		return fenceShell(s, code, logPath, om), nil
 	case <-time.After(time.Duration(timeout+30) * time.Second):
 		c.Process.Kill()
-		return note + "[timeout]", nil
+		return note + fenceShell("[timeout]", 124, logPath, 0), nil
 	}
 }
 
@@ -502,7 +660,11 @@ func toolMemorySearch(ctx *ToolCtx, inp map[string]any) (string, error) {
 	if k <= 0 {
 		k = 5
 	}
-	return meridianRun(ctx, "search", "--query", strv(inp, "query"), "--k", fmt.Sprint(k))
+	args := []string{"search", "--query", strv(inp, "query"), "--k", fmt.Sprint(k)}
+	if s := strv(inp, "scope"); s != "" {
+		args = append(args, "--scope", s)
+	}
+	return meridianRun(ctx, args...)
 }
 
 func toolMemoryWrite(ctx *ToolCtx, inp map[string]any) (string, error) {

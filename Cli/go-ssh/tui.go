@@ -1,6 +1,6 @@
-// tui.go — bubbletea TUI for zagy (Antigravity-style): transcript viewport,
-// `> ` composer with / autocomplete, shortcuts overlay, permission card,
-// shift+tab mode cycling, ctrl+r thought expansion.
+// tui.go — bubbletea TUI for zagy (Cosmos family: same galaxy, chrome and
+// onboarding as zcli / zdev): transcript viewport, ❯ composer with /
+// autocomplete, shortcuts overlay, permission card, shift+tab mode cycling.
 package main
 
 import (
@@ -9,12 +9,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -68,6 +69,9 @@ const (
 	overlayNone overlayKind = iota
 	overlayHelp
 	overlayModels
+	overlayProviders
+	overlayKey
+	overlayWelcome
 )
 
 type slashCmd struct {
@@ -78,11 +82,22 @@ type slashCmd struct {
 var slashCmds = []slashCmd{
 	{"/plan", "Switch to plan mode (read-only)"},
 	{"/agent", "Switch to agent mode"},
+	{"/accept-edits", "Writes and edits run without asking"},
 	{"/yolo", "Switch to yolo mode (auto-approve)"},
+	{"/compact", "Five-layer compact; keep the goal in world.md"},
+	{"/undo", "Restore the last file checkpoint (not git)"},
+	{"/skillify", "Distill this session into a skill"},
 	{"/approve", "Approve the pending plan"},
 	{"/model", "Pick a model"},
+	{"/providers", "Configure providers — API keys, ChatGPT, Devin subscription"},
+	{"/connect", "Add an API key (shared with zcli/zdev)"},
+	{"/mode", "Show or switch mode: plan|agent|accept-edits|yolo"},
+	{"/context", "Show context window usage"},
 	{"/session", "Show session id"},
 	{"/usage", "Show token usage"},
+	{"/clear", "Clear the transcript"},
+	{"/copy", "Copy the last reply"},
+	{"/onboarding", "Replay the first-run setup"},
 	{"/help", "Keyboard shortcuts"},
 	{"/quit", "Quit zagy"},
 }
@@ -124,17 +139,25 @@ type tuiModel struct {
 	models    []modelRow
 	pendModel string
 
+	provSel    int
+	provFilter string
+	keyProvID  string
+	keyBuf     string
+
 	slashSel    int
 	slashOffFor string // slash menu dismissed while this value is in the box
 
 	permIdx   int
 	permReply chan int
+
+	user    string
+	welcome *welcomeFlow
 }
 
 func newTUIModel(a *Agent, opts *RunOpts, cwd string, br *tuiBridge) tuiModel {
 	ta := textarea.New()
-	ta.Prompt = "> "
-	ta.Placeholder = ""
+	ta.Prompt = "❯ "
+	ta.Placeholder = "Ask zagy — / commands · @ files · ! shell · # remember"
 	ta.ShowLineNumbers = false
 	ta.EndOfBufferCharacter = ' '
 	ta.CharLimit = 0
@@ -162,6 +185,7 @@ func newTUIModel(a *Agent, opts *RunOpts, cwd string, br *tuiBridge) tuiModel {
 		ta: ta, spin: sp, vp: vp,
 		width: 80, height: 24,
 		lastThought: -1,
+		user:        configUserName(),
 	}
 	m.items = append(m.items, tItem{kind: "banner"})
 	if opts.Resume != "" {
@@ -173,15 +197,54 @@ func newTUIModel(a *Agent, opts *RunOpts, cwd string, br *tuiBridge) tuiModel {
 	return m
 }
 
-func (m tuiModel) Init() tea.Cmd { return textarea.Blink }
+func (m tuiModel) Init() tea.Cmd {
+	if m.overlay == overlayWelcome && m.welcome != nil {
+		return tea.Batch(textarea.Blink, m.welcome.schedule())
+	}
+	return textarea.Blink
+}
+
+func (m *tuiModel) startWelcome() {
+	m.welcome = newWelcome(m.width, m.height)
+	m.overlay = overlayWelcome
+}
+
+func (m *tuiModel) finishWelcome() {
+	m.user = configUserName()
+	if m.agent != nil {
+		m.agent.Cfg = loadConfig(cliHome())
+		if d := m.agent.Cfg.DefaultModel; d != "" && d != "fixture" {
+			m.applyModel(d)
+		}
+	}
+	m.overlay = overlayNone
+	m.welcome = nil
+	m.reflow()
+}
 
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		if m.welcome != nil {
+			m.welcome.resize(msg.Width, msg.Height)
+		}
 		m.layout()
 		m.reflow()
+		return m, nil
+	case welcomeTickMsg:
+		if m.overlay == overlayWelcome && m.welcome != nil {
+			m.welcome.step(time.Time(msg))
+			if m.welcome.quit {
+				return m, m.quit()
+			}
+			if m.welcome.done {
+				m.finishWelcome()
+				return m, nil
+			}
+			return m, m.welcome.schedule()
+		}
 		return m, nil
 	case spinner.TickMsg:
 		if !m.busy {
@@ -239,11 +302,28 @@ func (m tuiModel) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// overlays own the keyboard first
+	if m.overlay == overlayWelcome && m.welcome != nil {
+		cmd := m.welcome.onKey(msg)
+		if m.welcome.quit {
+			return m, m.quit()
+		}
+		if m.welcome.done {
+			m.finishWelcome()
+			return m, nil
+		}
+		return m, cmd
+	}
 	if m.overlay == overlayHelp {
 		return m.helpKey(msg)
 	}
 	if m.overlay == overlayModels {
 		return m.modelKey(msg)
+	}
+	if m.overlay == overlayProviders {
+		return m.providersKey(msg)
+	}
+	if m.overlay == overlayKey {
+		return m.keyEntryKey(msg)
 	}
 
 	switch key {
@@ -398,15 +478,42 @@ func (m tuiModel) submit() (tea.Model, tea.Cmd) {
 	if strings.HasPrefix(text, "/") {
 		return m.execSlash(text)
 	}
+	if strings.HasPrefix(text, "!") {
+		cmd := strings.TrimSpace(strings.TrimPrefix(text, "!"))
+		if cmd == "" {
+			return m, nil
+		}
+		out := runTool(m.agent.Ctx, "bash", map[string]any{"command": cmd, "timeout_s": 30})
+		m.appendItem(tItem{kind: "note", text: "!" + cmd + "\n" + out})
+		m.reflow()
+		return m, nil
+	}
+	if strings.HasPrefix(text, "#") {
+		mem := strings.TrimSpace(strings.TrimPrefix(text, "#"))
+		if mem == "" {
+			return m, nil
+		}
+		ctx := NewToolCtx(m.cwd)
+		ctx.Home = cliHome()
+		r := runTool(ctx, "memory_write", map[string]any{"type": "preference", "text": mem, "scope": "zagy"})
+		if strings.HasPrefix(r, "ERROR") || strings.Contains(strings.ToLower(r), "error") {
+			m.appendItem(tItem{kind: "note", err: true, text: "Memory: " + r})
+		} else {
+			m.appendItem(tItem{kind: "note", text: "Remembered — “" + shortQuote(mem, 80) + "”"})
+		}
+		m.reflow()
+		return m, nil
+	}
 	if m.busy {
 		m.appendItem(tItem{kind: "note", text: "still working — esc to interrupt"})
 		m.reflow()
 		return m, nil
 	}
+	full := expandMentions(text, m.cwd)
 	m.appendItem(tItem{kind: "user", text: text})
 	m.reflow()
 	cmd := m.startTurns(func(emit func(Event)) {
-		m.agent.SendUser(text, emit)
+		m.agent.SendUser(full, emit)
 	})
 	return m, cmd
 }
@@ -419,8 +526,24 @@ func (m tuiModel) execSlash(text string) (tea.Model, tea.Cmd) {
 	switch cmd {
 	case "/quit", "/exit", "/q":
 		return m, m.quit()
-	case "/plan", "/agent", "/yolo":
+	case "/plan", "/agent", "/yolo", "/accept-edits":
 		m.setMode(strings.TrimPrefix(cmd, "/"))
+	case "/compact":
+		focus := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(arg, "focus:"), "focus"))
+		m.agent.CompactNow(focus, func(ev Event) {
+			if ev.Kind == "compact_thrash" {
+				m.appendItem(tItem{kind: "note", err: true, text: "compact thrash — skipped another L5"})
+			}
+		})
+		m.appendItem(tItem{kind: "note", text: "compacted — world.md saved"})
+	case "/undo":
+		m.appendItem(tItem{kind: "note", text: m.agent.UndoLast(func(Event) {})})
+	case "/skillify":
+		name := arg
+		if name == "" {
+			name = "session"
+		}
+		m.appendItem(tItem{kind: "note", text: m.agent.Skillify(name, func(Event) {})})
 	case "/approve":
 		if m.busy {
 			m.appendItem(tItem{kind: "note", text: "still working — esc to interrupt"})
@@ -437,10 +560,42 @@ func (m tuiModel) execSlash(text string) (tea.Model, tea.Cmd) {
 		} else {
 			m.openModels()
 		}
+	case "/providers", "/connect":
+		if arg != "" {
+			m.connectProvider(arg)
+		} else {
+			m.openProviders()
+		}
+	case "/mode":
+		if arg == "" {
+			m.appendItem(tItem{kind: "note", text: "mode: " + a.Mode + " — /mode plan|agent|accept-edits|yolo, or shift+tab"})
+		} else if arg == "plan" || arg == "agent" || arg == "accept-edits" || arg == "yolo" {
+			m.setMode(arg)
+		} else {
+			m.appendItem(tItem{kind: "note", err: true, text: "unknown mode " + arg})
+		}
+	case "/context":
+		m.appendItem(tItem{kind: "note", text: a.contextReport()})
+	case "/clear":
+		m.items = []tItem{{kind: "banner"}}
+		m.lastThought = -1
+	case "/copy":
+		if t := lastAssistantText(m.items); t != "" {
+			if err := clipboard.WriteAll(t); err != nil {
+				m.appendItem(tItem{kind: "note", err: true, text: "copy failed: " + err.Error()})
+			} else {
+				m.appendItem(tItem{kind: "note", text: "copied last reply"})
+			}
+		} else {
+			m.appendItem(tItem{kind: "note", text: "nothing to copy"})
+		}
 	case "/session":
 		m.appendItem(tItem{kind: "note", text: "session " + a.Session.ID})
 	case "/usage":
 		m.appendItem(tItem{kind: "note", text: m.usageLine()})
+	case "/onboarding":
+		m.startWelcome()
+		return m, m.welcome.schedule()
 	case "/help":
 		m.overlay = overlayHelp
 		m.helpTab = 0
@@ -465,12 +620,14 @@ func (m *tuiModel) setMode(mode string) {
 			text: "busy — switch modes when idle (esc to interrupt)"})
 		return
 	}
+	old := m.agent.Mode
 	m.agent.Mode = mode
+	m.agent.Session.append("mode", map[string]string{"from": old, "to": mode})
 	m.appendItem(tItem{kind: "note", text: "mode: " + mode})
 }
 
 func (m *tuiModel) cycleMode() {
-	order := []string{"agent", "plan", "yolo"}
+	order := []string{"plan", "agent", "accept-edits", "yolo"}
 	cur := 0
 	for i, v := range order {
 		if v == m.agent.Mode {
@@ -492,33 +649,14 @@ func (m *tuiModel) usageLine() string {
 // ---- model picker ----------------------------------------------------------
 
 func (m *tuiModel) openModels() {
-	var aliases []string
-	for alias := range m.agent.Cfg.Models {
-		aliases = append(aliases, alias)
-	}
-	sort.Strings(aliases)
-	m.models = m.models[:0]
-	cur := m.agent.Opts.Model
-	for _, alias := range aliases {
-		mr := modelRow{alias: alias, entry: m.agent.Cfg.Models[alias],
-			current: alias == cur || m.agent.ModelAlias == alias ||
-				strings.HasPrefix(m.agent.ModelAlias, alias+" ")}
-		m.models = append(m.models, mr)
-	}
-	m.modelSel = 0
-	for i, r := range m.models {
-		if r.current {
-			m.modelSel = i
-		}
-	}
-	m.overlay = overlayModels
-	m.layout()
+	m.openModelsFor("")
 }
 
 func (m *tuiModel) applyModel(alias string) {
 	a := m.agent
-	if _, ok := a.Cfg.Models[alias]; !ok {
-		m.appendItem(tItem{kind: "note", err: true, text: "no model " + alias})
+	pcfg, ok := a.Cfg.providerFor(alias)
+	if !ok {
+		m.appendItem(tItem{kind: "note", err: true, text: "no model " + alias + " — try provider/model, e.g. anthropic/claude-opus-5-5"})
 		return
 	}
 	if m.busy {
@@ -526,12 +664,12 @@ func (m *tuiModel) applyModel(alias string) {
 		m.appendItem(tItem{kind: "note", text: "model → " + alias + " (applies next turn)"})
 		return
 	}
-	if pcfg, ok := a.Cfg.providerFor(alias); ok {
-		a.Provider = pcfg
-		a.ModelAlias = alias + " (" + pcfg.Model + ")"
-		a.Opts.Model = alias
-		m.appendItem(tItem{kind: "note", text: "model: " + a.ModelAlias})
-	}
+	a.Provider = pcfg
+	a.ModelAlias = alias + " (" + pcfg.Model + ")"
+	a.Opts.Model = alias
+	a.Session.append("model_switch", map[string]string{"alias": alias, "id": pcfg.Model})
+	m.appendItem(tItem{kind: "note", text: "model: " + a.ModelAlias})
+	_ = setDefaultModel(cliHome(), alias)
 }
 
 func (m tuiModel) modelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -559,6 +697,192 @@ func (m tuiModel) modelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.reflow()
 		}
 		m.layout()
+	}
+	return m, nil
+}
+
+func (m *tuiModel) openProviders() {
+	m.provFilter = ""
+	m.provSel = 0
+	m.overlay = overlayProviders
+	m.layout()
+}
+
+func (m *tuiModel) connectProvider(id string) {
+	p := catalogProvider(id)
+	if p == nil {
+		m.appendItem(tItem{kind: "note", err: true, text: "unknown provider " + id})
+		return
+	}
+	switch p.Kind {
+	case "chatgpt":
+		m.overlay = overlayNone
+		m.appendItem(tItem{kind: "note", text: "ChatGPT OAuth lives in zcli and zdev — run `zcli` or `zdev`, then /login. Devin and API keys work here."})
+		m.layout()
+		return
+	case "devin":
+		m.connectDevin()
+		return
+	}
+	if ready, _ := providerStatus(*p); ready {
+		if models, err := liveFetch(*p); err == nil {
+			liveStore(p.ID, models)
+		}
+		m.openModelsFor(p.ID)
+		return
+	}
+	m.keyProvID = p.ID
+	m.keyBuf = ""
+	m.overlay = overlayKey
+	m.layout()
+}
+
+func (m *tuiModel) connectDevin() {
+	devinInvalidate()
+	if !devinReady() {
+		m.overlay = overlayNone
+		m.appendItem(tItem{kind: "note", err: true, text: devinHint()})
+		m.layout()
+		return
+	}
+	def := catalogProvider("devin")
+	if def == nil {
+		m.appendItem(tItem{kind: "note", err: true, text: "Devin is missing from the catalog"})
+		return
+	}
+	models, err := liveFetch(*def)
+	if err != nil {
+		m.overlay = overlayNone
+		m.appendItem(tItem{kind: "note", err: true, text: err.Error()})
+		m.layout()
+		return
+	}
+	liveStore("devin", models)
+	m.agent.Cfg = loadConfig(cliHome())
+	m.appendItem(tItem{kind: "note", text: fmt.Sprintf("Devin · %s · %d models", devinDetail(), len(models))})
+	m.openModelsFor("devin")
+}
+
+func (m *tuiModel) openModelsFor(provider string) {
+	cur := m.agent.Opts.Model
+	choices := m.agent.Cfg.availableModels(cur)
+	m.models = m.models[:0]
+	m.modelSel = 0
+	for _, c := range choices {
+		if provider != "" && c.provider != provider {
+			continue
+		}
+		mr := modelRow{
+			alias: c.alias,
+			entry: ModelEntry{Provider: c.provider, ID: c.id, Context: float64(c.context)},
+			current: c.current || c.alias == m.agent.Opts.Model ||
+				strings.HasPrefix(m.agent.ModelAlias, c.alias),
+		}
+		if mr.current {
+			m.modelSel = len(m.models)
+		}
+		m.models = append(m.models, mr)
+	}
+	m.overlay = overlayModels
+	m.layout()
+}
+
+func (m *tuiModel) saveProviderKey() {
+	id := m.keyProvID
+	key := strings.TrimSpace(m.keyBuf)
+	m.keyBuf = ""
+	if id == "" || key == "" {
+		m.overlay = overlayProviders
+		m.layout()
+		return
+	}
+	p := catalogProvider(id)
+	if p == nil {
+		m.overlay = overlayProviders
+		m.layout()
+		return
+	}
+	if err := storeKey(id, key); err != nil {
+		m.overlay = overlayNone
+		m.appendItem(tItem{kind: "note", err: true, text: p.Name + ": " + err.Error()})
+		m.layout()
+		return
+	}
+	wp := welcomeProv{id: p.ID, name: p.Name, env: "", kind: p.Kind, base: p.BaseURL}
+	if len(p.Env) > 0 {
+		wp.env = p.Env[0]
+	}
+	_ = ensureProvider(cliHome(), wp)
+	m.agent.Cfg = loadConfig(cliHome())
+	if models, err := liveFetch(*p); err == nil {
+		liveStore(p.ID, models)
+	}
+	m.keyProvID = ""
+	m.appendItem(tItem{kind: "note", text: "✓ " + catalogDisplayName(*p) + " key saved — works in zcli and zdev too"})
+	m.openModelsFor(p.ID)
+}
+
+func (m tuiModel) providersKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	rows := filterProviders(m.provFilter)
+	n := len(rows)
+	if m.provSel >= n && n > 0 {
+		m.provSel = n - 1
+	}
+	switch msg.String() {
+	case "esc":
+		m.overlay = overlayNone
+		m.layout()
+	case "up", "k":
+		if m.provSel > 0 {
+			m.provSel--
+		}
+	case "down", "j":
+		if m.provSel < n-1 {
+			m.provSel++
+		}
+	case "pgup":
+		m.provSel = 0
+	case "pgdown":
+		if n > 0 {
+			m.provSel = n - 1
+		}
+	case "enter":
+		if m.provSel >= 0 && m.provSel < n {
+			m.connectProvider(rows[m.provSel].ID)
+		}
+	case "backspace":
+		if m.provFilter != "" {
+			_, sz := utf8.DecodeLastRuneInString(m.provFilter)
+			m.provFilter = m.provFilter[:len(m.provFilter)-sz]
+			m.provSel = 0
+		}
+	default:
+		if msg.Type == tea.KeyRunes {
+			m.provFilter += string(msg.Runes)
+			m.provSel = 0
+		}
+	}
+	return m, nil
+}
+
+func (m tuiModel) keyEntryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.keyBuf = ""
+		m.keyProvID = ""
+		m.overlay = overlayProviders
+		m.layout()
+	case "enter":
+		m.saveProviderKey()
+	case "backspace":
+		if m.keyBuf != "" {
+			_, sz := utf8.DecodeLastRuneInString(m.keyBuf)
+			m.keyBuf = m.keyBuf[:len(m.keyBuf)-sz]
+		}
+	default:
+		if msg.Type == tea.KeyRunes {
+			m.keyBuf += string(msg.Runes)
+		}
 	}
 	return m, nil
 }
@@ -646,7 +970,7 @@ func shortcutRows() []helpRow {
 		{"\\ + enter", "Insert newline fallback"},
 		{"alt+enter, ctrl+j, shift+enter", "Insert newline"},
 		{"?", "Open shortcuts (empty input)"},
-		{"shift+tab", "Cycle mode: agent → plan → yolo"},
+		{"shift+tab", "Cycle mode: plan → agent → accept-edits → yolo"},
 		{"ctrl+r", "Toggle thought / draft view"},
 		{"esc", "Close overlay · interrupt · clear input"},
 		{"ctrl+c, ctrl+d", "Exit"},
@@ -868,6 +1192,9 @@ func stubToolResult(a *Agent, emit func(Event), bm map[string]any) {
 
 func (m *tuiModel) appendItem(it tItem) {
 	m.items = append(m.items, it)
+	if len(m.items) > 200 {
+		m.items = m.items[len(m.items)-200:]
+	}
 }
 
 func (m *tuiModel) reflow() {
@@ -939,6 +1266,14 @@ func (m tuiModel) overlayHeight() int {
 		return 3 + n + 1 // tabbar+title+note + rows + counter
 	case overlayModels:
 		return 1 + len(m.models) // title + rows
+	case overlayProviders:
+		n := len(filterProviders(m.provFilter))
+		if n > 12 {
+			n = 12
+		}
+		return 4 + n + 2
+	case overlayKey:
+		return 8
 	}
 	return 0
 }
@@ -979,6 +1314,9 @@ func runTUI(opts *RunOpts, cwd string) int {
 	}
 	bridge := &tuiBridge{done: make(chan struct{})}
 	m := newTUIModel(a, opts, cwd, bridge)
+	if welcomeNeeded() {
+		m.startWelcome()
+	}
 	p := tea.NewProgram(m)
 	bridge.prog = p
 	bridge.emit = func(ev Event) { p.Send(eventMsg{ev}) }

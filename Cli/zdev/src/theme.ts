@@ -17,6 +17,7 @@ export const BRAILLE = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 export const MODE_COLOR: Record<string, string> = {
   agent: "#ffffff", // ⏵⏵ bright
   plan: "#8a8a8a", // ⏸ dim — read-only
+  "accept-edits": "#d8d8d8",
   yolo: "#e8e8e8", // ⏵⏵ white — no guardrails
 };
 

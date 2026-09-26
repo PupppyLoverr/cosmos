@@ -99,6 +99,33 @@ fn skill_index(repo: &Path) -> Vec<String> {
     out
 }
 
+/// Latest world.md from COSMOS_CLI_HOME (any session) — keep goal/status.
+fn world_md() -> String {
+    let Some(home) = std::env::var_os("COSMOS_CLI_HOME") else {
+        return String::new();
+    };
+    let dir = PathBuf::from(home).join("world");
+    let Ok(rd) = fs::read_dir(&dir) else {
+        return String::new();
+    };
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let mt = e.metadata().and_then(|m| m.modified()).ok();
+        if let Some(t) = mt {
+            if newest.as_ref().map(|(ot, _)| t > *ot).unwrap_or(true) {
+                newest = Some((t, p));
+            }
+        }
+    }
+    newest
+        .and_then(|(_, p)| fs::read_to_string(p).ok())
+        .unwrap_or_default()
+}
+
 fn agents_md(repo: &Path) -> String {
     let mut parts = Vec::new();
     let root = repo.join("AGENTS.md");
@@ -160,6 +187,12 @@ pub fn context(vault: &Vault, repo: &Path, _harness: &str) -> Result<BootContext
                 "skill descriptions trimmed to names to fit the boot budget".to_string(),
             );
         }
+    }
+
+    let world = world_md();
+    if !world.is_empty() {
+        head.push_str("\n\n## World\n");
+        head.push_str(&world);
     }
 
     let mut body = agents_md(repo);

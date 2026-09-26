@@ -257,13 +257,22 @@ describe("zdev TUI in a terminal emulator", () => {
   test("/connect lists 9Router and OpenRouter and asks for a key", async () => {
     await type("/connect");
     await type("\r");
-    let s = await until((x) => x.includes("Connect a provider"));
-    for (const p of ["ChatGPT", "OpenRouter", "9Router", "Anthropic"]) expect(s).toContain(p);
+    let     s = await until((x) => x.includes("Providers"));
+    for (const p of ["ChatGPT", "Devin", "OpenRouter", "9Router", "Anthropic"]) expect(s).toContain(p);
     await type("9router");
     await type("\r");
     s = await until((x) => x.includes("9Router API key"));
     expect(s).toContain("localhost:20128");
     await type("\x1b");
+    await type("\x1b");
+  });
+
+  test("/providers opens the same picker as /connect", async () => {
+    await type("/providers");
+    await type("\r");
+    const s = await until((x) => x.includes("Providers"));
+    expect(s).toContain("Devin");
+    expect(s).toContain("ChatGPT");
     await type("\x1b");
   });
 
@@ -323,10 +332,10 @@ describe("zdev TUI in a terminal emulator", () => {
 
   test("shift+tab cycles the mode", async () => {
     await type("\x1b[Z");
-    await until((x) => x.includes("plan mode"));
+    await until((x) => x.includes("accept edits"));
     await type("\x1b[Z");
     await until((x) => x.includes("⏵⏵ yolo"));
     await type("\x1b[Z");
-    await until((x) => x.includes("⏵⏵ agent"));
+    await until((x) => x.includes("plan mode"));
   });
 });

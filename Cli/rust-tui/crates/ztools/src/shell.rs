@@ -1,5 +1,5 @@
-//! bash → zsandbox.exe (contract §5). Never a raw spawn when the sandbox
-//! binary is available.
+//! bash → zsandbox.exe (contract §5) + shell v2 job protocol.
+//! Additive fields: wait=now|next_write|exit, from_offset, timeout_s.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -7,9 +7,8 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::ToolContext;
+use crate::{jobs, ToolContext};
 
-/// Locate zsandbox.exe: ZSANDBOX_BIN env → next to current exe → PATH.
 fn sandbox_bin(ctx: &ToolContext) -> Option<PathBuf> {
     if let Some(b) = &ctx.sandbox_bin {
         return Some(b.clone());
@@ -30,7 +29,6 @@ fn sandbox_bin(ctx: &ToolContext) -> Option<PathBuf> {
             }
         }
     }
-    // PATH search
     if let Ok(path) = std::env::var("PATH") {
         for d in std::env::split_paths(&path) {
             for name in ["zsandbox.exe", "zsandbox"] {
@@ -44,8 +42,7 @@ fn sandbox_bin(ctx: &ToolContext) -> Option<PathBuf> {
     None
 }
 
-fn shell_argv(command: &str) -> Vec<String> {
-    // Git Bash when present, else powershell non-interactive (contract §1)
+pub fn shell_argv(command: &str) -> Vec<String> {
     if let Ok(path) = std::env::var("PATH") {
         for d in std::env::split_paths(&path) {
             let b = d.join("bash.exe");
@@ -67,32 +64,25 @@ fn shell_argv(command: &str) -> Vec<String> {
     ]
 }
 
-pub fn bash(ctx: &mut ToolContext, input: &Value) -> Result<String> {
-    let command = input["command"].as_str().unwrap_or("");
-    let timeout_s = input["timeout_s"].as_u64().unwrap_or(120).min(600);
-    let argv = shell_argv(command);
-    let net = if ctx.net_allow {
-        zsandbox::NetPolicy::Allow
-    } else {
-        zsandbox::NetPolicy::Deny
-    };
+fn deny_env_command(command: &str) -> bool {
+    let c = command.replace('\\', "/").to_ascii_lowercase();
+    c.contains("/.ssh") || c.contains("/.gnupg") || c.contains(".env")
+}
 
+fn run_blocking(ctx: &ToolContext, argv: &[String], timeout_s: u64) -> Result<(i32, String)> {
     if ctx.no_sandbox {
-        // explicitly operator-disabled
         let mut it = argv.iter();
         let prog = it.next().unwrap();
         let out = std::process::Command::new(prog)
             .args(it)
             .current_dir(&ctx.workspace)
             .output()?;
-        return Ok(format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ));
+        let code = out.status.code().unwrap_or(1);
+        let mut s = String::new();
+        s.push_str(&String::from_utf8_lossy(&out.stdout));
+        s.push_str(&String::from_utf8_lossy(&out.stderr));
+        return Ok((code, s));
     }
-
-    // Prefer the library in-process when linked (this crate), else the exe.
     let degraded_note = ctx
         .sandbox_degraded
         .as_ref()
@@ -110,27 +100,30 @@ pub fn bash(ctx: &mut ToolContext, input: &Value) -> Result<String> {
                 timeout_s.to_string(),
                 "--".into(),
             ];
-            args.extend(argv);
+            args.extend(argv.iter().cloned());
             let out = std::process::Command::new(bin)
                 .args(&args)
                 .current_dir(&ctx.workspace)
                 .output()?;
-            let mut s = String::new();
-            s.push_str(&degraded_note);
+            let mut s = degraded_note;
             s.push_str(&String::from_utf8_lossy(&out.stdout));
             s.push_str(&String::from_utf8_lossy(&out.stderr));
-            if out.status.code().unwrap_or(1) == 124 {
+            let code = out.status.code().unwrap_or(1);
+            if code == 124 {
                 s.push_str("\n[timeout]");
             }
-            Ok(s)
+            Ok((code, s))
         }
         None => {
-            // in-process fallback — zsandbox is linked into this binary
             let r = zsandbox::exec(&zsandbox::ExecOpts {
                 workspace: ctx.workspace.clone(),
-                net,
+                net: if ctx.net_allow {
+                    zsandbox::NetPolicy::Allow
+                } else {
+                    zsandbox::NetPolicy::Deny
+                },
                 timeout: Duration::from_secs(timeout_s),
-                argv,
+                argv: argv.to_vec(),
             })?;
             let mut s = degraded_note;
             if let Some(d) = &r.degraded {
@@ -141,7 +134,71 @@ pub fn bash(ctx: &mut ToolContext, input: &Value) -> Result<String> {
             if r.timed_out {
                 s.push_str("\n[timeout]");
             }
-            Ok(s)
+            Ok((r.code, s))
         }
     }
+}
+
+pub fn bash(ctx: &mut ToolContext, input: &Value) -> Result<String> {
+    let command = input["command"].as_str().unwrap_or("");
+    if deny_env_command(command) && ctx.sandbox_mode != "full" {
+        anyhow::bail!("sandbox deny: command touches ~/.ssh, ~/.gnupg, or .env");
+    }
+    if ctx.sandbox_mode == "read-only" {
+        anyhow::bail!("sandbox read-only: bash writes denied");
+    }
+    let timeout_s = input["timeout_s"].as_u64().unwrap_or(30).min(600);
+    let wait = input["wait"].as_str().unwrap_or("exit");
+    let from_offset = input["from_offset"].as_u64();
+    let tool_id = if ctx.current_tool_id.is_empty() {
+        format!("bash-{}", std::process::id())
+    } else {
+        ctx.current_tool_id.clone()
+    };
+    let session = if ctx.session_id.is_empty() {
+        "adhoc"
+    } else {
+        ctx.session_id.as_str()
+    };
+    let log = jobs::log_path(&ctx.home, session, &tool_id);
+
+    if let Some(off) = from_offset {
+        let (bytes, _n) = if log.is_file() {
+            jobs::read_from(&log, off)?
+        } else {
+            (Vec::new(), 0)
+        };
+        let raw = String::from_utf8_lossy(&bytes);
+        return Ok(jobs::middle_out_fence(&raw, 0, &log, 0));
+    }
+
+    let argv = shell_argv(command);
+
+    if wait == "now" {
+        let start = jobs::spawn_now(&argv, &ctx.workspace, log.clone())?;
+        return Ok(format!(
+            "{{\"task_id\":\"{}\",\"pid\":{},\"log_path\":\"{}\",\"offset\":{}}}",
+            start.task_id,
+            start.pid,
+            start.log_path.display().to_string().replace('\\', "/"),
+            start.offset
+        ));
+    }
+
+    if wait == "next_write" {
+        if !log.is_file() {
+            let _ = jobs::spawn_now(&argv, &ctx.workspace, log.clone())?;
+        }
+        let off = 0u64;
+        let (bytes, _) = jobs::wait_next_write(&log, off, Duration::from_secs(timeout_s))?;
+        let raw = String::from_utf8_lossy(&bytes);
+        let omitted = 0usize;
+        return Ok(jobs::middle_out_fence(&raw, 0, &log, omitted));
+    }
+
+    // wait=exit (default)
+    let (code, raw) = run_blocking(ctx, &argv, timeout_s)?;
+    let _ = jobs::append_log(&log, raw.as_bytes());
+    let omitted = raw.len().saturating_sub(8_000);
+    Ok(jobs::middle_out_fence(&raw, code, &log, omitted))
 }

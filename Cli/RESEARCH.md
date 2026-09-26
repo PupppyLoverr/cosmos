@@ -172,3 +172,18 @@ Research for the Cosmos CLI family. All clones live in `.research\` (gitignored)
   tasks/events/pages/meetings/briefings — the desktop app's own store, not an agent memory
   vault. Bridge uses `MERIDIAN_VAULT` (default `%USERPROFILE%\.meridian\vault`) per contract
   and never writes to the app vault.
+
+## 2026-09-26 addendum — harness kernel (implemented, not re-cloned)
+
+No new vendor clones. Ideas taken from the 2026-09-22 map and re-implemented against
+`CONTRACT.md` + `contracts/tools.json` in all three harnesses:
+
+- Five-layer compaction (Claude Code order) + Codex-style `world.md` rollover + Command Code
+  shell fencing / `wait` / `from_offset` / middle-out.
+- Tool-call repair + doom-loop (Command Code / Pi hashline STALE ±5 already in contract).
+- Permission × sandbox dials (Codex) as two flags; Shift+Tab cycles plan→agent→accept-edits→yolo.
+- Checkpoints + `/undo` without git (Claude Code). Fusion-lite: `task.write` defaults worktree.
+- `/skillify` / `/refine` / meridian `refine.*` (Grok Build + Prime). Autonomous gate flag stub.
+- `zgpui` typed ACP adapter; daily `zcli` does not link GPUI (Antigravity surface idea, not a rebuild).
+- Rejected again: 90-crate sprawl, Codex WFP/OS users, HTTP client/server split, 40-tool default
+  prompt, python-cloud revival, proprietary source.

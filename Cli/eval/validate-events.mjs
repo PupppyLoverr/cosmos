@@ -8,6 +8,9 @@ const KINDS = new Set([
   "tool_call", "tool_result", "plan", "permission_request",
   "permission_decision", "usage", "model_switch", "cache_break",
   "compaction", "subagent_start", "subagent_end", "handoff", "error", "mode",
+  "snip", "compact", "compact_thrash", "tool_repair",
+  "checkpoint", "verify", "self_improve", "job_start", "job_end",
+  "doom_loop", "aside",
 ]);
 const HARNESSES = new Set(["zcli", "zdev", "zagy"]);
 const ULID = /^[0-9a-z]{26}$/;

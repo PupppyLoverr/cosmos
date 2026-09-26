@@ -438,6 +438,7 @@ fn status_line(app: &App, w: usize) -> Line<'static> {
     match app.mode {
         Mode::Plan => left.push(Span::styled("  plan mode", theme::fg(YELLOW))),
         Mode::Yolo => left.push(Span::styled("  yolo", theme::fg(RED))),
+        Mode::AcceptEdits => left.push(Span::styled("  accept-edits", theme::fg(ACCENT))),
         Mode::Agent => {}
     }
     let first = app.input.first().copied();
@@ -546,7 +547,7 @@ fn help_rows(w: usize) -> Vec<Line<'static>> {
         ("↑ ↓", "prompt history"),
         ("ctrl+w · ctrl+u · ctrl+k", "delete word · to start · to end"),
         ("ctrl+l", "clear the screen"),
-        ("/", "commands — /model /connect /login /resume /review …"),
+        ("/", "commands — /model /providers /connect /login /resume /review …"),
     ];
     let kw = ROWS.iter().map(|(k, _)| width_of(k)).max().unwrap_or(0);
     let mut out: Vec<Line<'static>> = ROWS
@@ -630,7 +631,13 @@ fn model_picker(app: &App, filter: &[char], sel: usize, effort: usize, w: usize)
     out.push(Line::default());
     if let Some(m) = order.get(sel).map(|&i| &app.models[i]) {
         let mut detail = if m.free() {
-            let what = if m.alias.starts_with("chatgpt/") { " · included in your ChatGPT plan" } else { " · no quota consumed" };
+            let what = if m.alias.starts_with("chatgpt/") {
+                " · included in your ChatGPT plan"
+            } else if m.alias.starts_with("devin/") {
+                " · included in your Devin subscription"
+            } else {
+                " · no quota consumed"
+            };
             vec![sp("  "), Span::styled(" FREE ", Style::new().fg(ratatui::style::Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)), dim(what)]
         } else {
             vec![sp("  "), sp(format!("${:.2} in · ${:.2} out", m.price.input, m.price.output)), dim(" per 1M tokens")]
@@ -660,16 +667,27 @@ fn connect_picker(filter: &[char], sel: usize, w: usize) -> (Vec<Line<'static>>,
     for (vi, &i) in order.iter().enumerate().skip(top).take(MODEL_ROWS) {
         let p = &ps[i];
         let on = vi == sel;
-        let status = if p.is_subscription() {
-            match zcore::chatgpt::load() {
-                Some(t) => Span::styled(format!("✓ signed in{}", t.email.map(|e| format!(" as {e}")).unwrap_or_default()), theme::fg(GREEN)),
+        let status = match p.kind.as_str() {
+            "chatgpt" => match zcore::chatgpt::load() {
+                Some(t) => Span::styled(
+                    format!("✓ signed in{}", t.email.map(|e| format!(" as {e}")).unwrap_or_default()),
+                    theme::fg(GREEN),
+                ),
                 None => dim("sign in"),
-            }
-        } else {
-            match zcore::creds::key_for(&p.id, &p.env) {
+            },
+            "devin" => match zcore::devin::peek() {
+                Some((true, d)) => Span::styled(format!("✓ {d}"), theme::fg(GREEN)),
+                Some((false, d)) => dim(d),
+                None => match zcore::live::cached("devin") {
+                    Some(m) if !m.is_empty() => Span::styled(format!("✓ cached · {} models", m.len()), theme::fg(GREEN)),
+                    _ if zcore::devin::signed_in() => dim("enter to connect"),
+                    _ => dim(if zcore::devin::executable().is_some() { "enter to connect" } else { "devin auth login" }),
+                },
+            },
+            _ => match zcore::creds::key_for(&p.id, &p.env) {
                 Some((k, src)) => Span::styled(format!("✓ {} · {}", zcore::creds::mask(&k), src.label()), theme::fg(GREEN)),
                 None => dim(format!("{} models", p.models.len())),
-            }
+            },
         };
         out.push(Line::from(vec![
             if on { Span::styled("❯ ", ACCENT_BOLD) } else { dim("· ") },
@@ -682,10 +700,10 @@ fn connect_picker(filter: &[char], sel: usize, w: usize) -> (Vec<Line<'static>>,
     }
     out.push(Line::default());
     if let Some(p) = order.get(sel).map(|&i| &ps[i]) {
-        let how = if p.is_subscription() {
-            "Opens your browser — use your ChatGPT Plus/Pro plan instead of an API key".to_string()
-        } else {
-            format!("Paste a key, or set {} · {}", p.env.join(" / "), p.base_url)
+        let how = match p.kind.as_str() {
+            "chatgpt" => "Opens your browser — use your ChatGPT Plus/Pro plan instead of an API key".to_string(),
+            "devin" => "Uses your Devin subscription models. Cosmos runs the tools — not Devin's agent.".to_string(),
+            _ => format!("Paste a key, or set {} · {}", p.env.join(" / "), p.base_url),
         };
         out.push(Line::from(dim(format!("  {}", ellipsize(&how, w.saturating_sub(3))))));
     }
@@ -847,7 +865,7 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
         }
         Some(Popup::Connect { filter, sel }) => {
             out.push(rule(w));
-            out.push(Line::from(vec![sp("❯ "), dim("/connect")]));
+            out.push(Line::from(vec![sp("❯ "), dim("/providers")]));
             let base = out.len() as u16;
             let (rows, (r, c)) = connect_picker(filter, *sel, w);
             out.extend(rows);

@@ -17,6 +17,7 @@ import { HeaderBox, TranscriptItem, type ReadCache } from "../components/Transcr
 import { parseReadDetail } from "../diff";
 import { RejectedKey } from "../live";
 import { PINNED, pitchFor } from "../pinned";
+import * as devin from "../devin";
 import type { RunOpts } from "../proto";
 import { applyUpdate, settle, summarizeArg } from "../reducer";
 import { DIM, GRAY, GREEN, ROSE } from "../theme";
@@ -45,7 +46,7 @@ const note = (text: string, tone?: "ok" | "warn" | "error"): Item => ({ kind: "n
 export type Boot = { cwd: string; model?: string; mode?: string; opts: RunOpts };
 export type ExitReason = "quit" | "onboarding";
 
-const MODES = ["agent", "plan", "yolo"];
+const MODES = ["plan", "agent", "accept-edits", "yolo"];
 const EFFORTS = ["", "low", "medium", "high"];
 const INIT_PROMPT =
   "Explore this repository and write an AGENTS.md at its root for coding agents: what the project is, how the code is laid out, how to build, run, test and lint it, the conventions to follow, and anything surprising. Read the files you describe; keep it short and accurate. If AGENTS.md exists, improve it instead of replacing it.";
@@ -70,7 +71,7 @@ const fmtK = (n: number) => (n >= 1_000_000 ? `${(n / 1_048_576).toFixed(n % 1_0
 const money = (x: number) => `$${x.toFixed(2).replace(/\.?0+$/, "")}`;
 
 function priceText(m: { price: Model["price"]; free: boolean; kind: string }): string {
-  if (m.kind === "chatgpt") return "plan";
+  if (m.kind === "chatgpt" || m.kind === "devin") return "plan";
   if (m.free) return "free";
   return `${money(m.price.input)}/${money(m.price.output)}`;
 }
@@ -323,10 +324,11 @@ export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitRe
     async (p: ProviderDef, justStored: boolean) => {
       const ac = new AbortController();
       connectAbort.current = ac;
-      setPopup({ kind: "connect", c: { step: "wait", provider: p, message: `Checking your key and fetching live models from ${p.base_url.split("/")[2]}…` } });
+      const host = p.base_url.split("/")[2] || p.name;
+      setPopup({ kind: "connect", c: { step: "wait", provider: p, message: `Checking your key and fetching live models from ${host}…` } });
       try {
         const models = await driver.fetchModels(p.id, ac.signal);
-        setPopup({ kind: "connect", c: { step: "models", provider: p, models, query: "", sel: 0, source: `${models.length} models live from ${p.base_url.split("/")[2]}` } });
+        setPopup({ kind: "connect", c: { step: "models", provider: p, models, query: "", sel: 0, source: `${models.length} models live from ${host}` } });
       } catch (e: any) {
         if (ac.signal.aborted) return;
         if (e instanceof RejectedKey && justStored) {
@@ -360,6 +362,15 @@ export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitRe
             setPopup(null);
             say(`Sign-in failed: ${e?.message ?? e}`, "error");
           });
+        return;
+      }
+      if (p.kind === "devin") {
+        devin.invalidate();
+        if (devin.ready()) void fetchForConnect(p, false);
+        else {
+          setPopup(null);
+          say(devin.hint(), "error");
+        }
         return;
       }
       const ready = driver.providers().find((x) => x.def.id === p.id)?.ready;
@@ -436,6 +447,7 @@ export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitRe
           if (args) void setModelTo(args);
           else void openModelPicker();
           return;
+        case "providers":
         case "connect": {
           if (args) {
             const p = driver.providers().find((x) => x.def.id === args || x.def.name.toLowerCase() === args.toLowerCase());
@@ -456,15 +468,31 @@ export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitRe
           return;
         }
         case "mode":
-          if (!args) return say(`Mode: ${mode} — /mode plan|agent|yolo, or shift+tab to cycle`);
-          if (!MODES.includes(args)) return say(`Unknown mode ${args} — plan, agent or yolo`, "error");
+          if (!args) return say(`Mode: ${mode} — /mode plan|agent|accept-edits|yolo, or shift+tab to cycle`);
+          if (!MODES.includes(args)) return say(`Unknown mode ${args} — plan, agent, accept-edits or yolo`, "error");
           return void setModeTo(args);
         case "plan":
         case "agent":
         case "yolo":
+        case "accept-edits":
           return void setModeTo(name);
         case "approve":
           return void runPrompt("session/approve");
+        case "compact": {
+          const focus = args.replace(/^focus:?\s*/, "");
+          driver.agent?.compactNow(focus || undefined, () => {});
+          return say(focus ? `Compacted — focus: ${focus}` : "Compacted — world.md saved", "ok");
+        }
+        case "undo": {
+          const msg = driver.agent?.undoLast(() => {}) ?? "no session";
+          return say(msg, msg.startsWith("undo") ? "error" : "ok");
+        }
+        case "skillify": {
+          const msg = driver.agent?.skillify(args || "session", () => {}) ?? "no session";
+          return say(msg, msg.includes("wrote") ? "ok" : "error");
+        }
+        case "refine":
+          return say("Refine proposes a bounded skill edit via meridian refine.* — use /skillify first", "ok");
         case "usage": {
           const u = tr.usage;
           const rl = driver.rateLimits();
@@ -963,7 +991,7 @@ export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitRe
     const keys: Row[] = [
       ["enter", "send · \\+enter or ctrl+j for a new line"],
       ["esc", "interrupt the agent · close menus"],
-      ["shift+tab", "cycle agent → plan → yolo"],
+      ["shift+tab", "cycle plan → agent → accept-edits → yolo"],
       ["↑ ↓", "prompt history · move between lines"],
       ["@", "attach a file (fuzzy search)"],
       ["!cmd", "run a shell command; its output rides with your next message"],
@@ -1048,13 +1076,13 @@ export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitRe
     if (c.step === "provider") {
       overlay = (
         <Picker
-          title="Connect a provider"
+          title="Providers"
           subtitle="Keys stay on this machine (Windows Credential Manager) and work in zcli too."
           query={c.query}
           placeholder="Type to search providers"
           rows={providerRows(c.query).map((x) => ({
             key: x.def.id,
-            label: x.def.kind === "chatgpt" ? "ChatGPT" : x.def.name,
+            label: x.def.kind === "chatgpt" ? "ChatGPT" : x.def.kind === "devin" ? "Devin" : x.def.name,
             detail: ` ${pitchFor(x.def)}`,
             tag: x.ready ? `✓ ${x.detail}` : undefined,
           }))}
@@ -1117,7 +1145,7 @@ export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitRe
               key: m.id,
               label: m.id,
               detail: m.name !== m.id ? ` ${m.name}` : undefined,
-              right: `${fmtK(m.context)}  ${c.provider.kind === "chatgpt" ? "plan" : m.price[0] || m.price[1] ? `${money(m.price[0])}/${money(m.price[1])}` : c.provider.id === "openrouter" ? "free" : ""}`,
+              right: `${fmtK(m.context)}  ${c.provider.kind === "chatgpt" || c.provider.kind === "devin" ? "plan" : m.price[0] || m.price[1] ? `${money(m.price[0])}/${money(m.price[1])}` : c.provider.id === "openrouter" ? "free" : ""}`,
             };
           })}
           sel={c.sel}

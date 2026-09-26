@@ -176,6 +176,13 @@ pub struct RunOpts {
     pub resume: Option<String>,
     pub approve_plan: bool,
     pub allow_escalation: Vec<String>,
+    pub sandbox: Option<String>,
+    pub ask: Option<String>,
+    pub autonomous: bool,
+    pub autonomous_gate: Option<String>,
+    pub allow_self_mutate: bool,
+    pub arena: bool,
+    pub self_improve: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

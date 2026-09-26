@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
 
 type Agent struct {
@@ -33,7 +35,20 @@ type Agent struct {
 	// LogW receives the per-turn usage line; io.Discard silences it (TUI).
 	LogW io.Writer
 	// task{worktree:true} checkouts — removed on cleanup only if clean (§10)
-	Worktrees [][2]string
+	Worktrees       [][2]string
+	World           World
+	LastModelAt     *time.Time
+	PrefixHash      string
+	Doom            []string
+	SandboxMode     string
+	AskMode         string
+	ImproveEnabled  bool
+	ForceCompact    bool
+	CompactFocus    string
+	StaleHits       int
+	AllowSelfMutate bool
+	LastL5Before    int
+	LastL5After     int
 }
 
 func systemSnippet() string {
@@ -126,6 +141,11 @@ func NewAgent(opts *RunOpts, harness, cwd string) (*Agent, error) {
 	ctx := NewToolCtx(ws)
 	ctx.LargeReadLines = cfg.LargeRead
 	ctx.NoSandbox = opts.NoSandbox
+	ctx.Home = home
+	ctx.SandboxMode = opts.Sandbox
+	if ctx.SandboxMode == "" {
+		ctx.SandboxMode = "workspace-write"
+	}
 	ctx.Escalations = opts.AllowEscalation
 	for _, e := range opts.AllowEscalation {
 		if e == "network" {
@@ -161,7 +181,54 @@ func NewAgent(opts *RunOpts, harness, cwd string) (*Agent, error) {
 	for _, s := range specs {
 		a.Tools = append(a.Tools, s)
 	}
+	a.Ctx.SessionID = a.Session.ID
+	restoreReadState(a.Ctx, a.Messages)
+	a.World = loadWorld(home, a.Session.ID)
+	a.PrefixHash = prefixHash(a.System, ToolsJSON)
+	a.SandboxMode = ctx.SandboxMode
+	a.AskMode = opts.Ask
+	if a.AskMode == "" {
+		a.AskMode = "on-request"
+	}
+	if opts.SelfImprove != nil {
+		a.ImproveEnabled = *opts.SelfImprove
+	} else {
+		a.ImproveEnabled = opts.Output == "text"
+	}
+	a.AllowSelfMutate = opts.AllowSelfMutate
 	return a, nil
+}
+
+func restoreReadState(ctx *ToolCtx, messages []map[string]any) {
+	paths := map[string]string{}
+	for _, m := range messages {
+		for _, b := range anySlice(m["content"]) {
+			bm, _ := b.(map[string]any)
+			if strv(bm, "type") == "tool_use" && strv(bm, "name") == "read" {
+				inp, _ := bm["input"].(map[string]any)
+				if p := strv(inp, "path"); p != "" {
+					if abs, err := resolve(ctx, p); err == nil {
+						paths[strv(bm, "id")] = abs
+					}
+				}
+			}
+			if strv(bm, "type") == "tool_result" {
+				if err, _ := bm["is_error"].(bool); err {
+					continue
+				}
+				c := strv(bm, "content")
+				if i := strings.Index(c, "file_sha256="); i >= 0 {
+					sha := c[i+12:]
+					if len(sha) >= 64 {
+						sha = sha[:64]
+					}
+					if p, ok := paths[strv(bm, "tool_use_id")]; ok && len(sha) == 64 {
+						ctx.ReadState[p] = sha
+					}
+				}
+			}
+		}
+	}
 }
 
 func (a *Agent) permitted(name string) string {
@@ -170,6 +237,9 @@ func (a *Agent) permitted(name string) string {
 	}
 	if a.Mode == "plan" && !PlanTools[name] {
 		return "deny"
+	}
+	if a.Mode == "accept-edits" && (name == "write" || name == "edit") {
+		return "allow"
 	}
 	for _, t := range a.Opts.Allow {
 		if t == name {
@@ -183,6 +253,9 @@ func (a *Agent) permitted(name string) string {
 	}
 	for _, t := range a.Cfg.PermAsk {
 		if t == name {
+			if a.AskMode == "never" {
+				return "deny"
+			}
 			return "ask"
 		}
 	}
@@ -191,10 +264,56 @@ func (a *Agent) permitted(name string) string {
 
 func (a *Agent) SendUser(text string, emit func(Event)) {
 	emit(a.Session.append("user", map[string]string{"text": text}))
+	a.World.SetGoalIfEmpty(text)
+	saveWorld(a.Home, a.Session.ID, a.World)
 	a.Messages = append(a.Messages, map[string]any{
 		"role":    "user",
 		"content": []any{map[string]any{"type": "text", "text": text}},
 	})
+}
+
+func (a *Agent) CompactNow(focus string, emit func(Event)) {
+	a.ForceCompact = true
+	a.CompactFocus = focus
+	a.maybeCompact(emit)
+	a.ForceCompact = false
+	a.CompactFocus = ""
+}
+
+func (a *Agent) UndoLast(emit func(Event)) string {
+	p, err := ckptRestoreLast(a.Home, a.Session.ID)
+	if err != nil {
+		return "undo failed: " + err.Error()
+	}
+	emit(a.Session.append("checkpoint", map[string]any{"op": "restore", "path": p}))
+	return "restored " + p
+}
+
+func (a *Agent) Skillify(name string, emit func(Event)) string {
+	if !a.ImproveEnabled && !a.Opts.Yolo {
+		return "self_improve disabled"
+	}
+	dest, err := skillify(a.Home, name, a.World, false, a.AllowSelfMutate)
+	if err != nil {
+		return err.Error()
+	}
+	emit(a.Session.append("self_improve", improveEvent("skillify", map[string]any{"kind": "skill", "name": name})))
+	return "wrote " + dest
+}
+
+func (a *Agent) contextReport() string {
+	tokens := estimateTokens(a.Messages, a.BootTokens)
+	budget := int(a.Provider.Context)
+	if budget == 0 {
+		budget = 128000
+	}
+	pct := 0
+	if budget > 0 {
+		pct = tokens * 100 / budget
+	}
+	warm := cacheWarm(a.LastModelAt, a.PrefixHash, a.PrefixHash, time.Now(), 4*time.Minute)
+	b, _ := json.Marshal(map[string]any{"tokens_in": tokens, "tokens_budget": budget, "percent": pct, "cache_warm": warm})
+	return string(b)
 }
 
 func (a *Agent) ApprovePlan(emit func(Event)) {
@@ -236,7 +355,7 @@ func (a *Agent) Turn(emit func(Event)) (bool, error) {
 	req := map[string]any{
 		"system":     a.System,
 		"tools":      a.Tools,
-		"messages":   a.Messages,
+		"messages":   layer4(a.Messages),
 		"session_id": a.Session.ID,
 		"max_tokens": 4096,
 	}
@@ -294,8 +413,15 @@ func (a *Agent) Turn(emit func(Event)) (bool, error) {
 	if w == nil {
 		w = os.Stderr
 	}
-	fmt.Fprintf(w, "turn · in %d · cache_r %d · cache_w %d · out %d · %s · Σ $%.4f · ctx n/a\n",
-		usage.Input, usage.CacheRead, usage.CacheWrite, usage.Output, costStr, a.CumUSD)
+	var ctxPct int
+	if r := a.contextReport(); r != "" {
+		var m map[string]any
+		if json.Unmarshal([]byte(r), &m) == nil {
+			ctxPct = int(numv(m, "percent"))
+		}
+	}
+	fmt.Fprintf(w, "turn · in %d · cache_r %d · cache_w %d · out %d · %s · Σ $%.4f · ctx %d%%\n",
+		usage.Input, usage.CacheRead, usage.CacheWrite, usage.Output, costStr, a.CumUSD, ctxPct)
 	var blocks []any
 	if text.Len() > 0 {
 		blocks = append(blocks, map[string]any{"type": "text", "text": text.String()})
@@ -305,10 +431,42 @@ func (a *Agent) Turn(emit func(Event)) (bool, error) {
 			"id": c["id"], "name": c["name"], "input": c["input"]})
 	}
 	a.Messages = append(a.Messages, map[string]any{"role": "assistant", "content": blocks})
+	now := time.Now()
+	a.LastModelAt = &now
 	return len(calls) == 0, nil
 }
 
 func (a *Agent) ExecTool(id, name string, inp map[string]any, emit func(Event)) (string, bool) {
+	repaired := repairTool(name, inp)
+	for _, r := range repaired.Repairs {
+		emit(a.Session.append("tool_repair", map[string]any{"from": r.From, "to": r.To, "reason": r.Reason}))
+	}
+	if repaired.Reject != "" {
+		a.Session.append("tool_call", map[string]any{"id": id, "name": name, "input": inp})
+		emit(a.Session.append("tool_result", map[string]any{"tool_use_id": id, "name": name, "content": repaired.Reject, "is_error": true}))
+		a.Messages = append(a.Messages, map[string]any{
+			"role":    "user",
+			"content": []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": repaired.Reject, "is_error": true}},
+		})
+		return repaired.Reject, true
+	}
+	name = repaired.Name
+	inp = repaired.Input
+	h := callHash(name, inp)
+	a.Doom = append(a.Doom, h)
+	if len(a.Doom) > 3 {
+		a.Doom = a.Doom[1:]
+	}
+	if len(a.Doom) == 3 && a.Doom[0] == a.Doom[1] && a.Doom[1] == a.Doom[2] {
+		msg := "doom_loop: same tool+args fired 3 times with no file change — stop and ask"
+		emit(a.Session.append("doom_loop", map[string]any{"tool": name, "input": inp}))
+		a.Messages = append(a.Messages, map[string]any{
+			"role":    "user",
+			"content": []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": msg, "is_error": true}},
+		})
+		return msg, true
+	}
+	a.Ctx.CurrentToolID = id
 	a.Session.append("tool_call", map[string]any{"id": id, "name": name, "input": inp})
 	var text string
 	var isErr bool
@@ -371,11 +529,40 @@ func (a *Agent) dispatch(name string, inp map[string]any, emit func(Event)) (str
 		}
 		return fmt.Sprintf("escalation denied: %s — rerun with --allow-escalation %s", cap, cap), true
 	case "task":
-		wt, _ := inp["worktree"].(bool)
+		write, _ := inp["write"].(bool)
+		wt, ok := inp["worktree"].(bool)
+		if !ok {
+			wt = write
+		}
 		return a.subagent(strv(inp, "prompt"), wt, emit), false
+	case "context_remaining":
+		return a.contextReport(), false
+	case "new_context":
+		a.CompactNow("", emit)
+		return "reseeding from world.md\n" + a.World.Render(), false
 	}
 	out := runTool(a.Ctx, name, inp)
-	return out, strings.HasPrefix(out, "ERROR")
+	err := strings.HasPrefix(out, "ERROR") || strings.Contains(out, "STALE")
+	if err && strings.Contains(out, "STALE") {
+		a.StaleHits++
+		if a.StaleHits >= 2 && a.ImproveEnabled {
+			emit(a.Session.append("self_improve", improveEvent("correction", map[string]any{"text": correctionRow(name, "re-read then edit")})))
+		}
+	}
+	if !err && (name == "write" || name == "edit") {
+		if p := strv(inp, "path"); p != "" {
+			if abs, e := resolve(a.Ctx, p); e == nil {
+				if b, e2 := os.ReadFile(abs); e2 == nil {
+					a.World.TouchFile(p, b)
+					saveWorld(a.Home, a.Session.ID, a.World)
+				}
+			}
+			if diag := afterWrite(a.Workspace, p); diag != "" {
+				emit(a.Session.append("verify", map[string]any{"path": p, "text": diag}))
+			}
+		}
+	}
+	return out, err
 }
 
 // addWorktree runs `git worktree add COSMOS_CLI_HOME\worktrees\<session>\<child>`
@@ -400,6 +587,9 @@ func (a *Agent) childCtx(workspace string) *ToolCtx {
 	c.NoSandbox = a.Ctx.NoSandbox
 	c.LargeReadLines = a.Ctx.LargeReadLines
 	c.MCPServers = a.Ctx.MCPServers
+	c.Home = a.Ctx.Home
+	c.SessionID = a.Ctx.SessionID
+	c.SandboxMode = a.Ctx.SandboxMode
 	return c
 }
 
@@ -507,45 +697,96 @@ func trunc(s string, n int) string {
 }
 
 func (a *Agent) maybeCompact(emit func(Event)) {
-	est := func(m map[string]any) uint64 {
-		var t uint64
-		for _, b := range anySlice(m["content"]) {
-			bm, _ := b.(map[string]any)
-			if s := strv(bm, "text"); s != "" {
-				t += uint64(len(s) / 4)
-			} else if s := strv(bm, "content"); s != "" {
-				t += uint64(len(s) / 4)
-			} else {
-				t += 8
-			}
+	prefixNow := prefixHash(a.System, ToolsJSON)
+	warm := cacheWarm(a.LastModelAt, prefixNow, a.PrefixHash, time.Now(), 4*time.Minute)
+	runHooks(a.Cfg, "pre_compact", "", map[string]any{}, a.Session.ID)
+	ctxWin := int(a.Provider.Context)
+	if ctxWin == 0 {
+		ctxWin = 128000
+	}
+	out := compactMsgs(&a.Messages, a.Session.ID, a.Home, a.Ctx.LargeReadLines, ctxWin, a.BootTokens, warm, a.ForceCompact, a.CompactFocus, 6, a.LastL5Before, a.LastL5After)
+	if out.World != "" {
+		a.World.ApplyCompactMd(out.World)
+		saveWorld(a.Home, a.Session.ID, a.World)
+		a.LastL5Before = out.Before
+		a.LastL5After = out.After
+	}
+	for _, ev := range out.Events {
+		emit(a.Session.append(ev.Kind, ev.Data))
+	}
+	a.PrefixHash = prefixNow
+}
+
+type toolCall struct {
+	ID, Name string
+	Input    map[string]any
+}
+
+func (a *Agent) ExecToolsBatch(calls []toolCall, emit func(Event)) [][3]any {
+	var ro, wr []toolCall
+	for _, c := range calls {
+		if ReadOnlyTools[c.Name] {
+			ro = append(ro, c)
+		} else {
+			wr = append(wr, c)
 		}
-		return t
 	}
-	var total uint64 = uint64(a.BootTokens)
-	for _, m := range a.Messages {
-		total += est(m)
+	var out [][3]any
+	if len(ro) > 1 {
+		slice := ro
+		var rest []toolCall
+		if len(slice) > 8 {
+			rest = slice[8:]
+			slice = slice[:8]
+		}
+		type res struct {
+			c     toolCall
+			text  string
+			state map[string]string
+		}
+		ch := make([]res, len(slice))
+		var wg sync.WaitGroup
+		for i, c := range slice {
+			wg.Add(1)
+			go func(i int, c toolCall) {
+				defer wg.Done()
+				ctx := a.childCtx(a.Ctx.Workspace)
+				ctx.CurrentToolID = c.ID
+				ctx.ReadState = map[string]string{}
+				for k, v := range a.Ctx.ReadState {
+					ctx.ReadState[k] = v
+				}
+				text := runTool(ctx, c.Name, c.Input)
+				ch[i] = res{c, text, ctx.ReadState}
+			}(i, c)
+		}
+		wg.Wait()
+		for _, r := range ch {
+			for k, v := range r.state {
+				a.Ctx.ReadState[k] = v
+			}
+			a.Session.append("tool_call", map[string]any{"id": r.c.ID, "name": r.c.Name, "input": r.c.Input})
+			err := strings.HasPrefix(r.text, "ERROR")
+			emit(a.Session.append("tool_result", map[string]any{"tool_use_id": r.c.ID, "name": r.c.Name, "content": r.text, "is_error": err}))
+			a.Messages = append(a.Messages, map[string]any{
+				"role":    "user",
+				"content": []any{map[string]any{"type": "tool_result", "tool_use_id": r.c.ID, "content": r.text, "is_error": err}},
+			})
+			out = append(out, [3]any{r.c.Name, r.text, err})
+		}
+		for _, c := range rest {
+			text, err := a.ExecTool(c.ID, c.Name, c.Input, emit)
+			out = append(out, [3]any{c.Name, text, err})
+		}
+	} else {
+		for _, c := range ro {
+			text, err := a.ExecTool(c.ID, c.Name, c.Input, emit)
+			out = append(out, [3]any{c.Name, text, err})
+		}
 	}
-	if total <= a.Provider.Context*8/10 {
-		return
+	for _, c := range wr {
+		text, err := a.ExecTool(c.ID, c.Name, c.Input, emit)
+		out = append(out, [3]any{c.Name, text, err})
 	}
-	before := total
-	head, tail := 2, 6
-	if len(a.Messages) <= head+tail {
-		return
-	}
-	dropped := len(a.Messages) - head - tail
-	var next []map[string]any
-	next = append(next, a.Messages[:head]...)
-	next = append(next, map[string]any{"role": "user", "content": []any{
-		map[string]any{"type": "text", "text": fmt.Sprintf(
-			"[compaction: %d earlier messages elided — see session log for detail]", dropped)}}})
-	next = append(next, a.Messages[len(a.Messages)-tail:]...)
-	a.Messages = next
-	runHooks(a.Cfg, "pre_compact", "", map[string]any{"before_tokens": before}, a.Session.ID)
-	var after uint64 = uint64(a.BootTokens)
-	for _, m := range a.Messages {
-		after += est(m)
-	}
-	emit(a.Session.append("compaction", map[string]any{
-		"before_tokens": before, "after_tokens": after, "reason": "context>80%"}))
+	return out
 }

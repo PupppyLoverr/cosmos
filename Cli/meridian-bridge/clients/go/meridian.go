@@ -185,6 +185,47 @@ func (b *Bridge) PlaybookGet(name string) (string, error) {
 	return out.Body, err
 }
 
+func (b *Bridge) WorldUpsert(sessionID, markdown string) (string, error) {
+	var out struct {
+		Path string `json:"path"`
+	}
+	err := b.Call("world.upsert", map[string]any{"session_id": sessionID, "markdown": markdown}, &out)
+	return out.Path, err
+}
+
+func (b *Bridge) WorldGet(sessionID string) (string, int, error) {
+	var out struct {
+		Markdown string `json:"markdown"`
+		Tokens   int    `json:"tokens"`
+	}
+	err := b.Call("world.get", map[string]any{"session_id": sessionID}, &out)
+	return out.Markdown, out.Tokens, err
+}
+
+func (b *Bridge) RefinePropose(target, diff, evidence string) (string, error) {
+	var out struct {
+		ID string `json:"id"`
+	}
+	err := b.Call("refine.propose", map[string]any{"target": target, "diff": diff, "evidence": evidence}, &out)
+	return out.ID, err
+}
+
+func (b *Bridge) RefineApply(id string) error {
+	return b.Call("refine.apply", map[string]any{"id": id}, nil)
+}
+
+func (b *Bridge) RefineRollback(id string) error {
+	return b.Call("refine.rollback", map[string]any{"id": id}, nil)
+}
+
+func (b *Bridge) SessionSearch(query string, k int) ([]SearchHit, error) {
+	var out struct {
+		Results []SearchHit `json:"results"`
+	}
+	err := b.Call("session.search", map[string]any{"query": query, "k": k}, &out)
+	return out.Results, err
+}
+
 func (b *Bridge) SessionRegister(sessionID, harness, logPath, title string) (string, error) {
 	var out struct {
 		Path string `json:"path"`

@@ -528,19 +528,17 @@ impl App {
             "subagent_end" | "child_session" => self.note("Subagent finished"),
             "mode" => {
                 let to = ev.data["to"].as_str().unwrap_or("");
-                self.mode = match to {
-                    "plan" => Mode::Plan,
-                    "yolo" => Mode::Yolo,
-                    _ => Mode::Agent,
-                };
+                self.mode = Mode::parse(to);
                 let label = match self.mode {
                     Mode::Plan => "Plan mode — zcli proposes before it changes anything",
                     Mode::Yolo => "Yolo mode — tools run without asking (sandbox stays on)",
+                    Mode::AcceptEdits => "Accept-edits — writes auto-allow inside the workspace",
                     Mode::Agent => "Agent mode",
                 };
                 self.flash(label, match self.mode {
                     Mode::Plan => theme::YELLOW,
                     Mode::Yolo => theme::RED,
+                    Mode::AcceptEdits => theme::ACCENT,
                     Mode::Agent => theme::GREEN,
                 });
             }
@@ -903,6 +901,14 @@ impl App {
             }
             match zcore::creds::store_key(&k.provider, key) {
                 Ok(src) => {
+                    if let Some(p) = zcore::catalog::provider(&k.provider) {
+                        match zcore::live::fetch(p) {
+                            Ok(models) => {
+                                let _ = zcore::live::store(&k.provider, &models);
+                            }
+                            Err(e) => self.note(format!("Saved the key, but the live list failed: {e:#}")),
+                        }
+                    }
                     self.reload_models();
                     let first = self.models.iter().find(|m| m.alias.starts_with(&format!("{}/", k.provider))).map(|m| m.alias.clone());
                     self.note(format!("Saved {} key {} to the {}", k.name, zcore::creds::mask(key), src.label()));
@@ -962,7 +968,7 @@ impl App {
                     self.error(format!("Unknown model: {args} — try provider/model, e.g. anthropic/claude-opus-5-5"));
                 }
             }
-            "connect" => {
+            "connect" | "providers" => {
                 if args.is_empty() {
                     self.popup = Some(Popup::Connect { filter: Vec::new(), sel: 0 });
                 } else {
@@ -983,17 +989,20 @@ impl App {
             }
             "voice" => self.toggle_dictation(),
             "mode" => match args {
-                "" => self.note(format!("Mode: {} · shift+tab cycles plan → agent → yolo", self.mode.name())),
+                "" => self.note(format!("Mode: {} · shift+tab cycles plan → agent → accept-edits → yolo", self.mode.name())),
                 "plan" => {
                     let _ = cmd.send(Cmd::SetMode(Mode::Plan));
                 }
                 "agent" => {
                     let _ = cmd.send(Cmd::SetMode(Mode::Agent));
                 }
+                "accept-edits" | "accept_edits" => {
+                    let _ = cmd.send(Cmd::SetMode(Mode::AcceptEdits));
+                }
                 "yolo" => {
                     let _ = cmd.send(Cmd::SetMode(Mode::Yolo));
                 }
-                other => self.error(format!("Unknown mode: {other} (plan, agent or yolo)")),
+                other => self.error(format!("Unknown mode: {other} (plan, agent, accept-edits or yolo)")),
             },
             // kept as shortcuts for muscle memory
             "plan" => {
@@ -1005,6 +1014,9 @@ impl App {
             "yolo" => {
                 let _ = cmd.send(Cmd::SetMode(Mode::Yolo));
             }
+            "accept-edits" | "accept_edits" => {
+                let _ = cmd.send(Cmd::SetMode(Mode::AcceptEdits));
+            }
             "approve" => {
                 if self.plan_pending {
                     self.plan_pending = false;
@@ -1013,6 +1025,26 @@ impl App {
                 } else {
                     self.note("No plan is waiting for approval");
                 }
+            }
+            "compact" => {
+                let focus = args.strip_prefix("focus:").or_else(|| args.strip_prefix("focus")).unwrap_or(args).trim();
+                let prompt = if focus.is_empty() {
+                    "/compact".to_string()
+                } else {
+                    format!("/compact focus: {focus}")
+                };
+                self.send_prompt(&prompt, prompt.clone(), cmd);
+            }
+            "undo" => {
+                self.send_prompt("/undo", "/undo".into(), cmd);
+            }
+            "skillify" => {
+                let name = if args.is_empty() { "session" } else { args };
+                self.note(format!("skillify {name} — run after the turn, or use zcli skillify"));
+                self.send_prompt(&format!("/skillify {name}"), format!("/skillify {name}"), cmd);
+            }
+            "refine" => {
+                self.note("refine: use meridian refine.apply / refine.rollback");
             }
             "usage" | "cost" => {
                 let lines = view::usage(self);
@@ -1093,11 +1125,15 @@ impl App {
         }
     }
 
-    /// Begin /connect for a provider: ChatGPT signs in, others ask for a key.
+    /// Begin /connect for a provider: ChatGPT and Devin sign in, others ask for a key.
     fn connect(&mut self, id: &str) {
         self.popup = None;
         if id == "chatgpt" {
             self.start_login();
+            return;
+        }
+        if id == "devin" {
+            self.connect_devin();
             return;
         }
         match zcore::catalog::provider(id) {
@@ -1108,6 +1144,27 @@ impl App {
                 self.flash(format!("Paste your {} API key and press ↵ (or set {env}) · esc cancels", p.name), theme::ACCENT);
             }
             None => self.error(format!("Unknown provider: {id}")),
+        }
+    }
+
+    fn connect_devin(&mut self) {
+        zcore::devin::invalidate();
+        if !zcore::devin::ready() {
+            self.error(zcore::devin::hint());
+            return;
+        }
+        let Some(def) = zcore::catalog::provider("devin") else {
+            self.error("Devin is missing from the catalog");
+            return;
+        };
+        match zcore::live::fetch(def) {
+            Ok(models) => {
+                let _ = zcore::live::store("devin", &models);
+                self.reload_models();
+                self.note(format!("Devin · {} · {} models", zcore::devin::detail(), models.len()));
+                self.open_model_picker_for("devin");
+            }
+            Err(e) => self.error(format!("{e:#}")),
         }
     }
 
@@ -1123,12 +1180,7 @@ impl App {
     }
 
     fn cycle_mode(&mut self, cmd: &Sender<Cmd>) {
-        let next = match self.mode {
-            Mode::Plan => Mode::Agent,
-            Mode::Agent => Mode::Yolo,
-            Mode::Yolo => Mode::Plan,
-        };
-        let _ = cmd.send(Cmd::SetMode(next));
+        let _ = cmd.send(Cmd::SetMode(self.mode.cycle()));
     }
 
     fn request_quit(&mut self, cmd: &Sender<Cmd>) {
@@ -1565,7 +1617,7 @@ pub fn try_run(opts: &RunOpts, cwd: &Path) -> Result<Option<i32>> {
     if opts.model.is_none() {
         if let Some(m) = saved_model() {
             let cfg = zcore::config::Config::load(&zcore::cli_home());
-            if cfg.provider_for(&m).is_some_and(|(p, _)| p.kind == zproviders::ProviderKind::Fixture || p.api_key.is_some() || p.base_url.starts_with("http://")) || cfg.models.contains_key(&m) {
+            if cfg.provider_for(&m).is_some() {
                 opts.model = Some(m);
             }
         }

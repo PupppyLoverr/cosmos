@@ -4,7 +4,11 @@ A ground-up native rewrite of [zeron](../zeron) — a multi-device controller fo
 (Claude Code / Codex) — in Rust, with a gpui UI. Fresh app; no backwards compatibility required.
 
 **Pillars (from the goal):**
-- Optional sync uses Loro CRDT docs (loro-mirror model) through Cloudflare Durable Objects; the same docs persist locally when sync is disabled.
+- Optional sync through Cloudflare Durable Objects: session docs are Loro CRDTs (loro-mirror
+  model) relayed as opaque append-only rows (chat2 — the DO never parses doc bytes); the
+  workspace registry is a replicated row table, not a CRDT (per-field LWW/HLC over `reg1/`;
+  decision + evidence: `docs/registry-sync.md`, `docs/chat2-sync.md`). The same state persists
+  locally when sync is disabled.
 - Durable Objects stay **TypeScript** (decision + evidence: `docs/research/durable-objects-language.md`).
   Everything device-side is Rust.
 - Feature parity with zeron **except token-usage display** (poor fit for CRDTs; excluded).

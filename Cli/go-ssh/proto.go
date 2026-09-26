@@ -72,7 +72,7 @@ func (e Event) Line() string {
 type RunOpts struct {
 	Prompt          *string
 	Output          string // text|json|json-stream
-	Mode            string // ""|plan|agent
+	Mode            string // ""|plan|agent|accept-edits
 	Allow           []string
 	Yolo            bool
 	NoSandbox       bool
@@ -83,6 +83,13 @@ type RunOpts struct {
 	Resume          string
 	ApprovePlan     bool
 	AllowEscalation []string
+	Sandbox         string
+	Ask             string
+	Autonomous      bool
+	AutonomousGate  string
+	AllowSelfMutate bool
+	Arena           bool
+	SelfImprove     *bool
 }
 
 func cliHome() string {

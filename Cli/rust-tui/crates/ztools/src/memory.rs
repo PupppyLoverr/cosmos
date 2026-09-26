@@ -67,10 +67,19 @@ fn run_bridge(ctx: &ToolContext, args: &[String]) -> Result<String> {
 pub fn search(ctx: &mut ToolContext, input: &Value) -> Result<String> {
     let q = input["query"].as_str().unwrap_or("");
     let k = input["k"].as_u64().unwrap_or(5).to_string();
-    let out = run_bridge(
-        ctx,
-        &["search".into(), "--query".into(), q.into(), "--k".into(), k],
-    )?;
+    let scope = input["scope"].as_str().unwrap_or("memory");
+    let mut args = vec![
+        "search".into(),
+        "--query".into(),
+        q.into(),
+        "--k".into(),
+        k,
+    ];
+    if !scope.is_empty() && scope != "memory" {
+        args.push("--scope".into());
+        args.push(scope.into());
+    }
+    let out = run_bridge(ctx, &args)?;
     Ok(out.trim().to_string())
 }
 

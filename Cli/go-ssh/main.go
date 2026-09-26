@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,8 +16,9 @@ import (
 const help = `zagy — Cosmos coding-agent harness (Go)
 
 usage:
-  zagy                        interactive session (REPL)
+  zagy                        interactive session (TUI; line REPL on pipes)
   zagy -p "<task>" [flags]    headless run; -p - reads the task from stdin
+  zagy onboarding             replay the first-run setup
   zagy tools dump             canonical tools.json (byte-identical to zcli/zdev)
   zagy session list           sessions in COSMOS_CLI_HOME
   zagy session export <id> [--format md|jsonl]
@@ -25,9 +27,11 @@ usage:
   zagy memory search <q>      search the shared Meridian vault
   zagy memory add <text>      append to the vault (scope: zagy)
 
-flags: --output text|json|json-stream · --mode plan|agent · --allow a,b ·
+flags: --output text|json|json-stream · --mode plan|agent|accept-edits · --allow a,b ·
 --yolo · --no-sandbox · --model <alias> · --max-turns N · --max-usd F ·
---cwd <dir> · --resume <id> · --approve-plan · --allow-escalation cap,...
+--cwd <dir> · --resume <id> · --approve-plan · --allow-escalation cap,... ·
+--sandbox read-only|workspace-write|full · --ask on-request|never|untrusted ·
+--autonomous · --autonomous-gate "<cmd>" · --allow-self-mutate · --arena 1
 `
 
 func splitList(s string) []string {
@@ -131,6 +135,39 @@ func parse(args []string) (*RunOpts, error) {
 				return nil, err
 			}
 			o.AllowEscalation = splitList(v)
+		case "--sandbox":
+			v, err := val()
+			if err != nil {
+				return nil, err
+			}
+			o.Sandbox = v
+		case "--ask":
+			v, err := val()
+			if err != nil {
+				return nil, err
+			}
+			o.Ask = v
+		case "--autonomous":
+			o.Autonomous = true
+		case "--autonomous-gate":
+			v, err := val()
+			if err != nil {
+				return nil, err
+			}
+			o.AutonomousGate = v
+		case "--allow-self-mutate":
+			o.AllowSelfMutate = true
+		case "--arena":
+			if _, err := val(); err != nil {
+				return nil, err
+			}
+			o.Arena = true
+		case "--self-improve":
+			t := true
+			o.SelfImprove = &t
+		case "--no-self-improve":
+			f := false
+			o.SelfImprove = &f
 		case "--version", "--help", "-h", "-V":
 			fmt.Printf("zagy contract v%d\n%s", ContractVersion, help)
 			os.Exit(ExitDone)
@@ -216,14 +253,18 @@ func runTurns(a *Agent, emit func(Event)) {
 			break
 		}
 		last := a.Messages[len(a.Messages)-1]
+		var calls []toolCall
 		for _, b := range anySlice(last["content"]) {
 			bm, _ := b.(map[string]any)
 			if bm["type"] != "tool_use" {
 				continue
 			}
 			inp, _ := bm["input"].(map[string]any)
-			a.ExecTool(strv(bm, "id"), strv(bm, "name"), inp, emit)
-			if strv(bm, "name") == "submit_plan" {
+			calls = append(calls, toolCall{ID: strv(bm, "id"), Name: strv(bm, "name"), Input: inp})
+		}
+		results := a.ExecToolsBatch(calls, emit)
+		for _, r := range results {
+			if name, _ := r[0].(string); name == "submit_plan" {
 				return
 			}
 		}
@@ -288,14 +329,41 @@ func lineREPL(a *Agent, opts *RunOpts) int {
 		case "/yolo":
 			a.Mode = "yolo"
 			fmt.Fprintln(os.Stderr, "mode: yolo")
+		case "/accept-edits":
+			a.Mode = "accept-edits"
+			fmt.Fprintln(os.Stderr, "mode: accept-edits")
+		case "/compact":
+			a.CompactNow("", emit)
+			fmt.Fprintln(os.Stderr, "compacted")
+		case "/undo":
+			fmt.Fprintln(os.Stderr, a.UndoLast(emit))
 		case "/approve":
 			a.ApprovePlan(emit)
 			runTurns(a, emit)
 		case "/session":
 			fmt.Fprintf(os.Stderr, "session %s\n", a.Session.ID)
 		case "/help":
-			fmt.Fprintln(os.Stderr, "commands: /plan /agent /yolo /approve /session /quit")
+			fmt.Fprintln(os.Stderr, "commands: /plan /agent /accept-edits /yolo /compact /undo /skillify /approve /onboarding /model /providers /connect /context /usage /session /quit")
+		case "/context":
+			fmt.Fprintln(os.Stderr, a.contextReport())
+		case "/usage":
+			fmt.Fprintf(os.Stderr, "tokens · in %d · out %d · Σ $%.4f\n", a.LastUsage.Input, a.LastUsage.Output, a.CumUSD)
 		default:
+			if strings.HasPrefix(line, "/skillify") {
+				name := strings.TrimSpace(strings.TrimPrefix(line, "/skillify"))
+				if name == "" {
+					name = "session"
+				}
+				fmt.Fprintln(os.Stderr, a.Skillify(name, emit))
+				continue
+			}
+			if strings.HasPrefix(line, "/compact") {
+				focus := strings.TrimSpace(strings.TrimPrefix(line, "/compact"))
+				focus = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(focus, "focus:"), "focus"))
+				a.CompactNow(focus, emit)
+				fmt.Fprintln(os.Stderr, "compacted")
+				continue
+			}
 			a.SendUser(line, emit)
 			runTurns(a, emit)
 		}
@@ -322,12 +390,29 @@ func runHeadless(opts *RunOpts, harness, cwd string) int {
 		"sandbox":     map[bool]string{true: "off", false: "appcontainer"}[a.Ctx.NoSandbox],
 		"boot_tokens": a.BootTokens, "resume": optStr(opts.Resume)}))
 	runHooks(a.Cfg, "session_start", "", map[string]any{}, a.Session.ID)
-	emit(a.Session.append("user", map[string]string{"text": prompt}))
+	if strings.HasPrefix(prompt, "/compact") {
+		focus := strings.TrimSpace(strings.TrimPrefix(prompt, "/compact"))
+		focus = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(focus, "focus:"), "focus"))
+		a.CompactNow(focus, emit)
+		emit(a.Session.append("session_end", map[string]string{"reason": "compact"}))
+		return ExitDone
+	}
+	if strings.TrimSpace(prompt) == "/undo" {
+		fmt.Fprintln(os.Stderr, a.UndoLast(emit))
+		emit(a.Session.append("session_end", map[string]string{"reason": "undo"}))
+		return ExitDone
+	}
+	if strings.HasPrefix(prompt, "/skillify") {
+		name := strings.TrimSpace(strings.TrimPrefix(prompt, "/skillify"))
+		if name == "" {
+			name = "session"
+		}
+		fmt.Fprintln(os.Stderr, a.Skillify(name, emit))
+		emit(a.Session.append("session_end", map[string]string{"reason": "skillify"}))
+		return ExitDone
+	}
+	a.SendUser(prompt, emit)
 	runHooks(a.Cfg, "user_prompt", "", map[string]string{"text": prompt}, a.Session.ID)
-	a.Messages = append(a.Messages, map[string]any{
-		"role":    "user",
-		"content": []any{map[string]any{"type": "text", "text": prompt}},
-	})
 	max := opts.MaxTurns
 	if max <= 0 {
 		max = 16
@@ -343,19 +428,54 @@ func runHeadless(opts *RunOpts, harness, cwd string) int {
 			return ExitProvider
 		}
 		if done {
+			if opts.AutonomousGate != "" {
+				var c *exec.Cmd
+				if filepath.Separator == '\\' {
+					c = exec.Command("cmd", "/C", opts.AutonomousGate)
+				} else {
+					c = exec.Command("sh", "-lc", opts.AutonomousGate)
+				}
+				c.Dir = a.Workspace
+				out, err := c.CombinedOutput()
+				if err != nil {
+					a.Messages = append(a.Messages, map[string]any{
+						"role":    "user",
+						"content": []any{map[string]any{"type": "text", "text": "[autonomous-gate failed]\n" + string(out)}},
+					})
+					continue
+				}
+			}
+			if a.ImproveEnabled {
+				draft := "draft-"
+				if len(a.Session.ID) >= 8 {
+					draft += a.Session.ID[:8]
+				} else {
+					draft += a.Session.ID
+				}
+				if dest, err := skillify(a.Home, draft, a.World, true, a.AllowSelfMutate); err == nil {
+					emit(a.Session.append("self_improve", improveEvent("draft_skill", map[string]any{"name": draft, "path": dest, "draft": true})))
+				}
+			}
 			emit(a.Session.append("session_end", map[string]string{"reason": "done"}))
 			return ExitDone
 		}
 		last := a.Messages[len(a.Messages)-1]
 		denied := false
+		var calls []toolCall
 		for _, b := range anySlice(last["content"]) {
 			bm, _ := b.(map[string]any)
 			if bm["type"] != "tool_use" {
 				continue
 			}
 			inp, _ := bm["input"].(map[string]any)
-			text, isErr := a.ExecTool(strv(bm, "id"), strv(bm, "name"), inp, emit)
-			if strv(bm, "name") == "submit_plan" && !isErr {
+			calls = append(calls, toolCall{ID: strv(bm, "id"), Name: strv(bm, "name"), Input: inp})
+		}
+		results := a.ExecToolsBatch(calls, emit)
+		for _, r := range results {
+			name, _ := r[0].(string)
+			text, _ := r[1].(string)
+			isErr, _ := r[2].(bool)
+			if name == "submit_plan" && !isErr {
 				if opts.ApprovePlan {
 					a.ApprovePlan(emit)
 				} else {
@@ -383,6 +503,35 @@ func optStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+func modelsCmd(args []string) int {
+	cfg := loadConfig(cliHome())
+	want := ""
+	if len(args) > 0 {
+		want = args[0]
+	}
+	if want != "" && catalogProvider(want) == nil && cfg.Providers[want] == nil {
+		fmt.Fprintf(os.Stderr, "unknown provider %q\n", want)
+		return ExitUsage
+	}
+	n := 0
+	for _, m := range cfg.availableModels("") {
+		if want != "" && m.provider != want {
+			continue
+		}
+		fmt.Printf("%-48s %8d  %s\n", m.alias, m.context, m.provider)
+		n++
+	}
+	if n == 0 {
+		if want == "devin" {
+			fmt.Fprintln(os.Stderr, "no Devin models yet — /providers → Devin (subscription models; Cosmos runs the tools)")
+		} else {
+			fmt.Fprintln(os.Stderr, "no models yet")
+		}
+		return ExitUsage
+	}
+	return ExitDone
 }
 
 func sessionCmd(args []string) int {
@@ -511,11 +660,70 @@ func main() {
 	if len(args) > 0 && args[0] == "session" {
 		os.Exit(sessionCmd(args[1:]))
 	}
+	if len(args) > 0 && args[0] == "models" {
+		os.Exit(modelsCmd(args[1:]))
+	}
 	if len(args) > 0 && args[0] == "memory" {
 		os.Exit(memoryCmd(args[1:]))
 	}
 	if len(args) > 0 && args[0] == "acp" {
 		os.Exit(acpRun())
+	}
+	if len(args) > 0 && (args[0] == "onboarding" || args[0] == "onboard") {
+		os.Exit(runOnboarding())
+	}
+	if len(args) > 0 && (args[0] == "compact" || args[0] == "undo" || args[0] == "skillify" || args[0] == "checkpoint") {
+		flag := func(n string) string {
+			for i, a := range args {
+				if a == n && i+1 < len(args) {
+					return args[i+1]
+				}
+			}
+			return ""
+		}
+		o := &RunOpts{Output: "text", Model: "fixture"}
+		switch args[0] {
+		case "compact":
+			sid := flag("--session")
+			if sid == "" {
+				fmt.Fprintln(os.Stderr, "usage: zagy compact --session <id> [--focus …]")
+				os.Exit(ExitUsage)
+			}
+			o.Resume = sid
+			focus := flag("--focus")
+			p := "/compact"
+			if focus != "" {
+				p = "/compact focus: " + focus
+			}
+			o.Prompt = &p
+			os.Exit(runHeadless(o, "zagy", cwd))
+		case "undo", "checkpoint":
+			sid := flag("--session")
+			if sid == "" {
+				if list := sessionList(cliHome()); len(list) > 0 {
+					if id, ok := list[len(list)-1]["id"].(string); ok {
+						sid = id
+					}
+				}
+			}
+			if sid == "" {
+				fmt.Fprintln(os.Stderr, "usage: zagy undo --session <id>")
+				os.Exit(ExitUsage)
+			}
+			o.Resume = sid
+			p := "/undo"
+			o.Prompt = &p
+			os.Exit(runHeadless(o, "zagy", cwd))
+		case "skillify":
+			name := "session"
+			if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
+				name = args[1]
+			}
+			p := "/skillify " + name
+			o.Prompt = &p
+			o.Resume = flag("--session")
+			os.Exit(runHeadless(o, "zagy", cwd))
+		}
 	}
 	opts, err := parse(args)
 	if err != nil {

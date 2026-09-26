@@ -6,6 +6,7 @@ import path from "node:path";
 
 import * as catalog from "./catalog";
 import * as creds from "./creds";
+import * as devin from "./devin";
 import * as live from "./live";
 import { authorizeUrl, pkce, tokensFrom } from "./oauth";
 import { allowedHosts, availableModels, loadConfig, projectInstructions, providerFor, setDefaultModel, setUserName } from "./store";
@@ -80,11 +81,18 @@ describe("ChatGPT sign-in", () => {
 
 describe("catalog + model resolution", () => {
   test("the shared catalog has the headliners, 9Router and OpenRouter", () => {
-    for (const id of ["chatgpt", "router9", "openrouter", "openai", "anthropic", "google", "xai", "meta", "xiaomi", "deepseek", "ollama"])
+    for (const id of ["chatgpt", "devin", "router9", "openrouter", "openai", "anthropic", "google", "xai", "meta", "xiaomi", "deepseek", "ollama"])
       expect(catalog.provider(id)).toBeDefined();
     expect(catalog.provider("router9")!.base_url).toBe("http://localhost:20128/v1");
     expect(catalog.splitRef("openrouter/anthropic/claude-x")).toEqual(["openrouter", "anthropic/claude-x"]);
     expect(catalog.splitRef("r9")).toBeNull();
+    expect(catalog.isSubscription(catalog.provider("chatgpt")!)).toBe(true);
+    expect(catalog.isSubscription(catalog.provider("devin")!)).toBe(true);
+    expect(catalog.provider("devin")!.models[0].id).toBe("swe-2-max");
+    expect(catalog.provider("devin")!.base_url).toBe("https://server.codeium.com");
+    expect(devin.parseList(`{"families":[{"variants":[{"model_uid":"swe-1-7-medium","label":"SWE-1.7 Medium"}]}]}`)[0].id).toBe("swe-1-7-medium");
+    expect(devin.parseCliModelConfigs({ clientModelConfigs: [{ label: "SWE-2 Max", modelUid: "swe-2-max" }] })[0].id).toBe("swe-2-max");
+    expect(devin.parseCliModelConfigs({ clientModelConfigs: [{ modelUid: "bare", disabled: true }] })[0]).toMatchObject({ id: "bare", name: "bare" });
   });
 
   test("provider/model refs resolve with stored keys; config aliases still work", () => {
@@ -104,7 +112,17 @@ describe("catalog + model resolution", () => {
     expect(models.some((m) => m.provider === "anthropic")).toBe(true);
     expect(models.some((m) => m.provider === "openai")).toBe(false); // no key
     const hosts = allowedHosts(cfg);
-    for (const h of ["api.anthropic.com", "openrouter.ai", "chatgpt.com", "auth.openai.com", "localhost"]) expect(hosts).toContain(h);
+    for (const h of ["api.anthropic.com", "openrouter.ai", "chatgpt.com", "auth.openai.com", "localhost", "server.codeium.com"]) expect(hosts).toContain(h);
+  });
+
+  test("catalog models still list when the provider is already in config.toml", () => {
+    fs.writeFileSync(
+      path.join(home, "config.toml"),
+      '[providers.openai]\nkind = "responses"\nbase_url = "https://api.openai.com/v1"\napi_key_env = "OPENAI_API_KEY"\n',
+    );
+    creds.storeKey("openai", "sk-test");
+    const models = availableModels(loadConfig(home));
+    expect(models.some((m) => m.alias.startsWith("openai/"))).toBe(true);
   });
 
   test("a cached live list replaces the snapshot in /model", () => {

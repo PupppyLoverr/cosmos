@@ -194,6 +194,62 @@ Check "task worktree create+cleanup" {
 }
 
 # --- C9: tool call terminates (fixture regression) ---
+Check "headless /compact writes world.md" {
+  $tmp = Join-Path $env:TEMP "cosmos-compact"
+  if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+  New-Item -ItemType Directory -Force $tmp | Out-Null
+  $env:COSMOS_CLI_HOME = Join-Path $tmp "home"; New-Item -ItemType Directory -Force $env:COSMOS_CLI_HOME | Out-Null
+  RunHarness "zcli" @("-p","ship the login form","--model","fixture","--output","json") | Out-Null
+  $list = RunHarness "zcli" @("session","list")
+  $id = ($list | Select-String -Pattern '01[0-9a-z]{24}').Matches[0].Value
+  RunHarness "zcli" @("-p","/compact","--model","fixture","--resume",$id) | Out-Null
+  Assert (Test-Path (Join-Path $env:COSMOS_CLI_HOME "world\$id.md")) "world.md missing after /compact"
+  $md = Get-Content (Join-Path $env:COSMOS_CLI_HOME "world\$id.md") -Raw
+  Assert ($md -match "ship the login form") "goal missing from world.md"
+  Remove-Item Env:\COSMOS_CLI_HOME
+}
+
+Check "Read alias repairs to read" {
+  $tmp = Join-Path $env:TEMP "cosmos-repair"
+  if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+  New-Item -ItemType Directory -Force $tmp | Out-Null
+  Set-Content (Join-Path $tmp "a.txt") "hello"
+  $o = RunHarness "zcli" @("-p",'tool:Read {\"path\":\"a.txt\"}',"--allow","read","--cwd",$tmp,"--output","json-stream","--model","fixture")
+  $rep = @(EventsOf $o | Where-Object { $_.kind -eq "tool_repair" })
+  Assert ($rep.Count -ge 1) "no tool_repair"
+  $r = @(EventsOf $o | Where-Object { $_.kind -eq "tool_result" })[0]
+  Assert ($r.data.content -match "file_sha256=") "repaired read failed: $($r.data.content)"
+}
+
+Check "checkpoint /undo restores file" {
+  $tmp = Join-Path $env:TEMP "cosmos-ckpt"
+  if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+  New-Item -ItemType Directory -Force $tmp | Out-Null
+  Set-Content (Join-Path $tmp "v.txt") "keep-me"
+  $env:COSMOS_CLI_HOME = Join-Path $tmp "home"; New-Item -ItemType Directory -Force $env:COSMOS_CLI_HOME | Out-Null
+  RunHarness "zcli" @("-p",'tool:read {\"path\":\"v.txt\"}',"--allow","read,write","--cwd",$tmp,"--output","json-stream","--model","fixture") | Out-Null
+  $list = RunHarness "zcli" @("session","list")
+  $id = ($list | Select-String -Pattern '01[0-9a-z]{24}').Matches[0].Value
+  RunHarness "zcli" @("-p",'tool:write {\"path\":\"v.txt\",\"content\":\"clobber\"}',"--allow","read,write","--cwd",$tmp,"--output","json-stream","--model","fixture","--resume",$id) | Out-Null
+  $clobber = Get-Content (Join-Path $tmp "v.txt") -Raw
+  Assert ($clobber -match "clobber") "write did not clobber: $clobber"
+  RunHarness "zcli" @("-p","/undo","--model","fixture","--resume",$id) | Out-Null
+  $body = Get-Content (Join-Path $tmp "v.txt") -Raw
+  Assert ($body -match "keep-me") "undo did not restore: $body"
+  Remove-Item Env:\COSMOS_CLI_HOME
+}
+
+Check "self_improve draft skill after fixture done" {
+  $tmp = Join-Path $env:TEMP "cosmos-improve"
+  if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+  New-Item -ItemType Directory -Force $tmp | Out-Null
+  $env:COSMOS_CLI_HOME = Join-Path $tmp "home"; New-Item -ItemType Directory -Force $env:COSMOS_CLI_HOME | Out-Null
+  $o = RunHarness "zcli" @("-p","ping","--model","fixture","--output","json-stream","--self-improve")
+  $ev = @(EventsOf $o | Where-Object { $_.kind -eq "self_improve" })
+  Assert ($ev.Count -ge 1 -or (Test-Path (Join-Path $env:COSMOS_CLI_HOME "skills"))) "no self_improve draft"
+  Remove-Item Env:\COSMOS_CLI_HOME
+}
+
 Check "tool call terminates in 1 turn" {
   $tmp = Join-Path $env:TEMP "cosmos-t1"
   if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }

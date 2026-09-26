@@ -93,6 +93,9 @@ impl Bridge {
                 let query = params.get("query").and_then(Value::as_str).unwrap_or("");
                 let k = params.get("k").and_then(Value::as_u64).unwrap_or(5) as usize;
                 let scope = params.get("scope").and_then(Value::as_str);
+                if scope == Some("sessions") {
+                    return Ok(json!({ "results": crate::search::session_search(&self.vault, query, k) }));
+                }
                 let seen: Vec<String> = params
                     .get("seen_ids")
                     .and_then(Value::as_array)
@@ -127,6 +130,39 @@ impl Bridge {
             "playbook.get" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 Ok(json!({ "body": self.playbook_get(name)? }))
+            }
+            "world.upsert" => {
+                let session_id = params.get("session_id").and_then(Value::as_str).unwrap_or("");
+                let markdown = params.get("markdown").and_then(Value::as_str).unwrap_or("");
+                let p = crate::world::upsert(&self.vault, session_id, markdown)?;
+                Ok(json!({"path": p.display().to_string()}))
+            }
+            "world.get" => {
+                let session_id = params.get("session_id").and_then(Value::as_str).unwrap_or("");
+                let (markdown, tokens) = crate::world::get(&self.vault, session_id)?;
+                Ok(json!({"markdown": markdown, "tokens": tokens}))
+            }
+            "refine.propose" => {
+                let id = crate::refine::propose(
+                    &self.vault,
+                    params.get("target").and_then(Value::as_str).unwrap_or(""),
+                    params.get("diff").and_then(Value::as_str).unwrap_or(""),
+                    params.get("evidence").and_then(Value::as_str).unwrap_or(""),
+                )?;
+                Ok(json!({"id": id}))
+            }
+            "refine.apply" => crate::refine::apply(
+                &self.vault,
+                params.get("id").and_then(Value::as_str).unwrap_or(""),
+            ),
+            "refine.rollback" => crate::refine::rollback(
+                &self.vault,
+                params.get("id").and_then(Value::as_str).unwrap_or(""),
+            ),
+            "session.search" => {
+                let query = params.get("query").and_then(Value::as_str).unwrap_or("");
+                let k = params.get("k").and_then(Value::as_u64).unwrap_or(5) as usize;
+                Ok(json!({"results": crate::search::session_search(&self.vault, query, k)}))
             }
             "session.register" => {
                 let session_id = params

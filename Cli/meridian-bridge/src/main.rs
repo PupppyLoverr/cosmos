@@ -24,7 +24,13 @@ fn usage() -> &'static str {
        meridian boot --repo <dir> [--harness <h>]\n\
        meridian cache-read --path <file> [--max-lines <n>]\n\
        meridian playbook <name>\n\
-       meridian session-register --session <id> --harness <h> --log-path <p> --title <t>\n"
+       meridian session-register --session <id> --harness <h> --log-path <p> --title <t>\n\
+       meridian world-get --session <id>\n\
+       meridian world-upsert --session <id> --markdown <md>\n\
+       meridian refine-propose --target <p> --diff <d> [--evidence <e>]\n\
+       meridian refine-apply --id <id>\n\
+       meridian refine-rollback --id <id>\n\
+       meridian session-search --query <q> [--k <n>]\n"
 }
 
 fn main() -> ExitCode {
@@ -105,6 +111,46 @@ fn run(args: &[String]) -> Result<u8> {
                 return Ok(2);
             };
             println!("{}", bridge.playbook_get(name)?);
+            Ok(0)
+        }
+        "world-get" => {
+            let sid = arg_value(args, "--session").unwrap_or("");
+            let (md, tokens) = meridian_bridge::world::get(bridge.vault(), sid)?;
+            println!("{}", serde_json::to_string(&json!({"markdown": md, "tokens": tokens}))?);
+            Ok(0)
+        }
+        "world-upsert" => {
+            let sid = arg_value(args, "--session").unwrap_or("");
+            let md = arg_value(args, "--markdown").unwrap_or("");
+            let p = meridian_bridge::world::upsert(bridge.vault(), sid, md)?;
+            println!("{}", p.display());
+            Ok(0)
+        }
+        "refine-propose" => {
+            let id = meridian_bridge::refine::propose(
+                bridge.vault(),
+                arg_value(args, "--target").unwrap_or(""),
+                arg_value(args, "--diff").unwrap_or(""),
+                arg_value(args, "--evidence").unwrap_or(""),
+            )?;
+            println!("{}", serde_json::to_string(&json!({"id": id}))?);
+            Ok(0)
+        }
+        "refine-apply" => {
+            let v = meridian_bridge::refine::apply(bridge.vault(), arg_value(args, "--id").unwrap_or(""))?;
+            println!("{v}");
+            Ok(0)
+        }
+        "refine-rollback" => {
+            let v = meridian_bridge::refine::rollback(bridge.vault(), arg_value(args, "--id").unwrap_or(""))?;
+            println!("{v}");
+            Ok(0)
+        }
+        "session-search" => {
+            let q = arg_value(args, "--query").unwrap_or("");
+            let k = arg_value(args, "--k").and_then(|s| s.parse().ok()).unwrap_or(5);
+            let hits = meridian_bridge::search::session_search(bridge.vault(), q, k);
+            println!("{}", serde_json::to_string(&hits)?);
             Ok(0)
         }
         "session-register" => {

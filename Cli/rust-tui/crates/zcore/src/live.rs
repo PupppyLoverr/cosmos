@@ -36,6 +36,7 @@ struct Raw {
 pub fn fetch(def: &ProviderDef) -> Result<Vec<ModelDef>> {
     let raw = match def.kind.as_str() {
         "chatgpt" => chatgpt()?,
+        "devin" => devin()?,
         "anthropic" => anthropic(def)?,
         "google" => google(def)?,
         _ => openai(def)?,
@@ -178,6 +179,22 @@ fn google(def: &ProviderDef) -> Result<Vec<Raw>> {
         .collect())
 }
 
+/// Devin subscription — `GetCliModelConfigs` over the signed-in plan.
+fn devin() -> Result<Vec<Raw>> {
+    let models = crate::devin::models()?;
+    Ok(models
+        .into_iter()
+        .map(|m| Raw {
+            id: m.id,
+            name: Some(m.name),
+            context: Some(m.context),
+            output: Some(m.output),
+            reasoning: m.reasoning,
+            ..Raw::default()
+        })
+        .collect())
+}
+
 /// The models a ChatGPT plan serves, from the Codex backend's own list.
 fn chatgpt() -> Result<Vec<Raw>> {
     let t = crate::chatgpt::fresh().context("not signed in to ChatGPT")?;
@@ -226,7 +243,11 @@ fn noise(id: &str) -> bool {
 /// Filter, enrich from the catalog and order best-first.
 fn merge(def: &ProviderDef, raw: Vec<Raw>) -> Vec<ModelDef> {
     let mut seen = std::collections::HashSet::new();
-    let mut raw: Vec<Raw> = raw.into_iter().filter(|r| !noise(&r.id) && seen.insert(r.id.clone())).collect();
+    let keep_all = def.is_subscription();
+    let mut raw: Vec<Raw> = raw
+        .into_iter()
+        .filter(|r| (keep_all || !noise(&r.id)) && seen.insert(r.id.clone()))
+        .collect();
     let rank = |id: &str| def.models.iter().position(|m| m.id == id);
     raw.sort_by(|a, b| match (rank(&a.id), rank(&b.id)) {
         (Some(x), Some(y)) => x.cmp(&y),
@@ -272,7 +293,17 @@ fn cache_path() -> std::path::PathBuf {
 }
 
 fn load() -> Cache {
-    std::fs::read_to_string(cache_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    let Ok(t) = std::fs::read_to_string(cache_path()) else {
+        return Cache::default();
+    };
+    if let Ok(c) = serde_json::from_str::<Cache>(&t) {
+        if !c.providers.is_empty() {
+            return c;
+        }
+    }
+    serde_json::from_str::<BTreeMap<String, Entry>>(&t)
+        .map(|providers| Cache { providers })
+        .unwrap_or_default()
 }
 
 /// The last live list fetched for `provider`, if any.
@@ -333,6 +364,30 @@ mod tests {
         let d = def();
         store("openai", &d.models[..2]).unwrap();
         assert_eq!(cached("openai").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cache_reads_map_shaped_file() {
+        let _env = crate::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COSMOS_CLI_HOME", dir.path());
+        std::fs::write(
+            dir.path().join("live_models.json"),
+            r#"{"devin":{"at":1,"models":[{"id":"swe-2-max","name":"SWE-2 Max","context":200000,"output":32000,"reasoning":true,"price":[0,0,0,0]}]}}"#,
+        )
+        .unwrap();
+        let m = cached("devin").expect("map-shaped live_models.json");
+        assert_eq!(m[0].id, "swe-2-max");
+    }
+
+    #[test]
+    fn merge_keeps_subscription_ids() {
+        let d = crate::catalog::provider("devin").unwrap().clone();
+        let m = merge(
+            &d,
+            vec![Raw { id: "foo-clip-bar".into(), name: Some("Clip".into()), ..Raw::default() }],
+        );
+        assert_eq!(m[0].id, "foo-clip-bar");
     }
 
     /// Hits the network: `cargo test -p zcore live -- --ignored`.

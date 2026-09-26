@@ -54,6 +54,9 @@ fn collect_docs(vault: &Vault, scope: Option<&str>) -> Vec<Doc> {
         });
     }
     // Playbook headings count as searchable docs.
+    if scope == Some("memory") {
+        return docs;
+    }
     if let Ok(rd) = fs::read_dir(vault.playbooks_dir()) {
         for e in rd.flatten() {
             let p = e.path();
@@ -128,6 +131,105 @@ pub fn search(
             let idf = ((n - dfv + 0.5) / (dfv + 0.5) + 1.0).ln();
             let dl = d.terms.len() as f64;
             score += idf * (freq * (K1 + 1.0)) / (freq + K1 * (1.0 - B + B * dl / avgdl.max(1e-9)));
+        }
+        if score > 0.0 {
+            scored.push((score, d));
+        }
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+        .into_iter()
+        .take(k)
+        .map(|(score, d)| SearchHit {
+            id: d.id.clone(),
+            text: d.text.clone(),
+            kind: d.kind.clone(),
+            date: d.date.clone(),
+            score,
+        })
+        .collect()
+}
+
+/// BM25 over session pointer cards + first user line + world.md snapshots.
+pub fn session_search(vault: &Vault, query: &str, k: usize) -> Vec<SearchHit> {
+    let mut docs = Vec::new();
+    if let Ok(rd) = fs::read_dir(vault.sessions_dir()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&p) else { continue };
+            let id = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            docs.push(Doc {
+                id: id.clone(),
+                text: text.chars().take(400).collect(),
+                kind: "session".into(),
+                date: String::new(),
+                terms: tokenize(&text),
+            });
+        }
+    }
+    if let Ok(rd) = fs::read_dir(vault.root().join("world")) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&p) else { continue };
+            let id = format!("world:{}", p.file_stem().and_then(|s| s.to_str()).unwrap_or(""));
+            docs.push(Doc {
+                id,
+                text: text.chars().take(400).collect(),
+                kind: "world".into(),
+                date: String::new(),
+                terms: tokenize(&text),
+            });
+        }
+    }
+    if let Some(home) = std::env::var_os("COSMOS_CLI_HOME") {
+        let dir = std::path::PathBuf::from(home).join("sessions");
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Ok(text) = fs::read_to_string(&p) else { continue };
+                let first_user = text.lines().find_map(|l| {
+                    let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                    if v["kind"] == "user" {
+                        v["data"]["text"].as_str().map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                }).unwrap_or_default();
+                let id = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                docs.push(Doc {
+                    id,
+                    text: first_user.clone(),
+                    kind: "session".into(),
+                    date: String::new(),
+                    terms: tokenize(&first_user),
+                });
+            }
+        }
+    }
+    let q = tokenize(query);
+    if docs.is_empty() || q.is_empty() {
+        return Vec::new();
+    }
+    let n = docs.len() as f64;
+    let avgdl = docs.iter().map(|d| d.terms.len() as f64).sum::<f64>() / n.max(1.0);
+    let mut scored = Vec::new();
+    for d in &docs {
+        let mut score = 0.0;
+        for qt in &q {
+            let freq = d.terms.iter().filter(|t| *t == qt).count() as f64;
+            if freq == 0.0 {
+                continue;
+            }
+            score += freq / (1.0 + avgdl / 10.0);
         }
         if score > 0.0 {
             scored.push((score, d));

@@ -9,8 +9,9 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { hostOf, model as catalogModel, type ModelDef, type ProviderDef } from "./catalog";
+import { hostOf, isSubscription, model as catalogModel, type ModelDef, type ProviderDef } from "./catalog";
 import * as creds from "./creds";
+import * as devin from "./devin";
 import { fresh } from "./oauth";
 import { cliHome } from "./proto";
 
@@ -132,6 +133,18 @@ async function google(def: ProviderDef, signal?: AbortSignal): Promise<Raw[]> {
     .filter((m: Raw) => m.id);
 }
 
+async function devinModels(): Promise<Raw[]> {
+  const models = await devin.fetchModels();
+  return models.map((m) => ({
+    id: m.id,
+    name: m.name,
+    context: m.context,
+    output: m.output,
+    created: 0,
+    reasoning: m.reasoning,
+  }));
+}
+
 async function chatgpt(signal?: AbortSignal): Promise<Raw[]> {
   const t = await fresh();
   if (!t) throw new Error("not signed in to ChatGPT");
@@ -162,7 +175,7 @@ export function noise(id: string): boolean {
 /** Filter, enrich from the catalog and order best-first. */
 export function merge(def: ProviderDef, raw: Raw[]): ModelDef[] {
   const seen = new Set<string>();
-  const list = raw.filter((r) => !noise(r.id) && !seen.has(r.id) && seen.add(r.id));
+  const list = raw.filter((r) => (isSubscription(def) || !noise(r.id)) && !seen.has(r.id) && seen.add(r.id));
   const rank = (id: string) => {
     const i = def.models.findIndex((x) => x.id === id);
     return i < 0 ? null : i;
@@ -192,11 +205,13 @@ export async function fetchModels(def: ProviderDef, signal?: AbortSignal): Promi
   const raw =
     def.kind === "chatgpt"
       ? await chatgpt(signal)
-      : def.kind === "anthropic"
-        ? await anthropic(def, signal)
-        : def.kind === "google"
-          ? await google(def, signal)
-          : await openai(def, signal);
+      : def.kind === "devin"
+        ? await devinModels()
+        : def.kind === "anthropic"
+          ? await anthropic(def, signal)
+          : def.kind === "google"
+            ? await google(def, signal)
+            : await openai(def, signal);
   const models = merge(def, raw);
   if (!models.length) throw new Error(`${hostOf(def.base_url)} returned no chat models`);
   return models;
