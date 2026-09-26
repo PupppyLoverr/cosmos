@@ -11,14 +11,8 @@ import { HarnessMark } from '../../components/harness-mark';
 import { Screen } from '../../components/surface';
 import { ensureNotificationPermission } from '../../lib/notify';
 import { markOnboardingUnseen } from '../../lib/onboarding-store';
+import { describeLink } from '../../lib/connection-state';
 
-function connectionLabel(status: string, detail?: string) {
-  if (status === 'connected') return 'Online';
-  if (status === 'connecting') return 'Connecting…';
-  if (status === 'reconnecting') return 'Reconnecting…';
-  if (status === 'disconnected') return 'Offline';
-  return detail ?? 'Error';
-}
 
 export default function SettingsScreen() {
   const t = useTheme();
@@ -41,8 +35,10 @@ export default function SettingsScreen() {
   const openAppearance = () => router.push('/settings/appearance');
   const initials = (auth?.user.name || auth?.user.email || '?')
     .split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]!.toUpperCase()).join('');
-  const dot = connection.status === 'connected' ? 'connected'
-    : connection.status === 'connecting' || connection.status === 'reconnecting' ? 'awaitingInput' : undefined;
+  const link = describeLink(connection);
+  const dot = link.tone === 'online' ? 'connected'
+    : link.tone === 'pending' ? 'awaitingInput'
+    : link.tone === 'attention' ? 'errored' : undefined;
 
   return (
     <Screen>
@@ -78,9 +74,9 @@ export default function SettingsScreen() {
           <Row
             icon={connection.desktop?.kind === 'local' ? 'wifi' : 'globe'}
             title={connection.desktop ? desktopDisplayName(connection.desktop) : 'Not linked'}
-            value={connectionLabel(connection.status, connection.detail)}
+            value={link.label}
             trailing={<StatusDot status={dot} size={8} />}
-            onPress={() => router.push('/desktops')}
+            onPress={() => router.push(link.needsPair ? '/pair' : '/desktops')}
             chevron
           />
           <Row icon="qrcode.viewfinder" title="Pair a desktop" onPress={() => router.push('/pair')} chevron />

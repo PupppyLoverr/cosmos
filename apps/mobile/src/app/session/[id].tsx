@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ActivityIndicator, Alert, FlatList, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useLocalSearchParams, router } from 'expo-router';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../../lib/client';
+import { describeLink } from '../../lib/connection-state';
 import { SessionMessageEntry, TranscriptUpdate, isComputerCall, type Chat } from '../../lib/protocol';
 import { applyTranscriptUpdate } from '../../lib/transcript';
 import { PickedFile, ensureDecodable, fileToBase64Chunks } from '../../lib/attachments';
@@ -83,6 +84,7 @@ export default function SessionScreen() {
 
   useEffect(() => {
     if (!client.raw() || connection.status !== 'connected') return;
+    setStreamLost(false);
     const stream = client.raw()!.stream('WatchDocMessages', { chatId }, (item) => {
       setStreamLost(false);
       setEntries((prev) => applyTranscriptUpdate(prev, item as TranscriptUpdate));
@@ -218,6 +220,7 @@ export default function SessionScreen() {
   };
 
   const desktopName = connection.status === 'connected' && connection.desktop ? desktopDisplayName(connection.desktop) : undefined;
+  const link = describeLink(connection, connection.desktop ? desktopDisplayName(connection.desktop) : 'your desktop');
   const base = baseConfig();
 
   return (
@@ -238,10 +241,10 @@ export default function SessionScreen() {
         ) : connection.status !== 'connected' && entries.length === 0 ? (
           <View style={[styles.fill, styles.center]}>
             <EmptyState
-              title={connection.status === 'connecting' || connection.status === 'reconnecting' ? 'Connecting to the desktop…' : 'Desktop offline'}
-              body={connection.detail}
-              actionLabel="Desktops"
-              onAction={() => router.push('/desktops')}
+              title={link.title}
+              body={link.body}
+              actionLabel={link.needsPair ? 'Pair again' : 'Desktops'}
+              onAction={() => router.push(link.needsPair ? '/pair' : '/desktops')}
             />
           </View>
         ) : entries.length === 0 ? (
@@ -322,7 +325,7 @@ export default function SessionScreen() {
           onSend={(text) => void send(text)}
           onStop={stop}
           bottomInset={dockInset}
-          placeholder={connection.status !== 'connected' ? 'Desktop offline' : undefined}
+          placeholder={connection.status !== 'connected' ? (link.tone === 'asleep' ? 'Desktop asleep — reconnects on wake' : link.label) : undefined}
           chips={
             <>
               <ComposerChip

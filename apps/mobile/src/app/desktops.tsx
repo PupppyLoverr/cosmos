@@ -4,7 +4,8 @@ import { Link, router } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import { formatTimeAgo } from '../lib/activity';
-import { desktopDisplayName, useCosmos, useSnapshot, LinkedDesktop } from '../lib/client';
+import { desktopDisplayName, pairingExpired, useCosmos, useSnapshot, LinkedDesktop } from '../lib/client';
+import { describeLink } from '../lib/connection-state';
 import { Device } from '../lib/protocol';
 import { showMenu } from '../lib/menu';
 import { spacing, type, useTheme } from '../lib/theme';
@@ -28,7 +29,7 @@ function platformName(platform?: string): string | undefined {
   return undefined;
 }
 
-type Presence = 'online' | 'connecting' | 'offline' | 'unknown';
+type Presence = 'online' | 'connecting' | 'asleep' | 'repair' | 'offline' | 'unknown';
 
 function DesktopRow({ desktop, device, presence, active, onPress }: {
   desktop: LinkedDesktop; device?: Device; presence: Presence; active: boolean; onPress: () => void;
@@ -37,9 +38,14 @@ function DesktopRow({ desktop, device, presence, active, onPress }: {
   const kind = [platformName(device?.platform), desktop.kind === 'local' ? 'This network' : 'Remote'].filter(Boolean).join(' · ');
   const seen = presence === 'online' ? (active ? 'Connected' : 'Online')
     : presence === 'connecting' ? 'Connecting…'
+    : presence === 'repair' ? 'Pair again'
+    : presence === 'asleep' ? 'Asleep · reconnects on wake'
     : device?.lastSeenAt ? `Seen ${formatTimeAgo(device.lastSeenAt)}`
     : presence === 'offline' ? 'Offline' : undefined;
-  const dot = presence === 'online' ? t.success : presence === 'connecting' ? t.warning : t.separator;
+  const dot = presence === 'online' ? t.success
+    : presence === 'connecting' ? t.warning
+    : presence === 'repair' ? t.danger
+    : presence === 'asleep' ? t.textTertiary : t.separator;
   return (
     <Pressable
       onPress={onPress}
@@ -85,12 +91,16 @@ export default function DesktopsScreen() {
   const ordered = [...desktops].sort((a, b) => Number(b.id === activeId) - Number(a.id === activeId));
 
   const presenceOf = (d: LinkedDesktop): Presence => {
+    if (pairingExpired(d)) return 'repair';
     if (d.id === activeId) {
-      if (connection.status === 'connected') return 'online';
-      if (connection.status === 'connecting' || connection.status === 'reconnecting') return 'connecting';
+      const link = describeLink(connection);
+      if (link.needsPair) return 'repair';
+      if (link.tone === 'online') return 'online';
+      if (link.tone === 'asleep') return 'asleep';
+      if (link.tone === 'pending') return 'connecting';
       return 'offline';
     }
-    if (d.kind === 'remote') return remoteOnline[d.address] === true ? 'online' : remoteOnline[d.address] === false ? 'offline' : 'unknown';
+    if (d.kind === 'remote') return remoteOnline[d.address] === true ? 'online' : remoteOnline[d.address] === false ? 'asleep' : 'unknown';
     return 'unknown';
   };
 
@@ -125,7 +135,12 @@ export default function DesktopsScreen() {
                 device={device}
                 presence={presenceOf(d)}
                 active={d.id === activeId}
-                onPress={() => { void Haptics.selectionAsync(); if (Platform.OS === 'ios') void client.connect(d); else actions(d); }}
+                onPress={() => {
+                  void Haptics.selectionAsync();
+                  if (presenceOf(d) === 'repair') router.push('/pair');
+                  else if (Platform.OS === 'ios') void client.connect(d);
+                  else actions(d);
+                }}
               />
             );
             if (Platform.OS !== 'ios') return <View key={d.id}>{row}</View>;

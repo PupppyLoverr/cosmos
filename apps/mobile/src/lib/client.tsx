@@ -6,7 +6,9 @@
 import React, {
   createContext, useContext, useMemo, useSyncExternalStore,
 } from 'react';
-import { RpcClient, ConnectionStatus, TransportSpec, localSpec, relaySpec, StreamHandle } from './rpc';
+import {
+  RpcClient, ConnectionStatus, TransportSpec, localSpec, relaySpec, StreamHandle, DESKTOP_OFFLINE,
+} from './rpc';
 import {
   Chat, Device, Session, Space, SessionCommandPayload, RunRequest,
   HarnessInfo, EngineInfo, ComputerStatus, UserInputAnswer,
@@ -15,7 +17,8 @@ import {
   StoredSession, loadSession, clearSession, freshAccessToken,
   idTokenExpiry, isFirebaseIdToken, signInInteractive, EDGE_URL,
 } from './auth';
-import { Platform } from 'react-native';
+import { PAIRING_EXPIRED, PHONE_UNPAIRED } from './connection-state';
+import { AppState, Platform } from 'react-native';
 // SecureStore has no sync API at module scope; the store below hydrates async.
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
@@ -72,6 +75,23 @@ export function desktopDisplayName(desktop: LinkedDesktop): string {
   return !name || name === desktop.address ? PLACEHOLDER_NAME : name;
 }
 
+/** A QR pairing is trusted for six months; after that the phone asks for a
+ *  fresh code (the desktop enforces the same window on its grants). */
+export const PAIRING_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+const LIVENESS_INTERVAL_MS = 20_000;
+const LIVENESS_TIMEOUT_MS = 12_000;
+
+export function pairingExpired(desktop: LinkedDesktop, now = Date.now()): boolean {
+  return desktop.kind === 'remote' && !!desktop.deviceToken && now - desktop.addedAt > PAIRING_TTL_MS;
+}
+
+/** The desktop refused the stored grant (revoked, expired, or lost) — only a
+ *  new pairing fixes that. Transport failures (host asleep, timeouts) don't. */
+function isGrantRejection(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /not paired|unknown phone grant|pairing expired/i.test(msg);
+}
+
 const DESKTOPS_KEY = 'cosmos.desktops';
 const ACTIVE_DESKTOP_KEY = 'cosmos.activeDesktop';
 
@@ -118,6 +138,7 @@ export class CosmosClient {
 
   private rpc: RpcClient | null = null;
   private streams: StreamHandle[] = [];
+  private livenessTimer: ReturnType<typeof setInterval> | null = null;
   private accessTokenCache: { token: string; expiresAt: number } | null = null;
 
   async hydrate() {
@@ -452,6 +473,7 @@ export class CosmosClient {
   // -- connection ------------------------------------------------------------
 
   disconnect() {
+    this.stopLivenessProbe();
     for (const s of this.streams) s.cancel();
     this.streams = [];
     this.rpc?.close();
@@ -459,8 +481,51 @@ export class CosmosClient {
     this.connection.set({ ...this.connection.get(), status: 'disconnected' });
   }
 
+  /** App returned to the foreground: redial now rather than after backoff. */
+  resume() {
+    const rpc = this.rpc;
+    if (!rpc) return;
+    rpc.reconnectNow();
+    if (this.connection.get().status === 'connected' && this.connection.get().desktop?.kind === 'remote') {
+      void this.probeLiveness(rpc);
+    }
+  }
+
+  /** A sleeping laptop rarely closes its relay socket cleanly, so the phone's
+   *  watches can sit silent on a dead host. Ping the desktop through the relay
+   *  and, if it stops answering, drop to "asleep" and let reconnect take over. */
+  private startLivenessProbe(rpc: RpcClient) {
+    this.stopLivenessProbe();
+    this.livenessTimer = setInterval(() => void this.probeLiveness(rpc), LIVENESS_INTERVAL_MS);
+  }
+
+  private stopLivenessProbe() {
+    if (this.livenessTimer) clearInterval(this.livenessTimer);
+    this.livenessTimer = null;
+  }
+
+  private async probeLiveness(rpc: RpcClient) {
+    if (this.rpc !== rpc) return;
+    if (this.connection.get().status !== 'connected') return;
+    try {
+      await rpc.call('EngineInfo', undefined, LIVENESS_TIMEOUT_MS);
+    } catch (err) {
+      if (this.rpc !== rpc || this.connection.get().status !== 'connected') return;
+      if (err instanceof Error && err.message === 'not connected') return;
+      this.stopLivenessProbe();
+      const desktop = this.connection.get().desktop;
+      this.connection.set({ status: 'reconnecting', detail: DESKTOP_OFFLINE, desktop });
+      rpc.bounce(true);
+    }
+  }
+
   async connect(desktop: LinkedDesktop): Promise<void> {
     this.disconnect();
+    if (pairingExpired(desktop)) {
+      this.connection.set({ status: 'error', detail: PAIRING_EXPIRED, desktop });
+      await SecureStore.setItemAsync(ACTIVE_DESKTOP_KEY, desktop.id);
+      return;
+    }
     let spec: TransportSpec;
     if (desktop.kind === 'local') {
       const [host, portStr] = desktop.address.split(':');
@@ -472,43 +537,73 @@ export class CosmosClient {
     this.rpc = rpc;
     this.connection.set({ status: 'connecting', desktop });
     rpc.onStatusChange((s, detail) => {
-      this.connection.set({ status: s, detail, desktop });
+      if (this.rpc !== rpc) return;
+      const prev = this.connection.get();
+      if (s === 'connected' && desktop.kind === 'remote') {
+        // The relay accepts the socket even while the desktop is asleep —
+        // it only counts as connected once the desktop authorizes us.
+        this.connection.set({
+          status: prev.status === 'connected' ? 'reconnecting' : prev.status,
+          detail: prev.detail,
+          desktop,
+          localDeviceId: prev.localDeviceId,
+        });
+        void this.afterConnect(desktop, rpc);
+        return;
+      }
+      this.connection.set({ status: s, detail, desktop, localDeviceId: prev.localDeviceId });
       if (s === 'connected') {
-        void this.afterConnect(desktop);
+        void this.afterConnect(desktop, rpc);
       }
     });
     rpc.connect();
     await SecureStore.setItemAsync(ACTIVE_DESKTOP_KEY, desktop.id);
   }
 
-  private async afterConnect(desktop: LinkedDesktop) {
+  private async afterConnect(desktop: LinkedDesktop, rpc: RpcClient) {
     try {
       // Remote conns land behind the pairing gate — authorize with the
       // stored grant BEFORE anything else or every call errors.
-      if (desktop.kind === 'remote' && desktop.deviceToken) {
+      if (desktop.kind === 'remote') {
         try {
-          await this.rpc!.call('AuthorizePhone', { deviceToken: desktop.deviceToken });
-        } catch {
-          // Revoked on the desktop (or grant lost) — leave a dead pipe that
-          // reconnect-loops forever. Disconnect and say why instead.
-          this.disconnect();
-          this.connection.set({
-            status: 'error',
-            detail: 'This phone was unpaired on the desktop — pair again with a fresh code.',
-            desktop,
-          });
+          if (desktop.deviceToken) {
+            await rpc.call('AuthorizePhone', { deviceToken: desktop.deviceToken });
+          } else {
+            await rpc.call('EngineInfo');
+          }
+        } catch (err) {
+          if (this.rpc !== rpc) return;
+          if (isGrantRejection(err)) {
+            // Revoked or expired on the desktop — redialing can't fix it.
+            this.disconnect();
+            this.connection.set({
+              status: 'error',
+              detail: /expired/i.test(String(err)) ? PAIRING_EXPIRED : PHONE_UNPAIRED,
+              desktop,
+            });
+            return;
+          }
+          // Desktop asleep / unreachable: keep the pairing and let the
+          // reconnect loop pick it back up when the desktop wakes.
+          this.connection.set({ status: 'reconnecting', detail: DESKTOP_OFFLINE, desktop });
+          rpc.bounce(true);
           return;
         }
+        if (this.rpc !== rpc) return;
+        this.connection.set({ status: 'connected', desktop, localDeviceId: this.connection.get().localDeviceId });
+        this.startLivenessProbe(rpc);
       }
+      if (this.rpc !== rpc) return;
       const [info, local] = await Promise.all([
-        this.rpc!.call<EngineInfo>('EngineInfo').catch(() => null),
-        this.rpc!.call<{ deviceId: string }>('LocalDevice').catch(() => null),
+        rpc.call<EngineInfo>('EngineInfo').catch(() => null),
+        rpc.call<{ deviceId: string }>('LocalDevice').catch(() => null),
       ]);
       this.engine.set(info);
       if (local?.deviceId) {
         this.connection.set({ ...this.connection.get(), localDeviceId: local.deviceId });
       }
-      void this.rpc!.call<ComputerStatus>('ComputerStatus')
+      if (this.rpc !== rpc) return;
+      void rpc.call<ComputerStatus>('ComputerStatus')
         .then((s) => this.computer.set(s))
         .catch(() => this.computer.set(null));
       this.startWatches();
@@ -686,6 +781,12 @@ export function CosmosProvider({ children }: { children: React.ReactNode }) {
     void c.hydrate();
     return c;
   }, []);
+  React.useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') client.resume();
+    });
+    return () => sub.remove();
+  }, [client]);
   return <ClientContext.Provider value={client}>{children}</ClientContext.Provider>;
 }
 

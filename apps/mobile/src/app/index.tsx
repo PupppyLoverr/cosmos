@@ -11,10 +11,11 @@ import * as Haptics from 'expo-haptics';
 import { LinearGradient } from 'expo-linear-gradient';
 import { formatTimeAgo } from '../lib/activity';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../lib/client';
+import { describeLink } from '../lib/connection-state';
 import { Chat, Device, Session, Space } from '../lib/protocol';
 import { showMenu } from '../lib/menu';
 import { alpha, spacing, statusColor, type, useTheme } from '../lib/theme';
-import { EmptyState, Icon, Notice, StatusDot } from '../components/bits';
+import { Button, EmptyState, Icon, Notice, StatusDot } from '../components/bits';
 import { CircleButton, FilterChip, PillButton, ScreenTitle, TopBar } from '../components/chrome';
 import { DrawerEdge, useDrawer } from '../components/drawer';
 import { harnessLabel } from '../components/harness-mark';
@@ -217,6 +218,7 @@ export default function HomeScreen() {
     transform: [{ translateY: -Math.max(0, keyboard.height.get() - insets.bottom) }],
   }));
   const desktopName = connection.desktop ? desktopDisplayName(connection.desktop) : 'your desktop';
+  const link = describeLink(connection, desktopName);
 
   const header = (
     <View>
@@ -236,9 +238,16 @@ export default function HomeScreen() {
         ))}
         <FilterChip label="Pair" icon="plus" onPress={() => router.push('/pair')} />
       </ScrollView>
-      {!connected && connection.desktop && connection.detail ? (
+      {!connected && connection.desktop && connection.detail && items.length > 0 ? (
         <View style={styles.notice}>
-          <Notice kind="warning" title={connecting ? `Connecting to ${desktopName}…` : `Can't reach ${desktopName}`} body={connection.detail} />
+          <Notice
+            kind={link.tone === 'attention' ? 'error' : link.tone === 'asleep' ? 'info' : 'warning'}
+            title={link.title}
+            body={link.body}
+            action={link.needsPair ? (
+              <Button title="Pair again" size="sm" variant="tinted" style={styles.noticeAction} onPress={() => router.push('/pair')} />
+            ) : undefined}
+          />
         </View>
       ) : null}
     </View>
@@ -259,12 +268,18 @@ export default function HomeScreen() {
         keyboardShouldPersistTaps="handled"
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} tintColor={t.textTertiary} />}
         ListEmptyComponent={
-          connection.status === 'connecting' ? (
-            <EmptyState title={`Connecting to ${desktopName}…`} />
-          ) : !connection.desktop ? (
+          !connection.desktop ? (
             <EmptyState title="Pair a desktop to start" body="Open Cosmos on your computer and scan its code." actionLabel="Pair this phone" onAction={() => router.push('/pair')} />
           ) : !connected ? (
-            <EmptyState title={`Can't reach ${desktopName}`} actionLabel="Retry" onAction={() => { if (connection.desktop) void client.connect(connection.desktop); }} />
+            <EmptyState
+              title={link.title}
+              body={link.body}
+              actionLabel={link.needsPair ? 'Pair again' : link.tone === 'pending' ? undefined : 'Try now'}
+              onAction={() => {
+                if (link.needsPair) router.push('/pair');
+                else if (connection.desktop) void client.connect(connection.desktop);
+              }}
+            />
           ) : query ? (
             <EmptyState title={`Nothing matches “${query}”`} />
           ) : (
@@ -330,6 +345,7 @@ const styles = StyleSheet.create({
   flex: { flex: 1 },
   chips: { flexDirection: 'row', gap: spacing(2), paddingHorizontal: spacing(4), paddingBottom: spacing(3) },
   notice: { paddingHorizontal: spacing(4), paddingBottom: spacing(2) },
+  noticeAction: { alignSelf: 'flex-start', marginTop: spacing(2) },
   header: { flexDirection: 'row', alignItems: 'center', gap: spacing(2.5), minHeight: 44, paddingHorizontal: spacing(4), marginTop: spacing(3) },
   headerText: { fontSize: 17, fontWeight: '600', flexShrink: 1 },
   row: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing(3), paddingHorizontal: spacing(4), paddingVertical: spacing(3), minHeight: 64 },

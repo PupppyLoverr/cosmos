@@ -5,6 +5,7 @@ import { useLocalSearchParams, router } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import { useCosmos, useSnapshot } from '../../lib/client';
+import { describeLink } from '../../lib/connection-state';
 import { radii, spacing, type, useTheme } from '../../lib/theme';
 import { Button, Icon, StatusChip } from '../../components/bits';
 import { CircleButton } from '../../components/chrome';
@@ -96,7 +97,7 @@ export default function WatchLiveScreen() {
         <View style={styles.titleWrap}>
           <Text style={[type.headline, { color: t.text }]} numberOfLines={1}>{chat?.title ?? 'Watch live'}</Text>
           <Text style={[type.meta, { color: offline ? t.warning : t.textSecondary }]} numberOfLines={1}>
-            {offline ? 'Desktop offline — reconnecting…' : [control, ageLabel].filter(Boolean).join(' · ')}
+            {offline ? (describeLink(connection).tone === 'asleep' ? 'Desktop asleep — resumes on wake' : 'Reconnecting…') : [control, ageLabel].filter(Boolean).join(' · ')}
           </Text>
         </View>
         <View style={styles.topSpacer} />

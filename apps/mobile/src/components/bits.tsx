@@ -7,6 +7,8 @@ import { Host, Slider as NativeSlider } from '@expo/ui';
 import * as Haptics from 'expo-haptics';
 import { Theme, alpha, edge, motion, radii, shadows, spacing, statusColor, type, useTheme } from '../lib/theme';
 import { useReduceMotion } from '../lib/motion';
+import { describeLink } from '../lib/connection-state';
+import type { ConnectionStatus } from '../lib/rpc';
 import { HIT_SLOP_44, useLargeText } from '../lib/a11y';
 import { icons, solarFor } from '../lib/icons';
 import { SOLAR_ICONS } from '../lib/solar-icons';
@@ -415,17 +417,14 @@ export function EmptyState({ title, body, actionLabel, onAction, children }: {
 
 export function ConnectionBadge({ status, detail }: { status: string; detail?: string }) {
   const t = useTheme();
-  const label = status === 'connected' ? 'Connected'
-    : status === 'connecting' ? 'Connecting…'
-    : status === 'reconnecting' ? 'Reconnecting…'
-    : status === 'disconnected' ? 'Offline'
-    : (detail ?? 'Error');
-  const color = status === 'connected' ? t.success
-    : status === 'connecting' || status === 'reconnecting' ? t.warning
-    : status === 'disconnected' ? t.textTertiary : t.danger;
+  const link = describeLink({ status: status as ConnectionStatus, detail });
+  const label = link.label;
+  const color = link.tone === 'online' ? t.success
+    : link.tone === 'pending' ? t.warning
+    : link.tone === 'attention' ? t.danger : t.textTertiary;
   return (
     <View style={styles.badge} accessibilityLabel={`Connection: ${label}`}>
-      {status === 'connecting' || status === 'reconnecting'
+      {link.tone === 'pending'
         ? <ActivityIndicator size={10} color={color} />
         : <View style={[styles.badgeDot, { backgroundColor: color }]} />}
       <Text style={[type.footnote, { color: t.textSecondary, fontWeight: '500' }]}>{label}</Text>

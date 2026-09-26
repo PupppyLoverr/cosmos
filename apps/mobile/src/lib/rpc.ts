@@ -25,6 +25,11 @@ interface PendingCall {
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_RECONNECT_DELAY_MS = 15_000;
+
+/** Status detail set while the relay reports the desktop host as absent
+ *  (asleep, lid closed, app quit) — the link keeps redialing until it returns. */
+export const DESKTOP_OFFLINE = 'desktop_offline';
 const STREAM_TIMEOUT_MS = 600_000;
 
 // ---- device-room relay framing (uleb128 len ‖ {"s","k"}‖ payload) ----------
@@ -96,6 +101,7 @@ export class RpcClient {
   private reconnectDelay = 1_000;
   private closed = false;
   private status: ConnectionStatus = 'disconnected';
+  private hostOffline = false;
 
   constructor(
     private readonly spec: TransportSpec,
@@ -122,6 +128,41 @@ export class RpcClient {
     void this.dial();
   }
 
+  /** Redial immediately (app foregrounded, network back) instead of waiting
+   *  out the backoff. No-op while a socket is open or opening. */
+  reconnectNow() {
+    if (this.closed) return;
+    const state = this.ws?.readyState;
+    if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) return;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.reconnectDelay = 1_000;
+    void this.dial();
+  }
+
+  /** Drop the current socket and let the reconnect loop dial a fresh one.
+   *  `hostOffline` marks the drop as "desktop unreachable" for the UI. */
+  bounce(hostOffline = false) {
+    if (this.closed) return;
+    if (hostOffline) this.hostOffline = true;
+    const ws = this.ws;
+    if (!ws) return;
+    // Don't wait on the close handshake — a dead peer can stall it for seconds.
+    this.socketGone(ws, 1000);
+    ws.close();
+  }
+
+  private socketGone(ws: WebSocket, code: number, reason?: string) {
+    if (this.ws !== ws) return;
+    this.ws = null;
+    const detail = this.hostOffline ? DESKTOP_OFFLINE : reason || undefined;
+    this.failAll(new Error(`socket closed (${code})`));
+    if (!this.closed) {
+      this.setStatus('reconnecting', detail);
+      this.scheduleReconnect();
+    }
+  }
+
   close() {
     this.closed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -132,7 +173,10 @@ export class RpcClient {
 
   private async dial() {
     if (this.closed) return;
-    this.setStatus(this.status === 'disconnected' ? 'connecting' : 'reconnecting');
+    this.setStatus(
+      this.status === 'disconnected' ? 'connecting' : 'reconnecting',
+      this.hostOffline ? DESKTOP_OFFLINE : undefined,
+    );
     let url = this.spec.url;
     if (this.spec.relay && this.tokenProvider) {
       const token = await this.tokenProvider();
@@ -155,21 +199,17 @@ export class RpcClient {
     }
     this.ws = ws;
     ws.onopen = () => {
-      this.reconnectDelay = 1_000;
+      // An absent host still accepts the socket; only reset the backoff once
+      // the desktop has actually answered (see the rpc frame branch below).
+      if (!this.hostOffline) this.reconnectDelay = 1_000;
       this.setStatus('connected');
     };
     ws.onerror = () => {
       // onclose follows; nothing else to do here.
     };
-    ws.onclose = (ev) => {
-      const detail = ev.reason || undefined;
-      this.failAll(new Error(`socket closed (${ev.code})`));
-      if (!this.closed) {
-        this.setStatus('reconnecting', detail);
-        this.scheduleReconnect();
-      }
-    };
+    ws.onclose = (ev) => this.socketGone(ws, ev.code, ev.reason);
     ws.onmessage = (ev) => {
+      if (this.ws !== ws) return;
       if (this.spec.relay) {
         const frame = typeof ev.data === 'string'
           ? decodeRelayFrame(textEncoder.encode(ev.data).buffer as ArrayBuffer)
@@ -182,11 +222,15 @@ export class RpcClient {
           // is gone either way, so drop the socket and let onclose redial a
           // fresh conn that re-authorizes and re-subscribes.
           const code = (() => { try { return (JSON.parse(frame.payload) as { error?: string }).error; } catch { return undefined; } })();
+          if (code === 'host_offline' || code === 'host_closed') this.hostOffline = true;
           this.failAll(new Error(code === 'host_closed' ? 'the desktop went offline' : 'the desktop is offline'));
-          this.ws?.close();
+          this.socketGone(ws, 1000);
+          ws.close();
           return;
         }
         if (frame.header.k !== 'rpc') return;
+        this.hostOffline = false;
+        this.reconnectDelay = 1_000;
         this.handleText(frame.payload);
       } else if (typeof ev.data === 'string') {
         this.handleText(ev.data);
@@ -198,7 +242,7 @@ export class RpcClient {
     if (this.closed) return;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => void this.dial(), this.reconnectDelay);
-    this.reconnectDelay = Math.min(this.reconnectDelay * 2, 15_000);
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_DELAY_MS);
   }
 
   private failAll(err: Error) {
@@ -254,8 +298,8 @@ export class RpcClient {
     }
   }
 
-  call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
-    return this.request(method, params, undefined, DEFAULT_TIMEOUT_MS) as Promise<T>;
+  call<T = unknown>(method: string, params?: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
+    return this.request(method, params, undefined, timeoutMs) as Promise<T>;
   }
 
   stream(method: string, params: Record<string, unknown> | undefined, onItem: (item: unknown) => void): StreamHandle & { done: Promise<void> } {
