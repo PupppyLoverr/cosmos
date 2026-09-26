@@ -486,7 +486,7 @@ export class CosmosClient {
     const rpc = this.rpc;
     if (!rpc) return;
     rpc.reconnectNow();
-    if (this.connection.get().status === 'connected' && this.connection.get().desktop?.kind === 'remote') {
+    if (this.connection.get().status === 'connected') {
       void this.probeLiveness(rpc);
     }
   }
@@ -591,9 +591,9 @@ export class CosmosClient {
         }
         if (this.rpc !== rpc) return;
         this.connection.set({ status: 'connected', desktop, localDeviceId: this.connection.get().localDeviceId });
-        this.startLivenessProbe(rpc);
       }
       if (this.rpc !== rpc) return;
+      this.startLivenessProbe(rpc);
       const [info, local] = await Promise.all([
         rpc.call<EngineInfo>('EngineInfo').catch(() => null),
         rpc.call<{ deviceId: string }>('LocalDevice').catch(() => null),

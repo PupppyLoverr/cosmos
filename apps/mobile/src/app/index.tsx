@@ -23,8 +23,7 @@ import { Screen } from '../components/surface';
 
 type State = 'working' | 'awaitingInput' | 'errored' | 'unread' | 'idle';
 
-function stateOf(chat: Chat, sessions: Session[]): State {
-  const live = sessions.find((s) => s.chatId === chat.id);
+function stateOf(chat: Chat, live: Session | undefined): State {
   if (live?.status === 'working') return 'working';
   if (live?.status === 'awaitingInput') return 'awaitingInput';
   if (live?.status === 'errored') return 'errored';
@@ -36,6 +35,7 @@ function projectOf(chat: Chat, spaces: Space[]): string {
   const space = chat.spaceId ? spaces.find((s) => s.id === chat.spaceId) : undefined;
   if (space?.name?.trim()) return space.name.trim();
   const path = (space?.path ?? chat.cwd ?? '').replace(/\\/g, '/');
+  if (!path || path === '~' || path === '~/' || /^\/(Users|home)\/[^/]+\/?$/.test(path) || /^[A-Za-z]:\/Users\/[^/]+\/?$/.test(path)) return path ? 'Home' : 'No project';
   return path.split('/').filter(Boolean).pop() || 'No project';
 }
 
@@ -47,10 +47,10 @@ function elapsed(startedAt?: string | null): string | undefined {
 
 type Item =
   | { kind: 'header'; key: string; title: string; icon?: string; count: number; collapsible?: boolean; collapsed?: boolean; tone?: 'attention' }
-  | { kind: 'chat'; key: string; chat: Chat; state: State; desktop: string; startedAt?: string | null };
+  | { kind: 'chat'; key: string; chat: Chat; state: State; desktop?: string; startedAt?: string | null };
 
 /** One session: status dot, title, "harness · desktop · state", time on the right. */
-function SessionItem({ chat, state, desktop, startedAt }: { chat: Chat; state: State; desktop: string; startedAt?: string | null }) {
+const SessionItem = React.memo(function SessionItem({ chat, state, desktop, startedAt }: { chat: Chat; state: State; desktop?: string; startedAt?: string | null }) {
   const t = useTheme();
   const client = useCosmos();
   const title = chat.title || chat.lastMessagePreview || 'Untitled session';
@@ -111,7 +111,7 @@ function SessionItem({ chat, state, desktop, startedAt }: { chat: Chat; state: S
       <Link.Preview />
     </Link>
   );
-}
+});
 
 export default function HomeScreen() {
   const t = useTheme();
@@ -155,7 +155,12 @@ export default function HomeScreen() {
 
   const items = useMemo<Item[]>(() => {
     const q = query.trim().toLowerCase();
-    const nameOf = (c: Chat) => devices.find((d) => d.id === c.deviceId)?.name?.trim() || 'Desktop';
+    const deviceNames = new Map(devices.map((d) => [d.id, d.name?.trim() || 'Desktop']));
+    const liveByChat = new Map<string, Session>();
+    for (const s of sessions) if (!liveByChat.has(s.chatId)) liveByChat.set(s.chatId, s);
+    // With a single desktop the host name on every row is noise.
+    const multiHost = new Set(chats.map((c) => c.deviceId)).size > 1;
+    const nameOf = (c: Chat) => (multiHost ? deviceNames.get(c.deviceId) ?? 'Desktop' : undefined);
     const pool = chats
       .filter((c) => (showArchived || q ? true : !c.archived))
       .filter((c) => host === 'all' || c.deviceId === host)
@@ -164,12 +169,15 @@ export default function HomeScreen() {
         || (c.lastMessagePreview ?? '').toLowerCase().includes(q)
         || projectOf(c, spaces).toLowerCase().includes(q))
       .sort((a, b) => (b.lastMessageAt ?? b.createdAt).localeCompare(a.lastMessageAt ?? a.createdAt))
-      .map((chat) => ({
-        chat,
-        state: stateOf(chat, sessions),
-        desktop: nameOf(chat),
-        startedAt: sessions.find((s) => s.chatId === chat.id && s.status === 'working')?.startedAt,
-      }));
+      .map((chat) => {
+        const live = liveByChat.get(chat.id);
+        return {
+          chat,
+          state: stateOf(chat, live),
+          desktop: nameOf(chat),
+          startedAt: live?.status === 'working' ? live.startedAt : undefined,
+        };
+      });
 
     const out: Item[] = [];
     const push = (rows: typeof pool) => rows.forEach((r) => out.push({ kind: 'chat', key: `${out.length}:${r.chat.id}`, ...r }));
@@ -262,6 +270,9 @@ export default function HomeScreen() {
       <FlatList
         data={items}
         keyExtractor={(i) => i.key}
+        initialNumToRender={14}
+        maxToRenderPerBatch={10}
+        windowSize={9}
         ListHeaderComponent={header}
         contentContainerStyle={{ paddingBottom: insets.bottom + 120 }}
         keyboardDismissMode="on-drag"
@@ -349,7 +360,7 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', alignItems: 'center', gap: spacing(2.5), minHeight: 44, paddingHorizontal: spacing(4), marginTop: spacing(3) },
   headerText: { fontSize: 17, fontWeight: '600', flexShrink: 1 },
   row: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing(3), paddingHorizontal: spacing(4), paddingVertical: spacing(3), minHeight: 64 },
-  dotCol: { width: 18, alignItems: 'center', paddingTop: 7 },
+  dotCol: { width: 18, alignItems: 'center', paddingTop: 8 },
   dot: { width: 8, height: 8, borderRadius: 4 },
   rowCopy: { flex: 1, minWidth: 0, gap: 3 },
   rowTop: { flexDirection: 'row', alignItems: 'baseline', gap: spacing(2) },

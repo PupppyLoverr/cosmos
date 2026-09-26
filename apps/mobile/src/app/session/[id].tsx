@@ -84,15 +84,20 @@ export default function SessionScreen() {
 
   useEffect(() => {
     if (!client.raw() || connection.status !== 'connected') return;
-    setStreamLost(false);
+    let live = true;
     const stream = client.raw()!.stream('WatchDocMessages', { chatId }, (item) => {
       setStreamLost(false);
       setEntries((prev) => applyTranscriptUpdate(prev, item as TranscriptUpdate));
       setLoaded(true);
     });
     const settle = setTimeout(() => setLoaded(true), 1500);
-    stream.done.catch(() => setStreamLost(true));
-    return () => { clearTimeout(settle); stream.cancel(); };
+    stream.done.catch(() => { if (live) setStreamLost(true); });
+    return () => {
+      live = false;
+      clearTimeout(settle);
+      stream.cancel();
+      setStreamLost(false);
+    };
   }, [chatId, connection.status, client, streamEpoch]);
 
   useEffect(() => {
@@ -161,11 +166,20 @@ export default function SessionScreen() {
     }
   };
 
-  const onAnswer = (requestId: string, answers: { questionId: string; labels: string[] }[]) => {
+  const onAnswer = useCallback((requestId: string, answers: { questionId: string; labels: string[] }[]) => {
     void client.respondInput(chatId, requestId, answers).catch((e) =>
       Alert.alert("Couldn't send answer", e instanceof Error ? e.message : String(e)),
     );
-  };
+  }, [client, chatId]);
+
+  const renderEntry = useCallback(({ item, index }: { item: SessionMessageEntry; index: number }) => (
+    <MessageView
+      entry={item}
+      onAnswer={onAnswer}
+      grouped={reversed[index + 1]?.role === item.role}
+      arrive={item.id === freshId}
+    />
+  ), [onAnswer, reversed, freshId]);
 
   const stop = () => void client.interrupt(chatId);
   const watch = () => router.push({ pathname: '/watch/[chatId]', params: { chatId } });
@@ -258,18 +272,15 @@ export default function SessionScreen() {
               data={reversed}
               inverted
               keyExtractor={entryKeyExtractor}
-              renderItem={({ item, index }) => (
-                <MessageView
-                  entry={item}
-                  onAnswer={onAnswer}
-                  grouped={reversed[index + 1]?.role === item.role}
-                  arrive={item.id === freshId}
-                />
-              )}
+              renderItem={renderEntry}
+              initialNumToRender={12}
+              maxToRenderPerBatch={8}
+              windowSize={11}
               contentContainerStyle={{ paddingTop: spacing(2), paddingBottom: spacing(3) }}
               maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 160 }}
               onScroll={(e) => {
                 const nextAtBottom = e.nativeEvent.contentOffset.y < 120;
+                if (nextAtBottom === atBottomRef.current) return;
                 atBottomRef.current = nextAtBottom;
                 setAtBottom(nextAtBottom);
                 if (nextAtBottom) setNewEntryCount(0);

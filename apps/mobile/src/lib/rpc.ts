@@ -233,6 +233,8 @@ export class RpcClient {
         this.reconnectDelay = 1_000;
         this.handleText(frame.payload);
       } else if (typeof ev.data === 'string') {
+        this.hostOffline = false;
+        this.reconnectDelay = 1_000;
         this.handleText(ev.data);
       }
     };
