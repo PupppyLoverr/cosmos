@@ -249,11 +249,17 @@ impl Agent {
             // full still sandboxed unless --no-sandbox
         }
 
-        let resume_id = opts.resume.as_deref().filter(|id| *id != "__latest__").map(str::to_owned).or_else(|| {
-            (opts.resume.as_deref() == Some("__latest__"))
-                .then(|| Session::latest_for_cwd(&home, &workspace))
-                .flatten()
-        });
+        let resume_id = match opts.resume.as_deref() {
+            Some("__latest__") => Some(
+                Session::latest_for_cwd(&home, &workspace)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "no previous session in {} to continue",
+                        workspace.display()
+                    ))?,
+            ),
+            Some(id) => Some(id.to_owned()),
+            None => None,
+        };
         let (session, messages) = if let Some(id) = resume_id {
             let s = Session::open(&home, &id)?;
             let msgs = Session::replay(&home, &id)?;
