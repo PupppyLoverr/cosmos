@@ -538,6 +538,7 @@ impl Agent {
                 "input": usage.input, "cache_read": usage.cache_read,
                 "cache_write": usage.cache_write, "output": usage.output,
                 "usd": cost, "cum_usd": self.cum_usd,
+                "model": self.model_alias, "turn_usd": cost,
             }),
         );
         emit(&uev);

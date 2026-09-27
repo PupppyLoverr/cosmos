@@ -50,6 +50,40 @@ pub fn project_instructions(workspace: &std::path::Path) -> Option<String> {
     (!parts.is_empty()).then(|| format!("The repository provides these instructions; follow them.\n\n{}", parts.join("\n\n")))
 }
 
+pub fn init_project(workspace: &std::path::Path) -> std::io::Result<String> {
+    let path = workspace.join("AGENTS.md");
+    if path.exists() {
+        return Ok("AGENTS.md already exists".into());
+    }
+    let mut commands = Vec::new();
+    if workspace.join("package.json").exists() {
+        commands.push("Build/test: inspect package.json scripts (for example, `npm run build` and `npm test`).");
+    }
+    if workspace.join("Cargo.toml").exists() {
+        commands.push("Build/test: `cargo build` and `cargo test`.");
+    }
+    if workspace.join("go.mod").exists() {
+        commands.push("Build/test: `go build ./...` and `go test ./...`.");
+    }
+    if workspace.join("Makefile").exists() {
+        commands.push("Build/test: inspect the Makefile targets.");
+    }
+    if commands.is_empty() {
+        commands.push("Build/test: document the repository's build and test commands.");
+    }
+    let claude = if workspace.join("CLAUDE.md").exists() {
+        "\n\nSee `CLAUDE.md` for additional repository instructions."
+    } else {
+        ""
+    };
+    let body = format!(
+        "# Agent instructions\n\n## Project summary\n\n<!-- Describe this project's purpose and key directories. -->\n\n## Build and test\n\n{}{}\n",
+        commands.join("\n"), claude
+    );
+    std::fs::write(path, body)?;
+    Ok("created AGENTS.md".into())
+}
+
 /// COSMOS_CLI_HOME — shared by zcli, zdev, zagy (contract §1).
 pub fn cli_home() -> PathBuf {
     if let Some(p) = std::env::var_os("COSMOS_CLI_HOME") {

@@ -97,8 +97,6 @@ var slashCmds = []slashCmd{
 	{"/usage", "Show token usage"},
 	{"/cost", "Show session cost breakdown"},
 	{"/init", "Write AGENTS.md for this repository"},
-	{"/cost", "Show session cost breakdown"},
-	{"/init", "Write AGENTS.md for this repository"},
 	{"/clear", "Clear the transcript"},
 	{"/copy", "Copy the last reply"},
 	{"/onboarding", "Replay the first-run setup"},
@@ -126,13 +124,18 @@ type tuiModel struct {
 	items       []tItem
 	lastThought int // index into items, -1 none
 
-	busy      bool
-	busySince time.Time
-	turnSince time.Time
-	turnOut   uint64
-	totIn     uint64
-	totOut    uint64
-	cumUSD    float64
+	busy          bool
+	busySince     time.Time
+	turnSince     time.Time
+	turnOut       uint64
+	totIn         uint64
+	totOut        uint64
+	totCacheRead  uint64
+	totCacheWrite uint64
+	turns         uint64
+	cumUSD        float64
+	modelUSD      map[string]float64
+	startedAt     time.Time
 
 	expandThoughts bool
 
@@ -190,6 +193,8 @@ func newTUIModel(a *Agent, opts *RunOpts, cwd string, br *tuiBridge) tuiModel {
 		width: 80, height: 24,
 		lastThought: -1,
 		user:        configUserName(),
+		modelUSD:    map[string]float64{},
+		startedAt:   time.Now(),
 	}
 	m.items = append(m.items, tItem{kind: "banner"})
 	if opts.Resume != "" {
@@ -600,6 +605,11 @@ func (m tuiModel) execSlash(text string) (tea.Model, tea.Cmd) {
 	case "/cost":
 		m.appendItem(tItem{kind: "note", text: m.usageLine()})
 	case "/init":
+		if msg, err := initProject(m.cwd); err != nil {
+			m.appendItem(tItem{kind: "note", err: true, text: "init failed: " + err.Error()})
+		} else {
+			m.appendItem(tItem{kind: "note", text: msg})
+		}
 		a.SendUser("/init", renderTUI)
 		runTurns(a, renderTUI)
 	case "/onboarding":
@@ -648,11 +658,24 @@ func (m *tuiModel) cycleMode() {
 }
 
 func (m *tuiModel) usageLine() string {
-	u := fmt.Sprintf("tokens · in %d · out %d", m.totIn, m.totOut)
-	if m.cumUSD > 0 {
-		u += fmt.Sprintf(" · Σ $%.4f", m.cumUSD)
+	return formatCostReport(m.totIn, m.totOut, m.totCacheRead, m.totCacheWrite, m.cumUSD, m.modelUSD, m.turns, time.Since(m.startedAt))
+}
+
+func formatCostReport(input, output, cacheRead, cacheWrite uint64, total float64, models map[string]float64, turns uint64, wall time.Duration) string {
+	out := fmt.Sprintf("Cost\nInput: %d\nOutput: %d\nCache read: %d\nCache write: %d\nUSD total: $%.4f\nTurns: %d\nWall time: %s", input, output, cacheRead, cacheWrite, total, turns, formatWall(wall))
+	if len(models) > 1 {
+		for model, usd := range models {
+			out += fmt.Sprintf("\n%s: $%.4f", model, usd)
+		}
 	}
-	return u + fmt.Sprintf(" · session %s", m.agent.Session.ID[:8])
+	return out
+}
+
+func formatWall(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	return fmt.Sprintf("%.1fm", d.Minutes())
 }
 
 // ---- model picker ----------------------------------------------------------
@@ -1075,8 +1098,16 @@ func (m *tuiModel) applyEvent(ev Event, history bool) {
 		cr := uint64(numv(dataGetMap(ev), "cache_read"))
 		cw := uint64(numv(dataGetMap(ev), "cache_write"))
 		out := uint64(numv(dataGetMap(ev), "output"))
-		m.totIn += in + cr + cw
+		m.totIn += in
+		m.totCacheRead += cr
+		m.totCacheWrite += cw
 		m.totOut += out
+		m.turns++
+		if model := dataStr(ev, "model"); model != "" {
+			if usd, ok := dataGet(ev, "turn_usd").(float64); ok {
+				m.modelUSD[model] += usd
+			}
+		}
 		m.turnOut += out
 		if c, ok := dataGet(ev, "cum_usd").(float64); ok {
 			m.cumUSD = c

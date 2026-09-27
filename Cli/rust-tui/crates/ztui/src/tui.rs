@@ -42,7 +42,7 @@ pub(crate) const PLACEHOLDER: &str = "Ask zcli to build features, fix bugs, or w
 pub const EFFORTS: &[(&str, Option<&str>)] =
     &[("Auto", None), ("Low", Some("low")), ("Medium", Some("medium")), ("High", Some("high"))];
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub struct UsageInfo {
     pub input: u64,
     pub cache_read: u64,
@@ -52,6 +52,7 @@ pub struct UsageInfo {
     pub last_prompt: u64,
     pub turns: u64,
     pub cum_usd: Option<f64>,
+    pub model_usd: HashMap<String, f64>,
 }
 
 /// A `/model` picker row: a config.toml alias or a catalog `provider/model`.
@@ -159,6 +160,7 @@ pub struct App {
     pub alias: String,
     pub session: String,
     pub cwd: PathBuf,
+    pub session_started: Instant,
     pub usage: UsageInfo,
     pub rate: Option<zproviders::RateLimits>,
     pub popup: Option<Popup>,
@@ -234,6 +236,7 @@ impl App {
             alias: String::new(),
             session: String::new(),
             cwd: cwd.to_path_buf(),
+            session_started: Instant::now(),
             usage: UsageInfo::default(),
             rate: None,
             popup: None,
@@ -515,6 +518,12 @@ impl App {
                 u.turns += 1;
                 if ev.data["usd"].is_number() {
                     u.cum_usd = ev.data["cum_usd"].as_f64();
+                }
+                if let (Some(model), Some(turn_usd)) = (
+                    ev.data["model"].as_str(),
+                    ev.data["turn_usd"].as_f64(),
+                ) {
+                    *u.model_usd.entry(model.to_owned()).or_default() += turn_usd;
                 }
             }
             "compaction" => {
@@ -1074,11 +1083,17 @@ impl App {
                     self.popup = Some(Popup::Resume { items, sel: 0 });
                 }
             }
-            "init" => self.send_prompt(
-                "/init",
-                "Explore this repository and write an AGENTS.md at its root for coding agents: what the project is, how the code is laid out, how to build, run, test and lint it, the conventions to follow, and anything surprising. Read the files you describe; keep it short and accurate. If AGENTS.md exists, improve it instead of replacing it.".into(),
-                cmd,
-            ),
+            "init" => {
+                match zcore::init_project(&self.cwd) {
+                    Ok(msg) => self.note(msg),
+                    Err(err) => self.note(format!("could not create AGENTS.md: {err}")),
+                }
+                self.send_prompt(
+                    "/init",
+                    "Review AGENTS.md and fill in its project summary, build, test, and contribution guidance accurately. Keep it short and preserve existing instructions.".into(),
+                    cmd,
+                );
+            }
             "review" => self.send_prompt(
                 "/review",
                 format!(

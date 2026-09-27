@@ -29,6 +29,9 @@ type Agent struct {
 	Tools       []any
 	Allowed     []string
 	CumUSD      float64
+	ModelUSD    map[string]float64
+	Turns       uint64
+	StartedAt   time.Time
 	LastUsage   Usage
 	BootTokens  int
 	Asker       func(tool string) bool
@@ -74,7 +77,11 @@ func systemSnippet() string {
 }
 
 func bootContext(workspace string) (string, int) {
-	mer := findBin([]string{"meridian.exe", "meridian"}, "MERIDIAN_BIN")
+	names := []string{"meridian"}
+	if runtime.GOOS == "windows" {
+		names = []string{"meridian.exe", "meridian"}
+	}
+	mer := findBin(names, "MERIDIAN_BIN")
 	if mer == "" {
 		return systemSnippet(), 0
 	}
@@ -185,7 +192,9 @@ func NewAgent(opts *RunOpts, harness, cwd string) (*Agent, error) {
 		Opts: opts, Home: home, Cfg: cfg, Workspace: ws,
 		Provider: pcfg, ModelAlias: alias + " (" + pcfg.Model + ")",
 		Mode: mode, Ctx: ctx, Allowed: cfg.allowedHosts(),
-		LogW: os.Stderr,
+		LogW:      os.Stderr,
+		ModelUSD:  map[string]float64{},
+		StartedAt: time.Now(),
 	}
 	resume := opts.Resume
 	if resume == "__latest__" {
@@ -448,7 +457,9 @@ func (a *Agent) Turn(emit func(Event)) (bool, error) {
 	cost := a.cost(usage)
 	if cost != nil {
 		a.CumUSD += *cost
+		a.ModelUSD[a.ModelAlias] += *cost
 	}
+	a.Turns++
 	tc := []any{}
 	for _, c := range calls {
 		tc = append(tc, map[string]any{"id": c["id"], "name": c["name"], "input": c["input"]})
@@ -462,7 +473,8 @@ func (a *Agent) Turn(emit func(Event)) (bool, error) {
 	emit(a.Session.append("usage", map[string]any{
 		"input": usage.Input, "cache_read": usage.CacheRead,
 		"cache_write": usage.CacheWrite, "output": usage.Output,
-		"usd": usd, "cum_usd": a.CumUSD}))
+		"usd": usd, "cum_usd": a.CumUSD,
+		"model": a.ModelAlias, "turn_usd": usd}))
 	costStr := "$?"
 	if cost != nil {
 		costStr = fmt.Sprintf("$%.4f", *cost)

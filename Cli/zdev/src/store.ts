@@ -331,10 +331,16 @@ export function projectInstructions(workspace: string): string | null {
 export function initProject(workspace: string): string {
   const file = path.join(workspace, "AGENTS.md");
   if (fs.existsSync(file)) return "AGENTS.md already exists";
-  const claude = path.join(workspace, "CLAUDE.md");
-  const body = fs.existsSync(claude)
-    ? "# Agent instructions\n\nSee `CLAUDE.md` for the repository's instructions.\n"
-    : "# Agent instructions\n\nDescribe the build, test, and contribution workflow for this repository.\n";
+  const commands: string[] = [];
+  if (fs.existsSync(path.join(workspace, "package.json"))) commands.push("Inspect package.json scripts for build and test commands.");
+  if (fs.existsSync(path.join(workspace, "Cargo.toml"))) commands.push("`cargo build` and `cargo test`.");
+  if (fs.existsSync(path.join(workspace, "go.mod"))) commands.push("`go build ./...` and `go test ./...`.");
+  if (fs.existsSync(path.join(workspace, "Makefile"))) commands.push("Inspect Makefile targets for build and test commands.");
+  if (!commands.length) commands.push("Document the repository's build and test commands.");
+  const claude = fs.existsSync(path.join(workspace, "CLAUDE.md"))
+    ? "\n\nSee `CLAUDE.md` for additional repository instructions."
+    : "";
+  const body = `# Agent instructions\n\n## Project summary\n\n<!-- Describe this project's purpose and key directories. -->\n\n## Build and test\n\n- ${commands.join("\n- ")}${claude}\n`;
   fs.writeFileSync(file, body, "utf8");
   return "created AGENTS.md";
 }

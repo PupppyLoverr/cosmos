@@ -24,6 +24,7 @@ import { DIM, GRAY, GREEN, ROSE } from "../theme";
 import * as t from "../tools";
 import type { Item, Model, PermissionReq, Usage } from "../types";
 import { emptyState } from "../types";
+import { formatCost } from "../cost";
 import { ZdevDriver } from "./driver";
 import { KeyParser, lineEnd, lineStart, verticalMove, wordLeft, wordRight, type Key } from "./keys";
 import {
@@ -508,11 +509,10 @@ export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitRe
           return push({ kind: "assistant", id: nextId(), text: lines.join("\n") });
         }
         case "cost": {
-          const u = tr.usage;
           return push({
             kind: "assistant",
             id: nextId(),
-            text: `**Session cost** — input ${u.input.toLocaleString()} · output ${u.output.toLocaleString()} · cache read ${u.cache_read.toLocaleString()} · cache write ${u.cache_write.toLocaleString()} · total ${u.cum_usd != null ? `$${u.cum_usd.toFixed(4)}` : "unpriced"}`,
+            text: formatCost(tr.usage),
           });
         }
         case "context": {

@@ -29,6 +29,9 @@ export type Usage = {
   cache_write: number;
   usd: number | null;
   cum_usd: number | null;
+  turns: number;
+  started_at: number;
+  models: Record<string, number>;
 };
 
 export type Model = {
@@ -56,5 +59,5 @@ export type PermissionReq = {
 export type State = { items: Item[]; usage: Usage };
 export const emptyState = (): State => ({
   items: [],
-  usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, usd: null, cum_usd: null },
+  usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, usd: null, cum_usd: null, turns: 0, started_at: Date.now(), models: {} },
 });

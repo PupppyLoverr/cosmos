@@ -50,13 +50,14 @@ export function systemSnippet(): string {
 function findMeridian(): string | null {
   const v = process.env.MERIDIAN_BIN;
   if (v && fs.existsSync(v) && fs.statSync(v).isFile()) return v;
+  const names = process.platform === "win32" ? ["meridian.exe", "meridian"] : ["meridian"];
   for (const d of (process.env.PATH ?? "").split(path.delimiter)) {
-    for (const n of ["meridian.exe", "meridian"]) {
+    for (const n of names) {
       const c = path.join(d, n);
       if (fs.existsSync(c) && fs.statSync(c).isFile()) return c;
     }
   }
-  for (const n of ["meridian.exe", "meridian"]) {
+  for (const n of names) {
     const c = path.join(path.dirname(process.execPath), n);
     if (fs.existsSync(c) && fs.statSync(c).isFile()) return c;
   }
@@ -455,6 +456,8 @@ export class Agent {
         output: usage.output,
         usd: c,
         cum_usd: this.cumUsd,
+        model: this.modelAlias,
+        turn_usd: c,
       }),
     );
     this.log(
