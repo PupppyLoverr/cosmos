@@ -6,7 +6,7 @@ import React from 'react';
 import { Keyboard, Platform, Pressable, StyleSheet, Text, View, type StyleProp, type ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
-import { spacing, type, useTheme } from '../lib/theme';
+import { edge, spacing, type, useTheme } from '../lib/theme';
 import { HIT_SLOP_44 } from '../lib/a11y';
 import { Icon } from './bits';
 
@@ -25,7 +25,7 @@ export function useDockInset(): number {
   return up ? spacing(2) : Math.max(insets.bottom, spacing(3));
 }
 
-/** 44pt floating circle (menu, back, more). White with a soft shadow in light. */
+/** 44pt circle (menu, back, more) with a quiet tonal surface. */
 export function CircleButton({ icon, label, onPress, size = 44, tint, disabled, badge }: {
   icon: string; label: string; onPress?: () => void; size?: number; tint?: string; disabled?: boolean;
   /** Small accent dot (e.g. "something needs you"). */
@@ -41,8 +41,8 @@ export function CircleButton({ icon, label, onPress, size = 44, tint, disabled, 
       accessibilityLabel={label}
       style={({ pressed }) => [
         styles.circle,
-        { width: size, height: size, borderRadius: size / 2, backgroundColor: t.floating, boxShadow: t.floatShadow },
-        { opacity: disabled ? 0.4 : pressed ? 0.7 : 1, transform: [{ scale: pressed ? 0.96 : 1 }] },
+        { width: size, height: size, borderRadius: size / 2, backgroundColor: t.surface },
+        { opacity: disabled ? 0.4 : pressed ? 0.8 : 1 },
       ]}
     >
       <Icon name={icon} size={Math.round(size * 0.42)} color={tint ?? t.text} weight="medium" />
@@ -55,19 +55,21 @@ export function CircleButton({ icon, label, onPress, size = 44, tint, disabled, 
  * Screen top bar: left circle, a title (optionally with a subtitle, Codex
  * thread style) and right-hand circles. Sits in flow under the status bar.
  */
-export function TopBar({ left, title, subtitle, right, center = false, style }: {
+export function TopBar({ left, title, subtitle, right, center = false, divider = false, style }: {
   left?: React.ReactNode;
   title?: React.ReactNode;
   subtitle?: string;
   right?: React.ReactNode;
   /** Centre the title (Cowork) instead of leading it (Codex thread). */
   center?: boolean;
+  /** Add a themed hairline below the bar when content follows immediately. */
+  divider?: boolean;
   style?: StyleProp<ViewStyle>;
 }) {
   const t = useTheme();
   const insets = useSafeAreaInsets();
   return (
-    <View style={[styles.bar, { paddingTop: insets.top + spacing(1.5) }, style]}>
+    <View style={[styles.bar, { paddingTop: insets.top + spacing(1.5), borderBottomWidth: divider ? StyleSheet.hairlineWidth : 0, borderBottomColor: divider ? t.separator : undefined, backgroundColor: divider ? t.background : undefined }, style]}>
       <View style={styles.side}>{left}</View>
       <View style={[styles.titleWrap, center ? styles.centered : null]} accessibilityRole="header">
         {typeof title === 'string' ? (
@@ -80,7 +82,7 @@ export function TopBar({ left, title, subtitle, right, center = false, style }: 
   );
 }
 
-/** Codex-style large screen title under the top bar. */
+/** Compact screen title used beneath the top bar. */
 export function ScreenTitle({ children, style }: { children: string; style?: StyleProp<ViewStyle> }) {
   const t = useTheme();
   return (
@@ -154,10 +156,17 @@ const styles = StyleSheet.create({
   titleWrap: { flex: 1, minWidth: 0 },
   centered: { alignItems: 'center' },
   screenTitle: { paddingHorizontal: spacing(4), paddingTop: spacing(3), paddingBottom: spacing(3) },
-  screenTitleText: { fontSize: 34, fontWeight: '600', letterSpacing: -0.4, lineHeight: 40 },
+  screenTitleText: { fontSize: 22, fontWeight: '600', letterSpacing: -0.2, lineHeight: 28 },
   pill: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing(2),
     minHeight: 52, paddingHorizontal: spacing(6), borderRadius: 999,
+  },
+  dockPill: {
+    flexDirection: 'row', alignItems: 'center', gap: spacing(2),
+    minHeight: 50, paddingHorizontal: spacing(3.5), borderRadius: 999,
+  },
+  dockSend: {
+    width: 30, height: 30, borderRadius: 15, alignItems: 'center', justifyContent: 'center',
   },
   chip: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(2),
@@ -165,3 +174,51 @@ const styles = StyleSheet.create({
   },
   dot: { width: 8, height: 8, borderRadius: 4 },
 });
+
+export function SectionLabel({ children, tone }: { children: string; tone?: 'attention' | 'muted' }) {
+  const t = useTheme();
+  return (
+    <Text
+      style={[
+        type.footnote,
+        {
+          color: tone === 'attention' ? t.warning : tone === 'muted' ? t.textTertiary : t.textSecondary,
+          fontWeight: '500',
+          paddingHorizontal: edge,
+          paddingTop: spacing(5),
+          paddingBottom: spacing(1.5),
+        },
+      ]}
+      accessibilityRole="header"
+    >
+      {children}
+    </Text>
+  );
+}
+
+export function DockPill({ placeholder, onPress, disabled, icon = 'plus' }: {
+  placeholder: string;
+  onPress: () => void;
+  disabled?: boolean;
+  icon?: string;
+}) {
+  const t = useTheme();
+  return (
+    <Pressable
+      onPress={() => { void Haptics.selectionAsync(); onPress(); }}
+      disabled={disabled}
+      accessibilityRole="button"
+      accessibilityLabel={placeholder}
+      style={({ pressed }) => [
+        styles.dockPill,
+        { backgroundColor: t.surface, opacity: disabled ? 0.4 : pressed ? 0.8 : 1 },
+      ]}
+    >
+      <Icon name={icon} size={19} color={t.textSecondary} weight="medium" />
+      <Text style={[type.body, { color: t.textTertiary, flex: 1 }]} numberOfLines={1}>{placeholder}</Text>
+      <View style={[styles.dockSend, { backgroundColor: t.fill }]}>
+        <Icon name="arrow.up" size={15} color={t.textSecondary} weight="semibold" />
+      </View>
+    </Pressable>
+  );
+}

@@ -120,7 +120,7 @@ export function Md({ children, streaming }: { children: string; streaming?: bool
       );
     };
     return { fence: renderCodeBlock, code_block: renderCodeBlock };
-  }, [t, style]);
+  }, [t]);
   const text = streaming ? sealIncompleteMarkdown(children) : children;
   return (
     <Markdown

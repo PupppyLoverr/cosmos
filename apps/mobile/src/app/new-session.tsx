@@ -134,7 +134,7 @@ export default function NewSessionScreen() {
           {!online ? (
             <Notice kind="warning" title="Desktop offline" body="Reconnect a desktop to start a session." />
           ) : null}
-          <Text accessibilityRole="header" style={[styles.question, { color: t.text }]}>What should we work on?</Text>
+          <Text accessibilityRole="header" style={[styles.question, { color: t.text }]}>Describe the task</Text>
           <Pressable onPress={pickSpace} accessibilityRole="button" accessibilityLabel={`Workspace, ${space.label}`} style={({ pressed }) => [styles.space, { opacity: pressed ? 0.6 : 1 }]}>
             <Icon name="folder" size={18} color={t.textSecondary} />
             <Text style={[styles.spaceLabel, { color: t.textSecondary }]} numberOfLines={1}>{space.label}</Text>
@@ -164,7 +164,7 @@ export default function NewSessionScreen() {
           key={draft}
           initialText={draft}
           autoFocus
-          placeholder="Ask Cosmos"
+          placeholder="Describe the task"
           onChangeText={(v) => setTyped(v.length > 0)}
           running={false}
           sending={busy}

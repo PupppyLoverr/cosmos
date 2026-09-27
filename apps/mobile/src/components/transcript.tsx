@@ -89,7 +89,7 @@ function summarizeInput(input: unknown): string {
   return keys.length ? keys.slice(0, 3).map((k) => `${k}: ${String(obj[k]).slice(0, 24)}`).join(' · ') : '';
 }
 
-function ToolLine({ part, t, last }: { part: ToolPart; t: Theme; last: boolean }) {
+function ToolLine({ part, t }: { part: ToolPart; t: Theme }) {
   const [open, setOpen] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const reduce = useReduceMotion();
@@ -145,7 +145,6 @@ function ToolLine({ part, t, last }: { part: ToolPart; t: Theme; last: boolean }
           {part.outputBytes && !part.output ? <Text style={[type.caption, { color: t.textTertiary }]}>{Math.round(part.outputBytes / 1024)} KB — full output on the desktop</Text> : null}
         </View>
       ) : null}
-      {!last ? <View style={[styles.toolSep, { backgroundColor: t.separator }]} /> : null}
     </View>
   );
 }
@@ -159,7 +158,7 @@ function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
   const [pinned, setPinned] = useState<boolean | null>(null);
   const open = pinned ?? running;
   const summary = toolGroupSummary(parts);
-  const state = running ? 'Running' : errors ? `${errors} failed` : 'Done';
+  const state = running ? 'Running' : errors ? `${errors} failed` : '';
   const diffStats = parts.reduce(
     (totals, part) => {
       for (const diff of part.diffStats ?? []) {
@@ -173,15 +172,12 @@ function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
   const hasDiffStats = !running && (diffStats.additions > 0 || diffStats.deletions > 0);
 
   return (
-    <View style={[
-      styles.toolCard,
-      { backgroundColor: t.surface, borderColor: t.separator },
-    ]}>
+    <View>
       <Pressable
         onPress={() => { animateLayout(reduce); setPinned(!(pinned ?? running)); }}
         accessibilityRole="button"
         accessibilityState={{ expanded: open }}
-        accessibilityLabel={`${summary}, ${state}`}
+        accessibilityLabel={state ? `${summary}, ${state}` : summary}
         style={({ pressed }) => [styles.toolHead, pressed && { backgroundColor: t.fill }]}
       >
         <Disclosure open={open} color={t.textTertiary} />
@@ -195,9 +191,9 @@ function ToolGroup({ parts, t }: { parts: ToolPart[]; t: Theme }) {
             </Text>
           ) : null}
         </View>
-        {running || errors > 0 ? <StatusPill status={running ? 'working' : 'errored'} label={state} pulse={running} /> : null}
+        {running ? <StatusPill status="working" label="Running" pulse /> : errors > 0 ? <Text style={[type.caption, { color: t.danger }]}>{errors} failed</Text> : null}
       </Pressable>
-      {open ? parts.map((p, i) => <ToolLine key={p.id} part={p} t={t} last={i === parts.length - 1} />) : null}
+      {open ? parts.map((p) => <ToolLine key={p.id} part={p} t={t} />) : null}
     </View>
   );
 }
@@ -348,8 +344,8 @@ export const MessageView = React.memo(function MessageView({ entry, onAnswer, gr
           </View>
         ) : null}
         {text ? (
-          <View style={[styles.userBubble, { backgroundColor: t.userBubble }]}>
-            <Text style={[type.transcript, { color: t.userBubbleText }]} selectable>{text}</Text>
+          <View style={[styles.userBubble, { backgroundColor: t.surface }]}>
+            <Text style={[type.body, { color: t.text }]} selectable>{text}</Text>
           </View>
         ) : null}
       </View>
@@ -420,8 +416,8 @@ const styles = StyleSheet.create({
   grouped: { marginTop: -spacing(2) },
   userEntry: { alignItems: 'flex-end', gap: spacing(1.5) },
   userBubble: {
-    maxWidth: '82%', borderRadius: radii.bubble, borderCurve: 'continuous',
-    paddingHorizontal: spacing(3.5), paddingVertical: spacing(2.5),
+    maxWidth: '80%', borderRadius: 18, borderCurve: 'continuous',
+    paddingHorizontal: spacing(3.5), paddingVertical: spacing(2),
   },
   attachments: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'flex-end', gap: spacing(1.5), maxWidth: '80%' },
   attachment: {
@@ -437,12 +433,10 @@ const styles = StyleSheet.create({
   reasoningHead: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5) },
   reasoningBody: { marginTop: spacing(2), paddingLeft: spacing(3), borderLeftWidth: 2, lineHeight: 19 },
 
-  toolCard: { borderRadius: radii.panel, borderCurve: 'continuous', borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
-  toolHead: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), minHeight: 44 },
+  toolHead: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), minHeight: 44 },
   toolSummary: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'baseline', gap: spacing(2) },
-  toolLine: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingHorizontal: spacing(3), minHeight: 44 },
+  toolLine: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), paddingLeft: spacing(2), minHeight: 44 },
   toolIcon: { width: 20, height: 20, alignItems: 'center', justifyContent: 'center' },
-  toolSep: { height: StyleSheet.hairlineWidth, marginLeft: spacing(3) + 20 + spacing(2) },
   toolOutput: { marginHorizontal: spacing(3), marginBottom: spacing(2.5), padding: spacing(2.5), borderRadius: radii.sm, borderCurve: 'continuous', gap: spacing(1) },
 
   approval: { borderRadius: radii.xl, borderCurve: 'continuous', borderWidth: 1, padding: spacing(4), gap: spacing(3.5) },

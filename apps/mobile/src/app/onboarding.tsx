@@ -9,10 +9,8 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { router } from 'expo-router';
 import Animated, { FadeIn, FadeInRight, FadeOutLeft } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { LinearGradient } from 'expo-linear-gradient';
-import Svg, { Circle, Defs, Pattern, Rect } from 'react-native-svg';
 import * as Haptics from 'expo-haptics';
-import { alpha, motion, spacing, type, useTheme } from '../lib/theme';
+import { motion, spacing, type, useTheme } from '../lib/theme';
 import { useReduceMotion } from '../lib/motion';
 import { markOnboardingSeen } from '../lib/onboarding-store';
 import { Button, Icon } from '../components/bits';
@@ -22,29 +20,6 @@ const ROWS = [
   { icon: 'display', title: 'Live desktop', body: 'Watch what the agent is doing. Stop it any time.' },
   { icon: 'qrcode.viewfinder', title: 'Pair', body: 'Scan once. The desktop remembers this phone.' },
 ] as const;
-
-/** Ambient dither: a fine dot field that fades out toward the content. */
-function DitherField() {
-  const t = useTheme();
-  return (
-    <View style={StyleSheet.absoluteFill} pointerEvents="none">
-      <Svg width="100%" height="100%">
-        <Defs>
-          <Pattern id="dots" width={8} height={8} patternUnits="userSpaceOnUse">
-            <Circle cx={2} cy={2} r={0.9} fill={t.text} fillOpacity={0.14} />
-            <Circle cx={6} cy={6} r={0.6} fill={t.text} fillOpacity={0.07} />
-          </Pattern>
-        </Defs>
-        <Rect x="0" y="0" width="100%" height="100%" fill="url(#dots)" />
-      </Svg>
-      <LinearGradient
-        colors={[alpha(t.background, 0.2), alpha(t.background, 0.85), t.background]}
-        locations={[0, 0.45, 0.8]}
-        style={StyleSheet.absoluteFill}
-      />
-    </View>
-  );
-}
 
 export default function OnboardingScreen() {
   const t = useTheme();
@@ -68,8 +43,6 @@ export default function OnboardingScreen() {
 
   return (
     <View style={[styles.shell, { backgroundColor: t.background, paddingTop: insets.top + spacing(3), paddingBottom: insets.bottom + spacing(4) }]}>
-      {step === 0 ? <DitherField /> : null}
-
       <View style={styles.top}>
         <View style={styles.dots} accessibilityLabel={`Step ${step + 1} of 4`}>
           {[0, 1, 2, 3].map((i) => (
@@ -100,11 +73,11 @@ export default function OnboardingScreen() {
         ) : step === 1 ? (
           <>
             <View style={styles.body}>
-              <Text accessibilityRole="header" style={[type.title, { color: t.text }]}>Your desktop agents, on this phone.</Text>
-              <View style={[styles.rows, { borderTopColor: t.separator }]}>
+              <Text accessibilityRole="header" style={[type.title, { color: t.text }]}>Direct your agents from anywhere.</Text>
+              <View style={styles.rows}>
                 {ROWS.map((r) => (
-                  <View key={r.title} style={[styles.row, { borderBottomColor: t.separator }]}>
-                    <Icon name={r.icon} size={20} color={t.text} />
+                  <View key={r.title} style={styles.row}>
+                    <Icon name={r.icon} size={20} color={t.textSecondary} />
                     <View style={{ flex: 1, minWidth: 0 }}>
                       <Text style={[type.headline, { color: t.text }]}>{r.title}</Text>
                       <Text style={[type.footnote, { color: t.textSecondary }]}>{r.body}</Text>
@@ -154,10 +127,9 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   wordmark: { fontSize: 44, fontWeight: '600', letterSpacing: -0.8 },
   body: { flex: 1, paddingTop: spacing(8) },
-  rows: { marginTop: spacing(8), borderTopWidth: StyleSheet.hairlineWidth },
+  rows: { marginTop: spacing(8), gap: spacing(5) },
   row: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing(4),
-    paddingVertical: spacing(4), borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row', alignItems: 'flex-start', gap: spacing(4),
   },
   actions: { gap: spacing(1) },
 });

@@ -14,7 +14,7 @@ import { useCosmos, useSnapshot } from '../lib/client';
 import { spacing, type, useTheme } from '../lib/theme';
 import { useReduceMotion } from '../lib/motion';
 import { Icon } from './bits';
-import { PillButton } from './chrome';
+import { PillButton, SectionLabel } from './chrome';
 
 interface DrawerApi { open: () => void; close: () => void }
 const DrawerContext = createContext<DrawerApi>({ open: () => {}, close: () => {} });
@@ -68,7 +68,7 @@ function Sidebar({ width, onNavigate }: { width: number; onNavigate: (go: () => 
 
         {recents.length ? (
           <>
-            <Text style={[type.subhead, styles.recentsLabel, { color: t.textTertiary }]}>Recents</Text>
+            <SectionLabel>Recent</SectionLabel>
             {recents.map((c) => (
               <Pressable
                 key={c.id}
@@ -88,7 +88,7 @@ function Sidebar({ width, onNavigate }: { width: number; onNavigate: (go: () => 
           onPress={() => onNavigate(() => router.push(auth ? '/settings' : '/sign-in'))}
           accessibilityRole="button"
           accessibilityLabel={auth ? 'Account' : 'Sign in'}
-          style={[styles.avatar, { backgroundColor: t.floating, boxShadow: t.floatShadow }]}
+          style={[styles.avatar, { backgroundColor: t.surface }]}
         >
           {initials ? <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>{initials}</Text> : <Icon name="person" size={18} color={t.text} />}
         </Pressable>
@@ -181,9 +181,8 @@ const styles = StyleSheet.create({
   sidebar: { flex: 1, paddingHorizontal: spacing(5) },
   wordmark: { fontSize: 30, fontWeight: '600', letterSpacing: -0.5, marginBottom: spacing(4) },
   sidebarScroll: { paddingBottom: spacing(6) },
-  navRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(4), minHeight: 52 },
-  navLabel: { fontSize: 18, lineHeight: 24 },
-  recentsLabel: { marginTop: spacing(6), marginBottom: spacing(2) },
+  navRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(4), minHeight: 48 },
+  navLabel: { fontSize: 16, lineHeight: 21 },
   recentRow: { minHeight: 44, justifyContent: 'center' },
   foot: { flexDirection: 'row', alignItems: 'center', gap: spacing(3), paddingTop: spacing(3) },
   avatar: { width: 48, height: 48, borderRadius: 24, alignItems: 'center', justifyContent: 'center' },

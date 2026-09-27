@@ -53,7 +53,7 @@ export default function SettingsScreen() {
               title={auth.user.name || auth.user.email}
               subtitle={auth.user.name ? auth.user.email : 'Signed in with Woozlit'}
               leading={(
-                <View style={[styles.avatar, { backgroundColor: t.floating }]}>
+                <View style={[styles.avatar, { backgroundColor: t.surface }]}>
                   <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>{initials}</Text>
                 </View>
               )}

@@ -9,7 +9,7 @@ import { PickedFile, ensureDecodable, fileToBase64Chunks } from '../../lib/attac
 import { notifySessionEvent } from '../../lib/notify';
 import { spacing, type, useTheme, type Theme } from '../../lib/theme';
 import { MessageView } from '../../components/transcript';
-import { Composer, ComposerChip } from '../../components/composer';
+import { Composer } from '../../components/composer';
 import { Button, EmptyState, Icon, Notice, Pulse } from '../../components/bits';
 import { harnessLabel } from '../../components/harness-mark';
 import { Screen } from '../../components/surface';
@@ -27,7 +27,7 @@ function HeaderTitle({ title, chat, status, desktop, t }: { title: string; chat?
   const live = status === 'working' || status === 'awaitingInput';
   const sub = live
     ? (status === 'working' ? 'Working' : 'Needs your input')
-    : (parts.join(' · ') || 'Cosmos');
+    : parts.join(' · ');
   return (
     <View style={styles.headerTitle} accessibilityRole="header" accessibilityLabel={`${title}, ${sub}`}>
       <View style={styles.headerMain}>
@@ -235,8 +235,6 @@ export default function SessionScreen() {
 
   const desktopName = connection.status === 'connected' && connection.desktop ? desktopDisplayName(connection.desktop) : undefined;
   const link = describeLink(connection, connection.desktop ? desktopDisplayName(connection.desktop) : 'your desktop');
-  const base = baseConfig();
-
   return (
     <Screen>
       <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
@@ -244,6 +242,7 @@ export default function SessionScreen() {
           left={<CircleButton icon="chevron.left" label="Back" onPress={back} />}
           title={<HeaderTitle title={title} chat={chat} status={status} desktop={desktopName} t={t} />}
           right={<CircleButton icon="ellipsis" label="Session options" onPress={sessionMenu} />}
+          divider
         />
 
         {streamLost && connection.status === 'connected' ? (
@@ -263,7 +262,7 @@ export default function SessionScreen() {
           </View>
         ) : entries.length === 0 ? (
           <View style={[styles.fill, styles.center]}>
-            <Text style={[styles.question, { color: t.text }]}>What should we work on?</Text>
+            <Text style={[type.footnote, { color: t.textTertiary }]}>Send a message to start.</Text>
           </View>
         ) : (
           <View style={styles.fill}>
@@ -336,36 +335,9 @@ export default function SessionScreen() {
           onSend={(text) => void send(text)}
           onStop={stop}
           bottomInset={dockInset}
-          placeholder={connection.status !== 'connected' ? (link.tone === 'asleep' ? 'Desktop asleep — reconnects on wake' : link.label) : undefined}
-          chips={
-            <>
-              <ComposerChip
-                icon={base.sandbox === 'danger-full-access' ? 'exclamationmark.shield' : 'lock.shield'}
-                tone={base.sandbox === 'danger-full-access' ? 'warning' : undefined}
-                label={ACCESS_LABEL[base.sandbox] ?? base.sandbox}
-                accessibilityLabel={`Access, ${ACCESS_LABEL[base.sandbox] ?? base.sandbox}`}
-                onPress={chat ? () => showMenu('Access', (['read-only', 'workspace-write', 'danger-full-access'] as const).map((s) => ({
-                  label: ACCESS_LABEL[s]!,
-                  checked: base.sandbox === s,
-                  onPress: () => void client.setChatConfig(chatId, { ...base, sandbox: s }),
-                }))) : undefined}
-              />
-              <ComposerChip
-                icon="bolt"
-                label={base.model ?? 'Default'}
-                accessibilityLabel={`Model, ${base.model ?? 'default'}`}
-                onPress={() => void openModel()}
-              />
-              {chat?.branch ? (
-                <ComposerChip
-                  icon="git.branch"
-                  label={chat.branch}
-                  accessibilityLabel={`Branch ${chat.branch}`}
-                  accessibilityHint="The branch this session is on. Changing the checkout stays on the desktop."
-                />
-              ) : null}
-            </>
-          }
+          placeholder={connection.status !== 'connected'
+            ? (link.tone === 'asleep' ? 'Desktop asleep — reconnects on wake' : link.label)
+            : entries.length ? 'Follow up…' : 'Message'}
         />
       </KeyboardAvoidingView>
     </Screen>

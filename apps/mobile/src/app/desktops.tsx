@@ -10,7 +10,7 @@ import { Device } from '../lib/protocol';
 import { showMenu } from '../lib/menu';
 import { spacing, type, useTheme } from '../lib/theme';
 import { EmptyState, Icon } from '../components/bits';
-import { CircleButton, PillButton, ScreenTitle, TopBar } from '../components/chrome';
+import { CircleButton, PillButton, ScreenTitle, SectionLabel, TopBar } from '../components/chrome';
 import { Screen } from '../components/surface';
 
 function platformIcon(platform?: string): string {
@@ -157,7 +157,7 @@ export default function DesktopsScreen() {
           })
         )}
 
-        <Text style={[type.subhead, styles.section, { color: t.textTertiary }]}>Other ways to connect</Text>
+        <SectionLabel>Other ways to connect</SectionLabel>
         <Pressable
           onPress={() => router.push({ pathname: '/pair', params: { mode: 'local' } })}
           accessibilityRole="button"
@@ -199,7 +199,6 @@ const styles = StyleSheet.create({
   dot: { position: 'absolute', right: -2, bottom: -2, width: 12, height: 12, borderRadius: 6, borderWidth: 2 },
   copy: { flex: 1, minWidth: 0, gap: 2 },
   name: { fontSize: 17, fontWeight: '500', lineHeight: 22 },
-  section: { paddingHorizontal: spacing(4), marginTop: spacing(8), marginBottom: spacing(1) },
   bar: { position: 'absolute', left: 0, right: 0, bottom: 0, paddingHorizontal: spacing(4) },
   pill: { alignSelf: 'stretch' },
 });

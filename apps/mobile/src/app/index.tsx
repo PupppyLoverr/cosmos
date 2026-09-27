@@ -3,20 +3,18 @@
 // Navigation lives in the sidebar (menu button or swipe from the left edge).
 
 import React, { useEffect, useMemo, useState } from 'react';
-import { Alert, FlatList, Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Alert, FlatList, Platform, Pressable, RefreshControl, StyleSheet, Text, TextInput, View } from 'react-native';
 import { Link, router } from 'expo-router';
-import Animated, { useAnimatedKeyboard, useAnimatedStyle } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
-import { LinearGradient } from 'expo-linear-gradient';
 import { formatTimeAgo } from '../lib/activity';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../lib/client';
 import { describeLink } from '../lib/connection-state';
 import { Chat, Device, Session, Space } from '../lib/protocol';
 import { showMenu } from '../lib/menu';
-import { alpha, spacing, statusColor, type, useTheme } from '../lib/theme';
-import { Button, EmptyState, Icon, Notice, StatusDot } from '../components/bits';
-import { CircleButton, FilterChip, PillButton, ScreenTitle, TopBar } from '../components/chrome';
+import { edge, spacing, statusColor, type, useTheme } from '../lib/theme';
+import { Button, EmptyState, Notice, StatusDot } from '../components/bits';
+import { CircleButton, DockPill, ScreenTitle, SectionLabel, TopBar } from '../components/chrome';
 import { DrawerEdge, useDrawer } from '../components/drawer';
 import { harnessLabel } from '../components/harness-mark';
 import { Screen } from '../components/surface';
@@ -46,7 +44,7 @@ function elapsed(startedAt?: string | null): string | undefined {
 }
 
 type Item =
-  | { kind: 'header'; key: string; title: string; icon?: string; count: number; collapsible?: boolean; collapsed?: boolean; tone?: 'attention' }
+  | { kind: 'header'; key: string; title: string; collapsible?: boolean; collapsed?: boolean; tone?: 'attention' }
   | { kind: 'chat'; key: string; chat: Chat; state: State; desktop?: string; startedAt?: string | null };
 
 /** One session: status dot, title, "harness · desktop · state", time on the right. */
@@ -97,7 +95,12 @@ const SessionItem = React.memo(function SessionItem({ chat, state, desktop, star
             </View>
             <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>
               {meta}
-              {stateLabel ? <Text style={{ color: stateTone, fontWeight: '600' }}>{`  ${stateLabel}`}</Text> : null}
+              {' · '}
+              {stateLabel ? (
+                <Text style={{ color: stateTone, fontWeight: '500' }}>{stateLabel}</Text>
+              ) : (
+                <Text style={{ color: t.textSecondary }}>Idle</Text>
+              )}
             </Text>
           </View>
           </View>
@@ -123,8 +126,8 @@ export default function HomeScreen() {
   const spaces = useSnapshot(client.spaces);
   const devices = useSnapshot(client.devices);
   const connection = useSnapshot(client.connection);
-  const keyboard = useAnimatedKeyboard();
   const [query, setQuery] = useState('');
+  const [searchOpen, setSearchOpen] = useState(false);
   const [host, setHost] = useState<string>('all');
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [showArchived, setShowArchived] = useState(false);
@@ -184,8 +187,8 @@ export default function HomeScreen() {
     const attention = pool.filter((r) => r.state === 'awaitingInput' || r.state === 'errored');
     const live = pool.filter((r) => r.state === 'working');
     const rest = pool.filter((r) => !attention.includes(r) && !live.includes(r));
-    if (attention.length) { out.push({ kind: 'header', key: 'h:attn', title: 'Needs you', count: attention.length, tone: 'attention' }); push(attention); }
-    if (live.length) { out.push({ kind: 'header', key: 'h:live', title: 'Working', count: live.length }); push(live); }
+    if (attention.length) { out.push({ kind: 'header', key: 'h:attn', title: 'Needs you', tone: 'attention' }); push(attention); }
+    if (live.length) { out.push({ kind: 'header', key: 'h:live', title: 'Working' }); push(live); }
 
     // Everything else grouped by project, most recently active project first.
     const groups = new Map<string, typeof pool>();
@@ -196,7 +199,7 @@ export default function HomeScreen() {
     for (const [project, rows] of groups) {
       const key = `p:${project}`;
       const isCollapsed = collapsed.has(key) && !q;
-      out.push({ kind: 'header', key, title: project, icon: 'folder', count: rows.length, collapsible: true, collapsed: isCollapsed });
+      out.push({ kind: 'header', key, title: project, collapsible: true, collapsed: isCollapsed });
       if (!isCollapsed) push(rows);
     }
     return out;
@@ -215,6 +218,8 @@ export default function HomeScreen() {
   };
 
   const more = () => showMenu(undefined, [
+    { label: 'All desktops', checked: host === 'all', onPress: () => setHost('all') },
+    ...hosts.map((h) => ({ label: h.name, checked: host === h.id, onPress: () => setHost(h.id) })),
     { label: showArchived ? 'Hide archived' : 'Show archived', onPress: () => setShowArchived((v) => !v) },
     { label: 'Desktops', onPress: () => router.push('/desktops') },
     { label: 'Pair a desktop', onPress: () => router.push('/pair') },
@@ -222,30 +227,30 @@ export default function HomeScreen() {
   ]);
 
   const needsYou = sessions.some((s) => s.status === 'awaitingInput' || s.status === 'errored');
-  const barStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: -Math.max(0, keyboard.height.get() - insets.bottom) }],
-  }));
   const desktopName = connection.desktop ? desktopDisplayName(connection.desktop) : 'your desktop';
   const link = describeLink(connection, desktopName);
 
   const header = (
     <View>
-      <ScreenTitle>Cosmos</ScreenTitle>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chips}>
-        <FilterChip label="All" selected={host === 'all'} onPress={() => setHost('all')} />
-        {hosts.map((h) => (
-          <FilterChip
-            key={h.id}
-            label={h.name}
-            dot={h.dot}
-            icon="laptopcomputer"
-            selected={host === h.id}
-            onPress={() => setHost(host === h.id ? 'all' : h.id)}
-            onLongPress={() => router.push('/desktops')}
+      <ScreenTitle>{host === 'all' ? 'Sessions' : hosts.find((h) => h.id === host)?.name ?? 'Sessions'}</ScreenTitle>
+      {searchOpen ? (
+        <View style={[styles.searchRow, { backgroundColor: t.surface }]}>
+          <TextInput
+            autoFocus
+            value={query}
+            onChangeText={setQuery}
+            placeholder="Search"
+            placeholderTextColor={t.textTertiary}
+            style={[type.body, styles.searchInput, { color: t.text }]}
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="search"
+            clearButtonMode="while-editing"
+            keyboardAppearance={t.scheme}
+            accessibilityLabel="Search sessions"
           />
-        ))}
-        <FilterChip label="Pair" icon="plus" onPress={() => router.push('/pair')} />
-      </ScrollView>
+        </View>
+      ) : null}
       {!connected && connection.desktop && connection.detail && items.length > 0 ? (
         <View style={styles.notice}>
           <Notice
@@ -265,7 +270,12 @@ export default function HomeScreen() {
     <Screen>
       <TopBar
         left={<CircleButton icon="line.3.horizontal" label="Open menu" onPress={drawer.open} badge={needsYou} />}
-        right={<CircleButton icon="ellipsis" label="More" onPress={more} />}
+        right={(
+          <>
+            <CircleButton icon="magnifyingglass" label="Search" onPress={() => setSearchOpen((v) => !v)} />
+            <CircleButton icon="line.3.horizontal.decrease" label="Filter sessions" onPress={more} />
+          </>
+        )}
       />
       <FlatList
         data={items}
@@ -274,13 +284,13 @@ export default function HomeScreen() {
         maxToRenderPerBatch={10}
         windowSize={9}
         ListHeaderComponent={header}
-        contentContainerStyle={{ paddingBottom: insets.bottom + 120 }}
+        contentContainerStyle={{ paddingBottom: insets.bottom + 90 }}
         keyboardDismissMode="on-drag"
         keyboardShouldPersistTaps="handled"
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} tintColor={t.textTertiary} />}
         ListEmptyComponent={
-          !connection.desktop ? (
-            <EmptyState title="Pair a desktop to start" body="Open Cosmos on your computer and scan its code." actionLabel="Pair this phone" onAction={() => router.push('/pair')} />
+            !connection.desktop ? (
+            <EmptyState title="No desktop paired" body="Open Cosmos on your computer and scan its code." actionLabel="Pair a desktop" onAction={() => router.push('/pair')} />
           ) : !connected ? (
             <EmptyState
               title={link.title}
@@ -292,22 +302,14 @@ export default function HomeScreen() {
               }}
             />
           ) : query ? (
-            <EmptyState title={`Nothing matches “${query}”`} />
+            <EmptyState title={`No results for “${query}”`} />
           ) : (
-            <EmptyState title="What should we work on?" body="Start a session and it shows up here." />
+            <EmptyState title="No sessions yet" body="Start one from the field below." />
           )
         }
         renderItem={({ item }) => {
           if (item.kind === 'header') {
-            const content = (
-              <>
-                {item.icon ? <Icon name={item.icon} size={18} color={t.text} /> : null}
-                <Text style={[styles.headerText, { color: item.tone === 'attention' ? t.warning : t.text }]} numberOfLines={1}>{item.title}</Text>
-                {item.collapsible ? <Icon name={item.collapsed ? 'chevron.right' : 'chevron.down'} size={12} color={t.textTertiary} weight="semibold" /> : null}
-                <View style={styles.flex} />
-                <Text style={[type.footnote, { color: t.textTertiary }]}>{item.count}</Text>
-              </>
-            );
+            const content = <SectionLabel tone={item.collapsed ? 'muted' : item.tone}>{item.title}</SectionLabel>;
             return item.collapsible ? (
               <Pressable
                 onPress={() => { void Haptics.selectionAsync(); toggle(item.key); }}
@@ -317,36 +319,15 @@ export default function HomeScreen() {
               >
                 {content}
               </Pressable>
-            ) : <View style={styles.header} accessibilityRole="header">{content}</View>;
+            ) : content;
           }
           return <SessionItem chat={item.chat} state={item.state} desktop={item.desktop} startedAt={item.startedAt} />;
         }}
       />
 
-      <LinearGradient
-        pointerEvents="none"
-        colors={[alpha(t.background, 0), t.background]}
-        style={[styles.fade, { height: insets.bottom + 120 }]}
-      />
-      <Animated.View style={[styles.bar, { paddingBottom: insets.bottom + spacing(2) }, barStyle]} pointerEvents="box-none">
-        <View style={[styles.search, { backgroundColor: t.floating, boxShadow: t.floatShadow }]}>
-          <Icon name="magnifyingglass" size={18} color={t.textSecondary} />
-          <TextInput
-            value={query}
-            onChangeText={setQuery}
-            placeholder="Search sessions"
-            placeholderTextColor={t.textTertiary}
-            style={[type.body, styles.searchInput, { color: t.text }]}
-            autoCapitalize="none"
-            autoCorrect={false}
-            returnKeyType="search"
-            clearButtonMode="while-editing"
-            keyboardAppearance={t.scheme}
-            accessibilityLabel="Search sessions"
-          />
-        </View>
-        <PillButton title="New" icon="square.and.pencil" onPress={() => router.push('/new-session')} disabled={!connected} />
-      </Animated.View>
+      <View style={[styles.bar, { backgroundColor: t.background, borderTopColor: t.separator, paddingBottom: insets.bottom + spacing(2) }]} pointerEvents="box-none">
+        <DockPill placeholder="Plan, ask, build…" onPress={() => router.push('/new-session')} disabled={!connected} />
+      </View>
       <DrawerEdge />
     </Screen>
   );
@@ -354,19 +335,16 @@ export default function HomeScreen() {
 
 const styles = StyleSheet.create({
   flex: { flex: 1 },
-  chips: { flexDirection: 'row', gap: spacing(2), paddingHorizontal: spacing(4), paddingBottom: spacing(3) },
   notice: { paddingHorizontal: spacing(4), paddingBottom: spacing(2) },
   noticeAction: { alignSelf: 'flex-start', marginTop: spacing(2) },
-  header: { flexDirection: 'row', alignItems: 'center', gap: spacing(2.5), minHeight: 44, paddingHorizontal: spacing(4), marginTop: spacing(3) },
-  headerText: { fontSize: 17, fontWeight: '600', flexShrink: 1 },
-  row: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing(3), paddingHorizontal: spacing(4), paddingVertical: spacing(3), minHeight: 64 },
-  dotCol: { width: 18, alignItems: 'center', paddingTop: 8 },
+  header: { paddingHorizontal: 0 },
+  row: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing(3), paddingHorizontal: spacing(4), paddingVertical: spacing(2.5), minHeight: 56 },
+  dotCol: { width: 16, alignItems: 'center', paddingTop: 7 },
   dot: { width: 8, height: 8, borderRadius: 4 },
   rowCopy: { flex: 1, minWidth: 0, gap: 3 },
   rowTop: { flexDirection: 'row', alignItems: 'baseline', gap: spacing(2) },
-  rowTitle: { flex: 1, fontSize: 17, lineHeight: 22 },
-  fade: { position: 'absolute', left: 0, right: 0, bottom: 0 },
-  bar: { position: 'absolute', left: 0, right: 0, bottom: 0, flexDirection: 'row', alignItems: 'center', gap: spacing(3), paddingHorizontal: spacing(4) },
-  search: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: spacing(2), minHeight: 52, paddingHorizontal: spacing(4), borderRadius: 999 },
-  searchInput: { flex: 1, paddingVertical: spacing(2) },
+  rowTitle: { flex: 1, fontSize: 16, lineHeight: 21 },
+  searchRow: { marginHorizontal: edge, minHeight: 40, borderRadius: 12, justifyContent: 'center', marginBottom: spacing(2) },
+  searchInput: { flex: 1, paddingHorizontal: spacing(3), paddingVertical: spacing(1) },
+  bar: { position: 'absolute', left: 0, right: 0, bottom: 0, paddingHorizontal: edge, paddingTop: spacing(2), borderTopWidth: StyleSheet.hairlineWidth },
 });

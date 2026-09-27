@@ -108,7 +108,7 @@ export function Card({ radius = radii.lg, style, children, ...rest }: ViewProps 
   }
   return (
     <View
-      style={[{ borderRadius: radius, borderCurve: 'continuous', backgroundColor: t.surface, borderWidth: StyleSheet.hairlineWidth, borderColor: t.glassStroke }, styles.clip, style]}
+      style={[{ borderRadius: radius, borderCurve: 'continuous', backgroundColor: t.surface, borderWidth: 0 }, styles.clip, style]}
       {...rest}
     >
       {children}
