@@ -156,13 +156,13 @@ export function DeviceStrip({ devices, selected, onSelect, onPair }: {
   const t = useTheme();
   const dotColor = (dot: 'online' | 'connecting' | 'offline') =>
     dot === 'online' ? t.success : dot === 'connecting' ? t.warning : t.textTertiary;
-  const chip = (key: string, label: string, active: boolean, onPress: () => void, dot?: 'online' | 'connecting' | 'offline', icon?: string) => (
+  const chip = (key: string, label: string | undefined, active: boolean, onPress: () => void, dot?: 'online' | 'connecting' | 'offline', icon?: string) => (
     <Pressable
       key={key}
       onPress={() => { void Haptics.selectionAsync(); onPress(); }}
       accessibilityRole="button"
       accessibilityState={{ selected: active }}
-      accessibilityLabel={label}
+      accessibilityLabel={label ?? 'Pair a desktop'}
       style={({ pressed }) => [
         styles.deviceChip,
         { backgroundColor: active ? t.text : t.surface, opacity: pressed ? 0.8 : 1 },
@@ -170,7 +170,7 @@ export function DeviceStrip({ devices, selected, onSelect, onPair }: {
     >
       {dot ? <View style={[styles.deviceDot, { backgroundColor: dotColor(dot) }]} /> : null}
       {icon ? <Icon name={icon} size={15} color={active ? t.background : t.textSecondary} weight="medium" /> : null}
-      <Text style={[type.subhead, { color: active ? t.background : t.text, fontWeight: '500' }]} numberOfLines={1}>{label}</Text>
+      {label ? <Text style={[type.subhead, { color: active ? t.background : t.text, fontWeight: '500' }]} numberOfLines={1}>{label}</Text> : null}
     </Pressable>
   );
   return (
@@ -182,7 +182,7 @@ export function DeviceStrip({ devices, selected, onSelect, onPair }: {
     >
       {chip('all', 'All', selected === 'all', () => onSelect('all'))}
       {devices.map((device) => chip(`device:${device.id}`, device.name, selected === device.id, () => onSelect(device.id), device.dot))}
-      {chip('pair', 'Pair a desktop', false, onPair, undefined, 'plus')}
+      {chip('pair', undefined, false, onPair, undefined, 'plus')}
     </ScrollView>
   );
 }
@@ -223,18 +223,20 @@ const styles = StyleSheet.create({
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
     gap: spacing(2), paddingHorizontal: edge, paddingTop: spacing(5), paddingBottom: spacing(1.5),
   },
+  sectionLabelCompact: { paddingTop: spacing(2) },
   sectionLabelTitle: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), minWidth: 0, flex: 1 },
 });
 
-export function SectionLabel({ children, tone, icon, trailing }: {
+export function SectionLabel({ children, tone, icon, trailing, compact = false }: {
   children: string;
   tone?: 'attention' | 'muted';
   icon?: string;
   trailing?: React.ReactNode;
+  compact?: boolean;
 }) {
   const t = useTheme();
   return (
-    <View style={styles.sectionLabel} accessibilityRole="header">
+    <View style={[styles.sectionLabel, compact ? styles.sectionLabelCompact : null]} accessibilityRole="header">
       <View style={styles.sectionLabelTitle}>
         {icon ? <Icon name={icon} size={13} color={t.textTertiary} weight="medium" /> : null}
         <Text style={[type.footnote, { color: tone === 'attention' ? t.warning : tone === 'muted' ? t.textTertiary : t.textSecondary, fontWeight: '500' }]} numberOfLines={1}>

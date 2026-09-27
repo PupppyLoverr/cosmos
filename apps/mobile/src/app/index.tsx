@@ -60,7 +60,9 @@ const SessionItem = React.memo(function SessionItem({ chat, state, desktop, star
     : undefined;
   const stateTone = state === 'working' ? t.link : state === 'awaitingInput' ? t.warning : state === 'errored' ? t.danger : undefined;
   const meta = [harnessLabel(chat.config?.harness), desktop].filter(Boolean).join(' · ');
-  const dot = state === 'idle' ? t.separator : state === 'unread' ? t.link : statusColor(t, state);
+  const hasMeta = Boolean(meta);
+  const hasDetail = hasMeta || Boolean(stateLabel);
+  const dot = state === 'idle' ? 'transparent' : state === 'unread' ? t.link : statusColor(t, state);
 
   const rename = () => Alert.prompt?.('Rename session', undefined, (v) => { if (v?.trim()) void client.renameChat(chat.id, v.trim()); }, 'plain-text', chat.title ?? '');
   const archive = () => void client.setChatArchived(chat.id, !chat.archived);
@@ -90,20 +92,18 @@ const SessionItem = React.memo(function SessionItem({ chat, state, desktop, star
           <View style={styles.dotCol}>
             {state === 'working' ? <StatusDot status="working" size={8} pulse /> : <View style={[styles.dot, { backgroundColor: dot }]} />}
           </View>
-          <View style={styles.rowCopy}>
+          <View style={[styles.rowCopy, !hasDetail && styles.rowCopyCentered]}>
             <View style={styles.rowTop}>
               <Text style={[styles.rowTitle, { color: t.text, fontWeight: state === 'unread' ? '600' : '500' }]} numberOfLines={1}>{title}</Text>
               <Text style={[type.footnote, { color: t.textTertiary }]}>{formatTimeAgo(chat.lastMessageAt ?? chat.createdAt)}</Text>
             </View>
-            <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>
-              {meta}
-              {' · '}
-              {stateLabel ? (
-                <Text style={{ color: stateTone, fontWeight: '500' }}>{stateLabel}</Text>
-              ) : (
-                <Text style={{ color: t.textSecondary }}>Idle</Text>
-              )}
-            </Text>
+            {hasDetail ? (
+              <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>
+                {meta}
+                {meta && stateLabel ? ' · ' : null}
+                {stateLabel ? <Text style={{ color: stateTone, fontWeight: '500' }}>{stateLabel}</Text> : null}
+              </Text>
+            ) : null}
           </View>
           </View>
         </Pressable>
@@ -136,7 +136,7 @@ const DeviceHeader = React.memo(function DeviceHeader({ name, dot, subtitle, onP
       <View style={styles.deviceHeader}>
         <View style={styles.deviceHeaderTitle}>
           <View style={[styles.deviceHeaderDot, { backgroundColor: color }]} />
-          <Text style={[type.headline, styles.deviceHeaderName, { color: t.text }]} numberOfLines={1}>{name}</Text>
+          <Text style={[type.subhead, styles.deviceHeaderName, { color: t.text }]} numberOfLines={1}>{name}</Text>
         </View>
         <Text style={[type.footnote, { color: t.textTertiary }]}>{subtitle}</Text>
       </View>
@@ -192,7 +192,6 @@ export default function HomeScreen() {
     const fallbackDeviceName = connection.desktop ? desktopDisplayName(connection.desktop) : 'Desktop';
     const liveByChat = new Map<string, Session>();
     for (const s of sessions) if (!liveByChat.has(s.chatId)) liveByChat.set(s.chatId, s);
-    const nameOf = (c: Chat) => host === 'all' ? deviceNames.get(c.deviceId) ?? fallbackDeviceName : undefined;
     const pool = chats
       .filter((c) => (showArchived || q ? true : !c.archived))
       .filter((c) => host === 'all' ? true : host === 'unknown' ? !knownDeviceIds.has(c.deviceId) : c.deviceId === host)
@@ -207,18 +206,24 @@ export default function HomeScreen() {
         return {
           chat,
           state: stateOf(chat, live),
-          desktop: nameOf(chat),
+          desktop: undefined,
           startedAt: live?.status === 'working' ? live.startedAt : undefined,
         };
       });
 
     const out: Item[] = [];
-    const push = (rows: typeof pool, prefix: string) => rows.forEach((r) => out.push({ kind: 'chat', key: `${prefix}:chat:${r.chat.id}`, ...r }));
+    const includeGlobalDevice = host === 'all' && hosts.length > 1;
+    const push = (rows: typeof pool, prefix: string, includeDevice = false) => rows.forEach((r) => out.push({
+      kind: 'chat',
+      key: `${prefix}:chat:${r.chat.id}`,
+      ...r,
+      desktop: includeDevice ? deviceNames.get(r.chat.deviceId) ?? fallbackDeviceName : undefined,
+    }));
     const attention = pool.filter((r) => r.state === 'awaitingInput' || r.state === 'errored');
     const live = pool.filter((r) => r.state === 'working');
     const rest = pool.filter((r) => !attention.includes(r) && !live.includes(r));
-    if (attention.length) { out.push({ kind: 'header', key: 'global:needs', title: 'Needs you', tone: 'attention' }); push(attention, 'global:needs'); }
-    if (live.length) { out.push({ kind: 'header', key: 'global:working', title: 'Working' }); push(live, 'global:working'); }
+    if (attention.length) { out.push({ kind: 'header', key: 'global:needs', title: 'Needs you', tone: 'attention' }); push(attention, 'global:needs', includeGlobalDevice); }
+    if (live.length) { out.push({ kind: 'header', key: 'global:working', title: 'Working' }); push(live, 'global:working', includeGlobalDevice); }
 
     if (host === 'all') {
       const known = new Set(hosts.map((h) => h.id));
@@ -396,7 +401,7 @@ export default function HomeScreen() {
             return <Text style={[type.footnote, styles.emptyDevice, { color: t.textTertiary }]}>No sessions</Text>;
           }
           if (item.kind === 'header') {
-            const content = <SectionLabel icon={item.icon} trailing={item.trailing} tone={item.collapsed ? 'muted' : item.tone}>{item.title}</SectionLabel>;
+            const content = <SectionLabel icon={item.icon} trailing={item.trailing} compact={Boolean(item.icon)} tone={item.collapsed ? 'muted' : item.tone}>{item.title}</SectionLabel>;
             return item.collapsible ? (
               <Pressable
                 onPress={() => { void Haptics.selectionAsync(); toggle(item.key); }}
@@ -426,9 +431,10 @@ const styles = StyleSheet.create({
   noticeAction: { alignSelf: 'flex-start', marginTop: spacing(2) },
   header: { paddingHorizontal: 0 },
   row: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing(3), paddingHorizontal: spacing(4), paddingVertical: spacing(2), minHeight: 52 },
-  dotCol: { width: 16, alignItems: 'center', paddingTop: 7 },
+  dotCol: { width: 16, alignItems: 'center', paddingTop: 6.5 },
   dot: { width: 8, height: 8, borderRadius: 4 },
-  rowCopy: { flex: 1, minWidth: 0, gap: 3 },
+  rowCopy: { flex: 1, minWidth: 0, minHeight: 36, gap: 3 },
+  rowCopyCentered: { justifyContent: 'center' },
   rowTop: { flexDirection: 'row', alignItems: 'baseline', gap: spacing(2) },
   rowTitle: { flex: 1, fontSize: 16, lineHeight: 21 },
   searchRow: { marginHorizontal: edge, minHeight: 40, borderRadius: 12, justifyContent: 'center', marginBottom: spacing(2) },
@@ -436,7 +442,7 @@ const styles = StyleSheet.create({
   bar: { position: 'absolute', left: 0, right: 0, bottom: 0, paddingHorizontal: edge, paddingTop: spacing(2), borderTopWidth: StyleSheet.hairlineWidth },
   deviceHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: spacing(2), paddingHorizontal: edge, paddingTop: spacing(5), paddingBottom: spacing(1) },
   deviceHeaderTitle: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), flex: 1, minWidth: 0 },
-  deviceHeaderDot: { width: 8, height: 8, borderRadius: 4 },
-  deviceHeaderName: { flex: 1, fontSize: 17, lineHeight: 22 },
+  deviceHeaderDot: { width: 6, height: 6, borderRadius: 3 },
+  deviceHeaderName: { flex: 1, fontSize: 15, fontWeight: '600', lineHeight: 20 },
   emptyDevice: { paddingHorizontal: edge + spacing(4), paddingVertical: spacing(2) },
 });
