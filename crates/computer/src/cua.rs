@@ -1032,21 +1032,23 @@ impl CuaBackend {
     }
 
     #[cfg(target_os = "macos")]
-    async fn ax_window_for_pid(&self, pid: i64) -> Option<Value> {
-        let window = self.window_for(pid, None).await.ok()?;
-        self.window_is_ax_resolvable(&window)
-            .await
-            .then_some(window)
-    }
-
-    #[cfg(target_os = "macos")]
     async fn wait_for_ax_window(&self, pid: i64) -> Option<Value> {
+        let started = Instant::now();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut interval = std::time::Duration::from_millis(60);
+        let mut attempts = 0_u32;
         loop {
+            attempts += 1;
             if let Ok(windows) = self.list_windows(Some(pid)).await {
                 for window in windows {
                     if self.window_is_ax_resolvable(&window).await {
+                        tracing::debug!(
+                            target: "zeron_computer",
+                            pid,
+                            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                            attempts,
+                            "launch_app AX readiness succeeded"
+                        );
                         return Some(window);
                     }
                 }
@@ -1058,6 +1060,13 @@ impl CuaBackend {
             tokio::time::sleep(interval.min(deadline - now)).await;
             interval = (interval * 3 / 2).min(std::time::Duration::from_millis(300));
         }
+        tracing::debug!(
+            target: "zeron_computer",
+            pid,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            attempts,
+            "launch_app AX readiness timed out"
+        );
         None
     }
 
@@ -1068,10 +1077,31 @@ impl CuaBackend {
         launch_args: &Value,
         summary: &mut String,
     ) {
-        if self.ax_window_for_pid(pid).await.is_some() {
+        let probe_started = Instant::now();
+        let visible = self.list_windows(Some(pid)).await.ok().and_then(|windows| {
+            windows.into_iter().find(|window| {
+                window.get("minimized").and_then(Value::as_bool) != Some(true)
+                    && window.get("is_on_screen").and_then(Value::as_bool) != Some(false)
+            })
+        });
+        tracing::debug!(
+            target: "zeron_computer",
+            pid,
+            elapsed_ms = probe_started.elapsed().as_secs_f64() * 1000.0,
+            visible = visible.is_some(),
+            "launch_app existing-window probe"
+        );
+        if let Some(window) = visible {
+            *summary = render_launch_summary(summary, pid, std::slice::from_ref(&window));
+            tracing::debug!(
+                target: "zeron_computer",
+                pid,
+                "launch_app skipped open and AX readiness for visible window"
+            );
             return;
         }
 
+        let open_started = Instant::now();
         let reopened = if let Some(bundle_id) = launch_args.get("bundle_id").and_then(Value::as_str)
         {
             tokio::process::Command::new("open")
@@ -1088,12 +1118,29 @@ impl CuaBackend {
         } else {
             false
         };
+        tracing::debug!(
+            target: "zeron_computer",
+            pid,
+            elapsed_ms = open_started.elapsed().as_secs_f64() * 1000.0,
+            reopened,
+            "launch_app open completed"
+        );
 
-        if reopened && self.wait_for_ax_window(pid).await.is_some() {
-            let windows = self.list_windows(Some(pid)).await.unwrap_or_default();
-            *summary = render_launch_summary(summary, pid, &windows);
+        if reopened && let Some(window) = self.wait_for_ax_window(pid).await {
+            *summary = render_launch_summary(summary, pid, std::slice::from_ref(&window));
             summary.push_str(" [reopened: app was running with no document window]");
         } else {
+            let final_list_started = Instant::now();
+            let windows = self.list_windows(Some(pid)).await.unwrap_or_default();
+            tracing::debug!(
+                target: "zeron_computer",
+                pid,
+                elapsed_ms = final_list_started.elapsed().as_secs_f64() * 1000.0,
+                "launch_app final list_windows completed"
+            );
+            if !windows.is_empty() {
+                *summary = render_launch_summary(summary, pid, &windows);
+            }
             summary.push_str(
                 " — app is running but exposes no accessibility window; try computer_invoke_menu with the app's menu bar or relaunch",
             );
