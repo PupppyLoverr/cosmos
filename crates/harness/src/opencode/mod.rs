@@ -97,6 +97,8 @@ const RETRY_ABORT_ATTEMPT: u64 = 8;
 /// Default bound on prompt-send → first session-scoped bus event.
 const DEFAULT_STALL_BOUND: Duration = Duration::from_secs(60);
 const STALL_ENV: &str = "ZERON_OPENCODE_STALL_MS";
+const DEFAULT_SILENCE_BOUND: Duration = Duration::from_secs(5 * 60);
+const SILENCE_ENV: &str = "ZERON_OPENCODE_SILENCE_MS";
 
 /// What a wedged/silent run usually means for opencode.
 const STALL_HINT: &str = "The model provider is likely unreachable or rejecting requests. \
@@ -121,6 +123,14 @@ fn stall_bound() -> Option<Duration> {
         },
         Err(_) => Some(DEFAULT_STALL_BOUND),
     }
+}
+
+fn silence_bound() -> Duration {
+    std::env::var(SILENCE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_SILENCE_BOUND)
 }
 
 fn opencode_install_paths() -> Vec<PathBuf> {
@@ -1479,6 +1489,8 @@ struct TurnState {
     aborted_for_retry: bool,
     /// Deadline for the first session-scoped event after the prompt.
     stall_deadline: Option<tokio::time::Instant>,
+    /// Most recent event received while this turn is active.
+    last_event_at: tokio::time::Instant,
 }
 
 /// A detached native-command HTTP request failed. `generation` binds the
@@ -1530,6 +1542,7 @@ impl TurnState {
             retry_reported: false,
             aborted_for_retry: false,
             stall_deadline: stall.map(|d| tokio::time::Instant::now() + d),
+            last_event_at: tokio::time::Instant::now(),
         }
     }
 
@@ -1537,6 +1550,25 @@ impl TurnState {
         self.saw_activity = true;
         self.stall_deadline = None;
     }
+
+    fn note_event(&mut self) {
+        self.last_event_at = tokio::time::Instant::now();
+    }
+}
+
+fn tool_is_running_or_pending(feed: &SessionFeed) -> bool {
+    feed.parts
+        .values()
+        .any(|part| part.kind == "tool" && !part.tool_done)
+}
+
+fn silence_expired(
+    last_event_at: tokio::time::Instant,
+    now: tokio::time::Instant,
+    bound: Duration,
+    tool_is_running_or_pending: bool,
+) -> bool {
+    !tool_is_running_or_pending && now.saturating_duration_since(last_event_at) >= bound
 }
 
 async fn run_session(session: Session) {
@@ -1746,6 +1778,7 @@ async fn run_session(session: Session) {
         );
     }
     let stall = stall_bound();
+    let silence = silence_bound();
     let (command_failure_tx, mut command_failure_rx) = mpsc::unbounded_channel();
     let mut turn_generation = 0_u64;
     if let Err(e) = post_prompt(
@@ -1902,11 +1935,15 @@ async fn run_session(session: Session) {
         // life; a running tool's silence never trips it (events already
         // proved the turn alive and disarmed it). Computed by value each
         // iteration so the future doesn't hold a borrow of `turn`.
-        let deadline = abort_deadline.or_else(|| {
-            (turn.active && !turn.saw_activity)
-                .then_some(turn.stall_deadline)
-                .flatten()
-        });
+        let silence_deadline = (turn.active && !tool_is_running_or_pending(&main_feed))
+            .then_some(turn.last_event_at + silence);
+        let deadline = abort_deadline
+            .or_else(|| {
+                (turn.active && !turn.saw_activity)
+                    .then_some(turn.stall_deadline)
+                    .flatten()
+            })
+            .or(silence_deadline);
         let stall_sleep = async {
             match deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -2068,6 +2105,26 @@ async fn run_session(session: Session) {
                     done_sent = true;
                     break 'main;
                 }
+                if silence_expired(
+                    turn.last_event_at,
+                    tokio::time::Instant::now(),
+                    silence,
+                    tool_is_running_or_pending(&main_feed),
+                ) {
+                    let message = "OpenCode stopped responding (no events for 5m)".to_owned();
+                    let _ = send(&event_tx, AgentEvent::Error {
+                        message: message.clone(),
+                    }).await;
+                    settle_children(&mut children, &event_tx, DoneStatus::Errored).await;
+                    let _ = send(&event_tx, AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(message),
+                        session_id: Some(session_id.clone()),
+                    }).await;
+                    done_sent = true;
+                    break 'main;
+                }
                 let message = format!(
                     "opencode made no progress for {}s after the prompt. {STALL_HINT}",
                     stall.unwrap_or(DEFAULT_STALL_BOUND).as_secs()
@@ -2151,6 +2208,9 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     BusMsg::Event(event) => {
+                        if turn.active {
+                            turn.note_event();
+                        }
                         if interrupt_requested {
                             // Only the terminal idle/interrupt acknowledgement may
                             // affect an aborted turn; discard late content and usage.
@@ -2173,6 +2233,7 @@ async fn run_session(session: Session) {
                             pending_spawns: &mut pending_spawns,
                             unbound_children: &mut unbound_children,
                             turn: &mut turn,
+                            interrupt_requested,
                             pending_usage: &mut pending_usage,
                             context_windows: &context_windows,
                         }).await;
@@ -2183,6 +2244,17 @@ async fn run_session(session: Session) {
                             BusOutcome::TurnInterrupted => {
                                 interrupt_requested = true;
                                 settle_idle!('main);
+                            }
+                            BusOutcome::TurnError(message) => {
+                                settle_children(&mut children, &event_tx, DoneStatus::Errored).await;
+                                let _ = send(&event_tx, AgentEvent::Done {
+                                    status: DoneStatus::Errored,
+                                    result: None,
+                                    error: Some(message),
+                                    session_id: Some(session_id.clone()),
+                                }).await;
+                                done_sent = true;
+                                break 'main;
                             }
                         }
                     }
@@ -2580,6 +2652,7 @@ enum BusOutcome {
     /// Our session's turn reached idle.
     TurnIdle,
     TurnInterrupted,
+    TurnError(String),
     ConsumerGone,
 }
 
@@ -2601,6 +2674,7 @@ struct BusCtx<'a> {
     pending_spawns: &'a mut VecDeque<PendingSpawn>,
     unbound_children: &'a mut HashMap<String, String>,
     turn: &'a mut TurnState,
+    interrupt_requested: bool,
     pending_usage: &'a mut Option<AgentEvent>,
     context_windows: &'a HashMap<String, u64>,
 }
@@ -2652,6 +2726,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
         pending_spawns,
         unbound_children,
         turn,
+        interrupt_requested,
         pending_usage,
         context_windows,
     } = ctx;
@@ -2755,11 +2830,11 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             }
             let error = props.get("error").unwrap_or(&Value::Null);
             let name = error.get("name").and_then(Value::as_str).unwrap_or("");
-            if name == "MessageAbortedError" {
+            if name == "MessageAbortedError" && interrupt_requested {
                 // The abort echo of an interrupt — not an error chip.
                 return BusOutcome::Continue;
             }
-            let message = error
+            let mut message = error
                 .get("data")
                 .and_then(|d| d.get("message"))
                 .and_then(Value::as_str)
@@ -2771,6 +2846,9 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                         name.to_owned()
                     }
                 });
+            if name == "MessageAbortedError" {
+                message = format!("OpenCode aborted the response: {message}");
+            }
             // opencode emits the same failure twice (once bare, once wrapped
             // with an exception-name/stack prefix) — one chip per distinct
             // failure: dedupe when either first line contains the other.
@@ -2786,7 +2864,11 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             if !duplicate && !send(event_tx, AgentEvent::Error { message }).await {
                 return BusOutcome::ConsumerGone;
             }
-            BusOutcome::Continue
+            if kind == "session.error" && turn.active {
+                BusOutcome::TurnError(turn.error.clone().unwrap_or_default())
+            } else {
+                BusOutcome::Continue
+            }
         }
         "session.created" => {
             let info = props.get("info").unwrap_or(&Value::Null);
@@ -3736,25 +3818,18 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
             "properties": { "sessionID": session() }
         })],
         "session.execution.failed" => {
-            vec![
-                v2_error_payload(&data),
-                json!({
-                    "type": "session.idle",
-                    "properties": { "sessionID": session() }
-                }),
-            ]
+            vec![v2_error_payload(&data)]
         }
         "session.step.failed" => {
-            // An interrupt surfaces as step.failed{aborted}; the terminal
-            // execution.interrupted frame settles the turn. Any other
-            // failure is a step-level provider error: surface it as a chip,
-            // the turn itself keeps going (execution.* decides its end).
+            // An interrupt surfaces as step.failed{aborted}; turn-level
+            // handling distinguishes the expected interrupt echo from a
+            // provider-induced abort.
             if data.pointer("/error/type").and_then(Value::as_str) == Some("aborted") {
-                return Vec::new();
+                let mut error = v2_error_payload(&data);
+                error["properties"]["error"]["name"] = json!("MessageAbortedError");
+                return vec![error];
             }
-            let mut warning = v2_error_payload(&data);
-            warning["type"] = json!("session.warning");
-            vec![warning]
+            vec![v2_error_payload(&data)]
         }
         "session.step.started" => vec![json!({
             "type": "message.updated",
