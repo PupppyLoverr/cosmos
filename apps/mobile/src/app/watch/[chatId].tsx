@@ -120,7 +120,7 @@ export default function WatchLiveScreen() {
       <View style={[styles.controls, { paddingBottom: insets.bottom + spacing(2), borderTopColor: t.separator }]}>
         <StatusChip state={session?.status === 'awaitingInput' ? 'awaitingInput' : running ? 'working' : 'idle'} />
         <Text style={[type.footnote, { color: t.textSecondary, flex: 1 }]} numberOfLines={1}>
-          {running ? (session?.status === 'awaitingInput' ? 'Waiting for your answer' : 'Controlling your desktop') : 'Nothing running'}
+          {running ? (session?.status === 'awaitingInput' ? 'Waiting for your answer' : 'Computer use') : 'Nothing running'}
         </Text>
         <Pressable
           onPress={() => { void Haptics.selectionAsync(); setPaused((p) => !p); }}

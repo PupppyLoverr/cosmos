@@ -316,8 +316,8 @@ export default function SessionScreen() {
                 title="Controlling your desktop"
                 actions={(
                   <>
-                    <Button title="Watch" size="sm" variant="secondary" icon="display" onPress={watch} />
-                    <Button title="Stop" size="sm" variant="secondary" onPress={stop} />
+                    <Pressable onPress={watch} hitSlop={8}><Text style={[type.footnote, { color: t.text, fontWeight: '600' }]}>Watch</Text></Pressable>
+                    <Pressable onPress={stop} hitSlop={8}><Text style={[type.footnote, { color: t.danger, fontWeight: '600' }]}>Stop</Text></Pressable>
                   </>
                 )}
               />
@@ -359,5 +359,5 @@ const styles = StyleSheet.create({
   headerSub: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), marginTop: 1 },
   jumpWrap: { position: 'absolute', bottom: spacing(3), left: 0, right: 0, alignItems: 'center' },
   jump: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing(1.5), minWidth: 44, paddingHorizontal: spacing(3.5), minHeight: 44, borderRadius: 999 },
-  bannerWrap: { paddingHorizontal: spacing(3), paddingTop: spacing(2) },
+  bannerWrap: { paddingHorizontal: spacing(3), paddingTop: spacing(1) },
 });

@@ -6,7 +6,7 @@ import Constants from 'expo-constants';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../../lib/client';
 import { backdropPresets, edge, familyById, spacing, surfaceOptions, type, useTheme, useThemePrefs } from '../../lib/theme';
 import { Group, Row, StatusDot } from '../../components/bits';
-import { CircleButton, ScreenTitle, TopBar } from '../../components/chrome';
+import { CircleButton, TopBar } from '../../components/chrome';
 import { HarnessMark } from '../../components/harness-mark';
 import { Screen } from '../../components/surface';
 import { ensureNotificationPermission } from '../../lib/notify';
@@ -42,9 +42,8 @@ export default function SettingsScreen() {
 
   return (
     <Screen>
-      <TopBar left={<CircleButton icon="chevron.left" label="Back" onPress={() => router.back()} />} />
+      <TopBar left={<CircleButton icon="chevron.left" label="Back" onPress={() => router.back()} />} title="Settings" center />
       <ScrollView contentContainerStyle={styles.content}>
-        <ScreenTitle style={styles.title}>Settings</ScreenTitle>
 
         <Group>
           {auth ? (

@@ -140,7 +140,7 @@ export function useAttachPicker(onAddAttachment: (f: PickedFile) => void): { bus
   return { busy, open: openAttachSheet };
 }
 
-/** The compact filled send circle. Ink on paper; dims when there's nothing to send. */
+/** Plain send icon; only the active action receives a filled treatment. */
 export function SendButton({ onPress, enabled, sending, label = 'Send' }: { onPress: () => void; enabled: boolean; sending?: boolean; label?: string }) {
   const t = useTheme();
   return (
@@ -153,9 +153,7 @@ export function SendButton({ onPress, enabled, sending, label = 'Send' }: { onPr
       accessibilityRole="button"
       accessibilityState={{ disabled: !enabled }}
     >
-      <View style={[styles.round, { backgroundColor: t.text, opacity: enabled ? 1 : 0.3 }]}>
-        {sending ? <ActivityIndicator size="small" color={t.background} /> : <Icon name="arrow.up" size={16} color={t.background} weight="bold" />}
-      </View>
+      {sending ? <ActivityIndicator size="small" color={t.textSecondary} /> : <Icon name="arrow.up" size={20} color={enabled ? t.text : t.textTertiary} weight="semibold" />}
     </Pressable>
   );
 }
@@ -235,9 +233,7 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
           />
           {showStop ? (
             <Pressable onPress={stop} style={({ pressed }) => [styles.hit, { opacity: pressed ? 0.75 : 1 }]} accessibilityLabel="Stop the run" accessibilityRole="button">
-              <View style={[styles.round, { backgroundColor: t.text }]}>
-                <View style={[styles.stop, { backgroundColor: t.background }]} />
-              </View>
+              <Icon name="stop.fill" size={20} color={t.danger} weight="semibold" />
             </Pressable>
           ) : (
             <Animated.View style={sendAnimStyle}>
@@ -286,9 +282,7 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
             </ScrollView>
             {showStop ? (
               <Pressable onPress={stop} style={({ pressed }) => [styles.hit, { opacity: pressed ? 0.75 : 1 }]} accessibilityLabel="Stop the run" accessibilityRole="button">
-                <View style={[styles.round, { backgroundColor: t.text }]}>
-                  <View style={[styles.stop, { backgroundColor: t.background }]} />
-                </View>
+                <Icon name="stop.fill" size={20} color={t.danger} weight="semibold" />
               </Pressable>
             ) : (
               <Animated.View style={sendAnimStyle}>
@@ -304,7 +298,7 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
   return (
     <View style={[styles.wrap, bottomInset !== undefined ? { paddingBottom: bottomInset } : null]}>
       {compact ? (
-        <View style={[styles.card, styles.compactCard, { backgroundColor: t.surface }]}>{body}</View>
+        <View style={[styles.card, styles.compactCard, { backgroundColor: 'transparent', borderColor: t.separator }]}>{body}</View>
       ) : (
         <Animated.View style={liftStyle}>
           <View style={[styles.card, { backgroundColor: t.surface, borderColor: t.separator }]}>{body}</View>
@@ -317,7 +311,7 @@ export function Composer({ placeholder, initialText, onChangeText, bottomInset, 
 const styles = StyleSheet.create({
   wrap: { paddingHorizontal: spacing(3), paddingTop: spacing(2), paddingBottom: spacing(2) },
   card: { borderRadius: radii.composer, borderCurve: 'continuous', paddingTop: spacing(1.5), paddingBottom: spacing(1.5), paddingHorizontal: spacing(1.5), borderWidth: StyleSheet.hairlineWidth },
-  compactCard: { paddingVertical: spacing(0.75), borderWidth: 0 },
+  compactCard: { minHeight: 44, paddingVertical: 0 },
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing(2), paddingHorizontal: spacing(2), paddingTop: spacing(1) },
   chip: {
     flexDirection: 'row', alignItems: 'center', gap: spacing(2),

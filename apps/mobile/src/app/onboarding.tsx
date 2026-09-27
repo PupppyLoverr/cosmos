@@ -68,7 +68,7 @@ export default function OnboardingScreen() {
                 Cosmos
               </Animated.Text>
             </View>
-            <Button title="Continue" onPress={next} />
+            <Button title="Continue" onPress={next} style={styles.primaryButton} />
           </>
         ) : step === 1 ? (
           <>
@@ -86,7 +86,7 @@ export default function OnboardingScreen() {
                 ))}
               </View>
             </View>
-            <Button title="Continue" onPress={next} />
+            <Button title="Continue" onPress={next} style={styles.primaryButton} />
           </>
         ) : step === 2 ? (
           <>
@@ -97,7 +97,7 @@ export default function OnboardingScreen() {
               </Text>
             </View>
             <View style={styles.actions}>
-              <Button title="Pair this phone" onPress={() => pair()} />
+              <Button title="Pair this phone" onPress={() => pair()} style={styles.primaryButton} />
               <Button title="Use on this Wi-Fi" variant="ghost" onPress={() => pair('local')} />
               <Button title="Later" variant="ghost" size="md" onPress={next} />
             </View>
@@ -110,7 +110,7 @@ export default function OnboardingScreen() {
                 Pair from Desktops whenever you’re ready.
               </Text>
             </View>
-            <Button title="Done" onPress={finish} />
+            <Button title="Done" onPress={finish} style={styles.primaryButton} />
           </>
         )}
       </Animated.View>
@@ -132,4 +132,5 @@ const styles = StyleSheet.create({
     flexDirection: 'row', alignItems: 'flex-start', gap: spacing(4),
   },
   actions: { gap: spacing(1) },
+  primaryButton: { minHeight: 48, borderRadius: 12 },
 });

@@ -37,9 +37,9 @@ function projectOf(chat: Chat, spaces: Space[]): string {
   return path.split('/').filter(Boolean).pop() || 'No project';
 }
 
-function elapsed(startedAt?: string | null): string | undefined {
+function elapsed(startedAt?: string | null, now = Date.now()): string | undefined {
   if (!startedAt) return undefined;
-  const minutes = Math.floor(Math.max(0, Date.now() - new Date(startedAt).getTime()) / 60_000);
+  const minutes = Math.floor(Math.max(0, now - new Date(startedAt).getTime()) / 60_000);
   return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
@@ -47,10 +47,10 @@ type Item =
   | { kind: 'header'; key: string; title: string; collapsible?: boolean; collapsed?: boolean; tone?: 'attention'; icon?: string; trailing?: number }
   | { kind: 'device'; key: string; deviceId: string; name: string; dot: 'online' | 'connecting' | 'offline'; subtitle: string }
   | { kind: 'empty-device'; key: string }
-  | { kind: 'chat'; key: string; chat: Chat; state: State; desktop?: string; startedAt?: string | null };
+  | { kind: 'chat'; key: string; chat: Chat; state: State; desktop?: string; startedAt?: string | null; updatedAt?: string | null };
 
 /** One session: status dot, title, "harness · desktop · state", time on the right. */
-const SessionItem = React.memo(function SessionItem({ chat, state, desktop, startedAt }: { chat: Chat; state: State; desktop?: string; startedAt?: string | null }) {
+const SessionItem = React.memo(function SessionItem({ chat, state, desktop, startedAt, updatedAt, now }: { chat: Chat; state: State; desktop?: string; startedAt?: string | null; updatedAt?: string | null; now: number }) {
   const t = useTheme();
   const client = useCosmos();
   const title = chat.title || chat.lastMessagePreview || 'Untitled session';
@@ -59,9 +59,14 @@ const SessionItem = React.memo(function SessionItem({ chat, state, desktop, star
     : state === 'errored' ? 'Failed'
     : undefined;
   const stateTone = state === 'working' ? t.link : state === 'awaitingInput' ? t.warning : state === 'errored' ? t.danger : undefined;
+  const quietMinutes = state === 'working' && updatedAt
+    ? Math.floor(Math.max(0, now - new Date(updatedAt).getTime()) / 60_000)
+    : 0;
+  const elapsedLabel = state === 'working' && quietMinutes >= 10 ? `Quiet ${quietMinutes}m` : elapsed(chat.lastMessageAt ?? chat.createdAt);
+  const detail = state === 'working' ? elapsedLabel : stateLabel;
   const meta = [harnessLabel(chat.config?.harness), desktop].filter(Boolean).join(' · ');
   const hasMeta = Boolean(meta);
-  const hasDetail = hasMeta || Boolean(stateLabel);
+  const hasDetail = hasMeta || Boolean(detail);
   const dot = state === 'idle' ? 'transparent' : state === 'unread' ? t.link : statusColor(t, state);
 
   const rename = () => Alert.prompt?.('Rename session', undefined, (v) => { if (v?.trim()) void client.renameChat(chat.id, v.trim()); }, 'plain-text', chat.title ?? '');
@@ -98,12 +103,13 @@ const SessionItem = React.memo(function SessionItem({ chat, state, desktop, star
               <Text style={[type.footnote, { color: t.textTertiary }]}>{formatTimeAgo(chat.lastMessageAt ?? chat.createdAt)}</Text>
             </View>
             {hasDetail ? (
-              <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>
+              <Text style={[type.meta, { color: t.textTertiary }]} numberOfLines={1}>
                 {meta}
-                {meta && stateLabel ? ' · ' : null}
-                {stateLabel ? <Text style={{ color: stateTone, fontWeight: '500' }}>{stateLabel}</Text> : null}
+                {meta && detail ? ' · ' : null}
+                {detail ? <Text style={{ color: stateTone, fontWeight: '500' }}>{detail}</Text> : null}
               </Text>
             ) : null}
+            <View style={[styles.rowRule, { backgroundColor: t.separator }]} />
           </View>
           </View>
         </Pressable>
@@ -160,14 +166,14 @@ export default function HomeScreen() {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [showArchived, setShowArchived] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [, setTick] = useState(0);
+  const [now, setNow] = useState(0);
 
   const connected = connection.status === 'connected';
   const connecting = connection.status === 'connecting' || connection.status === 'reconnecting';
   const anyWorking = sessions.some((s) => s.status === 'working');
   useEffect(() => {
     if (!anyWorking) return;
-    const id = setInterval(() => setTick((n) => n + 1), 30_000);
+    const id = setInterval(() => setNow(Date.now()), 30_000);
     return () => clearInterval(id);
   }, [anyWorking]);
 
@@ -208,6 +214,7 @@ export default function HomeScreen() {
           state: stateOf(chat, live),
           desktop: undefined,
           startedAt: live?.status === 'working' ? live.startedAt : undefined,
+          updatedAt: live?.updatedAt,
         };
       });
 
@@ -385,9 +392,9 @@ export default function HomeScreen() {
               }}
             />
           ) : query ? (
-            <EmptyState title={`No results for “${query}”`} />
+            <EmptyState title={`No results for “${query}”`} body="Try a different session, project, or desktop." />
           ) : (
-            <EmptyState title="No sessions yet" body="Start one from the field below." />
+            <EmptyState title="No sessions" body="Start one from the field below." />
           )
         }
         renderItem={({ item }) => {
@@ -401,7 +408,7 @@ export default function HomeScreen() {
             return <Text style={[type.footnote, styles.emptyDevice, { color: t.textTertiary }]}>No sessions</Text>;
           }
           if (item.kind === 'header') {
-            const content = <SectionLabel icon={item.icon} trailing={item.trailing} compact={Boolean(item.icon)} tone={item.collapsed ? 'muted' : item.tone}>{item.title}</SectionLabel>;
+            const content = <SectionLabel icon={undefined} trailing={item.trailing} compact={Boolean(item.icon)} rowAligned={Boolean(item.icon)} tone={item.collapsed ? 'muted' : item.tone}>{item.title}</SectionLabel>;
             return item.collapsible ? (
               <Pressable
                 onPress={() => { void Haptics.selectionAsync(); toggle(item.key); }}
@@ -413,7 +420,7 @@ export default function HomeScreen() {
               </Pressable>
             ) : content;
           }
-          return <SessionItem chat={item.chat} state={item.state} desktop={item.desktop} startedAt={item.startedAt} />;
+          return <SessionItem chat={item.chat} state={item.state} desktop={item.desktop} startedAt={item.startedAt} updatedAt={item.updatedAt} now={now} />;
         }}
       />
 
@@ -430,13 +437,14 @@ const styles = StyleSheet.create({
   notice: { paddingHorizontal: spacing(4), paddingBottom: spacing(2) },
   noticeAction: { alignSelf: 'flex-start', marginTop: spacing(2) },
   header: { paddingHorizontal: 0 },
-  row: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing(3), paddingHorizontal: spacing(4), paddingVertical: spacing(2), minHeight: 52 },
-  dotCol: { width: 16, alignItems: 'center', paddingTop: 6.5 },
+  row: { position: 'relative', flexDirection: 'row', alignItems: 'flex-start', gap: spacing(3), paddingHorizontal: spacing(4), paddingVertical: spacing(2.5), minHeight: 56 },
+  dotCol: { width: 20, alignItems: 'center', paddingTop: 6 },
   dot: { width: 8, height: 8, borderRadius: 4 },
   rowCopy: { flex: 1, minWidth: 0, minHeight: 36, gap: 3 },
   rowCopyCentered: { justifyContent: 'center' },
   rowTop: { flexDirection: 'row', alignItems: 'baseline', gap: spacing(2) },
-  rowTitle: { flex: 1, fontSize: 16, lineHeight: 21 },
+  rowTitle: { flex: 1, fontSize: 15, lineHeight: 20 },
+  rowRule: { position: 'absolute', left: spacing(4) + 20 + spacing(3), right: spacing(4), bottom: 0, height: StyleSheet.hairlineWidth },
   searchRow: { marginHorizontal: edge, minHeight: 40, borderRadius: 12, justifyContent: 'center', marginBottom: spacing(2) },
   searchInput: { flex: 1, paddingHorizontal: spacing(3), paddingVertical: spacing(1) },
   bar: { position: 'absolute', left: 0, right: 0, bottom: 0, paddingHorizontal: edge, paddingTop: spacing(2), borderTopWidth: StyleSheet.hairlineWidth },

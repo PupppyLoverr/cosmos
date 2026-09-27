@@ -164,7 +164,7 @@ export default function NewSessionScreen() {
           key={draft}
           initialText={draft}
           autoFocus
-          placeholder="Describe the task"
+          placeholder="Describe the task…"
           onChangeText={(v) => setTyped(v.length > 0)}
           running={false}
           sending={busy}

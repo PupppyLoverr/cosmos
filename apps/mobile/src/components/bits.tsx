@@ -405,8 +405,8 @@ export function EmptyState({ title, body, actionLabel, onAction, children }: {
   const t = useTheme();
   return (
     <View style={styles.empty}>
-      <Text accessibilityRole="header" style={[type.headline, { color: t.text, textAlign: 'center' }]}>{title}</Text>
-      {body ? <Text style={[type.footnote, { color: t.textSecondary, textAlign: 'center', marginTop: spacing(1), maxWidth: 300 }]}>{body}</Text> : null}
+      <Text accessibilityRole="header" style={[type.subhead, { color: t.textSecondary, textAlign: 'center', fontWeight: '400' }]}>{title}</Text>
+      {body ? <Text style={[type.caption, { color: t.textTertiary, textAlign: 'center', marginTop: spacing(1), maxWidth: 300 }]}>{body}</Text> : null}
       {actionLabel && onAction ? (
         <Button title={actionLabel} onPress={onAction} size="md" style={{ marginTop: spacing(4), alignSelf: 'center' }} />
       ) : null}

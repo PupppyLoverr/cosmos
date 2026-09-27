@@ -10,7 +10,7 @@ import { Device } from '../lib/protocol';
 import { showMenu } from '../lib/menu';
 import { spacing, type, useTheme } from '../lib/theme';
 import { EmptyState, Icon } from '../components/bits';
-import { CircleButton, PillButton, ScreenTitle, SectionLabel, TopBar } from '../components/chrome';
+import { CircleButton, PillButton, SectionLabel, TopBar } from '../components/chrome';
 import { Screen } from '../components/surface';
 
 function platformIcon(platform?: string): string {
@@ -120,9 +120,8 @@ export default function DesktopsScreen() {
 
   return (
     <Screen>
-      <TopBar left={<CircleButton icon="chevron.left" label="Back" onPress={() => router.back()} />} />
+      <TopBar left={<CircleButton icon="chevron.left" label="Back" onPress={() => router.back()} />} title="Desktops" center />
       <ScrollView contentContainerStyle={{ paddingBottom: insets.bottom + 120 }}>
-        <ScreenTitle>Desktops</ScreenTitle>
         {desktops.length === 0 ? (
           <EmptyState title="No desktops yet" body="Open Cosmos on your computer, then pair this phone." />
         ) : (
