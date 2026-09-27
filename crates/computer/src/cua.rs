@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -1293,6 +1294,7 @@ impl CuaBackend {
     /// normalize the outcome. `request.delivery` was already gated by the
     /// service — forward it verbatim.
     async fn act_inner(&self, request: &ActionRequest) -> Result<ActionOutcome, ComputerError> {
+        let action_started = Instant::now();
         let args = &request.args;
         let delivery = request.delivery.as_str();
         let (tool, mut call_args) = match request.tool.as_str() {
@@ -1505,6 +1507,7 @@ impl CuaBackend {
         let mut menu_path_note = None;
         let mut native_menu_note = None;
         let mut fast_route_fallback = false;
+        let mut action_route = "window";
         let result = if tool == "invoke_menu" {
             let native = self
                 .native_menu
@@ -1548,10 +1551,12 @@ impl CuaBackend {
                 None => self.call(tool, call_args.clone()).await,
             }
         } else if let Some(fast_args) = self.fast_input_args(tool, &call_args).await {
+            action_route = "fast-desktop";
             match self.call(tool, fast_args).await {
                 Ok(result) => Ok(result),
                 Err(error) => {
                     fast_route_fallback = true;
+                    action_route = "window";
                     tracing::debug!(
                         tool,
                         error = %error,
@@ -1716,6 +1721,12 @@ impl CuaBackend {
             self.reopen_running_app_if_needed(pid, &call_args, &mut summary)
                 .await;
         }
+        tracing::debug!(
+            tool,
+            route = action_route,
+            elapsed_ms = action_started.elapsed().as_secs_f64() * 1000.0,
+            "computer action completed"
+        );
         Ok(ActionOutcome {
             summary,
             details,
