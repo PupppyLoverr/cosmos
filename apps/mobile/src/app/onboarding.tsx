@@ -13,13 +13,7 @@ import * as Haptics from 'expo-haptics';
 import { motion, spacing, type, useTheme } from '../lib/theme';
 import { useReduceMotion } from '../lib/motion';
 import { markOnboardingSeen } from '../lib/onboarding-store';
-import { Button, Icon } from '../components/bits';
-
-const ROWS = [
-  { icon: 'bubble.left.and.bubble.right', title: 'Sessions', body: 'Every agent run on your desktops, in one list.' },
-  { icon: 'display', title: 'Live desktop', body: 'Watch what the agent is doing. Stop it any time.' },
-  { icon: 'qrcode.viewfinder', title: 'Pair', body: 'Scan once. The desktop remembers this phone.' },
-] as const;
+import { Button } from '../components/bits';
 
 export default function OnboardingScreen() {
   const t = useTheme();
@@ -67,31 +61,24 @@ export default function OnboardingScreen() {
               >
                 Cosmos
               </Animated.Text>
+              <Text style={[type.body, styles.wordmarkSubtitle, { color: t.textSecondary }]}>
+                Run and supervise your desktop agents from your phone.
+              </Text>
             </View>
             <Button title="Continue" onPress={next} style={styles.primaryButton} />
           </>
         ) : step === 1 ? (
           <>
             <View style={styles.body}>
-              <Text accessibilityRole="header" style={[type.title, { color: t.text }]}>Direct your agents from anywhere.</Text>
-              <View style={styles.rows}>
-                {ROWS.map((r) => (
-                  <View key={r.title} style={styles.row}>
-                    <Icon name={r.icon} size={20} color={t.textSecondary} />
-                    <View style={{ flex: 1, minWidth: 0 }}>
-                      <Text style={[type.headline, { color: t.text }]}>{r.title}</Text>
-                      <Text style={[type.footnote, { color: t.textSecondary }]}>{r.body}</Text>
-                    </View>
-                  </View>
-                ))}
-              </View>
+              <Text accessibilityRole="header" style={[styles.beatHeading, { color: t.text }]}>Sessions</Text>
+              <Text style={[type.body, { color: t.textSecondary, marginTop: spacing(2) }]}>Keep every desktop agent run in one list.</Text>
             </View>
             <Button title="Continue" onPress={next} style={styles.primaryButton} />
           </>
         ) : step === 2 ? (
           <>
             <View style={styles.body}>
-              <Text accessibilityRole="header" style={[type.title, { color: t.text }]}>Pair a desktop.</Text>
+              <Text accessibilityRole="header" style={[styles.beatHeading, { color: t.text }]}>Pair a desktop.</Text>
               <Text style={[type.body, { color: t.textSecondary, marginTop: spacing(2) }]}>
                 Open Cosmos on the desktop, then scan its code.
               </Text>
@@ -105,7 +92,7 @@ export default function OnboardingScreen() {
         ) : (
           <>
             <View style={styles.body}>
-              <Text accessibilityRole="header" style={[type.title, { color: t.text }]}>You’re set.</Text>
+              <Text accessibilityRole="header" style={[styles.beatHeading, { color: t.text }]}>You’re set.</Text>
               <Text style={[type.body, { color: t.textSecondary, marginTop: spacing(2) }]}>
                 Pair from Desktops whenever you’re ready.
               </Text>
@@ -126,11 +113,9 @@ const styles = StyleSheet.create({
   stage: { flex: 1, paddingHorizontal: spacing(5), paddingTop: spacing(6), justifyContent: 'space-between' },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   wordmark: { fontSize: 44, fontWeight: '600', letterSpacing: -0.8 },
-  body: { flex: 1, paddingTop: spacing(8) },
-  rows: { marginTop: spacing(8), gap: spacing(5) },
-  row: {
-    flexDirection: 'row', alignItems: 'flex-start', gap: spacing(4),
-  },
+  wordmarkSubtitle: { marginTop: spacing(2), textAlign: 'center' },
+  body: { flex: 1, justifyContent: 'center' },
+  beatHeading: { fontSize: 22, fontWeight: '600', lineHeight: 28 },
   actions: { gap: spacing(1) },
   primaryButton: { minHeight: 48, borderRadius: 12 },
 });

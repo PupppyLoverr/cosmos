@@ -49,8 +49,8 @@ type Item =
   | { kind: 'empty-device'; key: string }
   | { kind: 'chat'; key: string; chat: Chat; state: State; desktop?: string; startedAt?: string | null; updatedAt?: string | null };
 
-/** One session: status dot, title, "harness · desktop · state", time on the right. */
-const SessionItem = React.memo(function SessionItem({ chat, state, desktop, startedAt, updatedAt, now }: { chat: Chat; state: State; desktop?: string; startedAt?: string | null; updatedAt?: string | null; now: number }) {
+/** One session: status dot, title, harness and timing metadata, time on the right. */
+const SessionItem = React.memo(function SessionItem({ chat, state, startedAt, updatedAt, now }: { chat: Chat; state: State; startedAt?: string | null; updatedAt?: string | null; now: number }) {
   const t = useTheme();
   const client = useCosmos();
   const title = chat.title || chat.lastMessagePreview || 'Untitled session';
@@ -62,9 +62,13 @@ const SessionItem = React.memo(function SessionItem({ chat, state, desktop, star
   const quietMinutes = state === 'working' && updatedAt
     ? Math.floor(Math.max(0, now - new Date(updatedAt).getTime()) / 60_000)
     : 0;
-  const elapsedLabel = state === 'working' && quietMinutes >= 10 ? `Quiet ${quietMinutes}m` : elapsed(chat.lastMessageAt ?? chat.createdAt);
+  const elapsedLabel = state === 'working' && quietMinutes >= 10
+    ? `Quiet ${quietMinutes}m`
+    : state === 'working'
+      ? elapsed(updatedAt ?? chat.lastMessageAt ?? chat.createdAt, now)
+      : elapsed(chat.lastMessageAt ?? chat.createdAt);
   const detail = state === 'working' ? elapsedLabel : stateLabel;
-  const meta = [harnessLabel(chat.config?.harness), desktop].filter(Boolean).join(' · ');
+  const meta = harnessLabel(chat.config?.harness);
   const hasMeta = Boolean(meta);
   const hasDetail = hasMeta || Boolean(detail);
   const dot = state === 'idle' ? 'transparent' : state === 'unread' ? t.link : statusColor(t, state);
@@ -420,7 +424,7 @@ export default function HomeScreen() {
               </Pressable>
             ) : content;
           }
-          return <SessionItem chat={item.chat} state={item.state} desktop={item.desktop} startedAt={item.startedAt} updatedAt={item.updatedAt} now={now} />;
+          return <SessionItem chat={item.chat} state={item.state} startedAt={item.startedAt} updatedAt={item.updatedAt} now={now} />;
         }}
       />
 

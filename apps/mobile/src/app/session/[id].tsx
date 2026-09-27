@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useLocalSearchParams, router } from 'expo-router';
+import { LinearGradient } from 'expo-linear-gradient';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../../lib/client';
 import { describeLink } from '../../lib/connection-state';
 import { SessionMessageEntry, TranscriptUpdate, isComputerCall, type Chat } from '../../lib/protocol';
@@ -22,20 +23,21 @@ function entryKeyExtractor(entry: SessionMessageEntry): string {
 }
 
 /** Compact header: title with the harness + live status beneath, iMessage-style. */
-function HeaderTitle({ title, chat, status, desktop, t }: { title: string; chat?: Chat; status: string; desktop?: string; t: Theme }) {
-  const parts = [harnessLabel(chat?.config?.harness), desktop].filter(Boolean);
-  const live = status === 'working' || status === 'awaitingInput';
-  const sub = live
-    ? (status === 'working' ? 'Working' : 'Needs your input')
-    : parts.join(' · ');
+function HeaderTitle({ title, chat, status, t }: { title: string; chat?: Chat; status: string; t: Theme }) {
+  const live = status !== 'idle';
+  const sub = status === 'working' ? 'Working'
+    : status === 'awaitingInput' ? 'Needs you'
+      : status === 'errored' ? 'Failed'
+        : harnessLabel(chat?.config?.harness);
+  const subColor = status === 'working' ? t.link : status === 'awaitingInput' ? t.warning : status === 'errored' ? t.danger : t.textTertiary;
   return (
     <View style={styles.headerTitle} accessibilityRole="header" accessibilityLabel={`${title}, ${sub}`}>
       <View style={styles.headerMain}>
         <Text style={[type.headline, { color: t.text, flexShrink: 1 }]} numberOfLines={1}>{title}</Text>
       </View>
       <View style={styles.headerSub}>
-        {live ? <Pulse color={status === 'working' ? t.link : t.warning} /> : null}
-        <Text style={[type.caption, { color: live ? (status === 'working' ? t.link : t.warning) : t.textTertiary }]} numberOfLines={1}>
+        {live ? <Pulse color={subColor} /> : null}
+        <Text style={[type.meta, { color: subColor }]} numberOfLines={1}>
           {sub}
         </Text>
       </View>
@@ -233,15 +235,15 @@ export default function SessionScreen() {
     ]);
   };
 
-  const desktopName = connection.status === 'connected' && connection.desktop ? desktopDisplayName(connection.desktop) : undefined;
   const link = describeLink(connection, connection.desktop ? desktopDisplayName(connection.desktop) : 'your desktop');
   return (
     <Screen>
       <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <TopBar
           left={<CircleButton icon="chevron.left" label="Back" onPress={back} />}
-          title={<HeaderTitle title={title} chat={chat} status={status} desktop={desktopName} t={t} />}
+          title={<HeaderTitle title={title} chat={chat} status={status} t={t} />}
           right={<CircleButton icon="ellipsis" label="Session options" onPress={sessionMenu} />}
+          center
           divider
         />
 
@@ -288,6 +290,11 @@ export default function SessionScreen() {
               keyboardDismissMode="interactive"
               keyboardShouldPersistTaps="handled"
             />
+            <LinearGradient
+              pointerEvents="none"
+              colors={[t.background, 'transparent']}
+              style={styles.transcriptFade}
+            />
             {!atBottom ? (
               <View style={styles.jumpWrap} pointerEvents="box-none">
                 <Pressable
@@ -313,7 +320,7 @@ export default function SessionScreen() {
             ) : (
               <SessionBanner
                 kind="controlling"
-                title="Controlling your desktop"
+                title="Computer use"
                 actions={(
                   <>
                     <Pressable onPress={watch} hitSlop={8}><Text style={[type.footnote, { color: t.text, fontWeight: '600' }]}>Watch</Text></Pressable>
@@ -357,6 +364,7 @@ const styles = StyleSheet.create({
   headerTitle: { alignItems: 'flex-start', minWidth: 0 },
   headerMain: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), minWidth: 0 },
   headerSub: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), marginTop: 1 },
+  transcriptFade: { position: 'absolute', top: 0, left: 0, right: 0, height: 24 },
   jumpWrap: { position: 'absolute', bottom: spacing(3), left: 0, right: 0, alignItems: 'center' },
   jump: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing(1.5), minWidth: 44, paddingHorizontal: spacing(3.5), minHeight: 44, borderRadius: 999 },
   bannerWrap: { paddingHorizontal: spacing(3), paddingTop: spacing(1) },

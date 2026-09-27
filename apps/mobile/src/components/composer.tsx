@@ -51,7 +51,7 @@ export function ComposerChip({ label, icon, leading, tone, onPress, accessibilit
     <View style={styles.composerChip}>
       {leading}
       {icon ? <Icon name={icon} size={15} color={fg} /> : null}
-      <Text style={[type.subhead, { color: fg, fontWeight: '500', maxWidth: 170 }]} numberOfLines={1}>{label}</Text>
+      <Text style={[type.meta, { color: fg, fontWeight: '500', maxWidth: 170 }]} numberOfLines={1}>{label}</Text>
     </View>
   );
   if (!onPress) {

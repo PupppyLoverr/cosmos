@@ -195,7 +195,7 @@ const styles = StyleSheet.create({
   sideRight: { justifyContent: 'flex-end' },
   titleWrap: { flex: 1, minWidth: 0 },
   centered: { alignItems: 'center' },
-  screenTitle: { paddingHorizontal: spacing(4), paddingTop: spacing(3), paddingBottom: spacing(3) },
+  screenTitle: { paddingHorizontal: spacing(4), paddingTop: spacing(1), paddingBottom: spacing(3) },
   screenTitleText: { fontSize: 28, fontWeight: '600', letterSpacing: -0.2, lineHeight: 34 },
   pill: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing(2),
@@ -224,7 +224,7 @@ const styles = StyleSheet.create({
     gap: spacing(2), paddingHorizontal: edge, paddingTop: spacing(5), paddingBottom: spacing(1.5),
   },
   sectionLabelCompact: { paddingTop: spacing(2) },
-  sectionLabelAligned: { paddingLeft: edge + spacing(5) },
+  sectionLabelAligned: { paddingLeft: edge + 20 + spacing(3), paddingBottom: spacing(2) },
   sectionLabelTitle: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), minWidth: 0, flex: 1 },
 });
 
