@@ -524,7 +524,7 @@ async fn v2_wire_streams_text_and_settles_on_execution_success() {
     })
     .await
     .unwrap();
-    assert_eq!(status, DoneStatus::Errored);
+    assert_eq!(status, DoneStatus::Completed);
     assert_eq!(text, "PONG");
     assert_eq!(usage, Some((10, 2)));
 }
