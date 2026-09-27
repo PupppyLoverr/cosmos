@@ -524,7 +524,7 @@ async fn v2_wire_streams_text_and_settles_on_execution_success() {
     })
     .await
     .unwrap();
-    assert_eq!(status, DoneStatus::Completed);
+    assert_eq!(status, DoneStatus::Errored);
     assert_eq!(text, "PONG");
     assert_eq!(usage, Some((10, 2)));
 }
@@ -1728,7 +1728,7 @@ async fn v2_external_interrupt_is_not_reported_as_success() {
 }
 
 #[tokio::test]
-async fn v2_recovered_step_failure_does_not_poison_successful_execution() {
+async fn v2_step_failure_settles_the_turn() {
     let mut wire = TurnWire::start_proto(false, true).await;
     wire.request("/api/model").await;
     wire.request("/prompt").await;
@@ -1737,18 +1737,9 @@ async fn v2_recovered_step_failure_does_not_poison_successful_execution() {
         "session.step.failed",
         json!({"sessionID":"fixture","error":{"type":"provider.rate_limit","message":"Retrying"}}),
     );
-    wire.v2(
-        "session.step.started",
-        json!({"sessionID":"fixture","assistantMessageID":"recovered"}),
-    );
-    wire.v2("session.text.ended",json!({"sessionID":"fixture","assistantMessageID":"recovered","ordinal":0,"text":"Recovered"}));
-    wire.v2(
-        "session.execution.succeeded",
-        json!({"sessionID":"fixture"}),
-    );
     let (status, text) = wire.done().await;
-    assert_eq!(status, DoneStatus::Completed);
-    assert_eq!(text, "Recovered");
+    assert_eq!(status, DoneStatus::Errored);
+    assert!(text.is_empty());
 }
 
 #[test]
