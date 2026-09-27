@@ -23,7 +23,7 @@ usage:
   zcli onboarding             run the first-run setup again (until it retires itself)
 
 flags:
-  --output text|json|json-stream   (default text)
+  --output/--output-format text|json|stream-json   (default text)
   --mode plan|agent
   --allow <tool[,tool…]>           permit tools for this run
   --yolo                           allow all tools (sandbox stays on)
@@ -33,6 +33,11 @@ flags:
   --max-usd <f>                    budget cap → exit 5
   --cwd <dir>                      workspace root (default: cwd)
   --resume <session-id>
+  --continue, -c                    resume the most recent session in this cwd
+  --add-dir <path>                  additional tool sandbox root (repeatable)
+  --system-prompt <text|@file>      replace the default system prompt
+  --append-system-prompt <text|@file>
+  --allowedTools/--allowed-tools    alias for --allow
   --approve-plan                   headless: auto-approve a submitted plan
   --allow-escalation <cap[,…]>     e.g. network
   --sandbox read-only|workspace-write|full
@@ -68,12 +73,12 @@ fn parse(args: &[String]) -> Result<RunOpts, String> {
         };
         match a {
             "-p" | "--prompt" => o.prompt = Some(val("-p")?),
-            "--output" => {
-                let v = val("--output")?;
+            "--output" | "--output-format" => {
+                let v = val(a)?;
                 o.output = OutputMode::parse(&v).ok_or_else(|| format!("bad --output {v}"))?;
             }
             "--mode" => o.mode = Some(val("--mode")?),
-            "--allow" => o.allow = split_list(&val("--allow")?),
+            "--allow" | "--allowedTools" | "--allowed-tools" => o.allow = split_list(&val(a)?),
             "--yolo" => o.yolo = true,
             "--no-sandbox" => o.no_sandbox = true,
             "--model" => o.model = Some(val("--model")?),
@@ -85,6 +90,10 @@ fn parse(args: &[String]) -> Result<RunOpts, String> {
             }
             "--cwd" => o.cwd = Some(val("--cwd")?),
             "--resume" => o.resume = Some(val("--resume")?),
+            "--continue" | "-c" => o.resume = Some("__latest__".into()),
+            "--add-dir" => o.add_dirs.push(val("--add-dir")?),
+            "--system-prompt" => o.system_prompt = Some(val("--system-prompt")?),
+            "--append-system-prompt" => o.append_system_prompt = Some(val("--append-system-prompt")?),
             "--approve-plan" => o.approve_plan = true,
             "--allow-escalation" => o.allow_escalation = split_list(&val("--allow-escalation")?),
             "--sandbox" => o.sandbox = Some(val("--sandbox")?),
@@ -129,6 +138,15 @@ fn main() {
                 eprintln!("usage: zcli tools dump");
                 exit::USAGE
             }
+        }
+        Some("completion") => {
+            let shell = args.get(1).map(String::as_str).unwrap_or("bash");
+            if !["bash", "zsh", "fish"].contains(&shell) {
+                eprintln!("completion shell must be bash, zsh, or fish");
+                std::process::exit(exit::USAGE);
+            }
+            println!("_zcli_complete() {{ COMPREPLY=( $(compgen -W 'completion tools session compact undo checkpoint --help --version --output-format --allowedTools --add-dir --system-prompt --append-system-prompt --continue' -- \"${{COMP_WORDS[COMP_CWORD]}}\") ); }}\ncomplete -F _zcli_complete zcli");
+            exit::DONE
         }
         Some("session") => session_cmd(&args[1..]),
         Some("compact") => compact_cmd(&args[1..]),

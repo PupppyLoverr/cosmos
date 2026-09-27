@@ -21,6 +21,15 @@ export type Config = {
   [k: string]: any;
 };
 
+function projectMcp(cwd = process.cwd()): Record<string, any> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(cwd, ".mcp.json"), "utf8"));
+    return parsed?.mcpServers && typeof parsed.mcpServers === "object" ? parsed.mcpServers : {};
+  } catch {
+    return {};
+  }
+}
+
 export function sanitizeTomlText(s: string): string {
   return s.replace(/\0/g, "").replace(/\\x[0-9a-fA-F]{2}/g, "");
 }
@@ -43,7 +52,7 @@ export function loadConfig(home: string): Config {
     },
     subagents: { max_parallel: 3 },
     bridge: { large_read_lines: 200, summarizer_model: "" },
-    mcp: {},
+    mcp: projectMcp(),
     tools: {},
     hooks: [],
   };
@@ -319,6 +328,17 @@ export function projectInstructions(workspace: string): string | null {
   return parts.length ? `The repository provides these instructions; follow them.\n\n${parts.join("\n\n")}` : null;
 }
 
+export function initProject(workspace: string): string {
+  const file = path.join(workspace, "AGENTS.md");
+  if (fs.existsSync(file)) return "AGENTS.md already exists";
+  const claude = path.join(workspace, "CLAUDE.md");
+  const body = fs.existsSync(claude)
+    ? "# Agent instructions\n\nSee `CLAUDE.md` for the repository's instructions.\n"
+    : "# Agent instructions\n\nDescribe the build, test, and contribution workflow for this repository.\n";
+  fs.writeFileSync(file, body, "utf8");
+  return "created AGENTS.md";
+}
+
 export type Message = {
   role: string;
   content: Record<string, any>[];
@@ -453,6 +473,7 @@ export class Session {
         started: evs[0].ts,
         events: evs.length,
         preview: firstUser.slice(0, 80),
+        cwd: evs.find((e) => e.kind === "session_start")?.data?.cwd ?? "",
       });
     }
     out.sort((a, b) => (a.started < b.started ? -1 : a.started > b.started ? 1 : 0));

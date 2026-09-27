@@ -79,6 +79,9 @@ export class RunOpts {
   max_usd: number | null = null;
   cwd: string | null = null;
   resume: string | null = null;
+  add_dirs: string[] = [];
+  system_prompt: string | null = null;
+  append_system_prompt: string | null = null;
   approve_plan = false;
   allow_escalation: string[] = [];
   sandbox: string | null = null;
@@ -93,6 +96,6 @@ export class RunOpts {
 export function cliHome(): string {
   const home = process.env.COSMOS_CLI_HOME;
   if (home) return home;
-  const base = process.env.USERPROFILE || os.homedir();
+  const base = process.env.HOME || process.env.USERPROFILE || os.homedir();
   return path.join(base, ".cosmos-cli");
 }

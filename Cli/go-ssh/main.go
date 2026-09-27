@@ -27,9 +27,11 @@ usage:
   zagy memory search <q>      search the shared Meridian vault
   zagy memory add <text>      append to the vault (scope: zagy)
 
-flags: --output text|json|json-stream · --mode plan|agent|accept-edits · --allow a,b ·
+flags: --output/--output-format text|json|stream-json · --mode plan|agent|accept-edits · --allow a,b ·
 --yolo · --no-sandbox · --model <alias> · --max-turns N · --max-usd F ·
---cwd <dir> · --resume <id> · --approve-plan · --allow-escalation cap,... ·
+--cwd <dir> · --resume <id> · --continue/-c · --add-dir <path> (repeatable) ·
+--system-prompt <text|@file> · --append-system-prompt <text|@file> ·
+--allowedTools/--allowed-tools · --approve-plan · --allow-escalation cap,... ·
 --sandbox read-only|workspace-write|full · --ask on-request|never|untrusted ·
 --autonomous · --autonomous-gate "<cmd>" · --allow-self-mutate · --arena 1
 `
@@ -64,10 +66,13 @@ func parse(args []string) (*RunOpts, error) {
 				return nil, err
 			}
 			o.Prompt = &v
-		case "--output":
+		case "--output", "--output-format":
 			v, err := val()
 			if err != nil {
 				return nil, err
+			}
+			if v == "stream-json" {
+				v = "json-stream"
 			}
 			if v != "text" && v != "json" && v != "json-stream" {
 				return nil, fmt.Errorf("bad --output %s", v)
@@ -79,7 +84,7 @@ func parse(args []string) (*RunOpts, error) {
 				return nil, err
 			}
 			o.Mode = v
-		case "--allow":
+		case "--allow", "--allowedTools", "--allowed-tools":
 			v, err := val()
 			if err != nil {
 				return nil, err
@@ -127,6 +132,26 @@ func parse(args []string) (*RunOpts, error) {
 				return nil, err
 			}
 			o.Resume = v
+		case "--continue", "-c":
+			o.Resume = "__latest__"
+		case "--add-dir":
+			v, err := val()
+			if err != nil {
+				return nil, err
+			}
+			o.AddDirs = append(o.AddDirs, v)
+		case "--system-prompt":
+			v, err := val()
+			if err != nil {
+				return nil, err
+			}
+			o.SystemPrompt = v
+		case "--append-system-prompt":
+			v, err := val()
+			if err != nil {
+				return nil, err
+			}
+			o.AppendSystemPrompt = v
 		case "--approve-plan":
 			o.ApprovePlan = true
 		case "--allow-escalation":
@@ -388,7 +413,8 @@ func runHeadless(opts *RunOpts, harness, cwd string) int {
 	emit(a.Session.append("session_start", map[string]any{
 		"model": a.ModelAlias, "mode": a.Mode,
 		"sandbox":     map[bool]string{true: "off", false: "appcontainer"}[a.Ctx.NoSandbox],
-		"boot_tokens": a.BootTokens, "resume": optStr(opts.Resume)}))
+		"boot_tokens": a.BootTokens, "resume": optStr(opts.Resume),
+		"cwd": filepath.Clean(a.Workspace)}))
 	runHooks(a.Cfg, "session_start", "", map[string]any{}, a.Session.ID)
 	if strings.HasPrefix(prompt, "/compact") {
 		focus := strings.TrimSpace(strings.TrimPrefix(prompt, "/compact"))
@@ -649,6 +675,18 @@ func main() {
 	args := os.Args[1:]
 	cwd, _ := os.Getwd()
 	code := ExitDone
+	if len(args) > 0 && args[0] == "completion" {
+		shell := "bash"
+		if len(args) > 1 {
+			shell = args[1]
+		}
+		if shell != "bash" && shell != "zsh" && shell != "fish" {
+			fmt.Fprintln(os.Stderr, "completion shell must be bash, zsh, or fish")
+			os.Exit(ExitUsage)
+		}
+		fmt.Println("_zagy_complete() { COMPREPLY=( $(compgen -W 'completion tools session models memory compact undo checkpoint --help --version --output-format --allowedTools --add-dir --system-prompt --append-system-prompt --continue' -- \"${COMP_WORDS[COMP_CWORD]}\") ); }\ncomplete -F _zagy_complete zagy")
+		os.Exit(ExitDone)
+	}
 	if len(args) > 0 && args[0] == "tools" {
 		if len(args) > 1 && args[1] == "dump" {
 			fmt.Print(ToolsJSON)

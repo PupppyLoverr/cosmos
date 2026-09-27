@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -89,6 +90,14 @@ func bootContext(workspace string) (string, int) {
 	return strv(v, "context"), int(numv(v, "tokens"))
 }
 
+func promptValue(value string) (string, error) {
+	if strings.HasPrefix(value, "@") {
+		b, err := os.ReadFile(strings.TrimPrefix(value, "@"))
+		return string(b), err
+	}
+	return value, nil
+}
+
 func runHooks(cfg *Config, event, tool string, payload any, session string) (string, bool) {
 	ev, _ := json.Marshal(map[string]any{
 		"event": event, "tool": tool, "data": payload, "session": session})
@@ -99,7 +108,12 @@ func runHooks(cfg *Config, event, tool string, payload any, session string) (str
 		if h.Matcher != "" && h.Matcher != "*" && h.Matcher != tool {
 			continue
 		}
-		c := exec.Command("cmd", "/c", h.Command)
+		var c *exec.Cmd
+		if runtime.GOOS == "windows" {
+			c = exec.Command("cmd", "/c", h.Command)
+		} else {
+			c = exec.Command("sh", "-c", h.Command)
+		}
 		c.Stdin = strings.NewReader(string(ev))
 		out, err := c.Output()
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -139,6 +153,21 @@ func NewAgent(opts *RunOpts, harness, cwd string) (*Agent, error) {
 		mode = "agent"
 	}
 	ctx := NewToolCtx(ws)
+	if raw, err := os.ReadFile(filepath.Join(ws, ".mcp.json")); err == nil {
+		var project struct {
+			MCPServers map[string]any `json:"mcpServers"`
+		}
+		if json.Unmarshal(raw, &project) == nil {
+			for name, server := range project.MCPServers {
+				ctx.MCPServers[name] = server
+			}
+		}
+	}
+	for _, d := range opts.AddDirs {
+		if p, err := filepath.Abs(d); err == nil {
+			ctx.AllowedRoots = append(ctx.AllowedRoots, p)
+		}
+	}
 	ctx.LargeReadLines = cfg.LargeRead
 	ctx.NoSandbox = opts.NoSandbox
 	ctx.Home = home
@@ -158,8 +187,21 @@ func NewAgent(opts *RunOpts, harness, cwd string) (*Agent, error) {
 		Mode: mode, Ctx: ctx, Allowed: cfg.allowedHosts(),
 		LogW: os.Stderr,
 	}
-	if opts.Resume != "" {
-		s, err := sessionOpen(home, opts.Resume)
+	resume := opts.Resume
+	if resume == "__latest__" {
+		list := sessionList(home)
+		for i := len(list) - 1; i >= 0; i-- {
+			if list[i]["cwd"] == ws {
+				resume, _ = list[i]["id"].(string)
+				break
+			}
+		}
+		if resume == "__latest__" {
+			return nil, fmt.Errorf("no previous session in %s to continue", ws)
+		}
+	}
+	if resume != "" {
+		s, err := sessionOpen(home, resume)
 		if err != nil {
 			return nil, err
 		}
@@ -171,10 +213,26 @@ func NewAgent(opts *RunOpts, harness, cwd string) (*Agent, error) {
 	}
 	boot, tokens := bootContext(ws)
 	a.BootTokens = tokens
-	if strings.Contains(boot, "You are Cosmos") {
+	if opts.SystemPrompt != "" {
+		prompt, err := promptValue(opts.SystemPrompt)
+		if err != nil {
+			return nil, err
+		}
+		a.System = []string{prompt}
+	} else if strings.Contains(boot, "You are Cosmos") {
 		a.System = []string{boot}
 	} else {
 		a.System = []string{systemSnippet(), boot}
+	}
+	if len(opts.AddDirs) > 0 {
+		a.System = append(a.System, "Additional tool roots granted for this run: "+strings.Join(opts.AddDirs, ", "))
+	}
+	if opts.AppendSystemPrompt != "" {
+		prompt, err := promptValue(opts.AppendSystemPrompt)
+		if err != nil {
+			return nil, err
+		}
+		a.System = append(a.System, prompt)
 	}
 	var specs []map[string]any
 	json.Unmarshal([]byte(ToolsJSON), &specs)

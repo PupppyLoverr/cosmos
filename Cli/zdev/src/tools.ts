@@ -52,6 +52,7 @@ export function toolSpecs(): Record<string, any>[] {
 
 export class Ctx {
   workspace: string;
+  allowedRoots: string[] = [];
   readState = new Map<string, string>();
   escalations: string[] = [];
   netAllow = false;
@@ -106,7 +107,13 @@ export function resolve(ctx: Ctx, p: string): string {
   const joined = isAbsolute(p) ? p : path.join(ctx.workspace, p);
   const norm = path.normalize(joined);
   const root = path.normalize(ctx.workspace);
-  if (!(norm === root || norm.startsWith(root + path.sep))) {
+  if (
+    !(norm === root || norm.startsWith(root + path.sep)) &&
+    !ctx.allowedRoots.some((r) => {
+      const extra = path.normalize(path.resolve(r));
+      return norm === extra || norm.startsWith(extra + path.sep);
+    })
+  ) {
     throw new Error(`path escapes workspace: ${p}`);
   }
   return norm;

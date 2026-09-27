@@ -133,6 +133,10 @@ function cost(prices: Record<string, any>, u: Record<string, number>): number | 
   );
 }
 
+function promptValue(value: string): string {
+  return value.startsWith("@") ? fs.readFileSync(value.slice(1), "utf8") : value;
+}
+
 export type Emit = (ev: proto.Event) => void;
 export type Asker = (tool: string) => Promise<boolean>;
 
@@ -200,13 +204,18 @@ export class Agent {
     this.modelAlias = `${alias} (${modelId})`;
     this.mode = opts.yolo ? "yolo" : opts.mode ?? "agent";
     this.ctx = new t.Ctx(this.workspace);
+    this.ctx.allowedRoots = opts.add_dirs.map((d) => path.resolve(d));
     this.ctx.mcpServers = this.cfg.mcp ?? {};
     this.ctx.largeReadLines = this.cfg.bridge.large_read_lines ?? 200;
     this.ctx.noSandbox = opts.no_sandbox;
     this.ctx.escalations = [...opts.allow_escalation];
     this.ctx.netAllow = opts.allow_escalation.includes("network");
     if (opts.resume) {
-      this.session = store.Session.open(this.home, opts.resume);
+      const id = opts.resume === "__latest__"
+        ? store.Session.list(this.home).filter((s) => s.cwd === path.resolve(this.workspace)).at(-1)?.id
+        : opts.resume;
+      if (!id) throw new Error(`no previous session in ${path.resolve(this.workspace)} to continue`);
+      this.session = store.Session.open(this.home, id);
       this.session.harness = harness;
       this.messages = this.session.replay();
     } else {
@@ -215,12 +224,18 @@ export class Agent {
     }
     const [boot, bootTokens] = bootContext(this.workspace);
     this.bootTokens = bootTokens;
-    this.system = boot.includes("You are Cosmos")
-      ? [boot]
-      : [systemSnippet(), boot];
+    this.system = opts.system_prompt
+      ? [promptValue(opts.system_prompt)]
+      : boot.includes("You are Cosmos")
+        ? [boot]
+        : [systemSnippet(), boot];
     // AGENTS.md / CLAUDE.md / .zcli/instructions.md from the repo
     const project = store.projectInstructions(this.workspace);
     if (project) this.system.push(project);
+    if (opts.add_dirs.length) {
+      this.system.push(`Additional tool roots granted for this run: ${opts.add_dirs.map((d) => path.resolve(d)).join(", ")}`);
+    }
+    if (opts.append_system_prompt) this.system.push(promptValue(opts.append_system_prompt));
     this.tools = t.toolSpecs();
     this.allowed = store.allowedHosts(this.cfg);
     this.ctx.home = this.home;
@@ -851,6 +866,7 @@ export async function runHeadless(
         sandbox: agent.ctx.noSandbox ? "off" : "appcontainer",
         boot_tokens: agent.bootTokens,
         resume: opts.resume,
+        cwd: path.resolve(agent.workspace),
       }),
     );
     runHooks(agent.cfg, "session_start", "", {}, agent.session.id);

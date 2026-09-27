@@ -70,33 +70,39 @@ func (e Event) Line() string {
 }
 
 type RunOpts struct {
-	Prompt          *string
-	Output          string // text|json|json-stream
-	Mode            string // ""|plan|agent|accept-edits
-	Allow           []string
-	Yolo            bool
-	NoSandbox       bool
-	Model           string
-	MaxTurns        int
-	MaxUSD          float64
-	Cwd             string
-	Resume          string
-	ApprovePlan     bool
-	AllowEscalation []string
-	Sandbox         string
-	Ask             string
-	Autonomous      bool
-	AutonomousGate  string
-	AllowSelfMutate bool
-	Arena           bool
-	SelfImprove     *bool
+	Prompt             *string
+	Output             string // text|json|json-stream
+	Mode               string // ""|plan|agent|accept-edits
+	Allow              []string
+	Yolo               bool
+	NoSandbox          bool
+	Model              string
+	MaxTurns           int
+	MaxUSD             float64
+	Cwd                string
+	Resume             string
+	AddDirs            []string
+	SystemPrompt       string
+	AppendSystemPrompt string
+	ApprovePlan        bool
+	AllowEscalation    []string
+	Sandbox            string
+	Ask                string
+	Autonomous         bool
+	AutonomousGate     string
+	AllowSelfMutate    bool
+	Arena              bool
+	SelfImprove        *bool
 }
 
 func cliHome() string {
 	if v := os.Getenv("COSMOS_CLI_HOME"); v != "" {
 		return v
 	}
-	base := os.Getenv("USERPROFILE")
+	base := os.Getenv("HOME")
+	if base == "" {
+		base = os.Getenv("USERPROFILE")
+	}
 	if base == "" {
 		base, _ = os.UserHomeDir()
 	}

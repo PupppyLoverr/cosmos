@@ -182,7 +182,11 @@ func sessionList(home string) []map[string]any {
 			continue
 		}
 		preview := ""
+		cwd := ""
 		for _, e := range evs {
+			if e.Kind == "session_start" {
+				cwd = dataStr(e, "cwd")
+			}
 			if e.Kind == "user" {
 				preview = dataStr(e, "text")
 				break
@@ -194,6 +198,7 @@ func sessionList(home string) []map[string]any {
 		out = append(out, map[string]any{
 			"id": strings.TrimSuffix(en.Name(), ".jsonl"), "harness": evs[0].Harness,
 			"started": evs[0].TS, "events": len(evs), "preview": preview,
+			"cwd": cwd,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

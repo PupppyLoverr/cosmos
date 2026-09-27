@@ -28,9 +28,11 @@ usage:
   zdev models [provider]      models you can use now (catalog + live lists)
   zdev onboarding             replay the first-run setup
 
-flags: --output text|json|json-stream · --mode plan|agent|accept-edits · --allow a,b ·
+flags: --output/--output-format text|json|stream-json · --mode plan|agent|accept-edits · --allow a,b ·
 --yolo · --no-sandbox · --model <alias> · --max-turns N · --max-usd F ·
---cwd <dir> · --resume <id> · --approve-plan · --allow-escalation cap,... ·
+--cwd <dir> · --resume <id> · --continue/-c · --add-dir <path> (repeatable) ·
+--system-prompt <text|@file> · --append-system-prompt <text|@file> ·
+--allowedTools/--allowed-tools · --approve-plan · --allow-escalation cap,... ·
 --sandbox read-only|workspace-write|full · --ask on-request|never|untrusted ·
 --autonomous · --autonomous-gate "<cmd>" · --allow-self-mutate · --arena 1
 `;
@@ -56,14 +58,15 @@ function parse(args: string[]): proto.RunOpts {
     };
     if (a === "-p" || a === "--prompt") {
       o.prompt = val();
-    } else if (a === "--output") {
+    } else if (a === "--output" || a === "--output-format") {
       o.output = val();
+      if (o.output === "stream-json") o.output = "json-stream";
       if (!["text", "json", "json-stream"].includes(o.output)) {
         throw new Error(`bad --output ${o.output}`);
       }
     } else if (a === "--mode") {
       o.mode = val();
-    } else if (a === "--allow") {
+    } else if (["--allow", "--allowedTools", "--allowed-tools"].includes(a)) {
       o.allow = val()
         .split(",")
         .map((x) => x.trim())
@@ -82,6 +85,14 @@ function parse(args: string[]): proto.RunOpts {
       o.cwd = val();
     } else if (a === "--resume") {
       o.resume = val();
+    } else if (a === "--continue" || a === "-c") {
+      o.resume = "__latest__";
+    } else if (a === "--add-dir") {
+      o.add_dirs.push(val());
+    } else if (a === "--system-prompt") {
+      o.system_prompt = val();
+    } else if (a === "--append-system-prompt") {
+      o.append_system_prompt = val();
     } else if (a === "--approve-plan") {
       o.approve_plan = true;
     } else if (a === "--allow-escalation") {
@@ -226,6 +237,7 @@ async function repl(opts: proto.RunOpts): Promise<number> {
         mode: ag.mode,
         sandbox: ag.ctx.noSandbox ? "off" : "appcontainer",
         boot_tokens: ag.bootTokens,
+        cwd: path.resolve(ag.workspace),
       }),
     );
     if (opts.prompt && opts.prompt !== "-") {
@@ -363,6 +375,15 @@ function memoryCmd(args: string[]): number {
 
 async function main(): Promise<number> {
   const args = argv();
+  if (args[0] === "completion") {
+    const shell = args[1] ?? "bash";
+    if (!["bash", "zsh", "fish"].includes(shell)) {
+      console.error("completion shell must be bash, zsh, or fish");
+      return proto.EXIT_USAGE;
+    }
+    console.log("_zdev_complete() { COMPREPLY=( $(compgen -W 'completion tools session memory compact undo checkpoint --help --version --output-format --allowedTools --add-dir --system-prompt --append-system-prompt --continue' -- \"${COMP_WORDS[COMP_CWORD]}\") ); }\ncomplete -F _zdev_complete zdev");
+    return proto.EXIT_DONE;
+  }
   if (args[0] === "tools") {
     if (args[1] === "dump") {
       process.stdout.write(t.toolsDump(), "utf8");

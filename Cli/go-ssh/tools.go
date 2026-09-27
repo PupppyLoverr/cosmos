@@ -36,6 +36,7 @@ var ReadOnlyTools = map[string]bool{
 
 type ToolCtx struct {
 	Workspace       string
+	AllowedRoots    []string
 	ReadState       map[string]string
 	Escalations     []string
 	NetAllow        bool
@@ -78,7 +79,14 @@ func resolve(ctx *ToolCtx, path string) (string, error) {
 	}
 	norm := filepath.Clean(joined)
 	root := filepath.Clean(ctx.Workspace)
-	if norm != root && !strings.HasPrefix(norm, root+string(os.PathSeparator)) {
+	allowed := norm == root || strings.HasPrefix(norm, root+string(os.PathSeparator))
+	for _, extra := range ctx.AllowedRoots {
+		extra = filepath.Clean(extra)
+		if norm == extra || strings.HasPrefix(norm, extra+string(os.PathSeparator)) {
+			allowed = true
+		}
+	}
+	if !allowed {
 		return "", fmt.Errorf("path escapes workspace: %s", path)
 	}
 	return norm, nil
