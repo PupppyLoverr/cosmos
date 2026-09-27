@@ -8,9 +8,15 @@ pub struct FrontmostWindow {
     pub height: f64,
 }
 
+fn should_skip_window(owner_name: Option<&str>, pid: i32, layer: i32, ignore_pids: &[i32]) -> bool {
+    layer != 0
+        || ignore_pids.contains(&pid)
+        || owner_name.is_some_and(|name| matches!(name, "Cua Driver" | "CuaDriver"))
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::FrontmostWindow;
+    use super::{FrontmostWindow, should_skip_window};
     use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
     use core_foundation::base::{CFIndex, CFRelease};
     use core_foundation::base::{CFType, CFTypeRef, TCFType};
@@ -50,6 +56,18 @@ mod platform {
         number_value(dictionary, key)?.to_f64()
     }
 
+    fn string_value(dictionary: CFDictionaryRef, key: &'static str) -> Option<String> {
+        let key = CFString::from_static_string(key);
+        let value =
+            unsafe { CFDictionaryGetValue(dictionary, key.as_concrete_TypeRef() as *const c_void) };
+        if value.is_null() {
+            return None;
+        }
+        unsafe { CFType::wrap_under_get_rule(value as CFTypeRef) }
+            .downcast::<CFString>()
+            .map(|value| value.to_string())
+    }
+
     fn bounds(dictionary: CFDictionaryRef) -> Option<(f64, f64, f64, f64)> {
         let key = CFString::from_static_string("kCGWindowBounds");
         let value =
@@ -72,7 +90,7 @@ mod platform {
         ))
     }
 
-    pub fn frontmost_window() -> Option<FrontmostWindow> {
+    pub fn frontmost_window(ignore_pids: &[i32]) -> Option<FrontmostWindow> {
         let windows = unsafe {
             CGWindowListCopyWindowInfo(
                 K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
@@ -89,13 +107,20 @@ mod platform {
                 return None;
             }
             let dictionary = value as CFDictionaryRef;
-            if number_i32(dictionary, "kCGWindowLayer")? != 0 {
+            let layer = number_i32(dictionary, "kCGWindowLayer")?;
+            let pid = number_i32(dictionary, "kCGWindowOwnerPID")?;
+            if should_skip_window(
+                string_value(dictionary, "kCGWindowOwnerName").as_deref(),
+                pid,
+                layer,
+                ignore_pids,
+            ) {
                 return None;
             }
             let (x, y, width, height) = bounds(dictionary)?;
             Some(FrontmostWindow {
                 window_id: number_i64(dictionary, "kCGWindowNumber")?,
-                pid: number_i32(dictionary, "kCGWindowOwnerPID")?,
+                pid,
                 x,
                 y,
                 width,
@@ -113,6 +138,29 @@ mod platform {
 pub use platform::frontmost_window;
 
 #[cfg(not(target_os = "macos"))]
-pub fn frontmost_window() -> Option<FrontmostWindow> {
+pub fn frontmost_window(_ignore_pids: &[i32]) -> Option<FrontmostWindow> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_skip_window;
+
+    #[test]
+    fn skips_nonzero_layers() {
+        assert!(should_skip_window(Some("TextEdit"), 10, 1, &[]));
+    }
+
+    #[test]
+    fn skips_ignored_pids() {
+        assert!(should_skip_window(Some("TextEdit"), 10, 0, &[10]));
+        assert!(!should_skip_window(Some("TextEdit"), 11, 0, &[10]));
+    }
+
+    #[test]
+    fn skips_driver_overlay_names() {
+        assert!(should_skip_window(Some("Cua Driver"), 10, 0, &[]));
+        assert!(should_skip_window(Some("CuaDriver"), 10, 0, &[]));
+        assert!(!should_skip_window(Some("TextEdit"), 10, 0, &[]));
+    }
 }

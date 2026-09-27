@@ -841,7 +841,13 @@ impl CuaBackend {
         }
         let pid = call_args.get("pid").and_then(Value::as_i64)?;
         let requested_window_id = call_args.get("window_id").and_then(Value::as_i64);
-        let frontmost = tokio::task::spawn_blocking(crate::macos_focus::frontmost_window);
+        let ignore_pids = self
+            .client
+            .child_pid()
+            .map(|pid| vec![pid as i32])
+            .unwrap_or_default();
+        let frontmost =
+            tokio::task::spawn_blocking(move || crate::macos_focus::frontmost_window(&ignore_pids));
         let (windows, frontmost) = tokio::join!(self.list_windows(Some(pid)), frontmost);
         let frontmost = frontmost.ok().flatten()?;
         let windows = windows.ok()?;
