@@ -853,7 +853,7 @@ impl CuaBackend {
         let windows = windows.ok()?;
         let target_window = frontmost_window(&windows, pid, requested_window_id)?;
         let target_window_id = target_window.get("window_id").and_then(Value::as_i64)?;
-        if !frontmost_target_is_eligible(&frontmost, pid, target_window) {
+        if !frontmost_target_is_eligible(tool, &frontmost, pid, target_window) {
             return None;
         }
 
@@ -1950,18 +1950,18 @@ fn frontmost_window(
     if target_window.get("pid").and_then(Value::as_i64) != Some(pid)
         || target_window.get("minimized").and_then(Value::as_bool) == Some(true)
         || target_window.get("is_on_screen").and_then(Value::as_bool) == Some(false)
-        || target_window.get("z_index").and_then(Value::as_i64)
-            != front_window.get("z_index").and_then(Value::as_i64)
     {
         return None;
     }
-    let target_window_id = target_window.get("window_id").and_then(Value::as_i64)?;
-    (front_window.get("window_id").and_then(Value::as_i64) == Some(target_window_id))
-        .then_some(target_window)
+    Some(target_window)
 }
 
 fn window_to_screen(frame: ElementFrame, x: f64, y: f64) -> (f64, f64) {
     (frame.x + x, frame.y + y)
+}
+
+fn is_keyboard_fast_input_tool(tool: &str) -> bool {
+    matches!(tool, "type_text" | "press_key" | "hotkey")
 }
 
 fn frontmost_window_matches(
@@ -1973,16 +1973,24 @@ fn frontmost_window_matches(
 }
 
 fn frontmost_target_is_eligible(
+    tool: &str,
     frontmost: &crate::macos_focus::FrontmostWindow,
     target_pid: i64,
     target_window: &Value,
 ) -> bool {
+    if target_window.get("pid").and_then(Value::as_i64) != Some(target_pid)
+        || target_window.get("minimized").and_then(Value::as_bool) == Some(true)
+        || target_window.get("is_on_screen").and_then(Value::as_bool) == Some(false)
+    {
+        return false;
+    }
+    if is_keyboard_fast_input_tool(tool) {
+        return i32::try_from(target_pid).ok() == Some(frontmost.pid);
+    }
     let Some(target_window_id) = target_window.get("window_id").and_then(Value::as_i64) else {
         return false;
     };
     frontmost_window_matches(frontmost, target_pid, target_window_id)
-        && target_window.get("minimized").and_then(Value::as_bool) != Some(true)
-        && target_window.get("is_on_screen").and_then(Value::as_bool) != Some(false)
 }
 
 fn str_arg(args: &Value, key: &str) -> Option<String> {
@@ -2084,6 +2092,58 @@ mod fast_input_tests {
     }
 
     #[test]
+    fn same_pid_different_window_allows_keyboard_fast_route() {
+        let frontmost = crate::macos_focus::FrontmostWindow {
+            pid: 12,
+            window_id: 113,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let target = json!({
+            "pid": 12,
+            "window_id": 112,
+            "is_on_screen": true
+        });
+        assert!(frontmost_target_is_eligible(
+            "type_text",
+            &frontmost,
+            12,
+            &target
+        ));
+        assert!(frontmost_target_is_eligible(
+            "press_key",
+            &frontmost,
+            12,
+            &target
+        ));
+        assert!(frontmost_target_is_eligible(
+            "hotkey", &frontmost, 12, &target
+        ));
+    }
+
+    #[test]
+    fn same_pid_different_window_rejects_pointer_fast_route() {
+        let frontmost = crate::macos_focus::FrontmostWindow {
+            pid: 12,
+            window_id: 113,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let target = json!({
+            "pid": 12,
+            "window_id": 112,
+            "is_on_screen": true
+        });
+        assert!(!frontmost_target_is_eligible(
+            "click", &frontmost, 12, &target
+        ));
+    }
+
+    #[test]
     fn frontmost_window_pid_mismatch_is_not_eligible() {
         let frontmost = crate::macos_focus::FrontmostWindow {
             pid: 11,
@@ -2112,7 +2172,12 @@ mod fast_input_tests {
             "minimized": true,
             "is_on_screen": true
         });
-        assert!(!frontmost_target_is_eligible(&frontmost, 12, &target));
+        assert!(!frontmost_target_is_eligible(
+            "press_key",
+            &frontmost,
+            12,
+            &target
+        ));
     }
 }
 
