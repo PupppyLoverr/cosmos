@@ -1,4 +1,4 @@
-//! memory_* tools → meridian bridge binary (`meridian` / meridian.exe).
+//! memory_* tools → meridian bridge binary.
 //! The bridge is the single writer; all harnesses share MERIDIAN_VAULT.
 
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ fn meridian_bin(ctx: &ToolContext) -> Option<PathBuf> {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for name in ["meridian.exe", "meridian"] {
+            for name in meridian_names() {
                 let cand = dir.join(name);
                 if cand.is_file() {
                     return Some(cand);
@@ -30,7 +30,7 @@ fn meridian_bin(ctx: &ToolContext) -> Option<PathBuf> {
     }
     if let Ok(path) = std::env::var("PATH") {
         for d in std::env::split_paths(&path) {
-            for name in ["meridian.exe", "meridian"] {
+            for name in meridian_names() {
                 let cand = d.join(name);
                 if cand.is_file() {
                     return Some(cand);
@@ -39,6 +39,10 @@ fn meridian_bin(ctx: &ToolContext) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn meridian_names() -> &'static [&'static str] {
+    if cfg!(windows) { &["meridian.exe", "meridian"] } else { &["meridian"] }
 }
 
 fn run_bridge(ctx: &ToolContext, args: &[String]) -> Result<String> {

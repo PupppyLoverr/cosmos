@@ -124,7 +124,7 @@ behaviour is tested against the alacritty terminal emulator.
 
 All harnesses read `COSMOS_CLI_HOME` (default `~/.cosmos-cli`):
 `sessions/<id>.jsonl` event logs, `worktrees/`, `skills/`. Memory lives in the
-Meridian vault (`MERIDIAN_VAULT`, default `%USERPROFILE%\.meridian\vault`),
+Meridian vault (`MERIDIAN_VAULT`, default `~/.meridian/vault`),
 append-only markdown bullets (`decision|preference|map|correction|playbook`)
 searched over BM25 — never touches Meridian's app vault.
 

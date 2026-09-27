@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -475,6 +476,15 @@ func findBin(names []string, env string) string {
 }
 
 func shellArgv(command string) []string {
+	if runtime.GOOS != "windows" {
+		for _, d := range filepath.SplitList(os.Getenv("PATH")) {
+			b := filepath.Join(d, "bash")
+			if _, err := os.Stat(b); err == nil {
+				return []string{b, "-lc", command}
+			}
+		}
+		return []string{"sh", "-lc", command}
+	}
 	for _, d := range filepath.SplitList(os.Getenv("PATH")) {
 		b := filepath.Join(d, "bash.exe")
 		if _, err := os.Stat(b); err == nil {
@@ -602,9 +612,13 @@ func toolBash(ctx *ToolCtx, inp map[string]any) (string, error) {
 		}
 		return fenceShell(string(out), code, logPath, om), nil
 	}
-	zsb := findBin([]string{"zsandbox.exe", "zsandbox"}, "ZSANDBOX_BIN")
+	names := []string{"zsandbox"}
+	if runtime.GOOS == "windows" {
+		names = []string{"zsandbox.exe", "zsandbox"}
+	}
+	zsb := findBin(names, "ZSANDBOX_BIN")
 	if zsb == "" {
-		return "", fmt.Errorf("zsandbox.exe not found (set ZSANDBOX_BIN)")
+		return "", fmt.Errorf("zsandbox not found (set ZSANDBOX_BIN)")
 	}
 	note := ""
 	if ctx.SandboxDegraded != "" {
@@ -651,7 +665,11 @@ func toolBash(ctx *ToolCtx, inp map[string]any) (string, error) {
 }
 
 func meridianRun(ctx *ToolCtx, args ...string) (string, error) {
-	mer := findBin([]string{"meridian.exe", "meridian"}, "MERIDIAN_BIN")
+	names := []string{"meridian"}
+	if runtime.GOOS == "windows" {
+		names = []string{"meridian.exe", "meridian"}
+	}
+	mer := findBin(names, "MERIDIAN_BIN")
 	if mer == "" {
 		return "", fmt.Errorf("meridian bridge binary not found (set MERIDIAN_BIN)")
 	}

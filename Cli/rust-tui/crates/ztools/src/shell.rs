@@ -1,4 +1,4 @@
-//! bash → zsandbox.exe (contract §5) + shell v2 job protocol.
+//! shell → zsandbox + shell v2 job protocol.
 //! Additive fields: wait=now|next_write|exit, from_offset, timeout_s.
 
 use std::path::PathBuf;
@@ -21,7 +21,7 @@ fn sandbox_bin(ctx: &ToolContext) -> Option<PathBuf> {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for name in ["zsandbox.exe", "zsandbox"] {
+            for name in sandbox_names() {
                 let cand = dir.join(name);
                 if cand.is_file() {
                     return Some(cand);
@@ -31,7 +31,7 @@ fn sandbox_bin(ctx: &ToolContext) -> Option<PathBuf> {
     }
     if let Ok(path) = std::env::var("PATH") {
         for d in std::env::split_paths(&path) {
-            for name in ["zsandbox.exe", "zsandbox"] {
+            for name in sandbox_names() {
                 let cand = d.join(name);
                 if cand.is_file() {
                     return Some(cand);
@@ -43,9 +43,12 @@ fn sandbox_bin(ctx: &ToolContext) -> Option<PathBuf> {
 }
 
 pub fn shell_argv(command: &str) -> Vec<String> {
+    if cfg!(windows) {
+        return vec!["powershell.exe".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), command.into()];
+    }
     if let Ok(path) = std::env::var("PATH") {
         for d in std::env::split_paths(&path) {
-            let b = d.join("bash.exe");
+            let b = d.join("bash");
             if b.is_file() {
                 return vec![
                     b.to_string_lossy().into_owned(),
@@ -55,13 +58,11 @@ pub fn shell_argv(command: &str) -> Vec<String> {
             }
         }
     }
-    vec![
-        "powershell.exe".into(),
-        "-NoProfile".into(),
-        "-NonInteractive".into(),
-        "-Command".into(),
-        command.into(),
-    ]
+    vec!["sh".into(), "-lc".into(), command.into()]
+}
+
+fn sandbox_names() -> &'static [&'static str] {
+    if cfg!(windows) { &["zsandbox.exe", "zsandbox"] } else { &["zsandbox"] }
 }
 
 fn deny_env_command(command: &str) -> bool {

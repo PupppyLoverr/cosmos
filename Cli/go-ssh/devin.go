@@ -52,11 +52,13 @@ func devinExtraPaths() []string {
 	local := os.Getenv("LOCALAPPDATA")
 	var out []string
 	if home != "" {
-		out = append(out, filepath.Join(home, ".local", "bin", "devin.exe"),
-			filepath.Join(home, ".local", "bin", "devin.cmd"),
-			filepath.Join(home, ".local", "bin", "devin"))
+		out = append(out, filepath.Join(home, ".local", "bin", "devin"))
+		if runtime.GOOS == "windows" {
+			out = append(out, filepath.Join(home, ".local", "bin", "devin.exe"),
+				filepath.Join(home, ".local", "bin", "devin.cmd"))
+		}
 	}
-	if local != "" {
+	if local != "" && runtime.GOOS == "windows" {
 		out = append(out,
 			filepath.Join(local, "devin", "cli", "bin", "devin.exe"),
 			filepath.Join(local, "devin", "cli", "bin", "devin.cmd"),
@@ -73,7 +75,10 @@ func devinExecutable() string {
 			return v
 		}
 	}
-	names := []string{"devin.exe", "devin.cmd", "devin"}
+	names := []string{"devin"}
+	if runtime.GOOS == "windows" {
+		names = []string{"devin.exe", "devin.cmd", "devin"}
+	}
 	for _, dir := range strings.Split(os.Getenv("PATH"), string(os.PathListSeparator)) {
 		for _, n := range names {
 			p := filepath.Join(dir, n)
@@ -636,20 +641,20 @@ func completeDevin(cfg ProviderCfg, req map[string]any, sink Sink) error {
 		cascade = newID()
 	}
 	body := map[string]any{
-		"metadata":           devinMetadata(creds.key),
-		"prompt":             strings.Join(sys, "\n\n"),
-		"chatMessagePrompts": chatPrompts(req),
-		"chatModelUid":       strings.TrimSpace(cfg.Model),
-		"requestType":        5,
-		"plannerMode":        1,
+		"metadata":                 devinMetadata(creds.key),
+		"prompt":                   strings.Join(sys, "\n\n"),
+		"chatMessagePrompts":       chatPrompts(req),
+		"chatModelUid":             strings.TrimSpace(cfg.Model),
+		"requestType":              5,
+		"plannerMode":              1,
 		"disableParallelToolCalls": true,
-		"cascadeId":          cascade,
-		"executionId":        newID(),
+		"cascadeId":                cascade,
+		"executionId":              newID(),
 		"systemPromptCacheOptions": map[string]any{"type": 1},
 		"configuration": map[string]any{
 			"numCompletions": "1", "maxTokens": maxTok, "maxNewlines": "200",
 			"temperature": 0.4, "firstTemperature": 0.4, "topK": "50", "topP": 1,
-			"stopPatterns": []string{"<|user|>", "<|bot|>", "<|context_request|>", "<|endoftext|>", "<|end_of_turn|>"},
+			"stopPatterns":        []string{"<|user|>", "<|bot|>", "<|context_request|>", "<|endoftext|>", "<|end_of_turn|>"},
 			"fimEotProbThreshold": 1,
 		},
 	}

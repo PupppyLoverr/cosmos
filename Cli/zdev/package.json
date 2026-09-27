@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "bun run src/cli.tsx",
-    "build": "bun build --compile src/cli.tsx --outfile dist/zdev.exe",
+    "build": "bun build --compile src/cli.tsx --outfile dist/zdev",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
