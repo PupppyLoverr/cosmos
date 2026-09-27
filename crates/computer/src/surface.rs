@@ -58,7 +58,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "computer_wait",
-            "description": "Wait for a UI condition instead of fixed sleeps — the right call after launch_app, clicks that open dialogs/menus, and loads. 'for' picks ONE condition: {element:{role?,labelContains}} appears, {elementGone:{...}} disappears, {text:'str'} appears anywhere, {window:true} exists for the pid, {windowGone:true} is gone, {stable:true} two consecutive identical snapshots (UI settled). Polls every ~300ms up to timeoutMs (default 10s, cap 45s). Returns the satisfied state or a timeout error with the last observed summary.",
+            "description": "Wait for a UI condition instead of fixed sleeps — the right call after launch_app, clicks that open dialogs/menus, and loads. 'for' picks ONE condition: {element:{role?,labelContains}} appears, {elementGone:{...}} disappears, {text:'str'} appears anywhere, {window:true} exists for the pid, {windowGone:true} is gone, {stable:true} two consecutive identical snapshots (UI settled). Polls adaptively (100–300ms) up to timeoutMs (default 10s, cap 45s). Returns the satisfied state or a timeout error with the last observed summary.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

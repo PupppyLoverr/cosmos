@@ -67,6 +67,11 @@ struct Endpoint {
     _serve: tokio::task::JoinHandle<()>,
 }
 
+struct WaitProbe {
+    satisfied: Option<String>,
+    summary: Option<String>,
+}
+
 /// Identical action failures tolerated before the service loop-breaks with a
 /// `repeated_failure` refusal — a hammering harness gets state, not a 4th noop.
 const REPEAT_FAIL_CAP: u32 = 3;
@@ -736,7 +741,7 @@ impl ComputerService {
 
     /// `computer_wait` — poll until a condition holds or the timeout elapses.
     /// Element/text conditions ride `verify_state` or a re-snapshot; window
-    /// and stability conditions re-snapshot directly. Polls ~3×/s.
+    /// and stability conditions re-snapshot directly. Polls adaptively.
     async fn wait_tool(
         &self,
         backend: &dyn ComputerBackend,
@@ -757,9 +762,10 @@ impl ComputerService {
         );
         let deadline = Instant::now() + timeout;
         let mut last_fingerprint: Option<String> = None;
+        let mut interval = Duration::from_millis(100);
         let mut last_summary = String::from("unavailable");
         loop {
-            match self
+            let probe = match self
                 .wait_check(
                     backend,
                     settings,
@@ -770,9 +776,14 @@ impl ComputerService {
                 )
                 .await
             {
-                Ok(Some(summary)) => return Ok(ToolReply::text(format!("satisfied: {summary}"))),
-                Ok(None) => {}
+                Ok(probe) => probe,
                 Err(error) => return Err(error),
+            };
+            if let Some(summary) = probe.summary {
+                last_summary = summary;
+            }
+            if let Some(summary) = probe.satisfied {
+                return Ok(ToolReply::text(format!("satisfied: {summary}")));
             }
             if Instant::now() >= deadline {
                 return Err(ComputerError::InvalidArgs(format!(
@@ -780,29 +791,13 @@ impl ComputerService {
                     timeout.as_millis()
                 )));
             }
-            if let Ok(state) = backend
-                .window_state(
-                    pid,
-                    window_id,
-                    true,
-                    false,
-                    settings.inspect_max_elements.min(600),
-                    0,
-                    &self.inner.screenshot_dir,
-                    None,
-                )
-                .await
-            {
-                last_summary = format!(
-                    "snapshot {} — {} elements",
-                    state.snapshot_id, state.returned_element_count
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(interval.min(remaining)).await;
+            interval = (interval * 3 / 2).min(Duration::from_millis(300));
         }
     }
 
-    /// One wait-condition evaluation → `Some(summary)` when satisfied.
+    /// One wait-condition evaluation.
     async fn wait_check(
         &self,
         backend: &dyn ComputerBackend,
@@ -811,7 +806,7 @@ impl ComputerService {
         window_id: Option<i64>,
         condition: &Value,
         last_fingerprint: &mut Option<String>,
-    ) -> Result<Option<String>, ComputerError> {
+    ) -> Result<WaitProbe, ComputerError> {
         let semantic_cap = settings.inspect_max_elements.min(600);
         if let Some(selector) = condition.get("element") {
             let expect = json!([{ "element": { "selector": selector, "exists": true } }]);
@@ -826,8 +821,14 @@ impl ComputerService {
             .await?;
             // verify_state reports `status` = satisfied|unsatisfied|unknown —
             // `unknown` is NOT success.
-            let satisfied = outcome.get("status").and_then(Value::as_str) == Some("satisfied");
-            return Ok(satisfied.then(|| format!("element matched {}", selector)));
+            let status = outcome
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            return Ok(WaitProbe {
+                satisfied: (status == "satisfied").then(|| format!("element matched {}", selector)),
+                summary: Some(format!("verify status {status}")),
+            });
         }
         if let Some(selector) = condition.get("elementGone") {
             let expect = json!([{ "element": { "selector": selector, "exists": true } }]);
@@ -841,20 +842,27 @@ impl ComputerService {
             )
             .await
             {
-                Ok(outcome) => Ok(
-                    if outcome.get("status").and_then(Value::as_str) == Some("satisfied") {
-                        None
-                    } else {
-                        Some(format!("element gone ({selector})"))
-                    },
-                ),
+                Ok(outcome) => {
+                    let status = outcome
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    Ok(WaitProbe {
+                        satisfied: (status != "satisfied")
+                            .then(|| format!("element gone ({selector})")),
+                        summary: Some(format!("verify status {status}")),
+                    })
+                }
                 Err(error)
                     if matches!(
                         error.code(),
                         "stale_element" | "element_not_found" | "window_not_found"
                     ) =>
                 {
-                    Ok(Some("element gone (window re-rendered)".into()))
+                    Ok(WaitProbe {
+                        satisfied: Some("element gone (window re-rendered)".into()),
+                        summary: None,
+                    })
                 }
                 Err(error) => Err(error),
             };
@@ -873,22 +881,25 @@ impl ComputerService {
                 )
                 .await?;
             let needle = text.to_lowercase();
-            return Ok(state
-                .elements
-                .iter()
-                .any(|e| {
-                    e.label
+            let satisfied = state.elements.iter().any(|e| {
+                e.label
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&needle)
+                    || e.value
                         .as_deref()
                         .unwrap_or_default()
                         .to_lowercase()
                         .contains(&needle)
-                        || e.value
-                            .as_deref()
-                            .unwrap_or_default()
-                            .to_lowercase()
-                            .contains(&needle)
-                })
-                .then(|| format!("text '{text}' visible")));
+            });
+            return Ok(WaitProbe {
+                satisfied: satisfied.then(|| format!("text '{text}' visible")),
+                summary: Some(format!(
+                    "snapshot {} — {} elements",
+                    state.snapshot_id, state.returned_element_count
+                )),
+            });
         }
         if condition.get("window").and_then(Value::as_bool) == Some(true) {
             return match backend
@@ -904,12 +915,21 @@ impl ComputerService {
                 )
                 .await
             {
-                Ok(state) => Ok(Some(format!(
-                    "window {} present ({})",
-                    state.window_id,
-                    state.window_title.as_deref().unwrap_or("untitled")
-                ))),
-                Err(_) => Ok(None),
+                Ok(state) => Ok(WaitProbe {
+                    satisfied: Some(format!(
+                        "window {} present ({})",
+                        state.window_id,
+                        state.window_title.as_deref().unwrap_or("untitled")
+                    )),
+                    summary: Some(format!(
+                        "snapshot {} — {} elements",
+                        state.snapshot_id, state.returned_element_count
+                    )),
+                }),
+                Err(_) => Ok(WaitProbe {
+                    satisfied: None,
+                    summary: None,
+                }),
             };
         }
         if condition.get("windowGone").and_then(Value::as_bool) == Some(true) {
@@ -926,8 +946,17 @@ impl ComputerService {
                 )
                 .await
             {
-                Ok(_) => Ok(None),
-                Err(_) => Ok(Some("window gone".into())),
+                Ok(state) => Ok(WaitProbe {
+                    satisfied: None,
+                    summary: Some(format!(
+                        "snapshot {} — {} elements",
+                        state.snapshot_id, state.returned_element_count
+                    )),
+                }),
+                Err(_) => Ok(WaitProbe {
+                    satisfied: Some("window gone".into()),
+                    summary: None,
+                }),
             };
         }
         if condition.get("stable").and_then(Value::as_bool) == Some(true) {
@@ -945,10 +974,22 @@ impl ComputerService {
                 .await?;
             let fingerprint = digest::render(&state);
             if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
-                return Ok(Some("UI stable (two identical snapshots)".into()));
+                return Ok(WaitProbe {
+                    satisfied: Some("UI stable (two identical snapshots)".into()),
+                    summary: Some(format!(
+                        "snapshot {} — {} elements",
+                        state.snapshot_id, state.returned_element_count
+                    )),
+                });
             }
             *last_fingerprint = Some(fingerprint);
-            return Ok(None);
+            return Ok(WaitProbe {
+                satisfied: None,
+                summary: Some(format!(
+                    "snapshot {} — {} elements",
+                    state.snapshot_id, state.returned_element_count
+                )),
+            });
         }
         Err(ComputerError::InvalidArgs(
             "'for' must name one condition: element|elementGone|text|window|windowGone|stable"
@@ -1033,7 +1074,7 @@ impl ComputerService {
                      or pick another container."
                 )));
             }
-            tokio::time::sleep(Duration::from_millis(220)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
         Err(ComputerError::InvalidArgs(format!(
             "scroll_until exhausted {max_steps} steps without finding '{query}' — \

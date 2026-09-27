@@ -952,7 +952,9 @@ impl CuaBackend {
 
     #[cfg(target_os = "macos")]
     async fn wait_for_ax_window(&self, pid: i64) -> Option<Value> {
-        for attempt in 0..=16 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut interval = std::time::Duration::from_millis(60);
+        loop {
             if let Ok(windows) = self.list_windows(Some(pid)).await {
                 for window in windows {
                     if self.window_is_ax_resolvable(&window).await {
@@ -960,9 +962,12 @@ impl CuaBackend {
                     }
                 }
             }
-            if attempt < 16 {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
             }
+            tokio::time::sleep(interval.min(deadline - now)).await;
+            interval = (interval * 3 / 2).min(std::time::Duration::from_millis(300));
         }
         None
     }
@@ -1693,19 +1698,20 @@ impl CuaBackend {
         alternates.sort_by_key(|w| {
             std::cmp::Reverse(w.get("z_index").and_then(Value::as_i64).unwrap_or(0))
         });
+        let retries = futures::future::join_all(alternates.iter().map(|candidate| {
+            self.window_state_inner(
+                candidate,
+                semantic,
+                screenshot,
+                max_elements,
+                max_dimension,
+                screenshot_dir,
+                query,
+            )
+        }))
+        .await;
         let mut resolvable = Vec::new();
-        for candidate in alternates {
-            let retry = self
-                .window_state_inner(
-                    candidate,
-                    semantic,
-                    screenshot,
-                    max_elements,
-                    max_dimension,
-                    screenshot_dir,
-                    query,
-                )
-                .await;
+        for retry in retries {
             let Ok(state) = retry else { continue };
             if Self::is_ax_unresolved_state(&state) {
                 continue;
