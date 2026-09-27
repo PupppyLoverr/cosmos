@@ -1108,15 +1108,28 @@ impl ComputerService {
         settings: &ComputerSettings,
         args: &Value,
     ) -> Result<Observation, ComputerError> {
+        let requested_pid = get_i64(args, "pid");
+        let requested_window_id = get_i64(args, "windowId").or_else(|| get_i64(args, "window_id"));
         let scope = match get_str(args, "scope").unwrap_or("frontmost") {
-            "desktop" => ObserveScope::Desktop,
             "window" => {
-                let pid = get_i64(args, "pid").ok_or_else(|| {
+                let pid = requested_pid.ok_or_else(|| {
                     ComputerError::InvalidArgs("scope 'window' needs 'pid'".into())
                 })?;
                 ObserveScope::Window {
                     pid,
-                    window_id: get_i64(args, "windowId"),
+                    window_id: requested_window_id,
+                }
+            }
+            "desktop" if requested_pid.is_none() && requested_window_id.is_none() => {
+                ObserveScope::Desktop
+            }
+            _ if requested_pid.is_some() || requested_window_id.is_some() => {
+                let pid = requested_pid.ok_or_else(|| {
+                    ComputerError::InvalidArgs("an explicit window target needs 'pid'".into())
+                })?;
+                ObserveScope::Window {
+                    pid,
+                    window_id: requested_window_id,
                 }
             }
             _ => ObserveScope::Frontmost,

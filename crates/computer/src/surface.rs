@@ -26,13 +26,14 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "computer_observe",
-            "description": "See a window or the desktop. scope 'frontmost' (default) describes the frontmost non-Cosmos window; 'window' targets an explicit pid/windowId; 'desktop' lists every on-screen window grouped by app. Returns a COMPACT digest: one line per meaningful element with E{n} refs, roles, labels, values, states and window-local bounds — not a raw accessibility dump. E-refs are valid only against the returned snapshotId; re-observe after UI changes. includeScreenshot adds a window PNG as an image block (requires user-enabled screenshots).",
+            "description": "See a window or the desktop. scope 'frontmost' (default) describes the frontmost non-Cosmos window; optional pid plus windowId/window_id pins any scope to an explicit target (windowId preserves exact identity, while pid alone picks that app's top visible window); 'window' requires pid; 'desktop' lists every on-screen window grouped by app. Returns a COMPACT digest: one line per meaningful element with E{n} refs, roles, labels, values, states and window-local bounds — not a raw accessibility dump. E-refs are valid only against the returned snapshotId; re-observe after UI changes. includeScreenshot adds a window PNG as an image block (requires user-enabled screenshots).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "scope": {"type": "string", "enum": ["frontmost", "desktop", "window"], "description": "What to observe. Default 'frontmost'."},
-                    "pid": {"type": "integer", "description": "For scope 'window': target process id (from computer_list_windows)."},
-                    "windowId": {"type": "integer", "description": "For scope 'window': exact window handle; defaults to the pid's frontmost window."},
+                    "pid": {"type": "integer", "description": "Optional explicit target process id from computer_list_windows. With frontmost/default scope, pins observation to this app; with no windowId, selects its top visible window."},
+                    "windowId": {"type": "integer", "description": "Optional exact target window handle from computer_list_windows. Supplying it with pid preserves that exact window even when another sibling is frontmost. Alias window_id is also accepted."},
+                    "window_id": {"type": "integer", "description": "Snake-case alias for windowId."},
                     "includeScreenshot": {"type": "boolean", "description": "Also return the window screenshot as an image (only when the user enabled screenshots in Settings → Computer)."},
                     "format": {"type": "string", "enum": ["digest", "full"], "description": "'digest' (default) = compact element lines. 'full' = the driver's raw accessibility tree — big; use only when the digest hides what you need."},
                     "maxElements": {"type": "integer", "description": "Accessibility walk cap. Defaults to the user's setting."},

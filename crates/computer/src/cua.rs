@@ -49,6 +49,35 @@ use crate::{
 /// respawn inside the TTL window with `session_unavailable`.
 const SESSION_LABEL_PREFIX: &str = "cosmos";
 
+fn select_frontmost_window(
+    windows: &[Value],
+    cg_frontmost: Option<crate::macos_focus::FrontmostWindow>,
+    own_pid: i64,
+    driver_pid: Option<i64>,
+) -> Option<(Value, &'static str)> {
+    let eligible = |window: &&Value| {
+        window.get("minimized").and_then(Value::as_bool) != Some(true)
+            && window.get("is_on_screen").and_then(Value::as_bool) != Some(false)
+            && window.get("pid").and_then(Value::as_i64) != Some(own_pid)
+            && window.get("pid").and_then(Value::as_i64) != driver_pid
+    };
+    if let Some(frontmost) = cg_frontmost
+        && let Some(window) = windows.iter().filter(eligible).find(|window| {
+            window.get("pid").and_then(Value::as_i64) == Some(frontmost.pid as i64)
+                && window.get("window_id").and_then(Value::as_i64) == Some(frontmost.window_id)
+        })
+    {
+        return Some((window.clone(), "cg-frontmost"));
+    }
+
+    windows
+        .iter()
+        .filter(eligible)
+        .max_by_key(|window| window.get("z_index").and_then(Value::as_i64).unwrap_or(0))
+        .cloned()
+        .map(|window| (window, "z-index-fallback"))
+}
+
 static FAST_INPUT_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Clone)]
@@ -903,38 +932,37 @@ impl CuaBackend {
         let own_pid = std::process::id() as i64;
         let driver_pid = self.client.child_pid().map(|p| p as i64);
         let windows = self.list_windows(None).await?;
-        let mut best: Option<&Value> = None;
-        let mut best_z = i64::MIN;
-        let mut any_z = false;
-        for window in &windows {
-            if window.get("minimized").and_then(Value::as_bool) == Some(true) {
-                continue;
-            }
-            let pid = window.get("pid").and_then(Value::as_i64);
-            if pid == Some(own_pid) || (driver_pid.is_some() && pid == driver_pid) {
-                continue;
-            }
-            match window.get("z_index").and_then(Value::as_i64) {
-                Some(z) => {
-                    any_z = true;
-                    if z > best_z {
-                        best_z = z;
-                        best = Some(window);
-                    }
-                }
-                None => {
-                    if best.is_none() && !any_z {
-                        best = Some(window);
-                    }
-                }
-            }
+        let mut ignore_pids = vec![own_pid as i32];
+        if let Some(pid) = driver_pid {
+            ignore_pids.push(pid as i32);
         }
-        best.cloned().ok_or_else(|| {
-            ComputerError::refused(
+        let cg_frontmost =
+            tokio::task::spawn_blocking(move || crate::macos_focus::frontmost_window(&ignore_pids))
+                .await
+                .ok()
+                .flatten();
+        let Some((window, source)) =
+            select_frontmost_window(&windows, cg_frontmost, own_pid, driver_pid)
+        else {
+            return Err(ComputerError::refused(
                 "no_window",
                 "No foreground application window is available to observe.",
-            )
-        })
+            ));
+        };
+        let selected_pid = window.get("pid").and_then(|value| value.as_i64());
+        let selected_window_id = window.get("window_id").and_then(|value| value.as_i64());
+        let selected_owner = window.get("app_name").and_then(|value| value.as_str());
+        let selected_z_index = window.get("z_index").and_then(|value| value.as_i64());
+        tracing::debug!(
+            target: "zeron_computer",
+            pid = ?selected_pid,
+            window_id = ?selected_window_id,
+            owner = ?selected_owner,
+            z_index = ?selected_z_index,
+            source,
+            "selected computer observe window"
+        );
+        Ok(window)
     }
 
     /// Resolve a pid (+optional window_id) to a concrete window record.
@@ -2022,6 +2050,61 @@ mod fast_input_tests {
             h: 488.0,
         };
         assert_eq!(window_to_screen(frame, 293.0, 317.2), (458.0, 403.2));
+    }
+
+    #[test]
+    fn observe_selection_prefers_exact_cg_frontmost_identity() {
+        let windows = vec![
+            json!({"pid": 10, "window_id": 1, "z_index": 99, "is_on_screen": true}),
+            json!({"pid": 10, "window_id": 2, "z_index": 1, "is_on_screen": true}),
+        ];
+        let cg = crate::macos_focus::FrontmostWindow {
+            window_id: 2,
+            pid: 10,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let (selected, source) = select_frontmost_window(&windows, Some(cg), 99, None).unwrap();
+        assert_eq!(selected["window_id"], 2);
+        assert_eq!(source, "cg-frontmost");
+    }
+
+    #[test]
+    fn observe_selection_falls_back_to_highest_visible_z_index() {
+        let windows = vec![
+            json!({"pid": 10, "window_id": 1, "z_index": 2, "is_on_screen": true}),
+            json!({"pid": 20, "window_id": 2, "z_index": 8, "is_on_screen": true}),
+            json!({"pid": 30, "window_id": 3, "z_index": 99, "is_on_screen": false}),
+        ];
+        let (selected, source) = select_frontmost_window(
+            &windows,
+            Some(crate::macos_focus::FrontmostWindow {
+                window_id: 99,
+                pid: 999,
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }),
+            40,
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected["window_id"], 2);
+        assert_eq!(source, "z-index-fallback");
+    }
+
+    #[test]
+    fn observe_selection_ignores_cosmos_and_driver_windows() {
+        let windows = vec![
+            json!({"pid": 40, "window_id": 1, "z_index": 100, "is_on_screen": true}),
+            json!({"pid": 50, "window_id": 2, "z_index": 90, "is_on_screen": true}),
+            json!({"pid": 60, "window_id": 3, "z_index": 80, "is_on_screen": true}),
+        ];
+        let (selected, _) = select_frontmost_window(&windows, None, 40, Some(50)).unwrap();
+        assert_eq!(selected["window_id"], 3);
     }
 
     #[test]
