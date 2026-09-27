@@ -507,6 +507,14 @@ export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitRe
           }
           return push({ kind: "assistant", id: nextId(), text: lines.join("\n") });
         }
+        case "cost": {
+          const u = tr.usage;
+          return push({
+            kind: "assistant",
+            id: nextId(),
+            text: `**Session cost** — input ${u.input.toLocaleString()} · output ${u.output.toLocaleString()} · cache read ${u.cache_read.toLocaleString()} · cache write ${u.cache_write.toLocaleString()} · total ${u.cum_usd != null ? `$${u.cum_usd.toFixed(4)}` : "unpriced"}`,
+          });
+        }
         case "context": {
           const used = tr.usage.input + tr.usage.cache_read + tr.usage.cache_write;
           if (!ctxLimit) return say(`~${used.toLocaleString()} tokens in context (window size unknown for this model)`);
@@ -520,6 +528,7 @@ export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitRe
           return setPopup({ kind: "resume", sessions, sel: 0 });
         }
         case "init":
+          store.initProject(driver.agent?.workspace ?? process.cwd());
           return sendPrompt("/init", INIT_PROMPT);
         case "review":
           return sendPrompt(args ? `/review ${args}` : "/review", REVIEW_PROMPT + (args ? ` Focus: ${args}` : ""));

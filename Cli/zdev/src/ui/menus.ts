@@ -65,6 +65,7 @@ export const BUILTIN: Slash[] = [
   { name: "refine", hint: "[name]", desc: "Evidence-backed edit to a skill, rollback by id" },
   { name: "approve", hint: "", desc: "Approve the submitted plan and run it" },
   { name: "usage", hint: "", desc: "Tokens, cost and ChatGPT plan limits for this session" },
+  { name: "cost", hint: "", desc: "Session token and cost breakdown" },
   { name: "context", hint: "", desc: "How full the context window is" },
   { name: "resume", hint: "", desc: "Continue an earlier session" },
   { name: "init", hint: "", desc: "Write an AGENTS.md that explains this repo to agents" },

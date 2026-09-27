@@ -95,6 +95,10 @@ var slashCmds = []slashCmd{
 	{"/context", "Show context window usage"},
 	{"/session", "Show session id"},
 	{"/usage", "Show token usage"},
+	{"/cost", "Show session cost breakdown"},
+	{"/init", "Write AGENTS.md for this repository"},
+	{"/cost", "Show session cost breakdown"},
+	{"/init", "Write AGENTS.md for this repository"},
 	{"/clear", "Clear the transcript"},
 	{"/copy", "Copy the last reply"},
 	{"/onboarding", "Replay the first-run setup"},
@@ -593,6 +597,11 @@ func (m tuiModel) execSlash(text string) (tea.Model, tea.Cmd) {
 		m.appendItem(tItem{kind: "note", text: "session " + a.Session.ID})
 	case "/usage":
 		m.appendItem(tItem{kind: "note", text: m.usageLine()})
+	case "/cost":
+		m.appendItem(tItem{kind: "note", text: m.usageLine()})
+	case "/init":
+		a.SendUser("/init", renderTUI)
+		runTurns(a, renderTUI)
 	case "/onboarding":
 		m.startWelcome()
 		return m, m.welcome.schedule()
@@ -1338,7 +1347,8 @@ func runTUI(opts *RunOpts, cwd string) int {
 	a.Session.append("session_start", map[string]any{
 		"model": a.ModelAlias, "mode": a.Mode,
 		"sandbox":     map[bool]string{true: "off", false: "appcontainer"}[a.Ctx.NoSandbox],
-		"boot_tokens": a.BootTokens, "resume": optStr(opts.Resume)})
+		"boot_tokens": a.BootTokens, "resume": optStr(opts.Resume),
+		"cwd": a.Workspace})
 	runHooks(a.Cfg, "session_start", "", map[string]any{}, a.Session.ID)
 	fm, err := p.Run()
 	if fm2, ok := fm.(tuiModel); ok {
