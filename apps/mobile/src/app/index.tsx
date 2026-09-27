@@ -325,7 +325,7 @@ export default function HomeScreen() {
 
   const header = (
     <View>
-      <ScreenTitle>{host === 'all' ? 'Sessions' : host === 'unknown' ? (connection.desktop ? desktopDisplayName(connection.desktop) : 'Desktop') : hosts.find((h) => h.id === host)?.name ?? 'Sessions'}</ScreenTitle>
+      <ScreenTitle>Sessions</ScreenTitle>
       {hosts.length ? <DeviceStrip devices={hosts} selected={host} onSelect={setHost} onPair={() => router.push('/pair')} /> : null}
       {searchOpen ? (
         <View style={[styles.searchRow, { backgroundColor: t.surface }]}>
@@ -444,11 +444,11 @@ const styles = StyleSheet.create({
   row: { position: 'relative', flexDirection: 'row', alignItems: 'flex-start', gap: spacing(3), paddingHorizontal: spacing(4), paddingVertical: spacing(2.5), minHeight: 56 },
   dotCol: { width: 20, alignItems: 'center', paddingTop: 6 },
   dot: { width: 8, height: 8, borderRadius: 4 },
-  rowCopy: { flex: 1, minWidth: 0, minHeight: 36, gap: 3 },
+  rowCopy: { flex: 1, minWidth: 0, minHeight: 36, gap: 3, position: 'relative' },
   rowCopyCentered: { justifyContent: 'center' },
   rowTop: { flexDirection: 'row', alignItems: 'baseline', gap: spacing(2) },
   rowTitle: { flex: 1, fontSize: 15, lineHeight: 20 },
-  rowRule: { position: 'absolute', left: spacing(4) + 20 + spacing(3), right: spacing(4), bottom: 0, height: StyleSheet.hairlineWidth },
+  rowRule: { position: 'absolute', left: 0, right: 0, bottom: 0, height: StyleSheet.hairlineWidth },
   searchRow: { marginHorizontal: edge, minHeight: 40, borderRadius: 12, justifyContent: 'center', marginBottom: spacing(2) },
   searchInput: { flex: 1, paddingHorizontal: spacing(3), paddingVertical: spacing(1) },
   bar: { position: 'absolute', left: 0, right: 0, bottom: 0, paddingHorizontal: edge, paddingTop: spacing(2), borderTopWidth: StyleSheet.hairlineWidth },

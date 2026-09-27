@@ -361,7 +361,7 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   center: { alignItems: 'center', justifyContent: 'center', padding: spacing(6) },
   question: { fontSize: 24, fontWeight: '500', lineHeight: 30, textAlign: 'center' },
-  headerTitle: { alignItems: 'flex-start', minWidth: 0 },
+  headerTitle: { alignItems: 'center', minWidth: 0 },
   headerMain: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), minWidth: 0 },
   headerSub: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), marginTop: 1 },
   transcriptFade: { position: 'absolute', top: 0, left: 0, right: 0, height: 24 },
