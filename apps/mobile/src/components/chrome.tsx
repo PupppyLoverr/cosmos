@@ -3,7 +3,7 @@
 // native large-title headers and tab bar.
 
 import React from 'react';
-import { Keyboard, Platform, Pressable, StyleSheet, Text, View, type StyleProp, type ViewStyle } from 'react-native';
+import { Keyboard, Platform, Pressable, ScrollView, StyleSheet, Text, View, type StyleProp, type ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import { edge, spacing, type, useTheme } from '../lib/theme';
@@ -147,6 +147,46 @@ export function FilterChip({ label, selected, dot, icon, onPress, onLongPress }:
   );
 }
 
+export function DeviceStrip({ devices, selected, onSelect, onPair }: {
+  devices: { id: string; name: string; dot: 'online' | 'connecting' | 'offline' }[];
+  selected: string;
+  onSelect: (id: string) => void;
+  onPair: () => void;
+}) {
+  const t = useTheme();
+  const dotColor = (dot: 'online' | 'connecting' | 'offline') =>
+    dot === 'online' ? t.success : dot === 'connecting' ? t.warning : t.textTertiary;
+  const chip = (key: string, label: string, active: boolean, onPress: () => void, dot?: 'online' | 'connecting' | 'offline', icon?: string) => (
+    <Pressable
+      key={key}
+      onPress={() => { void Haptics.selectionAsync(); onPress(); }}
+      accessibilityRole="button"
+      accessibilityState={{ selected: active }}
+      accessibilityLabel={label}
+      style={({ pressed }) => [
+        styles.deviceChip,
+        { backgroundColor: active ? t.text : t.surface, opacity: pressed ? 0.8 : 1 },
+      ]}
+    >
+      {dot ? <View style={[styles.deviceDot, { backgroundColor: dotColor(dot) }]} /> : null}
+      {icon ? <Icon name={icon} size={15} color={active ? t.background : t.textSecondary} weight="medium" /> : null}
+      <Text style={[type.subhead, { color: active ? t.background : t.text, fontWeight: '500' }]} numberOfLines={1}>{label}</Text>
+    </Pressable>
+  );
+  return (
+    <ScrollView
+      horizontal
+      showsHorizontalScrollIndicator={false}
+      contentContainerStyle={styles.deviceStrip}
+      keyboardShouldPersistTaps="handled"
+    >
+      {chip('all', 'All', selected === 'all', () => onSelect('all'))}
+      {devices.map((device) => chip(`device:${device.id}`, device.name, selected === device.id, () => onSelect(device.id), device.dot))}
+      {chip('pair', 'Pair a desktop', false, onPair, undefined, 'plus')}
+    </ScrollView>
+  );
+}
+
 const styles = StyleSheet.create({
   circle: { alignItems: 'center', justifyContent: 'center' },
   badge: { position: 'absolute', top: 9, right: 9, width: 9, height: 9, borderRadius: 5, borderWidth: 1.5 },
@@ -172,27 +212,37 @@ const styles = StyleSheet.create({
     flexDirection: 'row', alignItems: 'center', gap: spacing(2),
     minHeight: 36, paddingHorizontal: spacing(3.5), borderRadius: 999,
   },
+  deviceStrip: { paddingHorizontal: edge, gap: spacing(2), paddingBottom: spacing(1) },
+  deviceChip: {
+    flexDirection: 'row', alignItems: 'center', gap: spacing(2),
+    height: 32, paddingHorizontal: spacing(3), borderRadius: 999,
+  },
+  deviceDot: { width: 6, height: 6, borderRadius: 3 },
   dot: { width: 8, height: 8, borderRadius: 4 },
+  sectionLabel: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    gap: spacing(2), paddingHorizontal: edge, paddingTop: spacing(5), paddingBottom: spacing(1.5),
+  },
+  sectionLabelTitle: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), minWidth: 0, flex: 1 },
 });
 
-export function SectionLabel({ children, tone }: { children: string; tone?: 'attention' | 'muted' }) {
+export function SectionLabel({ children, tone, icon, trailing }: {
+  children: string;
+  tone?: 'attention' | 'muted';
+  icon?: string;
+  trailing?: React.ReactNode;
+}) {
   const t = useTheme();
   return (
-    <Text
-      style={[
-        type.footnote,
-        {
-          color: tone === 'attention' ? t.warning : tone === 'muted' ? t.textTertiary : t.textSecondary,
-          fontWeight: '500',
-          paddingHorizontal: edge,
-          paddingTop: spacing(5),
-          paddingBottom: spacing(1.5),
-        },
-      ]}
-      accessibilityRole="header"
-    >
-      {children}
-    </Text>
+    <View style={styles.sectionLabel} accessibilityRole="header">
+      <View style={styles.sectionLabelTitle}>
+        {icon ? <Icon name={icon} size={13} color={t.textTertiary} weight="medium" /> : null}
+        <Text style={[type.footnote, { color: tone === 'attention' ? t.warning : tone === 'muted' ? t.textTertiary : t.textSecondary, fontWeight: '500' }]} numberOfLines={1}>
+          {children}
+        </Text>
+      </View>
+      {trailing !== undefined ? <Text style={[type.caption, { color: t.textTertiary }]}>{trailing}</Text> : null}
+    </View>
   );
 }
 

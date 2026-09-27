@@ -14,7 +14,7 @@ import { Chat, Device, Session, Space } from '../lib/protocol';
 import { showMenu } from '../lib/menu';
 import { edge, spacing, statusColor, type, useTheme } from '../lib/theme';
 import { Button, EmptyState, Notice, StatusDot } from '../components/bits';
-import { CircleButton, DockPill, ScreenTitle, SectionLabel, TopBar } from '../components/chrome';
+import { CircleButton, DeviceStrip, DockPill, ScreenTitle, SectionLabel, TopBar } from '../components/chrome';
 import { DrawerEdge, useDrawer } from '../components/drawer';
 import { harnessLabel } from '../components/harness-mark';
 import { Screen } from '../components/surface';
@@ -44,7 +44,9 @@ function elapsed(startedAt?: string | null): string | undefined {
 }
 
 type Item =
-  | { kind: 'header'; key: string; title: string; collapsible?: boolean; collapsed?: boolean; tone?: 'attention' }
+  | { kind: 'header'; key: string; title: string; collapsible?: boolean; collapsed?: boolean; tone?: 'attention'; icon?: string; trailing?: number }
+  | { kind: 'device'; key: string; deviceId: string; name: string; dot: 'online' | 'connecting' | 'offline'; subtitle: string }
+  | { kind: 'empty-device'; key: string }
   | { kind: 'chat'; key: string; chat: Chat; state: State; desktop?: string; startedAt?: string | null };
 
 /** One session: status dot, title, "harness · desktop · state", time on the right. */
@@ -116,6 +118,32 @@ const SessionItem = React.memo(function SessionItem({ chat, state, desktop, star
   );
 });
 
+const DeviceHeader = React.memo(function DeviceHeader({ name, dot, subtitle, onPress }: {
+  name: string;
+  dot: 'online' | 'connecting' | 'offline';
+  subtitle: string;
+  onPress: () => void;
+}) {
+  const t = useTheme();
+  const color = dot === 'online' ? t.success : dot === 'connecting' ? t.warning : t.textTertiary;
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`${name}, ${subtitle}`}
+      style={({ pressed }) => ({ backgroundColor: pressed ? t.surface : t.background })}
+    >
+      <View style={styles.deviceHeader}>
+        <View style={styles.deviceHeaderTitle}>
+          <View style={[styles.deviceHeaderDot, { backgroundColor: color }]} />
+          <Text style={[type.headline, styles.deviceHeaderName, { color: t.text }]} numberOfLines={1}>{name}</Text>
+        </View>
+        <Text style={[type.footnote, { color: t.textTertiary }]}>{subtitle}</Text>
+      </View>
+    </Pressable>
+  );
+});
+
 export default function HomeScreen() {
   const t = useTheme();
   const insets = useSafeAreaInsets();
@@ -153,24 +181,26 @@ export default function HomeScreen() {
     if (!list.length && connection.desktop) {
       list.push({ id: connection.localDeviceId ?? connection.desktop.id, name: desktopDisplayName(connection.desktop), dot: connected ? 'online' : connecting ? 'connecting' : 'offline' });
     }
-    return list.sort((a, b) => Number(b.dot === 'online') - Number(a.dot === 'online'));
+    return list.sort((a, b) =>
+      Number(b.dot === 'online') - Number(a.dot === 'online') || a.name.localeCompare(b.name));
   }, [devices, connection, connected, connecting]);
 
   const items = useMemo<Item[]>(() => {
     const q = query.trim().toLowerCase();
-    const deviceNames = new Map(devices.map((d) => [d.id, d.name?.trim() || 'Desktop']));
+    const deviceNames = new Map(hosts.map((h) => [h.id, h.name]));
+    const knownDeviceIds = new Set(hosts.map((h) => h.id));
+    const fallbackDeviceName = connection.desktop ? desktopDisplayName(connection.desktop) : 'Desktop';
     const liveByChat = new Map<string, Session>();
     for (const s of sessions) if (!liveByChat.has(s.chatId)) liveByChat.set(s.chatId, s);
-    // With a single desktop the host name on every row is noise.
-    const multiHost = new Set(chats.map((c) => c.deviceId)).size > 1;
-    const nameOf = (c: Chat) => (multiHost ? deviceNames.get(c.deviceId) ?? 'Desktop' : undefined);
+    const nameOf = (c: Chat) => host === 'all' ? deviceNames.get(c.deviceId) ?? fallbackDeviceName : undefined;
     const pool = chats
       .filter((c) => (showArchived || q ? true : !c.archived))
-      .filter((c) => host === 'all' || c.deviceId === host)
+      .filter((c) => host === 'all' ? true : host === 'unknown' ? !knownDeviceIds.has(c.deviceId) : c.deviceId === host)
       .filter((c) => !q
         || (c.title ?? '').toLowerCase().includes(q)
         || (c.lastMessagePreview ?? '').toLowerCase().includes(q)
-        || projectOf(c, spaces).toLowerCase().includes(q))
+        || projectOf(c, spaces).toLowerCase().includes(q)
+        || (deviceNames.get(c.deviceId) ?? fallbackDeviceName).toLowerCase().includes(q))
       .sort((a, b) => (b.lastMessageAt ?? b.createdAt).localeCompare(a.lastMessageAt ?? a.createdAt))
       .map((chat) => {
         const live = liveByChat.get(chat.id);
@@ -183,12 +213,60 @@ export default function HomeScreen() {
       });
 
     const out: Item[] = [];
-    const push = (rows: typeof pool) => rows.forEach((r) => out.push({ kind: 'chat', key: `${out.length}:${r.chat.id}`, ...r }));
+    const push = (rows: typeof pool, prefix: string) => rows.forEach((r) => out.push({ kind: 'chat', key: `${prefix}:chat:${r.chat.id}`, ...r }));
     const attention = pool.filter((r) => r.state === 'awaitingInput' || r.state === 'errored');
     const live = pool.filter((r) => r.state === 'working');
     const rest = pool.filter((r) => !attention.includes(r) && !live.includes(r));
-    if (attention.length) { out.push({ kind: 'header', key: 'h:attn', title: 'Needs you', tone: 'attention' }); push(attention); }
-    if (live.length) { out.push({ kind: 'header', key: 'h:live', title: 'Working' }); push(live); }
+    if (attention.length) { out.push({ kind: 'header', key: 'global:needs', title: 'Needs you', tone: 'attention' }); push(attention, 'global:needs'); }
+    if (live.length) { out.push({ kind: 'header', key: 'global:working', title: 'Working' }); push(live, 'global:working'); }
+
+    if (host === 'all') {
+      const known = new Set(hosts.map((h) => h.id));
+      for (const device of hosts) {
+        const deviceRows = pool.filter((r) => r.chat.deviceId === device.id);
+        const deviceNameMatches = !q || device.name.toLowerCase().includes(q);
+        if (q && !deviceNameMatches && deviceRows.length === 0) continue;
+        const subtitle = device.id === connection.localDeviceId
+          ? (() => {
+            const tone = describeLink(connection, device.name).tone;
+            return tone === 'online' ? 'Online' : tone === 'pending' ? 'Connecting…' : tone === 'asleep' ? 'Asleep' : 'Offline';
+          })()
+          : 'Offline';
+        out.push({ kind: 'device', key: `device:${device.id}`, deviceId: device.id, name: device.name, dot: device.dot, subtitle });
+        if (!deviceRows.length) {
+          out.push({ kind: 'empty-device', key: `device:${device.id}:empty` });
+          continue;
+        }
+        const groups = new Map<string, typeof deviceRows>();
+        for (const r of deviceRows) {
+          const project = projectOf(r.chat, spaces);
+          groups.set(project, [...(groups.get(project) ?? []), r]);
+        }
+        for (const [project, rows] of groups) {
+          const key = `device:${device.id}:project:${project}`;
+          const isCollapsed = collapsed.has(key) && !q;
+          out.push({ kind: 'header', key, title: project, collapsible: true, collapsed: isCollapsed, icon: 'folder', trailing: rows.length });
+          if (!isCollapsed) push(rows, key);
+        }
+      }
+      const unknownRows = pool.filter((r) => !known.has(r.chat.deviceId));
+      if (unknownRows.length) {
+        const key = 'device:unknown';
+        out.push({ kind: 'device', key, deviceId: 'unknown', name: fallbackDeviceName, dot: 'offline', subtitle: 'Offline' });
+        const groups = new Map<string, typeof unknownRows>();
+        for (const r of unknownRows) {
+          const project = projectOf(r.chat, spaces);
+          groups.set(project, [...(groups.get(project) ?? []), r]);
+        }
+        for (const [project, rows] of groups) {
+          const projectKey = `${key}:project:${project}`;
+          const isCollapsed = collapsed.has(projectKey) && !q;
+          out.push({ kind: 'header', key: projectKey, title: project, collapsible: true, collapsed: isCollapsed, icon: 'folder', trailing: rows.length });
+          if (!isCollapsed) push(rows, projectKey);
+        }
+      }
+      return out;
+    }
 
     // Everything else grouped by project, most recently active project first.
     const groups = new Map<string, typeof pool>();
@@ -199,11 +277,11 @@ export default function HomeScreen() {
     for (const [project, rows] of groups) {
       const key = `p:${project}`;
       const isCollapsed = collapsed.has(key) && !q;
-      out.push({ kind: 'header', key, title: project, collapsible: true, collapsed: isCollapsed });
-      if (!isCollapsed) push(rows);
+      out.push({ kind: 'header', key, title: project, collapsible: true, collapsed: isCollapsed, icon: 'folder', trailing: rows.length });
+      if (!isCollapsed) push(rows, key);
     }
     return out;
-  }, [chats, collapsed, devices, host, query, sessions, showArchived, spaces]);
+  }, [chats, collapsed, connection, host, hosts, query, sessions, showArchived, spaces]);
 
   const toggle = (key: string) => setCollapsed((prev) => {
     const next = new Set(prev);
@@ -219,7 +297,6 @@ export default function HomeScreen() {
 
   const more = () => showMenu(undefined, [
     { label: 'All desktops', checked: host === 'all', onPress: () => setHost('all') },
-    ...hosts.map((h) => ({ label: h.name, checked: host === h.id, onPress: () => setHost(h.id) })),
     { label: showArchived ? 'Hide archived' : 'Show archived', onPress: () => setShowArchived((v) => !v) },
     { label: 'Desktops', onPress: () => router.push('/desktops') },
     { label: 'Pair a desktop', onPress: () => router.push('/pair') },
@@ -232,7 +309,8 @@ export default function HomeScreen() {
 
   const header = (
     <View>
-      <ScreenTitle>{host === 'all' ? 'Sessions' : hosts.find((h) => h.id === host)?.name ?? 'Sessions'}</ScreenTitle>
+      <ScreenTitle>{host === 'all' ? 'Sessions' : host === 'unknown' ? (connection.desktop ? desktopDisplayName(connection.desktop) : 'Desktop') : hosts.find((h) => h.id === host)?.name ?? 'Sessions'}</ScreenTitle>
+      {hosts.length ? <DeviceStrip devices={hosts} selected={host} onSelect={setHost} onPair={() => router.push('/pair')} /> : null}
       {searchOpen ? (
         <View style={[styles.searchRow, { backgroundColor: t.surface }]}>
           <TextInput
@@ -308,8 +386,17 @@ export default function HomeScreen() {
           )
         }
         renderItem={({ item }) => {
+          if (item.kind === 'device') {
+            return <DeviceHeader name={item.name} dot={item.dot} subtitle={item.subtitle} onPress={() => {
+              void Haptics.selectionAsync();
+              setHost(item.deviceId);
+            }} />;
+          }
+          if (item.kind === 'empty-device') {
+            return <Text style={[type.footnote, styles.emptyDevice, { color: t.textTertiary }]}>No sessions</Text>;
+          }
           if (item.kind === 'header') {
-            const content = <SectionLabel tone={item.collapsed ? 'muted' : item.tone}>{item.title}</SectionLabel>;
+            const content = <SectionLabel icon={item.icon} trailing={item.trailing} tone={item.collapsed ? 'muted' : item.tone}>{item.title}</SectionLabel>;
             return item.collapsible ? (
               <Pressable
                 onPress={() => { void Haptics.selectionAsync(); toggle(item.key); }}
@@ -338,7 +425,7 @@ const styles = StyleSheet.create({
   notice: { paddingHorizontal: spacing(4), paddingBottom: spacing(2) },
   noticeAction: { alignSelf: 'flex-start', marginTop: spacing(2) },
   header: { paddingHorizontal: 0 },
-  row: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing(3), paddingHorizontal: spacing(4), paddingVertical: spacing(2.5), minHeight: 56 },
+  row: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing(3), paddingHorizontal: spacing(4), paddingVertical: spacing(2), minHeight: 52 },
   dotCol: { width: 16, alignItems: 'center', paddingTop: 7 },
   dot: { width: 8, height: 8, borderRadius: 4 },
   rowCopy: { flex: 1, minWidth: 0, gap: 3 },
@@ -347,4 +434,9 @@ const styles = StyleSheet.create({
   searchRow: { marginHorizontal: edge, minHeight: 40, borderRadius: 12, justifyContent: 'center', marginBottom: spacing(2) },
   searchInput: { flex: 1, paddingHorizontal: spacing(3), paddingVertical: spacing(1) },
   bar: { position: 'absolute', left: 0, right: 0, bottom: 0, paddingHorizontal: edge, paddingTop: spacing(2), borderTopWidth: StyleSheet.hairlineWidth },
+  deviceHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: spacing(2), paddingHorizontal: edge, paddingTop: spacing(5), paddingBottom: spacing(1) },
+  deviceHeaderTitle: { flexDirection: 'row', alignItems: 'center', gap: spacing(2), flex: 1, minWidth: 0 },
+  deviceHeaderDot: { width: 8, height: 8, borderRadius: 4 },
+  deviceHeaderName: { flex: 1, fontSize: 17, lineHeight: 22 },
+  emptyDevice: { paddingHorizontal: edge + spacing(4), paddingVertical: spacing(2) },
 });
