@@ -840,12 +840,18 @@ impl CuaBackend {
         }
         let pid = call_args.get("pid").and_then(Value::as_i64)?;
         let requested_window_id = call_args.get("window_id").and_then(Value::as_i64);
-        let (windows, active) = tokio::join!(self.list_windows(Some(pid)), self.app_is_active(pid));
-        if active != Some(true) {
-            return None;
-        }
+        let focused = tokio::task::spawn_blocking(crate::macos_focus::focused_window_frame);
+        let (windows, focused) = tokio::join!(self.list_windows(Some(pid)), focused);
+        let focused = focused.ok().flatten()?;
         let windows = windows.ok()?;
         let target_window = frontmost_window(&windows, pid, requested_window_id)?;
+        let target_frame = window_frame(target_window)?;
+        if !focused_window_matches(&focused, pid, target_frame)
+            || target_window.get("minimized").and_then(Value::as_bool) == Some(true)
+            || target_window.get("is_on_screen").and_then(Value::as_bool) == Some(false)
+        {
+            return None;
+        }
         let target_window_id = target_window.get("window_id").and_then(Value::as_i64)?;
 
         let mut fast_args = call_args.clone();
@@ -1945,6 +1951,32 @@ fn window_to_screen(frame: ElementFrame, x: f64, y: f64) -> (f64, f64) {
     (frame.x + x, frame.y + y)
 }
 
+fn frames_match(left: ElementFrame, right: ElementFrame, tolerance: f64) -> bool {
+    (left.x - right.x).abs() <= tolerance
+        && (left.y - right.y).abs() <= tolerance
+        && (left.w - right.w).abs() <= tolerance
+        && (left.h - right.h).abs() <= tolerance
+}
+
+fn focused_window_matches(
+    focused: &crate::macos_focus::FocusedWindow,
+    target_pid: i64,
+    target_frame: ElementFrame,
+) -> bool {
+    i32::try_from(target_pid).ok() == Some(focused.pid)
+        && !focused.minimized
+        && frames_match(
+            target_frame,
+            ElementFrame {
+                x: focused.x,
+                y: focused.y,
+                w: focused.width,
+                h: focused.height,
+            },
+            2.0,
+        )
+}
+
 fn str_arg(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::to_string)
 }
@@ -2027,6 +2059,76 @@ mod fast_input_tests {
             json!({"pid": 20, "window_id": 2, "z_index": 7, "is_on_screen": true}),
         ];
         assert!(frontmost_window(&hidden, 10, Some(1)).is_none());
+    }
+
+    #[test]
+    fn focused_window_frame_matches_within_tolerance() {
+        let target = ElementFrame {
+            x: 165.0,
+            y: 86.0,
+            w: 586.0,
+            h: 488.0,
+        };
+        let focused = ElementFrame {
+            x: 166.5,
+            y: 84.5,
+            w: 587.5,
+            h: 486.5,
+        };
+        let focused_window = crate::macos_focus::FocusedWindow {
+            pid: 12,
+            x: focused.x,
+            y: focused.y,
+            width: focused.w,
+            height: focused.h,
+            minimized: false,
+        };
+        assert!(focused_window_matches(&focused_window, 12, target));
+        assert!(!frames_match(target, focused, 1.0));
+    }
+
+    #[test]
+    fn focused_window_pid_mismatch_is_not_eligible() {
+        let focused = crate::macos_focus::FocusedWindow {
+            pid: 11,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+            minimized: false,
+        };
+        assert!(!focused_window_matches(
+            &focused,
+            12,
+            ElementFrame {
+                x: 0.0,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+            }
+        ));
+    }
+
+    #[test]
+    fn minimized_focused_window_is_not_eligible() {
+        let focused = crate::macos_focus::FocusedWindow {
+            pid: 12,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+            minimized: true,
+        };
+        assert!(!focused_window_matches(
+            &focused,
+            12,
+            ElementFrame {
+                x: 0.0,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+            }
+        ));
     }
 }
 
