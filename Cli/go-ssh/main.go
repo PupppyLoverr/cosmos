@@ -684,7 +684,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "completion shell must be bash, zsh, or fish")
 			os.Exit(ExitUsage)
 		}
-		fmt.Println("_zagy_complete() { COMPREPLY=( $(compgen -W 'completion tools session models memory compact undo checkpoint --help --version --output-format --allowedTools --add-dir --system-prompt --append-system-prompt --continue' -- \"${COMP_WORDS[COMP_CWORD]}\") ); }\ncomplete -F _zagy_complete zagy")
+		fmt.Print(completionScript(shell, "zagy"))
 		os.Exit(ExitDone)
 	}
 	if len(args) > 0 && args[0] == "tools" {

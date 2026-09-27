@@ -7,6 +7,7 @@ import * as proto from "./proto";
 import * as store from "./store";
 import * as agent from "./agent";
 import * as t from "./tools";
+import { completionScript } from "./completion";
 
 export const HELP = `\
 zdev — Cosmos coding-agent harness (TypeScript/bun)
@@ -381,7 +382,7 @@ async function main(): Promise<number> {
       console.error("completion shell must be bash, zsh, or fish");
       return proto.EXIT_USAGE;
     }
-    console.log("_zdev_complete() { COMPREPLY=( $(compgen -W 'completion tools session memory compact undo checkpoint --help --version --output-format --allowedTools --add-dir --system-prompt --append-system-prompt --continue' -- \"${COMP_WORDS[COMP_CWORD]}\") ); }\ncomplete -F _zdev_complete zdev");
+    process.stdout.write(completionScript(shell, "zdev")!);
     return proto.EXIT_DONE;
   }
   if (args[0] === "tools") {

@@ -6,6 +6,8 @@ use zcore::agent::{emitter, run_headless};
 use zcore::session::Session;
 use zproto::{exit, OutputMode, RunOpts};
 
+mod completion;
+
 const HELP: &str = "\
 zcli — Cosmos coding-agent harness (Rust)
 
@@ -145,7 +147,7 @@ fn main() {
                 eprintln!("completion shell must be bash, zsh, or fish");
                 std::process::exit(exit::USAGE);
             }
-            println!("_zcli_complete() {{ COMPREPLY=( $(compgen -W 'completion tools session compact undo checkpoint --help --version --output-format --allowedTools --add-dir --system-prompt --append-system-prompt --continue' -- \"${{COMP_WORDS[COMP_CWORD]}}\") ); }}\ncomplete -F _zcli_complete zcli");
+            print!("{}", completion::script(shell, "zcli").unwrap());
             exit::DONE
         }
         Some("session") => session_cmd(&args[1..]),
