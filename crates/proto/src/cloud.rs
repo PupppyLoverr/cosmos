@@ -1,0 +1,362 @@
+//! Cloud / GitHub agent mode — wire types shared by engine, UI, and RPC.
+//!
+//! Cosmos does not host the VM. A [`CloudSeatBinding`] attaches a chat to a
+//! user-supplied computer (a Box token, an SSH alias to a Docker host, or a
+//! GitHub repo workspace); the desktop drives it over HTTP / SSH / the GitHub
+//! API. Keys live in the engine's `cloud-keys.json` — never in the workspace
+//! doc and never in `ui-settings.json`.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+/// The computer backend a cloud seat binds to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CloudSeatKind {
+    /// A token-authenticated hosted box (exec over the provider's HTTP API
+    /// when an endpoint is configured; otherwise config-only).
+    Box,
+    /// BYO VPS: an `~/.ssh/config` alias on this desktop to an x86_64 Linux
+    /// host running Docker; workspaces are `cosmos-cloud-<workspace>`
+    /// containers.
+    Ssh,
+    /// A GitHub repository + PAT: file/PR data rides the REST API; agent
+    /// execution rides `workflow_dispatch` on the repo's agent workflow.
+    GitHub,
+}
+
+impl CloudSeatKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Box => "Box",
+            Self::Ssh => "VPS (SSH)",
+            Self::GitHub => "GitHub workspace",
+        }
+    }
+}
+
+/// The seat a chat runs on. Stored on the synced `Chat` row so every device
+/// renders the same binding; carries no secrets (tokens stay in the engine's
+/// keys file, keyed by `seat_id`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudSeatBinding {
+    /// `SeatConfig::id` in the binding engine's `cloud.json`.
+    pub seat_id: String,
+    pub kind: CloudSeatKind,
+    /// Display name (defaults to the seat's label).
+    pub label: String,
+    /// `owner/name` for GitHub seats; also stamped for SSH seats bound to a
+    /// cloned repo so the Pull Requests pane knows what to query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Working directory on the seat (container path / clone root). None =
+    /// the seat's configured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    /// Model label for the seat chip, e.g. the BYOK provider's default model
+    /// or the seat CLI's own login ("seat CLI login").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_label: Option<String>,
+}
+
+/// The right-rail pane kinds for a cloud workspace session. One pane is
+/// visible at a time; the shell persists the last pick per chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CloudPane {
+    Computer,
+    /// An emulator endpoint on the seat (Android on Linux seats). Disabled
+    /// unless the seat advertises one — never faked.
+    Simulator,
+    Files,
+    Changes,
+    Shell,
+    Progress,
+    Context,
+    Tasks,
+    PullRequests,
+}
+
+impl CloudPane {
+    pub const ALL: [CloudPane; 9] = [
+        Self::Computer,
+        Self::Simulator,
+        Self::Files,
+        Self::Changes,
+        Self::Shell,
+        Self::Progress,
+        Self::Context,
+        Self::Tasks,
+        Self::PullRequests,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Computer => "Computer",
+            Self::Simulator => "Android Simulator",
+            Self::Files => "Files",
+            Self::Changes => "Changes",
+            Self::Shell => "Shell",
+            Self::Progress => "Progress",
+            Self::Context => "Context",
+            Self::Tasks => "Tasks",
+            Self::PullRequests => "Pull requests",
+        }
+    }
+}
+
+/// BYOK model providers for cloud sessions — the same families the `zdev`
+/// CLI drives (`Cli/zdev/src/providers.ts`): OpenAI chat completions /
+/// Responses, ChatGPT subscription, Anthropic Messages, plus the
+/// OpenAI-compatible vendors and Devin's cloud models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ByokProvider {
+    Anthropic,
+    OpenAi,
+    Xai,
+    OpenRouter,
+    DeepSeek,
+    Xiaomi,
+    /// ChatGPT subscription (OAuth access token; Responses on chatgpt.com).
+    ChatgptSub,
+    /// Devin subscription — Devin's cloud model catalog, not a harness key.
+    DevinSub,
+    /// Any OpenAI-compatible endpoint (the key + a base URL the user types).
+    Custom,
+}
+
+impl ByokProvider {
+    pub const ALL: [ByokProvider; 9] = [
+        Self::Anthropic,
+        Self::OpenAi,
+        Self::Xai,
+        Self::OpenRouter,
+        Self::DeepSeek,
+        Self::Xiaomi,
+        Self::ChatgptSub,
+        Self::DevinSub,
+        Self::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic",
+            Self::OpenAi => "OpenAI",
+            Self::Xai => "xAI / Grok",
+            Self::OpenRouter => "OpenRouter",
+            Self::DeepSeek => "DeepSeek",
+            Self::Xiaomi => "Xiaomi MiMo",
+            Self::ChatgptSub => "ChatGPT subscription",
+            Self::DevinSub => "Devin subscription",
+            Self::Custom => "Custom base URL",
+        }
+    }
+
+    /// Stable string id used as the key in `cloud-keys.json`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::Xai => "xai",
+            Self::OpenRouter => "openrouter",
+            Self::DeepSeek => "deepseek",
+            Self::Xiaomi => "xiaomi",
+            Self::ChatgptSub => "chatgpt-sub",
+            Self::DevinSub => "devin-sub",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.id() == id)
+    }
+
+    /// Default API base when the row leaves Base URL empty.
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            Self::Anthropic => "https://api.anthropic.com",
+            Self::OpenAi => "https://api.openai.com/v1",
+            Self::Xai => "https://api.x.ai/v1",
+            Self::OpenRouter => "https://openrouter.ai/api/v1",
+            Self::DeepSeek => "https://api.deepseek.com/v1",
+            Self::Xiaomi => "https://api.xiaomimimo.com/v1",
+            Self::ChatgptSub => "https://chatgpt.com/backend-api",
+            Self::DevinSub => "https://api.devin.ai",
+            Self::Custom => "",
+        }
+    }
+
+    /// Subscription rows take an access token rather than a raw API key.
+    pub fn is_subscription(self) -> bool {
+        matches!(self, Self::ChatgptSub | Self::DevinSub)
+    }
+}
+
+/// Where a run stands for Kanban. Derived from session status for local
+/// chats and from the cloud run ledger for seat runs — never faked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CloudRunStatus {
+    Queued,
+    Working,
+    WaitingForUser,
+    /// A tool call on the seat is parked on user approval.
+    NeedsApproval,
+    /// User-stopped (or paused) — resumable.
+    Stopped,
+    Done,
+    Error,
+}
+
+impl CloudRunStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "Queued",
+            Self::Working => "Working",
+            Self::WaitingForUser => "Waiting for user",
+            Self::NeedsApproval => "Needs approval",
+            Self::Stopped => "Stopped",
+            Self::Done => "Done",
+            Self::Error => "Error",
+        }
+    }
+
+    /// Kanban column order.
+    pub const COLUMNS: [CloudRunStatus; 7] = [
+        Self::Queued,
+        Self::Working,
+        Self::WaitingForUser,
+        Self::NeedsApproval,
+        Self::Stopped,
+        Self::Done,
+        Self::Error,
+    ];
+}
+
+/// One row of the cloud run ledger — a run dispatched to a seat. The ledger
+/// is engine-local (`cloud-runs.json`), survives restarts, and backs the
+/// Kanban cards, the bot bar, and the Progress pane for seats.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudRun {
+    pub id: String,
+    pub chat_id: String,
+    pub seat_id: String,
+    /// The seat's harness command line (for audit/display).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    pub status: CloudRunStatus,
+    /// Remote log path the run writes on the seat (detached runs tail it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+    /// Remote marker pid/kill hint (e.g. the docker exec label).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ref: Option<String>,
+    /// Bytes of the remote log already mirrored into the transcript.
+    #[serde(default)]
+    pub mirrored_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// An automation: a prompt on a schedule against a workspace or seat.
+/// Persisted next to the seat config (`cloud.json`) — "persistence next to
+/// existing settings". Fired by the engine's scheduler; a fire on an
+/// unreachable seat marks `last_status: Missed`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudAutomation {
+    pub id: String,
+    pub name: String,
+    pub prompt: String,
+    /// `hourly` | `daily` | `weekly` | a 5-field cron expression.
+    pub schedule: String,
+    /// Cloud seat id; `None` = run on this computer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_id: Option<String>,
+    /// Local workspace (space id) the run lands in for local automations —
+    /// and the project context for seat runs when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<DateTime<Utc>>,
+    /// `ok` | `missed` | `error:<message>` — for Kanban surfacing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    /// Chat the last fire produced (click-through from the list).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_chat_id: Option<String>,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// Seat health as the last probe reported it — drives the bot bar's dot and
+/// the settings "Health" block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeatProbe {
+    pub seat_id: String,
+    pub online: bool,
+    /// Human detail line: docker server version, GitHub repo name, error
+    /// text — verbatim, never secret-bearing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Running `cosmos-cloud-*` containers (SSH seats) or the repo's default
+    /// branch (GitHub seats) — small inventory for the status line.
+    #[serde(default)]
+    pub containers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+    /// Whether the seat can drive a desktop (a CUA endpoint is configured) —
+    /// the "Take control" gate.
+    #[serde(default)]
+    pub controllable: bool,
+    /// Whether the seat can start a harness that survives this app closing
+    /// (detached `docker exec`/`nohup` or `workflow_dispatch`). False → the
+    /// honest "runs only while the desktop app is open" banner.
+    #[serde(default)]
+    pub keeps_running: bool,
+    pub probed_at: DateTime<Utc>,
+}
+
+/// What one cloud seat can do — the honest capability surface the UI gates
+/// every pane and button on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeatCapabilities {
+    /// Remote command execution (ssh exec / docker exec / gh api).
+    #[serde(default)]
+    pub exec: bool,
+    /// Interactive remote shell (ssh alias → PTY via local terminal).
+    #[serde(default)]
+    pub shell: bool,
+    /// Files + Changes via exec or GitHub contents/compare APIs.
+    #[serde(default)]
+    pub files: bool,
+    #[serde(default)]
+    pub git: bool,
+    /// Pull requests pane (a repo is bound).
+    #[serde(default)]
+    pub pull_requests: bool,
+    /// A CUA remote endpoint is stamped — the Computer pane can drive.
+    #[serde(default)]
+    pub computer: bool,
+    /// An emulator endpoint on the seat.
+    #[serde(default)]
+    pub simulator: bool,
+    /// A harness run can outlive this app (detached exec / workflow).
+    #[serde(default)]
+    pub keeps_running: bool,
+}

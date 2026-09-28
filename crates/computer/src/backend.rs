@@ -68,7 +68,7 @@ pub enum ObserveScope {
 /// of the driver's `structuredContent.elements[]` entries. `index` is the
 /// per-snapshot `element_index` (`E{n}` in digests); `token` is the driver's
 /// snapshot-bound `element_token` — the robust action handle.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowElement {
     pub index: u32,
@@ -107,7 +107,7 @@ pub struct WindowElement {
     pub in_web_content: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ElementFrame {
     pub x: f64,
@@ -119,7 +119,7 @@ pub struct ElementFrame {
 /// A full window snapshot — the driver's `get_window_state` normalized into
 /// typed data. Element handles (`index`/`token`) are ONLY valid against
 /// `snapshot_id` and become stale on the next snapshot of the same window.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowState {
     pub snapshot_id: String,
@@ -138,7 +138,9 @@ pub struct WindowState {
     #[serde(skip_serializing)]
     pub tree_markdown: Option<String>,
     /// Total nodes walked vs returned (driver-side truncation signal).
+    #[serde(default)]
     pub returned_element_count: u32,
+    #[serde(default)]
     pub total_element_count: u32,
     /// Driver-reported caveat worth surfacing to the model — degradation
     /// (`degraded_reason`), Chromium compositing gaps (`capture_coverage`),
@@ -210,7 +212,7 @@ impl Delivery {
 
 /// What an action produced: the driver's own result text plus an optional
 /// post-action observation ("did it work" — semantic, cheap).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ActionOutcome {
     /// Human/model-readable summary of what the driver did.
     pub summary: String,

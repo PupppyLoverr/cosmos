@@ -230,6 +230,12 @@ pub struct Chat {
     /// human started; a dangling id (parent deleted) is tolerated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_chat_id: Option<String>,
+    /// Cloud/GitHub agent binding: `Some` pins the chat's runs to a
+    /// user-supplied seat (Box / SSH Docker host / GitHub workspace) instead
+    /// of this PC. No secrets — the seat config lives in the engine's
+    /// `cloud.json`, keyed by `seat_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_seat: Option<crate::cloud::CloudSeatBinding>,
 }
 
 impl Chat {

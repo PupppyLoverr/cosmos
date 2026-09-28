@@ -782,6 +782,14 @@ pub struct AppState {
     /// the engine LRU — closing a tab MUST go through
     /// [`Self::unwatch_subagent_doc`].
     sub_watch_tasks: HashMap<String, Task<()>>,
+    /// Cloud/GitHub agent mode: the engine's redacted `CloudGetConfig` view
+    /// (seats, providers, automations, the run ledger). Polled — there is no
+    /// watch; mutating RPCs answer with the fresh view so callers refresh it.
+    pub cloud: crate::popover::Loadable<crate::cloud::CloudView>,
+    /// Single-flight refresh task.
+    cloud_task: Option<Task<()>>,
+    /// When the last successful `CloudGetConfig` landed (staleness checks).
+    cloud_fetched_at: Option<std::time::Instant>,
 }
 
 /// Text/reasoning growth changes the transcript without changing session
@@ -851,6 +859,9 @@ impl AppState {
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
+            cloud: crate::popover::Loadable::Idle,
+            cloud_task: None,
+            cloud_fetched_at: None,
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -1141,8 +1152,7 @@ impl AppState {
         if Some(chat.device_id.as_str()) == self.local_device_id.as_deref() {
             return false;
         }
-        if self.connectivity.state == S::Offline
-            || !self.device_online(&chat.device_id, Utc::now())
+        if self.connectivity.state == S::Offline || !self.device_online(&chat.device_id, Utc::now())
         {
             return true;
         }
@@ -1922,6 +1932,94 @@ impl AppState {
         self.engine.as_ref()
     }
 
+    // ---- Cloud / GitHub agent mode -------------------------------------
+
+    /// The redacted cloud view when loaded (empty vec reads for the
+    /// never-fetched state — callers gate on `cloud_seats().is_empty()`).
+    pub fn cloud_view(&self) -> Option<&crate::cloud::CloudView> {
+        self.cloud.ready()
+    }
+
+    /// Configured seats (empty until the first fetch lands).
+    pub fn cloud_seats(&self) -> &[crate::cloud::SeatRow] {
+        self.cloud
+            .ready()
+            .map(|view| view.seats.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn cloud_seat(&self, seat_id: &str) -> Option<&crate::cloud::SeatRow> {
+        self.cloud_seats()
+            .iter()
+            .find(|seat| seat.config.id == seat_id)
+    }
+
+    /// The selected chat's seat binding (resolved to a live seat row when
+    /// the config names one — a chat bound to a removed seat still reports
+    /// its binding so the UI can say "seat not configured").
+    pub fn selected_chat_seat(
+        &self,
+    ) -> Option<(
+        &zeron_proto::CloudSeatBinding,
+        Option<&crate::cloud::SeatRow>,
+    )> {
+        let binding = self.selected_chat_row()?.cloud_seat.as_ref()?;
+        Some((binding, self.cloud_seat(&binding.seat_id)))
+    }
+
+    /// Latest ledger run for a chat — the Progress pane and the seat bar.
+    pub fn cloud_run_for_chat(&self, chat_id: &str) -> Option<&zeron_proto::CloudRun> {
+        self.cloud_view()?.run_for_chat(chat_id)
+    }
+
+    /// Refresh `cloud` from the engine. `stale_after` gates duplicate polls:
+    /// views call this on mount and after their own mutations (those callers
+    /// pass `None` to force).
+    pub fn refresh_cloud(
+        &mut self,
+        stale_after: Option<std::time::Duration>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cloud_task.is_some() {
+            return;
+        }
+        if let (Some(at), Some(stale)) = (self.cloud_fetched_at, stale_after)
+            && at.elapsed() < stale
+        {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        self.cloud_task = Some(cx.spawn(async move |this, cx| {
+            let reply = engine
+                .client()
+                .call(methods::CLOUD_GET_CONFIG, serde_json::json!({}))
+                .await;
+            this.update(cx, |state, cx| {
+                state.cloud_task = None;
+                state.cloud = match reply {
+                    Ok(value) => match serde_json::from_value::<crate::cloud::CloudView>(value) {
+                        Ok(view) => {
+                            state.cloud_fetched_at = Some(std::time::Instant::now());
+                            crate::popover::Loadable::Ready(view)
+                        }
+                        Err(err) => crate::popover::Loadable::Error(err.to_string()),
+                    },
+                    // An engine predating cloud mode answers UnknownMethod —
+                    // render the feature as "no seats" rather than an error.
+                    Err(RpcError::UnknownMethod(_)) => {
+                        state.cloud_fetched_at = Some(std::time::Instant::now());
+                        crate::popover::Loadable::Ready(crate::cloud::CloudView::default())
+                    }
+                    Err(err) => crate::popover::Loadable::Error(err.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     #[cfg(test)]
     pub(crate) fn set_test_engine(&mut self, handle: EngineHandle) {
         self.engine = Some(handle);
@@ -2418,7 +2516,10 @@ impl AppState {
         cx.spawn(async move |_, _| {
             if let Err(error) = handle
                 .client()
-                .call(methods::FOCUS_CHAT, serde_json::json!({ "chatId": chat_id }))
+                .call(
+                    methods::FOCUS_CHAT,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
                 .await
             {
                 tracing::debug!(%chat_id, %error, "chat focus sync hint unavailable");
@@ -3537,6 +3638,7 @@ mod tests {
             harness_session_id: None,
             harness_session_cwd: None,
             parent_chat_id: None,
+            cloud_seat: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,

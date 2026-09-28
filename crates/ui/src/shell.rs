@@ -507,6 +507,11 @@ pub enum SettingsSection {
     General,
     /// Cosmos Computer — Screen Context + the optional local driver component.
     Computer,
+    /// Cloud computer — Box / BYO-VPS / GitHub seats the app attaches to.
+    CloudComputer,
+    /// BYOK model providers for cloud seats — keys live in the engine's
+    /// cloud-keys file, never ui-settings.json.
+    Models,
     /// Cosmos Tools — Composio apps, MCP servers, and the computer summary.
     Tools,
     Appshots,
@@ -515,12 +520,14 @@ pub enum SettingsSection {
 
 impl SettingsSection {
     /// Sections shown in Settings. `Agents` is a legacy Accounts route alias.
-    pub const ALL: [SettingsSection; 11] = [
+    pub const ALL: [SettingsSection; 13] = [
         SettingsSection::General,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
         SettingsSection::Computer,
+        SettingsSection::CloudComputer,
+        SettingsSection::Models,
         SettingsSection::Tools,
         SettingsSection::Harnesses,
         SettingsSection::Devices,
@@ -567,6 +574,8 @@ impl SettingsSection {
             SettingsSection::Shortcuts => "shortcuts",
             SettingsSection::General => "general",
             SettingsSection::Computer => "computer",
+            SettingsSection::CloudComputer => "cloud",
+            SettingsSection::Models => "models",
             SettingsSection::Tools => "tools",
             SettingsSection::Appshots => "appshots",
             SettingsSection::Archived => "archived",
@@ -585,6 +594,8 @@ impl SettingsSection {
             "shortcuts" => SettingsSection::Shortcuts,
             "general" | "conversations" => SettingsSection::General,
             "computer" => SettingsSection::Computer,
+            "cloud" | "cloud-computer" | "seats" => SettingsSection::CloudComputer,
+            "models" => SettingsSection::Models,
             "tools" => SettingsSection::Tools,
             "appshots" => SettingsSection::Appshots,
             "archived" => SettingsSection::Archived,
@@ -611,6 +622,8 @@ impl SettingsSection {
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::General => "General",
             SettingsSection::Computer => "Computer",
+            SettingsSection::CloudComputer => "Cloud computer",
+            SettingsSection::Models => "Models",
             SettingsSection::Tools => "Tools",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
@@ -652,6 +665,10 @@ fn settings_open_route(route: &str, remembered: SettingsSection) -> Option<Setti
 pub enum Route {
     Chat,
     Settings(SettingsSection),
+    /// Agent-run board — Kanban columns over local + cloud runs.
+    Kanban,
+    /// Scheduled prompts (cron list + create form) — sidebar destination.
+    Automations,
 }
 
 /// Maximum width the right pane may occupy while retaining the conversation
@@ -1858,6 +1875,23 @@ pub struct Shell {
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
     computer_page: Option<Entity<ComputerPage>>,
+    /// Settings → Cloud computer — seat list + add-seat card.
+    cloud_seats_page: Option<Entity<crate::cloud::seats::CloudSeatsPage>>,
+    /// Settings → Models — BYOK provider rows for cloud sessions.
+    models_page: Option<Entity<crate::cloud::ModelsPage>>,
+    /// Sidebar boards — the Kanban run board and the Automations list.
+    kanban_page: Option<Entity<crate::cloud::boards::KanbanPage>>,
+    automations_page: Option<Entity<crate::cloud::boards::AutomationsPage>>,
+    /// Subscriptions feeding the boards' OpenChat click-through.
+    kanban_sub: Option<Subscription>,
+    automations_sub: Option<Subscription>,
+    /// The cloud seat rail, one entity per cloud-bound chat so the pane pick
+    /// survives navigation (per-session persistence).
+    cloud_rails: std::collections::HashMap<String, Entity<crate::cloud::CloudRail>>,
+    cloud_rail_subs: std::collections::HashMap<String, Subscription>,
+    /// Rail Event::OpenSideChat — surface creation needs `window`, so the
+    /// subscription queues it and render() drains it.
+    pending_side_chat: bool,
     tools_page: Option<Entity<ToolsPage>>,
     tools_sub: Option<Subscription>,
     shortcuts_sub: Option<Subscription>,
@@ -2217,7 +2251,7 @@ impl Shell {
             _ => None,
         };
         let nav = NavHistory::new(match route {
-            Route::Chat => NavEntry::Chat(String::new()),
+            Route::Chat | Route::Kanban | Route::Automations => NavEntry::Chat(String::new()),
             Route::Settings(section) => NavEntry::Settings(section),
         });
         // Parent notifications carry presentation changes (session status,
@@ -2329,6 +2363,15 @@ impl Shell {
             accounts_page: None,
             harnesses_page: None,
             computer_page: None,
+            cloud_seats_page: None,
+            models_page: None,
+            kanban_page: None,
+            automations_page: None,
+            kanban_sub: None,
+            automations_sub: None,
+            cloud_rails: std::collections::HashMap::new(),
+            cloud_rail_subs: std::collections::HashMap::new(),
+            pending_side_chat: false,
             tools_page: None,
             tools_sub: None,
             shortcuts_sub: None,
@@ -4694,6 +4737,110 @@ impl Shell {
         cx.notify();
     }
 
+    /// Boards are sidebar destinations, not settings pages — they keep the
+    /// chat sidebar and open through their own route like Settings does.
+    fn open_kanban(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.route = Route::Kanban;
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    fn open_automations(&mut self, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.route = Route::Automations;
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    fn kanban_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.kanban_page.is_none() {
+            let state = self.state.clone();
+            let page = cx.new(|cx| crate::cloud::boards::KanbanPage::new(state, cx));
+            self.kanban_sub = Some(cx.subscribe(
+                &page,
+                |this: &mut Shell, _, event: &crate::cloud::boards::BoardsEvent, cx| {
+                    let crate::cloud::boards::BoardsEvent::OpenChat(chat_id) = event;
+                    this.apply_nav(NavEntry::Chat(chat_id.clone()), cx);
+                },
+            ));
+            self.kanban_page = Some(page);
+        }
+        match &self.kanban_page {
+            Some(page) => page.clone().into_any_element(),
+            None => Empty.into_any_element(),
+        }
+    }
+
+    fn automations_outlet(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.automations_page.is_none() {
+            let state = self.state.clone();
+            let page = cx.new(|cx| crate::cloud::boards::AutomationsPage::new(state, cx));
+            self.automations_sub = Some(cx.subscribe(
+                &page,
+                |this: &mut Shell, _, event: &crate::cloud::boards::BoardsEvent, cx| {
+                    let crate::cloud::boards::BoardsEvent::OpenChat(chat_id) = event;
+                    this.apply_nav(NavEntry::Chat(chat_id.clone()), cx);
+                },
+            ));
+            self.automations_page = Some(page);
+        }
+        match &self.automations_page {
+            Some(page) => page.clone().into_any_element(),
+            None => Empty.into_any_element(),
+        }
+    }
+
+    /// The cloud rail column for the active chat — `Some` only for
+    /// cloud-bound chats; the entity persists per chat so the pane pick is
+    /// stable across navigation.
+    fn cloud_rail_element(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !matches!(self.route, Route::Chat) {
+            return None;
+        }
+        let chat = self.state.read(cx).selected_chat_row()?;
+        let binding = chat.cloud_seat.clone()?;
+        let chat_id = chat.id.clone();
+        if !self.cloud_rails.contains_key(&chat_id) {
+            let state = self.state.clone();
+            let rail = cx.new(|cx| {
+                crate::cloud::CloudRail::new(
+                    state,
+                    chat_id.clone(),
+                    binding,
+                    zeron_proto::CloudPane::Files,
+                    cx,
+                )
+            });
+            let sub = cx.subscribe(
+                &rail,
+                |this: &mut Shell, _, event: &crate::cloud::RailEvent, cx| match event {
+                    // Surface creation needs `window` — queue it; render()
+                    // drains `pending_side_chat` like `pending_workspace_command`.
+                    crate::cloud::RailEvent::OpenSideChat => {
+                        this.pending_side_chat = true;
+                        cx.notify();
+                    }
+                },
+            );
+            self.cloud_rail_subs.insert(chat_id.clone(), sub);
+            self.cloud_rails.insert(chat_id.clone(), rail);
+        }
+        let rail = self.cloud_rails.get(&chat_id)?.clone();
+        Some(
+            div()
+                .h_full()
+                .w(px(320.0))
+                .flex_none()
+                .border_l_1()
+                .border_color(Theme::of(cx).border)
+                .child(rail)
+                .into_any_element(),
+        )
+    }
+
     /// Generic entry points (⌘, / Ctrl+,, the footer gear, the palette,
     /// `/settings`) reopen the section last viewed. Links that name a
     /// section go through [`Self::open_settings`] instead.
@@ -4963,6 +5110,27 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::CloudComputer => {
+                if self.cloud_seats_page.is_none() {
+                    let state = self.state.clone();
+                    self.cloud_seats_page =
+                        Some(cx.new(|cx| crate::cloud::seats::CloudSeatsPage::new(state, cx)));
+                }
+                match &self.cloud_seats_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Models => {
+                if self.models_page.is_none() {
+                    let state = self.state.clone();
+                    self.models_page = Some(cx.new(|cx| crate::cloud::ModelsPage::new(state, cx)));
+                }
+                match &self.models_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Tools => {
                 if self.tools_page.is_none() {
                     let state = self.state.clone();
@@ -4984,9 +5152,7 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Shortcuts
-            | SettingsSection::General
-            | SettingsSection::Appshots => {
+            SettingsSection::Shortcuts | SettingsSection::General | SettingsSection::Appshots => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
                     let keymap = self.settings.keymap.clone();
@@ -6929,6 +7095,8 @@ impl Shell {
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::General => icons::SETTINGS,
             SettingsSection::Computer => icons::EYE,
+            SettingsSection::CloudComputer => icons::CLOUD,
+            SettingsSection::Models => icons::KEY_MINIMALISTIC,
             SettingsSection::Tools => icons::SETTINGS_MINIMALISTIC,
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
@@ -7725,13 +7893,19 @@ impl Shell {
         use zeron_proto::ConnectivityState as S;
         let conn = self.state.read(cx).connectivity.clone();
         let selected = self.state.read(cx).selected_chat.as_deref();
-        let chat = conn.chats.iter()
+        let chat = conn
+            .chats
+            .iter()
             .find(|c| Some(c.chat_id.as_str()) == selected);
         let chat_state = chat.map(|c| c.sync_state);
         let (label, glyph): (SharedString, AnyElement) = match conn.state {
             _ if chat_state == Some(zeron_proto::ChatSyncState::StorageError) => (
                 "Changes could not be saved".into(),
-                div().size(px(5.0)).rounded_full().bg(theme.warning).into_any_element(),
+                div()
+                    .size(px(5.0))
+                    .rounded_full()
+                    .bg(theme.warning)
+                    .into_any_element(),
             ),
             S::Disabled => return None,
             S::Connected => {
@@ -7739,9 +7913,13 @@ impl Shell {
                 (
                     caption.into(),
                     loaders::mini_mono_spinner(
-                        "chat-sync-spinner", 2.0, theme.text_muted,
-                        self.sidebar_pane.entity_id(), cx,
-                    ).into_any_element(),
+                        "chat-sync-spinner",
+                        2.0,
+                        theme.text_muted,
+                        self.sidebar_pane.entity_id(),
+                        cx,
+                    )
+                    .into_any_element(),
                 )
             }
             S::Offline => (
@@ -7994,7 +8172,6 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
         let filter_row = self.render_spaces_filter(theme, cx);
@@ -8169,6 +8346,9 @@ impl Shell {
             // window above this column.)
             .child(filter_row)
             .child(sidebar_lists)
+            // Boards — always visible sidebar destinations (Automations,
+            // Kanban) for local + cloud runs.
+            .child(self.render_boards_nav(theme, cx))
             // Global connection pill (durable-by-design UI truth): appears
             // whenever the edge posture is degraded; hidden while healthy —
             // appearing IS the signal.
@@ -8207,6 +8387,76 @@ impl Shell {
                     .flex_none()
                     .child(self.render_sidebar_footer(theme, cx)),
             )
+            .into_any_element()
+    }
+
+    /// The two always-visible board destinations: Automations (cron list)
+    /// and Kanban (run board). Slim rows between the session lists and the
+    /// account footer; active state follows the shell route.
+    fn render_boards_nav(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let item =
+            |id: &'static str, icon_path: &'static str, label: &'static str, active: bool| {
+                div()
+                    .id(id)
+                    .h(px(26.0))
+                    .px(px(Theme::SPACE_SM))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(Theme::SPACE_SM))
+                    .rounded(px(6.0))
+                    .text_size(crate::typography::ui_rems(12.5))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(if active {
+                        theme.text
+                    } else {
+                        motion::hover_blend(id, theme.text.opacity(0.75), theme.text)
+                    })
+                    .bg(if active {
+                        theme.glass_hover()
+                    } else {
+                        motion::hover_blend(
+                            id,
+                            theme.glass_hover().opacity(0.0),
+                            theme.glass_hover().opacity(0.8),
+                        )
+                    })
+                    .on_hover(motion::hover_listener(id))
+                    .cursor_pointer()
+                    .child(
+                        icon(icon_path)
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(if active { theme.text } else { theme.text_muted }),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+            };
+        let automations = item(
+            "sidebar-automations",
+            icons::BOLT,
+            "Automations",
+            matches!(self.route, Route::Automations),
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.open_automations(cx)));
+        let kanban = item(
+            "sidebar-kanban",
+            icons::WIDGET,
+            "Kanban",
+            matches!(self.route, Route::Kanban),
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.open_kanban(cx)));
+        div()
+            .flex_none()
+            .px(px(Theme::SPACE_SM))
+            .pb(px(Theme::SPACE_SM))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .border_t_1()
+            .border_color(theme.border.opacity(0.6))
+            .pt(px(Theme::SPACE_SM))
+            .child(automations)
+            .child(kanban)
             .into_any_element()
     }
 
@@ -10940,22 +11190,20 @@ impl Shell {
                 // up the carve-out. The bubble dispatch reaches the chip
                 // before the strip, and the handler consumes the drag, so
                 // the two never double-apply.
-                .on_drop::<RightTabDrag>(cx.listener(
-                    move |this, payload: &RightTabDrag, _, cx| {
-                        if payload.panel_key != this.panel_key(cx) {
-                            this.right_tab_drag = None;
-                            cx.notify();
-                            return;
-                        }
-                        let to = this
-                            .right_tab_drag
-                            .as_ref()
-                            .map(|d| d.over)
-                            .unwrap_or(payload.from);
+                .on_drop::<RightTabDrag>(cx.listener(move |this, payload: &RightTabDrag, _, cx| {
+                    if payload.panel_key != this.panel_key(cx) {
                         this.right_tab_drag = None;
-                        this.reorder_right_tabs(payload.from, to, cx);
-                    },
-                ))
+                        cx.notify();
+                        return;
+                    }
+                    let to = this
+                        .right_tab_drag
+                        .as_ref()
+                        .map(|d| d.over)
+                        .unwrap_or(payload.from);
+                    this.right_tab_drag = None;
+                    this.reorder_right_tabs(payload.from, to, cx);
+                }))
                 .child(
                     // Leading slot: icon normally, ✕ on tab hover — two
                     // stacked layers opacity-swapped by the group hover.
@@ -11993,6 +12241,9 @@ impl Render for Shell {
                 WorkspaceCommand::New => self.open_new_session(cx),
                 WorkspaceCommand::Resume => self.toggle_command_palette(window, cx),
                 WorkspaceCommand::Settings => self.open_last_settings(cx),
+                WorkspaceCommand::CloudComputer => {
+                    self.open_settings(SettingsSection::CloudComputer, cx)
+                }
                 WorkspaceCommand::Diff if !self.active_chat.is_empty() => {
                     self.add_diff_surface(window, cx)
                 }
@@ -12010,6 +12261,10 @@ impl Render for Shell {
                 }
                 _ => {}
             }
+        }
+        if self.pending_side_chat {
+            self.pending_side_chat = false;
+            self.add_side_chat_surface(window, cx);
         }
 
         self.render_time = Some(std::time::Instant::now());
@@ -12438,7 +12693,9 @@ impl Render for Shell {
                         .child(sidebar_tone)
                         .child(motion::fade_in("phase-app", page));
                 }
-                let on_chat = true;
+                // Boards keep the chat sidebar but never show the chat-scoped
+                // right pane (surfaces are per-conversation).
+                let on_chat = matches!(self.route, Route::Chat);
                 let right_target_width = if on_chat {
                     self.right_visible_width(cx)
                 } else {
@@ -12498,7 +12755,16 @@ impl Render for Shell {
                     },
                     cx,
                 );
-                let main = self.render_main(window, main_content_width, transcript_width, cx);
+                let main = match self.route {
+                    Route::Kanban => self.kanban_outlet(cx),
+                    Route::Automations => self.automations_outlet(cx),
+                    _ => self.render_main(window, main_content_width, transcript_width, cx),
+                };
+                // Cloud-bound chats carry a second column — the seat rail —
+                // between the conversation and the surfaces pane.
+                let cloud_rail = self
+                    .cloud_rail_element(cx)
+                    .unwrap_or_else(|| Empty.into_any_element());
                 // The Changes pane is chat-scoped chrome: the Settings route
                 // never renders it (zeron __root.tsx `!isSettings && activeChat`
                 // around the diff column) — the per-session open flags stay
@@ -12611,6 +12877,9 @@ impl Render for Shell {
                             .child(sidebar)
                             .child(sidebar_seam)
                             .child(card)
+                            // Cloud sessions dock their seat rail here — a
+                            // second column, hidden entirely on local chats.
+                            .child(cloud_rail)
                             // The right pane is ONE container: the surface
                             // host column and the docked explorer column
                             // sit side by side under a shared titlebar
@@ -12820,6 +13089,7 @@ mod tests {
             last_seen_at: None,
             room_gen: None,
             parent_chat_id: None,
+            cloud_seat: None,
         }
     }
 
@@ -12888,17 +13158,26 @@ mod tests {
 
         chat.sync_state = S::Waiting;
         chat.connected = false;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued — changes are saved"));
+        assert_eq!(
+            chat_sync_pill_caption(&chat),
+            Some("Sync queued — changes are saved")
+        );
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
         chat.sync_state = S::Offline;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Offline — changes are saved"));
+        assert_eq!(
+            chat_sync_pill_caption(&chat),
+            Some("Offline — changes are saved")
+        );
 
         // Real pending pushes remain visible even with a live room.
         chat.connected = true;
         chat.pending_pushes = 1;
         chat.sync_state = S::Waiting;
-        assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued — changes are saved"));
+        assert_eq!(
+            chat_sync_pill_caption(&chat),
+            Some("Sync queued — changes are saved")
+        );
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
     }
@@ -15430,9 +15709,7 @@ mod right_tab_mouse_regressions {
             Some(MouseButton::Left),
             gpui::Modifiers::default(),
         );
-        cx.update(|_, cx| {
-            assert!(cx.has_active_drag(), "tab drag did not start")
-        });
+        cx.update(|_, cx| assert!(cx.has_active_drag(), "tab drag did not start"));
         cx.simulate_mouse_up(start, MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_down(start, MouseButton::Middle, gpui::Modifiers::default());
         cx.simulate_mouse_up(start, MouseButton::Middle, gpui::Modifiers::default());

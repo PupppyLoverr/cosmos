@@ -52,6 +52,7 @@
 
 use async_trait::async_trait;
 use base64::Engine as _;
+use chrono::Utc;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
@@ -366,6 +367,9 @@ struct OpenTerminalParams {
     /// space named by a `space-canvas:{spaceId}` chat id.
     #[serde(default)]
     cwd: Option<String>,
+    /// Run an exact command in the login shell (cloud seats: `ssh -tt …`).
+    #[serde(default)]
+    command: Option<String>,
 }
 
 /// Matches the UI canvas panel key (`AppState::panel_session_key`).
@@ -507,6 +511,88 @@ struct FetchToolBlobParams {
     blob_ref: String,
 }
 
+// ── Cloud / GitHub agent mode params ────────────────────────────────────────
+
+/// `CloudSaveSeat` — the seat row plus an optional `secrets` bag the store
+/// splits into `cloud-keys.json` (never `cloud.json`, never logged).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudSaveSeatParams {
+    seat: serde_json::Value,
+    #[serde(default)]
+    secrets: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// `CloudVerifyProvider` / `CloudSaveProvider`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudProviderParams {
+    provider: String,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    use_for_cloud: bool,
+}
+
+/// Seat + path shared by list/read/git methods (`path` is a directory for
+/// `CloudListDir`, a file for `CloudReadFile`, an optional filter for diffs).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudSeatPathParams {
+    seat_id: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// `CloudExec` — a bounded non-interactive command on the seat.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudExecParams {
+    seat_id: String,
+    command: String,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// `CloudGitHubPr` / `CloudGitHubMerge`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudPrParams {
+    seat_id: String,
+    number: u64,
+}
+
+/// `CloudAutomationSave`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudAutomationParams {
+    automation: serde_json::Value,
+}
+
+/// `CloudSeatControl` — the bot bar's seat actions.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudSeatControlParams {
+    chat_id: String,
+    op: String,
+    #[serde(default)]
+    seat_id: Option<String>,
+}
+
+/// A ledger status stamp — `update_run`'s closure form, named for the one
+/// place a status write needs a whole row.
+fn store_update_run_status(
+    store: &crate::cloud::CloudStore,
+    run_id: &str,
+    status: zeron_proto::CloudRunStatus,
+) {
+    store.update_run(run_id, |run| run.status = status);
+}
+
 /// The Mutate surface (feature-inventory §2 DataRpc), tagged by `op`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
@@ -539,6 +625,10 @@ enum MutateParams {
         /// on the row as `parentChatId` for orchestration trees.
         #[serde(default)]
         parent_chat_id: Option<String>,
+        /// Cloud/GitHub agent seat binding (Cloud agent mode): when set, the
+        /// chat's runs dispatch to the named seat instead of a local harness.
+        #[serde(default)]
+        cloud_seat: Option<zeron_proto::CloudSeatBinding>,
     },
     /// Create a space (device + folder pair). Idempotent by id; a live
     /// duplicate `(deviceId, path)` no-ops. `gitDetected` is seeded from the
@@ -642,6 +732,12 @@ pub struct EngineRpc {
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
     local_import: Option<crate::local_import::LocalImporter>,
+    /// Cloud/GitHub agent mode store (seats, BYOK keys, automations, run
+    /// ledger). `Option` so bare test rigs stay light; every `Cloud*` handler
+    /// fails "unavailable" without it.
+    cloud: Option<crate::cloud::CloudStore>,
+    /// Shared HTTP client for seat probes / provider verification / GitHub.
+    http: reqwest::Client,
     engine_info: EngineInfo,
 }
 
@@ -689,6 +785,8 @@ impl EngineRpc {
             links: None,
             updater: None,
             local_import: None,
+            cloud: None,
+            http: reqwest::Client::new(),
             engine_info,
         }
     }
@@ -742,6 +840,13 @@ impl EngineRpc {
         self
     }
 
+    /// Attach the cloud-seat store (Settings → Models / Cloud computer, the
+    /// cloud rail, automations, Kanban).
+    pub fn with_cloud(mut self, cloud: crate::cloud::CloudStore) -> Self {
+        self.cloud = Some(cloud);
+        self
+    }
+
     fn computer(&self) -> Result<&zeron_computer::ComputerService, RpcError> {
         self.computer
             .as_ref()
@@ -752,6 +857,12 @@ impl EngineRpc {
         self.tools
             .as_ref()
             .ok_or_else(|| RpcError::Failed("tools service unavailable".into()))
+    }
+
+    fn cloud(&self) -> Result<&crate::cloud::CloudStore, RpcError> {
+        self.cloud
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("cloud service unavailable".into()))
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -1132,6 +1243,7 @@ impl EngineRpc {
                 cwd,
                 archived,
                 parent_chat_id,
+                cloud_seat,
             } => {
                 self.workspace
                     .create_chat_with_parent(
@@ -1141,6 +1253,7 @@ impl EngineRpc {
                         config,
                         cwd,
                         parent_chat_id,
+                        cloud_seat,
                     )
                     .map_err(failed)?;
                 if let Some(branch) = branch.as_deref().filter(|b| !b.is_empty()) {
@@ -3484,10 +3597,17 @@ impl RpcService for EngineRpc {
                         .map(|space| space.path)
                 });
                 let cwd = resolve_open_terminal_cwd(p.cwd, chat_cwd, space_cwd);
-                let session = self
-                    .terminals
-                    .open(&cwd, p.cols, p.rows)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let session = match p.command.as_deref() {
+                    Some(command) => self.terminals.open_with_command(
+                        &cwd,
+                        p.cols,
+                        p.rows,
+                        &std::collections::HashMap::new(),
+                        command,
+                    ),
+                    None => self.terminals.open(&cwd, p.cols, p.rows),
+                }
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&session)
             }
             methods::SUBSCRIBE_TERMINAL => {
@@ -3634,6 +3754,463 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "text": text }))
+            }
+            // ── Cloud / GitHub agent mode ─────────────────────────────────
+            // All device-local: seats, keys, and the run ledger live in this
+            // engine's data dir, and only this engine's ssh agent / tokens can
+            // drive a seat. Never in `forwardable`.
+            methods::CLOUD_GET_CONFIG => {
+                let cloud = self.cloud()?;
+                RpcReply::value(&cloud.view())
+            }
+            methods::CLOUD_SAVE_SEAT => {
+                let p: CloudSaveSeatParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let seat: crate::cloud::SeatConfig = serde_json::from_value(p.seat)
+                    .map_err(|e| RpcError::BadParams(e.to_string()))?;
+                if seat.id.trim().is_empty() {
+                    return Err(RpcError::BadParams("seat needs an id".into()));
+                }
+                cloud.save_seat(seat.clone());
+                if let Some(secrets) = p.secrets {
+                    if let Some(token) = secrets.get("boxToken").and_then(|v| v.as_str()) {
+                        cloud.set_seat_token(&seat.id, "boxToken", Some(token.to_string()));
+                    }
+                    if let Some(token) = secrets.get("githubPat").and_then(|v| v.as_str()) {
+                        cloud.set_seat_token(&seat.id, "githubPat", Some(token.to_string()));
+                    }
+                    if let Some(token) = secrets.get("cuaToken").and_then(|v| v.as_str()) {
+                        cloud.set_seat_token(&seat.id, "cuaToken", Some(token.to_string()));
+                    }
+                }
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLOUD_REMOVE_SEAT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    seat_id: String,
+                }
+                let p: P = parse_params(params)?;
+                self.cloud()?.remove_seat(&p.seat_id);
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLOUD_PROBE_SEAT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    seat_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                let probe = crate::cloud::probe_seat(&self.http, &cloud, &seat).await;
+                cloud.record_probe(&seat.id, probe.clone());
+                RpcReply::value(&probe)
+            }
+            methods::CLOUD_VERIFY_PROVIDER => {
+                let p: CloudProviderParams = parse_params(params)?;
+                let provider = zeron_proto::ByokProvider::from_id(&p.provider)
+                    .ok_or_else(|| RpcError::BadParams("unknown provider".into()))?;
+                let cloud = self.cloud()?.clone();
+                let key = p
+                    .key
+                    .clone()
+                    .filter(|k| !k.trim().is_empty())
+                    .or_else(|| cloud.provider_key(provider))
+                    .ok_or_else(|| RpcError::Failed("no key saved for this provider".into()))?;
+                match crate::cloud::verify_provider(
+                    &self.http,
+                    provider,
+                    &key,
+                    p.base_url.as_deref(),
+                )
+                .await
+                {
+                    Ok(message) => {
+                        RpcReply::value(&serde_json::json!({ "ok": true, "message": message }))
+                    }
+                    Err(message) => {
+                        RpcReply::value(&serde_json::json!({ "ok": false, "message": message }))
+                    }
+                }
+            }
+            methods::CLOUD_SAVE_PROVIDER => {
+                let p: CloudProviderParams = parse_params(params)?;
+                let provider = zeron_proto::ByokProvider::from_id(&p.provider)
+                    .ok_or_else(|| RpcError::BadParams("unknown provider".into()))?;
+                let cloud = self.cloud()?.clone();
+                // Save only on success when a key is being set — the spec's
+                // rule; a metadata-only save (base URL / model / toggle) is
+                // unconditional.
+                if let Some(key) = p.key.clone().filter(|k| !k.trim().is_empty()) {
+                    crate::cloud::verify_provider(
+                        &self.http,
+                        provider,
+                        &key,
+                        p.base_url.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| RpcError::Failed(e))?;
+                }
+                cloud.save_provider(
+                    crate::cloud::ProviderConfig {
+                        provider: Some(provider),
+                        base_url: p.base_url.filter(|b| !b.trim().is_empty()),
+                        model: p.model.filter(|m| !m.trim().is_empty()),
+                        use_for_cloud: p.use_for_cloud,
+                        has_key: false,
+                    },
+                    p.key,
+                );
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLOUD_REMOVE_PROVIDER => {
+                #[derive(Deserialize)]
+                struct P {
+                    provider: String,
+                }
+                let p: P = parse_params(params)?;
+                let provider = zeron_proto::ByokProvider::from_id(&p.provider)
+                    .ok_or_else(|| RpcError::BadParams("unknown provider".into()))?;
+                self.cloud()?.remove_provider(provider);
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLOUD_LIST_DIR => {
+                let p: CloudSeatPathParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                let dir = p.path.clone().unwrap_or_else(|| seat.workspace());
+                let entries = crate::cloud::list_dir(&self.http, &cloud, &seat, &dir)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "entries": entries }))
+            }
+            methods::CLOUD_READ_FILE => {
+                let p: CloudSeatPathParams = parse_params(params)?;
+                let path = p
+                    .path
+                    .clone()
+                    .ok_or_else(|| RpcError::BadParams("missing path".into()))?;
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                let (content, truncated) =
+                    crate::cloud::read_file(&self.http, &cloud, &seat, &path)
+                        .await
+                        .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "content": content, "truncated": truncated }))
+            }
+            methods::CLOUD_GIT_STATUS => {
+                let p: CloudSeatPathParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                let status = crate::cloud::git_status(&self.http, &cloud, &seat)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&status)
+            }
+            methods::CLOUD_GIT_DIFF => {
+                let p: CloudSeatPathParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                let diff = crate::cloud::git_diff(&self.http, &cloud, &seat, p.path.as_deref())
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "diff": diff }))
+            }
+            methods::CLOUD_EXEC => {
+                let p: CloudExecParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                let out = crate::cloud::seat_exec(
+                    &seat,
+                    &p.command,
+                    std::time::Duration::from_secs(p.timeout_secs.unwrap_or(120).min(600)),
+                )
+                .await
+                .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({
+                    "code": out.code,
+                    "stdout": out.stdout,
+                    "stderr": out.stderr,
+                }))
+            }
+            methods::CLOUD_GITHUB_PRS => {
+                let p: CloudSeatPathParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                let repo = seat
+                    .repo
+                    .clone()
+                    .ok_or_else(|| RpcError::Failed("seat has no repo bound".into()))?;
+                let pat = cloud
+                    .github_pat(&seat.id)
+                    .ok_or_else(|| RpcError::Failed("seat has no GitHub token".into()))?;
+                let prs = crate::cloud::github(&self.http, &pat)
+                    .pulls(&repo)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&prs)
+            }
+            methods::CLOUD_GITHUB_PR => {
+                let p: CloudPrParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                let repo = seat
+                    .repo
+                    .clone()
+                    .ok_or_else(|| RpcError::Failed("seat has no repo bound".into()))?;
+                let pat = cloud
+                    .github_pat(&seat.id)
+                    .ok_or_else(|| RpcError::Failed("seat has no GitHub token".into()))?;
+                let detail = crate::cloud::github(&self.http, &pat)
+                    .pull(&repo, p.number)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&detail)
+            }
+            methods::CLOUD_GITHUB_MERGE => {
+                let p: CloudPrParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                let repo = seat
+                    .repo
+                    .clone()
+                    .ok_or_else(|| RpcError::Failed("seat has no repo bound".into()))?;
+                let pat = cloud
+                    .github_pat(&seat.id)
+                    .ok_or_else(|| RpcError::Failed("seat has no GitHub token".into()))?;
+                crate::cloud::github(&self.http, &pat)
+                    .merge(&repo, p.number)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLOUD_SCREENSHOT => {
+                let p: CloudSeatPathParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                let endpoint = seat.cua_endpoint.clone().ok_or_else(|| {
+                    RpcError::Failed("seat not controllable yet — no CUA endpoint".into())
+                })?;
+                let mut req = self
+                    .http
+                    .post(format!(
+                        "{}/computer/observe",
+                        endpoint.trim_end_matches('/')
+                    ))
+                    .json(&serde_json::json!({
+                        "scope": "desktop",
+                        "screenshot": true,
+                        "semantic": false,
+                    }));
+                if let Some(token) = cloud.cua_token(&seat.id) {
+                    req = req.bearer_auth(token);
+                }
+                let resp = req
+                    .timeout(std::time::Duration::from_secs(15))
+                    .send()
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("seat unreachable: {e}")))?;
+                if !resp.status().is_success() {
+                    return Err(RpcError::Failed(format!(
+                        "seat answered HTTP {}",
+                        resp.status()
+                    )));
+                }
+                let v: serde_json::Value = resp.json().await.map_err(|e| {
+                    RpcError::Failed(format!("seat returned unreadable observe: {e}"))
+                })?;
+                let png = v
+                    .get("screenshotPngB64")
+                    .or_else(|| v.get("screenshot").and_then(|s| s.get("pngBase64")))
+                    .and_then(|s| s.as_str())
+                    .ok_or_else(|| RpcError::Failed("seat returned no screenshot".into()))?;
+                RpcReply::value(&serde_json::json!({ "pngBase64": png }))
+            }
+            methods::CLOUD_AUTOMATION_SAVE => {
+                let p: CloudAutomationParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let automation: zeron_proto::CloudAutomation = serde_json::from_value(p.automation)
+                    .map_err(|e| RpcError::BadParams(e.to_string()))?;
+                // Stamp next_run_at when it's unset so the scheduler picks the
+                // row up without waiting for a restart.
+                let mut automation = automation;
+                if automation.enabled && automation.next_run_at.is_none() {
+                    automation.next_run_at =
+                        crate::cloud::next_run(&automation.schedule, Utc::now());
+                }
+                cloud.save_automation(automation);
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLOUD_AUTOMATION_REMOVE => {
+                #[derive(Deserialize)]
+                struct P {
+                    id: String,
+                }
+                let p: P = parse_params(params)?;
+                self.cloud()?.remove_automation(&p.id);
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLOUD_SEAT_CONTROL => {
+                let p: CloudSeatControlParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                match p.op.as_str() {
+                    // Interrupt the live run — the seat survives; the harness
+                    // process stops.
+                    "stop" | "interrupt" => {
+                        self.sessions
+                            .interrupt(&p.chat_id)
+                            .await
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    }
+                    // Approve: a NeedsApproval gate clears by continuing the
+                    // run — queue an affirmative steer the harness consumes
+                    // when it yields (the seat itself carries no permission
+                    // protocol to answer mid-exec).
+                    "approve" => {
+                        self.doc_host
+                            .queue_command_with_transfers(
+                                &p.chat_id,
+                                SessionCommandPayload::Steer {
+                                    prompt: "Approved — continue.".to_string(),
+                                    message_id: None,
+                                },
+                                Vec::new(),
+                            )
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    }
+                    // Pause/resume ride SIGSTOP/SIGCONT on the seat's harness
+                    // process — honest no-op when the seat can't exec.
+                    "pause" | "resume" => {
+                        let signal = if p.op == "pause" { "-STOP" } else { "-CONT" };
+                        let run = cloud
+                            .run_for_chat(&p.chat_id)
+                            .ok_or_else(|| RpcError::Failed("no cloud run for chat".into()))?;
+                        let seat = cloud.seat(&run.seat_id).ok_or_else(|| {
+                            RpcError::Failed("run's seat is not configured".into())
+                        })?;
+                        let command = seat
+                            .harness_command
+                            .clone()
+                            .unwrap_or_else(|| "agent".into());
+                        let prog = command.split_whitespace().next().unwrap_or("agent");
+                        let out = crate::cloud::seat_exec(
+                            &seat,
+                            &format!("pkill {signal} -x {prog} 2>/dev/null || true"),
+                            std::time::Duration::from_secs(10),
+                        )
+                        .await
+                        .map_err(RpcError::Failed)?;
+                        if out.code != 0 {
+                            return Err(RpcError::Failed(format!(
+                                "signal failed: {}",
+                                out.stderr.lines().next().unwrap_or("unknown")
+                            )));
+                        }
+                        store_update_run_status(
+                            &cloud,
+                            &run.id,
+                            match p.op.as_str() {
+                                "pause" => zeron_proto::CloudRunStatus::Stopped,
+                                _ => zeron_proto::CloudRunStatus::Working,
+                            },
+                        );
+                    }
+                    // Destroy = stop every run on the seat and, for SSH seats,
+                    // remove the container — the seat's own teardown.
+                    "destroy" => {
+                        let seat_id = p
+                            .seat_id
+                            .clone()
+                            .ok_or_else(|| RpcError::BadParams("destroy needs seatId".into()))?;
+                        let seat = cloud
+                            .seat(&seat_id)
+                            .ok_or_else(|| RpcError::Failed(format!("no such seat: {seat_id}")))?;
+                        for run in cloud.runs() {
+                            if run.seat_id == seat_id
+                                && matches!(
+                                    run.status,
+                                    zeron_proto::CloudRunStatus::Working
+                                        | zeron_proto::CloudRunStatus::Queued
+                                )
+                            {
+                                let _ = self.sessions.interrupt(&run.chat_id).await;
+                                cloud.update_run(&run.id, |r| {
+                                    r.status = zeron_proto::CloudRunStatus::Stopped;
+                                    r.finished_at = Some(Utc::now());
+                                });
+                            }
+                        }
+                        if matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Ssh))
+                            && let Some(alias) = seat.ssh_alias.clone()
+                        {
+                            let _ = crate::cloud::ssh_exec(
+                                &alias,
+                                &format!(
+                                    "docker rm -f {}",
+                                    crate::cloud::shell_word(&seat.container_name())
+                                ),
+                                std::time::Duration::from_secs(20),
+                            )
+                            .await;
+                        }
+                    }
+                    other => {
+                        return Err(RpcError::BadParams(format!(
+                            "unknown seat control op: {other}"
+                        )));
+                    }
+                }
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLOUD_SSH_COMMAND => {
+                let p: CloudSeatPathParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                match seat.kind {
+                    Some(zeron_proto::CloudSeatKind::Ssh) => {
+                        let alias = seat
+                            .ssh_alias
+                            .clone()
+                            .ok_or_else(|| RpcError::Failed("seat has no SSH alias".into()))?;
+                        // The local terminal spawns this verbatim — a real
+                        // PTY on the seat's workspace container.
+                        RpcReply::value(&serde_json::json!({
+                            "command": format!(
+                                "ssh -tt {} docker exec -it {} sh -lc {}",
+                                alias,
+                                seat.container_name(),
+                                crate::cloud::shell_word(&format!("cd {} && exec bash", seat.workspace()))
+                            )
+                        }))
+                    }
+                    _ => Err(RpcError::Failed(
+                        "interactive shell needs an SSH seat".into(),
+                    )),
+                }
             }
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }

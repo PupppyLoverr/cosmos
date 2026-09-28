@@ -32,6 +32,7 @@ mod macos_menu;
 pub mod mcp_client;
 pub(crate) mod menu;
 pub mod mock;
+pub mod remote;
 pub mod service;
 pub mod stdio;
 pub mod surface;

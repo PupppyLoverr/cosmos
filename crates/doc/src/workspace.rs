@@ -285,6 +285,10 @@ impl WorkspaceDoc {
         set_opt_str(&row, "spaceId", chat.space_id.as_deref())?;
         set_opt_ms(&row, "lastSeenAt", chat.last_seen_at)?;
         set_opt_str(&row, "parentChatId", chat.parent_chat_id.as_deref())?;
+        match &chat.cloud_seat {
+            Some(seat) => row.insert("cloudSeat", LoroValue::from(serde_json::to_value(seat)?))?,
+            None => row.delete("cloudSeat")?,
+        }
         self.doc.commit();
         Ok(())
     }
@@ -715,6 +719,8 @@ pub(crate) struct RawChat {
     room_gen: Option<u32>,
     #[serde(default)]
     parent_chat_id: Option<String>,
+    #[serde(default)]
+    cloud_seat: Option<zeron_proto::CloudSeatBinding>,
 }
 
 /// Decode a chat row's `config` leniently: unknown enum values (a newer
@@ -756,6 +762,7 @@ impl From<RawChat> for Chat {
             last_seen_at: raw.last_seen_at.map(dt),
             room_gen: raw.room_gen,
             parent_chat_id: raw.parent_chat_id,
+            cloud_seat: raw.cloud_seat,
         }
     }
 }
@@ -862,6 +869,7 @@ mod tests {
             harness_session_id: None,
             harness_session_cwd: None,
             parent_chat_id: Some("parent-chat".into()),
+            cloud_seat: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,

@@ -21,13 +21,14 @@ mod browser;
 pub mod change_requests;
 pub mod chat2_host;
 mod chat_persistence;
+pub mod cloud;
 pub mod diff_sync;
 pub mod doc_host;
 mod http_error;
 pub mod instance_lock;
 pub mod local_import;
-pub mod pairing;
 mod model_catalogs;
+pub mod pairing;
 pub mod profile;
 pub mod project_actions;
 pub mod registry;
@@ -162,6 +163,11 @@ pub struct EngineCore {
     pub pairing: Arc<pairing::PairingStore>,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
+    /// Cloud/GitHub agent mode: seat config + BYOK keys + automations + the
+    /// remote-run ledger, all under `data_dir` (`cloud.json` /
+    /// `cloud-keys.json` / `cloud-runs.json`). Sessions consults it to route
+    /// `cloudSeat` chats to the seat instead of a local harness.
+    pub cloud: cloud::CloudStore,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -348,6 +354,16 @@ impl EngineCore {
             registry.clone(),
             repos.clone(),
         ));
+        // Cloud/GitHub agent mode: `cloudSeat` chats dispatch to the seat.
+        let cloud = cloud::CloudStore::load(data_dir);
+        sessions.set_cloud(cloud.clone());
+        let scheduler = cloud::Scheduler::new(
+            cloud.clone(),
+            doc_host.clone(),
+            workspace.clone(),
+            device_id.clone(),
+        );
+        scheduler.start();
         let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
         // Turn starts snapshot the checkout tree — the "Latest turn" diff base.
         let turn_diff = diff_sync.clone();
@@ -375,6 +391,7 @@ impl EngineCore {
             device_id,
             pairing,
             local_import,
+            cloud,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
@@ -519,7 +536,8 @@ impl EngineCore {
         .with_pairing(self.pairing.clone())
         .with_previews(self.previews.clone())
         .with_computer(self.computer.clone())
-        .with_tools(self.tools.clone());
+        .with_tools(self.tools.clone())
+        .with_cloud(self.cloud.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }

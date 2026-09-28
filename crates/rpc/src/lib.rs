@@ -300,6 +300,57 @@ pub mod methods {
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
+    // Cloud / GitHub agent mode — device-local, NEVER relay-forwarded: seat
+    // config, BYOK keys, and the run ledger live in the engine's own data
+    // dir, and a seat's exec surface must run where the ssh agent / tokens
+    // actually are. Replies always carry redacted views (`has_*` booleans);
+    // secrets never cross the wire.
+    /// The redacted config + probe cache + run ledger → `cloud.view()`.
+    pub const CLOUD_GET_CONFIG: &str = "CloudGetConfig";
+    /// `{seat}` upsert (secrets as `{secrets:{boxToken?,githubPat?,cuaToken?}}`)
+    /// → `{ok}`.
+    pub const CLOUD_SAVE_SEAT: &str = "CloudSaveSeat";
+    /// `{seatId}` → `{ok}` (also drops stored seat tokens).
+    pub const CLOUD_REMOVE_SEAT: &str = "CloudRemoveSeat";
+    /// `{seatId}` → `SeatProbe` (and records it as the seat's last_probe).
+    pub const CLOUD_PROBE_SEAT: &str = "CloudProbeSeat";
+    /// `{provider, key, baseUrl?}` → `{ok, message}` — a models/list ping.
+    pub const CLOUD_VERIFY_PROVIDER: &str = "CloudVerifyProvider";
+    /// `{provider, baseUrl?, model?, useForCloud, key?}` → `{ok}` — the key,
+    /// when present, lands in `cloud-keys.json` (0600), never `cloud.json`.
+    pub const CLOUD_SAVE_PROVIDER: &str = "CloudSaveProvider";
+    /// `{provider}` → `{ok}` (config row + stored key both drop).
+    pub const CLOUD_REMOVE_PROVIDER: &str = "CloudRemoveProvider";
+    /// `{seatId, dir?}` → `{entries: [RemoteEntry]}`.
+    pub const CLOUD_LIST_DIR: &str = "CloudListDir";
+    /// `{seatId, path}` → `{content, truncated}` (256 KiB cap).
+    pub const CLOUD_READ_FILE: &str = "CloudReadFile";
+    /// `{seatId}` → `{branch, entries, stat}`.
+    pub const CLOUD_GIT_STATUS: &str = "CloudGitStatus";
+    /// `{seatId, path?}` → `{diff}` (unified, bounded).
+    pub const CLOUD_GIT_DIFF: &str = "CloudGitDiff";
+    /// `{seatId, command}` → `{code, stdout, stderr}` — the Shell pane's
+    /// non-interactive path (PTY attach rides the local terminal + `ssh`).
+    pub const CLOUD_EXEC: &str = "CloudExec";
+    /// `{seatId}` → `[PrRow]` (needs a bound repo + PAT).
+    pub const CLOUD_GITHUB_PRS: &str = "CloudGitHubPrs";
+    /// `{seatId, number}` → `PrDetail` (files + checks included).
+    pub const CLOUD_GITHUB_PR: &str = "CloudGitHubPr";
+    /// `{seatId, number}` → `{ok}` — squash merge via the API.
+    pub const CLOUD_GITHUB_MERGE: &str = "CloudGitHubMerge";
+    /// `{seatId}` → `{pngBase64}` | unavailable — rides the stamped CUA
+    /// endpoint's screenshot surface.
+    pub const CLOUD_SCREENSHOT: &str = "CloudScreenshot";
+    /// `{automation}` upsert → `{ok}`.
+    pub const CLOUD_AUTOMATION_SAVE: &str = "CloudAutomationSave";
+    /// `{id}` → `{ok}`.
+    pub const CLOUD_AUTOMATION_REMOVE: &str = "CloudAutomationRemove";
+    /// `{chatId, op: pause|resume|stop|destroy}` — seat-scoped control for
+    /// the bot bar; `stop` interrupts the live run on the host engine.
+    pub const CLOUD_SEAT_CONTROL: &str = "CloudSeatControl";
+    /// `{seatId}` → `{command}` — the exact local shell line a Terminal pane
+    /// spawns for an interactive seat shell (`ssh -tt …`), or an error.
+    pub const CLOUD_SSH_COMMAND: &str = "CloudSshCommand";
 }
 
 #[derive(Debug, thiserror::Error)]
