@@ -478,3 +478,23 @@ async fn startup_catalog_rate_limit_retries_before_sending_but_auth_does_not() {
         assert_eq!(state["attempts"], if succeeds { 2 } else { 1 });
     }
 }
+
+#[tokio::test]
+async fn cursor_sdk_loads_user_and_managed_mcp_settings_without_project_settings() {
+    let fixture = SessionFixture::new();
+    for resume in [false, true] {
+        let (mut child, stdin, mut lines) = fixture.start("normal", resume).await;
+        assert_eq!(frame(&mut lines).await["ev"], "ready");
+        assert_eq!(frame(&mut lines).await["ev"], "text");
+        assert_eq!(frame(&mut lines).await["status"], "finished");
+        finish(&mut child, stdin).await;
+        let options: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.dir.path().join("mcp-options.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            options["settingSources"],
+            serde_json::json!(["user", "team", "mdm", "plugins"])
+        );
+    }
+}
