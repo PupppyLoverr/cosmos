@@ -208,11 +208,12 @@ impl Shell {
         // drag region, and buttons. A session appends its target as a muted
         // "project @ device" tag right of the title (the composer footer no
         // longer carries it).
-        let (title, target, harness, on_canvas): (
+        let (title, target, harness, on_canvas, seat_chip): (
             SharedString,
             Option<SharedString>,
             Option<zeron_proto::HarnessId>,
             bool,
+            Option<(SharedString, bool)>,
         ) = {
             let state = self.state.read(cx);
             match state.selected_chat_row() {
@@ -226,6 +227,33 @@ impl Shell {
                     let device = state
                         .device_name(&chat.device_id)
                         .unwrap_or("Unknown device");
+                    // The seat chip on the session header: `Cloud · seat`,
+                    // `GitHub · repo`, or `Railway · Nm` while a trial counts
+                    // down — warning tint in the last 10 minutes / expired.
+                    let seat_chip = chat.cloud_seat.as_ref().map(|b| {
+                        let (prefix, label) = match b.kind {
+                            zeron_proto::CloudSeatKind::GitHub => {
+                                ("GitHub", b.repo.clone().unwrap_or_else(|| b.label.clone()))
+                            }
+                            zeron_proto::CloudSeatKind::Railway => {
+                                let left = b
+                                    .expires_at
+                                    .map(|at| {
+                                        at.signed_duration_since(chrono::Utc::now()).num_minutes()
+                                    })
+                                    .unwrap_or(0);
+                                ("Railway", format!("{} · {}m", b.label, left.max(0)))
+                            }
+                            _ => ("Cloud", b.label.clone()),
+                        };
+                        let urgent = b
+                            .expires_at
+                            .map(|at| {
+                                at.signed_duration_since(chrono::Utc::now()).num_minutes() < 10
+                            })
+                            .unwrap_or(false);
+                        (SharedString::from(format!("{prefix} · {label}")), urgent)
+                    });
                     (
                         SharedString::from(transcript::single_line(
                             &chat.title.clone().unwrap_or_else(|| "New session".into()),
@@ -233,9 +261,10 @@ impl Shell {
                         Some(SharedString::from(format!("{folder} @ {device}"))),
                         chat.config.as_ref().map(|c| c.harness),
                         false,
+                        seat_chip,
                     )
                 }
-                None => (SharedString::from(""), None, None, true),
+                None => (SharedString::from(""), None, None, true, None),
             }
         };
 
@@ -488,6 +517,32 @@ impl Shell {
                                             .text_size(crate::typography::ui_rems(12.0))
                                             .text_color(theme.text_muted.opacity(0.5))
                                             .child(target),
+                                    )
+                                })
+                                // The session-kind chip — one accent, 8px
+                                // radius, never decorative: it names where
+                                // the run actually executes.
+                                .when_some(seat_chip, |el, (chip, urgent)| {
+                                    el.child(
+                                        div()
+                                            .id("session-seat-chip")
+                                            .flex_none()
+                                            .px(px(7.0))
+                                            .py(px(2.0))
+                                            .rounded(px(8.0))
+                                            .bg(if urgent {
+                                                theme.warning.opacity(0.15)
+                                            } else {
+                                                theme.accent.opacity(0.12)
+                                            })
+                                            .text_size(crate::typography::ui_rems(10.0))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(if urgent {
+                                                theme.warning
+                                            } else {
+                                                theme.accent
+                                            })
+                                            .child(chip),
                                     )
                                 }),
                         )

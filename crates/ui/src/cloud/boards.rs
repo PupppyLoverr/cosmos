@@ -124,13 +124,50 @@ impl KanbanPage {
                         .and_then(|c| c.title.clone())
                         .unwrap_or_else(|| run.id.clone()),
                     status: run.status,
+                    // Seat chip: provider mark + seat label — `Railway ·
+                    // trial`, `Boat · box`, `Local` for unbound sessions.
                     seat: view
                         .seat(&run.seat_id)
-                        .map(|s| s.config.label.clone())
+                        .map(|s| match s.config.kind {
+                            Some(kind) => format!("{} · {}", kind.chip(), s.config.label),
+                            None => s.config.label.clone(),
+                        })
                         .unwrap_or_else(|| run.seat_id.clone())
                         .into(),
                     harness: harness_mark(chat).into(),
                     elapsed: Some(format_elapsed(run.started_at, run.finished_at, now)),
+                });
+            }
+        }
+        // Drafts — chats bound to a seat that were never run. They have no
+        // ledger row yet, and the local pass below skips bound chats, so
+        // without this they'd be invisible on the board. Clicking opens the
+        // session; sending the first message starts the run (Draft →
+        // In progress).
+        if self.filter != KanbanFilter::LocalOnly
+            && let Some(view) = self.view.ready()
+        {
+            for chat in &state.chats {
+                if chat.archived || cloud_bound_has_run(&view.runs, &chat.id) {
+                    continue;
+                }
+                let Some(binding) = chat.cloud_seat.as_ref() else {
+                    continue;
+                };
+                let seat = view
+                    .seat(&binding.seat_id)
+                    .map(|s| match s.config.kind {
+                        Some(kind) => format!("{} · {}", kind.chip(), s.config.label),
+                        None => s.config.label.clone(),
+                    })
+                    .unwrap_or_else(|| binding.label.clone());
+                cards.push(KanbanCard {
+                    chat_id: chat.id.clone(),
+                    title: chat.title.clone().unwrap_or_else(|| "Draft".into()),
+                    status: CloudRunStatus::Queued,
+                    seat: seat.into(),
+                    harness: harness_mark(Some(chat)).into(),
+                    elapsed: None,
                 });
             }
         }
@@ -187,6 +224,10 @@ impl KanbanPage {
     }
 }
 
+fn cloud_bound_has_run(runs: &[zeron_proto::CloudRun], chat_id: &str) -> bool {
+    runs.iter().any(|r| r.chat_id == chat_id)
+}
+
 fn format_elapsed(
     started: chrono::DateTime<chrono::Utc>,
     finished: Option<chrono::DateTime<chrono::Utc>>,
@@ -218,6 +259,19 @@ impl Render for KanbanPage {
         let theme = Theme::of(cx).clone();
         let scrollbar = popover::rail(self, "kanban-scrollbar", &theme, cx);
         let cards = self.cards(cx);
+        // The spec's five columns: Draft | In progress | Waiting | Needs
+        // approval | Done — Error rides Done as a red card, Stopped rides
+        // Waiting (a paused run awaits its user).
+        const BOARD_COLUMNS: [(&str, &[CloudRunStatus]); 5] = [
+            ("Draft", &[CloudRunStatus::Queued]),
+            ("In progress", &[CloudRunStatus::Working]),
+            (
+                "Waiting",
+                &[CloudRunStatus::WaitingForUser, CloudRunStatus::Stopped],
+            ),
+            ("Needs approval", &[CloudRunStatus::NeedsApproval]),
+            ("Done", &[CloudRunStatus::Done, CloudRunStatus::Error]),
+        ];
         let mut columns = div()
             .flex()
             .flex_row()
@@ -225,14 +279,14 @@ impl Render for KanbanPage {
             .p(px(16.0))
             .flex_1()
             .min_w_0();
-        for status in CloudRunStatus::COLUMNS {
+        for (label, members) in BOARD_COLUMNS {
             let mut col = div()
                 .w(px(220.0))
                 .flex_none()
                 .flex()
                 .flex_col()
                 .gap(px(6.0));
-            let count = cards.iter().filter(|c| c.status == status).count();
+            let count = cards.iter().filter(|c| members.contains(&c.status)).count();
             col = col.child(
                 div()
                     .flex()
@@ -245,7 +299,7 @@ impl Render for KanbanPage {
                             .text_size(crate::typography::ui_rems(11.5))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.text_muted)
-                            .child(SharedString::from(status.label())),
+                            .child(SharedString::from(label)),
                     )
                     .child(
                         div()
@@ -254,8 +308,13 @@ impl Render for KanbanPage {
                             .child(SharedString::from(count.to_string())),
                     ),
             );
-            for (ix, card) in cards.iter().enumerate().filter(|(_, c)| c.status == status) {
+            for (ix, card) in cards
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| members.contains(&c.status))
+            {
                 let chat_id = card.chat_id.clone();
+                let errored = card.status == CloudRunStatus::Error;
                 let fade = SharedString::from(format!("kanban-card-{ix}"));
                 col = col.child(
                     div()
@@ -263,8 +322,12 @@ impl Render for KanbanPage {
                         .w_full()
                         .rounded(px(8.0))
                         .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.surface_card)
+                        .border_color(if errored { theme.danger } else { theme.border })
+                        .bg(if errored {
+                            theme.danger.opacity(0.08)
+                        } else {
+                            theme.surface_card
+                        })
                         .p(px(8.0))
                         .flex()
                         .flex_col()
@@ -617,10 +680,18 @@ impl AutomationsPage {
     }
 
     fn create_card(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        // Automations never target Railway trial seats — they die at the
+        // hour. Local + Boat + VPS are the honest choices.
         let seats: Vec<SeatRow> = self
             .view
             .ready()
-            .map(|v| v.seats.clone())
+            .map(|v| {
+                v.seats
+                    .iter()
+                    .filter(|s| !matches!(s.config.kind, Some(zeron_proto::CloudSeatKind::Railway)))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         let mut card = widgets::section_card(theme);
         card = card.child(

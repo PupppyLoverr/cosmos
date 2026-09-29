@@ -4823,6 +4823,10 @@ impl Shell {
                         this.pending_side_chat = true;
                         cx.notify();
                     }
+                    // The keep card's CTA lands on Settings → Cloud computer.
+                    crate::cloud::RailEvent::OpenCloudSettings => {
+                        this.open_settings(SettingsSection::CloudComputer, cx);
+                    }
                 },
             );
             self.cloud_rail_subs.insert(chat_id.clone(), sub);

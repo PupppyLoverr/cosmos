@@ -669,18 +669,39 @@ impl SessionsEngine {
                 binding.seat_id
             ))
         })?;
+        if seat.expired() {
+            return Err(EngineError::Other(
+                "this Railway trial seat's hour ended — claim it from the rail, or start a new trial seat".into(),
+            ));
+        }
         let capabilities = seat.capabilities();
-        if !capabilities.exec {
+        // Boat seats provision their sandbox lazily on first run — a saved
+        // token alone is enough to start (exec capability flips on once the
+        // box exists).
+        let boat_lazy = matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box))
+            && seat.box_id.is_none()
+            && store.box_token(&seat.id).is_some();
+        if !capabilities.exec && !boat_lazy {
             return Err(EngineError::Other(format!(
-                "seat `{}` ({}) has no exec surface — Files/Changes/PRs still work, but runs need an SSH seat or a provider endpoint",
+                "seat `{}` ({}) has no exec surface — Files/Changes/PRs still work, but runs need an SSH seat, a Railway trial, or a Boat token",
                 seat.label,
                 seat.kind.map(|k| k.label()).unwrap_or("unconfigured")
             )));
         }
+        // Boat runs ride the provider's integrated-agent `/prompt` surface —
+        // no seat-local harness command needed. SSH/Railway exec the seat's
+        // configured harness; Railway defaults to the preinstalled `claude`.
         let command = seat
             .harness_command
             .clone()
             .filter(|c| !c.trim().is_empty())
+            .or_else(|| {
+                matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Railway))
+                    .then(|| "claude -p".to_string())
+            })
+            .or_else(|| {
+                matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box)).then(|| String::new())
+            })
             .ok_or_else(|| {
                 EngineError::Other(
                     "this seat has no harness command — set one in Settings → Cloud computer"
@@ -1729,6 +1750,28 @@ async fn drive_remote_run(
         lock(&inner.runs).remove(&chat_id);
     };
 
+    let http = reqwest::Client::new();
+
+    // Boat seats ride the provider's integrated-agent surface (`/prompt` +
+    // `/events` + `/interrupt`): the coding agent runs ON the box even with
+    // the desktop closed — the 24/7 rule satisfied honestly.
+    if matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box)) {
+        drive_boat_run(
+            inner,
+            store,
+            http,
+            chat_id,
+            run_id,
+            seat,
+            prompt,
+            doc,
+            cancel_rx,
+            interrupt_token,
+        )
+        .await;
+        return;
+    }
+
     let env = store
         .cloud_env()
         .into_iter()
@@ -1774,7 +1817,15 @@ async fn drive_remote_run(
             crate::cloud::shell_word(&log_path),
             crate::cloud::shell_word(&pid_path),
         );
-        match crate::cloud::seat_exec(&seat, &launch, std::time::Duration::from_secs(30)).await {
+        match crate::cloud::seat_exec(
+            &http,
+            &store,
+            &seat,
+            &launch,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        {
             Ok(out) if out.code == 0 => {
                 let pid = out.stdout.trim().to_string();
                 store.update_run(&run_id, |run| {
@@ -1783,6 +1834,7 @@ async fn drive_remote_run(
                 });
                 tail_remote_log(
                     &inner,
+                    &http,
                     &store,
                     &chat_id,
                     &run_id,
@@ -1850,16 +1902,18 @@ async fn drive_remote_run(
             _ = cancel_rx.changed() => {
                 interrupted = true;
                 let _ = stream.child.kill().await;
-                // Best-effort remote kill so a hung harness can't linger.
+                // Best-effort remote kill so a hung harness can't linger —
+                // seat_exec routes to docker-exec (SSH) or direct ssh
+                // (Railway); the run-id marker matches the detached cmdline.
                 let marker = format!("pkill -f {}", crate::cloud::shell_word(&run_id));
-                if let Some(alias) = seat.ssh_alias.clone() {
-                    let _ = crate::cloud::ssh_exec(
-                        &alias,
-                        &format!("docker exec {} sh -lc {}", crate::cloud::shell_word(&seat.container_name()), crate::cloud::shell_word(&marker)),
-                        std::time::Duration::from_secs(10),
-                    )
-                    .await;
-                }
+                let _ = crate::cloud::seat_exec(
+                    &http,
+                    &store,
+                    &seat,
+                    &marker,
+                    std::time::Duration::from_secs(10),
+                )
+                .await;
                 break;
             }
             _ = interrupt_token.cancelled() => {
@@ -1945,10 +1999,266 @@ async fn drive_remote_run(
     }
 }
 
+/// Boat seats run the provider's integrated agent: provision (or wake) the
+/// sandbox, POST `/prompt`, then mirror `/events` into the transcript. The
+/// agent process lives on the box — closing this app doesn't kill the run,
+/// so `keeps_running` is honest, not the desktop-lifetime warning.
+async fn drive_boat_run(
+    inner: Arc<Inner>,
+    store: crate::cloud::CloudStore,
+    http: reqwest::Client,
+    chat_id: String,
+    run_id: String,
+    seat: crate::cloud::SeatConfig,
+    prompt: String,
+    doc: crate::doc_host::DocWriter,
+    cancel_rx: watch::Receiver<bool>,
+    interrupt_token: CancellationToken,
+) {
+    let finish =
+        |status: SessionStatus, run_status: zeron_proto::CloudRunStatus, error: Option<String>| {
+            inner.set_status(&chat_id, status, false);
+            store.update_run(&run_id, |run| {
+                run.status = run_status;
+                run.error = error;
+                run.finished_at = Some(Utc::now());
+            });
+            lock(&inner.runs).remove(&chat_id);
+        };
+    let fail = |e: String| {
+        write_remote_error(&doc, &inner.device_id, &e);
+        finish(
+            SessionStatus::Errored,
+            zeron_proto::CloudRunStatus::Error,
+            Some(e),
+        );
+    };
+
+    let Some(token) = store.box_token(&seat.id) else {
+        fail("this Boat seat has no token — set one in Settings → Cloud computer".into());
+        return;
+    };
+    let api = crate::boat::boat(&http, &token, seat.box_endpoint.as_deref());
+
+    // Ensure a usable sandbox: reuse the bound box (waking it if Sleeping),
+    // else provision one and bind its `bx_…` id onto the seat. A dead box
+    // falls through to a fresh create — the seat keeps working.
+    let box_id = match seat.box_id.clone() {
+        Some(id) => match api.sandbox(&id).await {
+            Ok(s) if s.usable() => Some(id),
+            Ok(s) if s.sleeping() => match api.resume(&id).await {
+                Ok(_) => Some(id),
+                Err(e) => {
+                    fail(format!("couldn't wake the Boat box: {e}"));
+                    return;
+                }
+            },
+            Ok(_) | Err(_) => None,
+        },
+        None => None,
+    };
+    let box_id = match box_id {
+        Some(id) => id,
+        None => {
+            let name = format!("cosmos-{}", &chat_id[..chat_id.len().min(8)]);
+            match api.create(&name, &run_id).await {
+                Ok(s) => match api.wait_ready(&s.id).await {
+                    Ok(s) => {
+                        let id = s.id.clone();
+                        store.update_seat(&seat.id, |seat| {
+                            seat.box_id = Some(id.clone());
+                            seat.ssh_endpoint = s.ssh_endpoint.clone();
+                            seat.preview_url = s.desktop_url.clone().or(seat.preview_url.clone());
+                        });
+                        id
+                    }
+                    Err(e) => {
+                        fail(format!("Boat box never came ready: {e}"));
+                        return;
+                    }
+                },
+                Err(e) => {
+                    fail(format!("couldn't provision a Boat box: {e}"));
+                    return;
+                }
+            }
+        }
+    };
+    store.update_run(&run_id, |run| {
+        run.remote_ref = Some(format!("boat:{box_id}"));
+    });
+
+    // Kick the integrated agent. The prompt response carries the
+    // conversation handle; events stream the transcript we mirror.
+    if let Err(e) = api.prompt(&box_id, "claude", &prompt, None).await {
+        fail(format!("Boat couldn't start the agent: {e}"));
+        return;
+    }
+
+    let entry_id = new_id();
+    let mut segment =
+        zeron_doc::SegmentWriter::begin(&doc, &entry_id, &inner.device_id, now_ms()).ok();
+    let mut text = String::new();
+    let mut cursor: Option<String> = None;
+    let mut idle_ticks = 0u32;
+    loop {
+        if *cancel_rx.borrow() || interrupt_token.is_cancelled() {
+            let _ = api.interrupt(&box_id).await;
+            if let Some(segment) = segment {
+                let _ = segment.finish(
+                    &[MessagePart::Text {
+                        id: "t0".into(),
+                        text: text.clone(),
+                    }],
+                    zeron_doc::MessageStatus::Aborted,
+                );
+            }
+            finish(
+                SessionStatus::Idle,
+                zeron_proto::CloudRunStatus::Stopped,
+                None,
+            );
+            return;
+        }
+        match api.events(&box_id, cursor.as_deref()).await {
+            Ok(v) => {
+                let items = v
+                    .get("events")
+                    .or_else(|| v.get("items"))
+                    .and_then(|e| e.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut grew = false;
+                let mut done = false;
+                for event in items {
+                    cursor = event
+                        .get("cursor")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string)
+                        .or(cursor);
+                    let kind = event
+                        .get("type")
+                        .or_else(|| event.get("kind"))
+                        .and_then(|k| k.as_str())
+                        .unwrap_or_default();
+                    let data = event.get("data").cloned().unwrap_or_default();
+                    match kind {
+                        // Assistant text deltas — mirror verbatim.
+                        "assistant" | "message" | "text" => {
+                            if let Some(t) = data
+                                .get("text")
+                                .or_else(|| data.get("delta"))
+                                .and_then(|t| t.as_str())
+                            {
+                                text.push_str(t);
+                                grew = true;
+                            }
+                        }
+                        // Tool lines keep the transcript honest without a
+                        // second surface.
+                        "tool" | "tool_use" | "tool_result" => {
+                            if let Some(t) = data
+                                .get("summary")
+                                .or_else(|| data.get("name"))
+                                .and_then(|t| t.as_str())
+                            {
+                                text.push_str(&format!("\n\n› {t}\n"));
+                                grew = true;
+                            }
+                        }
+                        "done" | "complete" | "finished" => done = true,
+                        "error" => {
+                            let msg = data
+                                .get("message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("the Boat agent errored")
+                                .to_string();
+                            if let Some(segment) = segment.take() {
+                                let _ = segment.finish(
+                                    &[MessagePart::Text {
+                                        id: "t0".into(),
+                                        text,
+                                    }],
+                                    zeron_doc::MessageStatus::Aborted,
+                                );
+                            }
+                            fail(msg);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(next) = v
+                    .get("nextCursor")
+                    .or_else(|| v.get("cursor"))
+                    .and_then(|c| c.as_str())
+                {
+                    cursor = Some(next.to_string());
+                }
+                if grew {
+                    if let Some(segment) = segment.as_mut() {
+                        let _ = segment.sync(&[MessagePart::Text {
+                            id: "t0".into(),
+                            text: text.clone(),
+                        }]);
+                    }
+                    store.update_run(&run_id, |run| run.mirrored_bytes = text.len() as u64);
+                    idle_ticks = 0;
+                } else {
+                    idle_ticks += 1;
+                }
+                if done {
+                    if let Some(segment) = segment.take() {
+                        let _ = segment.finish(
+                            &[MessagePart::Text {
+                                id: "t0".into(),
+                                text,
+                            }],
+                            zeron_doc::MessageStatus::Complete,
+                        );
+                    }
+                    finish(SessionStatus::Idle, zeron_proto::CloudRunStatus::Done, None);
+                    return;
+                }
+            }
+            Err(e) => {
+                // A dead box mid-run is terminal; a transient network error
+                // is not — keep polling for ~2 min before giving up.
+                idle_ticks += 1;
+                if api
+                    .sandbox(&box_id)
+                    .await
+                    .map(|s| s.dead())
+                    .unwrap_or(false)
+                {
+                    fail(format!("the Boat box died mid-run: {e}"));
+                    return;
+                }
+            }
+        }
+        // No events for ~10 min → the agent likely wedged; end honestly.
+        if idle_ticks > 300 {
+            if let Some(segment) = segment.take() {
+                let _ = segment.finish(
+                    &[MessagePart::Text {
+                        id: "t0".into(),
+                        text,
+                    }],
+                    zeron_doc::MessageStatus::Aborted,
+                );
+            }
+            fail("no agent events for 10 minutes — the run likely stalled on the box".into());
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// Tail a detached run's log on the seat, mirroring new bytes into the doc
 /// until the remote process exits (or the caller cancels).
 async fn tail_remote_log(
     inner: &Arc<Inner>,
+    http: &reqwest::Client,
     store: &crate::cloud::CloudStore,
     chat_id: &str,
     run_id: &str,
@@ -1988,7 +2298,9 @@ async fn tail_remote_log(
             mirrored + 1,
             crate::cloud::shell_word(log_path),
         );
-        match crate::cloud::seat_exec(seat, &cmd, std::time::Duration::from_secs(20)).await {
+        match crate::cloud::seat_exec(http, store, seat, &cmd, std::time::Duration::from_secs(20))
+            .await
+        {
             Ok(out) => {
                 let mut alive = false;
                 let mut chunk = String::new();

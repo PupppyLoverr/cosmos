@@ -332,6 +332,12 @@ pub mod methods {
     /// `{seatId, command}` → `{code, stdout, stderr}` — the Shell pane's
     /// non-interactive path (PTY attach rides the local terminal + `ssh`).
     pub const CLOUD_EXEC: &str = "CloudExec";
+    /// `{seatId?, query?}` → `{repos: [RepoHit], orgs: [String]}` — the
+    /// GitHub-agent repo picker; resolves the seat's PAT or the shared one.
+    pub const CLOUD_GITHUB_REPOS: &str = "CloudGitHubRepos";
+    /// `{pat}` → `{ok}` — verify + store the shared GitHub PAT (repo scope)
+    /// that the picker and every PAT-less GitHub seat fall back to.
+    pub const CLOUD_GITHUB_SAVE: &str = "CloudGitHubSave";
     /// `{seatId}` → `[PrRow]` (needs a bound repo + PAT).
     pub const CLOUD_GITHUB_PRS: &str = "CloudGitHubPrs";
     /// `{seatId, number}` → `PrDetail` (files + checks included).
@@ -345,8 +351,10 @@ pub mod methods {
     pub const CLOUD_AUTOMATION_SAVE: &str = "CloudAutomationSave";
     /// `{id}` → `{ok}`.
     pub const CLOUD_AUTOMATION_REMOVE: &str = "CloudAutomationRemove";
-    /// `{chatId, op: pause|resume|stop|destroy}` — seat-scoped control for
-    /// the bot bar; `stop` interrupts the live run on the host engine.
+    /// `{chatId, seatId?, op}` — seat/run control for the bot bar:
+    /// `pause|resume|stop|approve|destroy` on runs; `sleep|wake` manage the
+    /// Boat sandbox lifecycle; `markKeepPrompted` records the one-shot
+    /// "Keep this computer" card so it never re-asks.
     pub const CLOUD_SEAT_CONTROL: &str = "CloudSeatControl";
     /// `{seatId}` → `{command}` — the exact local shell line a Terminal pane
     /// spawns for an interactive seat shell (`ssh -tt …`), or an error.

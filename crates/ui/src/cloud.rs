@@ -57,6 +57,8 @@ pub struct CloudView {
     pub automations: Vec<CloudAutomation>,
     pub default_seat: Option<String>,
     pub runs: Vec<CloudRun>,
+    /// The shared GitHub PAT exists (the repo picker's token flag).
+    pub has_github_pat: bool,
 }
 
 impl CloudView {
@@ -76,10 +78,17 @@ impl CloudView {
     }
 
     /// A seat is startable when it has the credentials its kind needs.
+    /// Railway needs nothing but an unexpired hour (the user's ssh key IS the
+    /// trial identity); Boat needs only a token — the box provisions lazily.
     pub fn seat_ready(seat: &SeatRow) -> bool {
         match seat.config.kind {
             Some(CloudSeatKind::Ssh) => seat.config.ssh_alias.is_some(),
-            Some(CloudSeatKind::Box) => seat.has_box_token || seat.config.box_endpoint.is_some(),
+            Some(CloudSeatKind::Railway) => !seat.config.expired(),
+            Some(CloudSeatKind::Box) => {
+                seat.has_box_token
+                    || seat.config.box_endpoint.is_some()
+                    || seat.config.box_id.is_some()
+            }
             Some(CloudSeatKind::GitHub) => seat.config.repo.is_some() && seat.has_github_pat,
             None => false,
         }
@@ -115,6 +124,7 @@ pub(crate) fn seat_pane_icon(pane: CloudPane) -> &'static str {
 /// The green/red/sleeping dot used by the bot bar and seat rows.
 pub(crate) fn status_dot(theme: &Theme, probe: Option<&SeatProbe>) -> gpui::Stateful<gpui::Div> {
     let (color, label) = match probe {
+        Some(p) if p.sleeping => (theme.warning, "sleeping"),
         Some(p) if p.online => (theme.success, "online"),
         Some(_) => (theme.danger, "offline"),
         None => (theme.text_faint, "not probed"),
@@ -206,6 +216,8 @@ impl PrTab {
 /// existing right-pane host, never inside the rail itself.
 pub enum RailEvent {
     OpenSideChat,
+    /// "Attach Boat token" on the keep card → Settings → Cloud computer.
+    OpenCloudSettings,
 }
 
 impl gpui::EventEmitter<RailEvent> for CloudRail {}
@@ -249,9 +261,15 @@ pub struct CloudRail {
     /// The chat's session stamp at the last ledger refresh — the state
     /// observer reloads the run row only when this actually moves.
     session_stamp: Option<(SessionStatus, chrono::DateTime<chrono::Utc>)>,
+    /// One-shot bookkeeping for the "Keep this computer" card: `None` = the
+    /// seat was never asked, `Some(false)` = card visible, `Some(true)` =
+    /// marked prompted this session (persisted engine-side).
+    keep_prompted: Option<bool>,
     task: Option<Task<()>>,
     _input_sub: Subscription,
     _state_sub: Subscription,
+    /// Railway countdown ticker — 1s re-render while a deadline is live.
+    _countdown: Option<Task<()>>,
 }
 
 impl CloudRail {
@@ -314,10 +332,38 @@ impl CloudRail {
             control_busy: false,
             control_error: None,
             session_stamp: None,
+            keep_prompted: None,
             task: None,
             _input_sub: input_sub,
             _state_sub: state_sub,
+            _countdown: None,
         };
+        // Live countdown: while a Railway deadline is ahead of the clock the
+        // rail re-renders once a second so the chip/banner stay honest.
+        if rail.binding.expires_at.is_some() {
+            rail._countdown = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(1))
+                        .await;
+                    let alive = this
+                        .update(cx, |rail, cx| {
+                            let left = rail
+                                .binding
+                                .expires_at
+                                .map(|at| at.signed_duration_since(chrono::Utc::now()))
+                                .map(|d| d.num_seconds())
+                                .unwrap_or(-1);
+                            cx.notify();
+                            left > 0
+                        })
+                        .unwrap_or(false);
+                    if !alive {
+                        break;
+                    }
+                }
+            }));
+        }
         rail.load_seat(cx);
         rail.ensure_loaded(cx);
         rail
@@ -431,6 +477,30 @@ impl CloudRail {
             })
             .ok();
         }));
+    }
+
+    /// Both keep-card answers land here — the engine stamps
+    /// `keep_prompted_at` so the card never asks twice, on any device.
+    fn mark_keep_prompted(&mut self, cx: &mut Context<Self>) {
+        self.keep_prompted = Some(true);
+        if let Some(engine) = self.engine(cx) {
+            let seat_id = self.binding.seat_id.clone();
+            self.task = Some(cx.spawn(async move |this, cx| {
+                let _ = engine
+                    .client()
+                    .call(
+                        methods::CLOUD_SEAT_CONTROL,
+                        serde_json::json!({
+                            "chatId": "",
+                            "seatId": seat_id,
+                            "op": "markKeepPrompted",
+                        }),
+                    )
+                    .await;
+                this.update(cx, |_, cx| cx.notify()).ok();
+            }));
+        }
+        cx.notify();
     }
 
     // -- Files --
@@ -2800,7 +2870,32 @@ impl CloudRail {
             .child(widgets::badge(theme, model))
             .when_some(run_status, |el, status| {
                 el.child(widgets::badge(theme, status.label()))
-            });
+            })
+            // The Railway countdown chip — the spec's required live MM:SS.
+            // Reads the persisted binding deadline so every device agrees.
+            .when_some(
+                self.binding
+                    .expires_at
+                    .map(|at| at.signed_duration_since(chrono::Utc::now())),
+                |el, left| {
+                    let secs = left.num_seconds().max(0);
+                    let text = format!("{:02}:{:02}", secs / 60, secs % 60);
+                    el.child(
+                        div()
+                            .id("rail-countdown")
+                            .flex_none()
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded(px(6.0))
+                            .bg(theme.warning.opacity(0.15))
+                            .text_size(crate::typography::ui_rems(10.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.warning)
+                            .child(text)
+                            .tooltip(widgets::text_tooltip("trial time left")),
+                    )
+                },
+            );
         // Controls — each rides CLOUD_SEAT_CONTROL; never decorative.
         let mut controls = div().flex_none().flex().flex_row().gap(px(2.0));
         let small_btn = |id: &'static str, label: &'static str, theme: &Theme| {
@@ -2850,11 +2945,36 @@ impl CloudRail {
             }
             _ => {}
         }
-        controls =
-            controls
-                .child(small_btn("preview", "Preview", theme).on_click(
-                    cx.listener(|this, _, _, cx| this.set_pane(CloudPane::Computer, cx)),
-                ));
+        // Boat lifecycle rides the same control RPC — Sleep archives the box
+        // (billing off); Wake resumes it. Only meaningful for a Box seat.
+        let is_boat = self
+            .seat
+            .ready()
+            .is_some_and(|s| s.config.kind == Some(CloudSeatKind::Box));
+        let sleeping = probe.as_ref().is_some_and(|p| p.sleeping);
+        if is_boat && self.seat.ready().is_some_and(|s| s.config.box_id.is_some()) {
+            let (id, label, op) = if sleeping {
+                ("wake", "Wake", "wake")
+            } else {
+                ("sleep", "Sleep", "sleep")
+            };
+            controls = controls.child(
+                small_btn(id, label, theme)
+                    .when(busy, |el| el.opacity(0.5))
+                    .on_click(cx.listener(move |this, _, _, cx| this.seat_control(op, cx))),
+            );
+        }
+        // Open preview: a provider-stamped URL (Railway *.up.railway.app,
+        // Boat desktop) opens in the user's browser; else the Computer pane
+        // carries the last screenshot.
+        let preview_url = self.seat.ready().and_then(|s| s.config.preview_url.clone());
+        controls = controls.child(match preview_url {
+            Some(url) => {
+                small_btn("preview", "Preview", theme).on_click(move |_, _, cx| cx.open_url(&url))
+            }
+            None => small_btn("preview", "Preview", theme)
+                .on_click(cx.listener(|this, _, _, cx| this.set_pane(CloudPane::Computer, cx))),
+        });
         let destroy = if self.confirm_destroy {
             small_btn("destroy-yes", "Destroy?", theme)
                 .text_color(theme.danger)
@@ -2934,7 +3054,39 @@ impl Render for CloudRail {
                 el.child(self.render_pane_menu(&theme, cx))
             });
         let bot_bar = self.render_bot_bar(&theme, cx);
-        let not_persistent = !self.capabilities().keeps_running;
+        let seat_row = self.seat.ready().cloned();
+        let is_railway = seat_row
+            .as_ref()
+            .is_some_and(|s| s.config.kind == Some(CloudSeatKind::Railway))
+            || self.binding.kind == CloudSeatKind::Railway;
+        let railway_expired = is_railway
+            && self
+                .binding
+                .expires_at
+                .map(|at| at <= chrono::Utc::now())
+                .unwrap_or(false);
+        let is_boat = seat_row
+            .as_ref()
+            .is_some_and(|s| s.config.kind == Some(CloudSeatKind::Box));
+        let sleeping = seat_row
+            .as_ref()
+            .and_then(|s| s.config.last_probe.as_ref())
+            .is_some_and(|p| p.sleeping);
+        let claim_url = seat_row.as_ref().and_then(|s| s.config.claim_url.clone());
+        let not_persistent = !self.capabilities().keeps_running && !sleeping && !railway_expired;
+        // The "Keep this computer" card shows once: a Railway (or
+        // desk-bound) seat that finished a run and has never been asked.
+        let show_keep_prompt = is_railway
+            && self.run.as_ref().is_some_and(|r| {
+                matches!(
+                    r.status,
+                    CloudRunStatus::Done | CloudRunStatus::Stopped | CloudRunStatus::Error
+                )
+            })
+            && self.keep_prompted.is_none()
+            && seat_row
+                .as_ref()
+                .is_some_and(|s| s.config.keep_prompted_at.is_none());
         let mut col = div()
             .size_full()
             .flex()
@@ -2952,6 +3104,162 @@ impl Render for CloudRail {
                         .text_size(crate::typography::ui_rems(10.5))
                         .text_color(theme.warning)
                         .child("This seat runs only while the desktop app is open"),
+                )
+            })
+            // Railway's one-line death sentence + the claim escape hatch.
+            .when(is_railway && !railway_expired, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(theme.warning)
+                                .child(
+                                    "This seat dies when the hour ends unless you claim it or attach Boat",
+                                ),
+                        )
+                        .when_some(claim_url.clone(), |el, url| {
+                            el.child(
+                                div()
+                                    .id("rail-claim")
+                                    .flex_none()
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .rounded(px(5.0))
+                                    .text_size(crate::typography::ui_rems(10.5))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.accent)
+                                    .bg(crate::motion::hover_blend(
+                                        "rail-claim",
+                                        gpui::transparent_black(),
+                                        theme.element_hover,
+                                    ))
+                                    .on_hover(crate::motion::hover_listener("rail-claim"))
+                                    .cursor_pointer()
+                                    .child("Claim")
+                                    .on_click(move |_, _, cx| cx.open_url(&url)),
+                            )
+                        }),
+                )
+            })
+            .when(railway_expired, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .text_size(crate::typography::ui_rems(10.5))
+                        .text_color(theme.danger)
+                        .child(
+                            "Trial ended — claim the VM from the link or start a new seat",
+                        ),
+                )
+            })
+            .when(is_boat && sleeping, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .text_size(crate::typography::ui_rems(10.5))
+                        .text_color(theme.warning)
+                        .child("Boat box is sleeping — billing off; Wake to resume"),
+                )
+            })
+            // The one-shot "Keep this computer" card — both answers stamp
+            // `markKeepPrompted` so it never asks twice.
+            .when(show_keep_prompt, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .px(px(10.0))
+                        .py(px(8.0))
+                        .m(px(8.0))
+                        .rounded(px(10.0))
+                        .border_1()
+                        .border_color(theme.accent.opacity(0.4))
+                        .bg(theme.accent.opacity(0.08))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child("Keep this computer?"),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(theme.text_muted)
+                                .child(
+                                    "Attach a Boat token to keep a persistent cloud PC — the trial's hour is almost up.",
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .id("keep-yes")
+                                        .px(px(8.0))
+                                        .py(px(3.0))
+                                        .rounded(px(5.0))
+                                        .text_size(crate::typography::ui_rems(10.5))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme.accent)
+                                        .bg(crate::motion::hover_blend(
+                                            "keep-yes",
+                                            gpui::transparent_black(),
+                                            theme.element_hover,
+                                        ))
+                                        .on_hover(crate::motion::hover_listener("keep-yes"))
+                                        .cursor_pointer()
+                                        .child("Attach Boat token")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.mark_keep_prompted(cx);
+                                            cx.emit(RailEvent::OpenCloudSettings);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("keep-no")
+                                        .px(px(8.0))
+                                        .py(px(3.0))
+                                        .rounded(px(5.0))
+                                        .text_size(crate::typography::ui_rems(10.5))
+                                        .text_color(theme.text_muted)
+                                        .bg(crate::motion::hover_blend(
+                                            "keep-no",
+                                            gpui::transparent_black(),
+                                            theme.element_hover,
+                                        ))
+                                        .on_hover(crate::motion::hover_listener("keep-no"))
+                                        .cursor_pointer()
+                                        .child("Not now")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.mark_keep_prompted(cx);
+                                        })),
+                                ),
+                        ),
                 )
             })
             .when_some(self.control_error.clone(), |el, err| {

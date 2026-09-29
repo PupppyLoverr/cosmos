@@ -9504,7 +9504,81 @@ impl Composer {
             model_label: self
                 .cloud_view(cx)
                 .map(|view| view.cloud_model_label().to_string()),
+            expires_at: seat.config.expires_at,
         })
+    }
+
+    /// One-click trial on-ramp: create a Railway seat row, provision the VM
+    /// via `ssh railway.new` (the probe stamps deadline/claim/preview), then
+    /// pick it — the send path just sees a bound seat.
+    fn start_railway_trial(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let seat_id = format!("seat-{}", uuid::Uuid::new_v4().simple());
+        cx.spawn(async move |this, cx| {
+            let saved = engine
+                .client()
+                .call(
+                    zeron_rpc::methods::CLOUD_SAVE_SEAT,
+                    serde_json::json!({
+                        "seat": {
+                            "id": seat_id,
+                            "kind": zeron_proto::CloudSeatKind::Railway,
+                            "label": "Railway trial",
+                            // A trial VM dies at the hour regardless — the
+                            // detached flag stays honest about what survives
+                            // the desktop closing.
+                            "detached": true,
+                        },
+                        "secrets": {},
+                    }),
+                )
+                .await;
+            if let Err(err) = saved {
+                tracing::warn!(error = %err, "railway trial seat save failed");
+                return;
+            }
+            // The probe IS the provisioning handshake — it can take tens of
+            // seconds while Railway brings the VM up.
+            let probe = engine
+                .client()
+                .call(
+                    zeron_rpc::methods::CLOUD_PROBE_SEAT,
+                    serde_json::json!({ "seatId": seat_id }),
+                )
+                .await;
+            // Re-read the view so the picked row carries the stamped
+            // deadline/capabilities (the shared refresh settles later).
+            let view = engine
+                .client()
+                .call(zeron_rpc::methods::CLOUD_GET_CONFIG, serde_json::json!({}))
+                .await
+                .ok()
+                .and_then(|v| serde_json::from_value::<crate::cloud::CloudView>(v).ok());
+            this.update(cx, |composer, cx| {
+                composer.state.update(cx, |state, cx| {
+                    state.refresh_cloud(None, cx);
+                });
+                match (probe, view) {
+                    (Ok(_), Some(view)) => {
+                        if let Some(row) = view.seats.iter().find(|s| s.config.id == seat_id) {
+                            composer.seat_pick = Some(row.clone());
+                        }
+                    }
+                    (Err(err), _) => {
+                        // Rate-limit/region-full errors surface verbatim —
+                        // the spec's "visible errors, no retry-loop" rule.
+                        tracing::warn!(error = %err, "railway trial provision failed");
+                        crate::notify::post("Railway trial couldn't start", &err.to_string(), None);
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The seat chip + menu — the new-session canvas's first destination
@@ -9684,10 +9758,53 @@ impl Composer {
                     cx.notify();
                 }))
         };
-        if cloud_seats.peek().is_some() {
+        // Railway is the on-ramp for EVERY user — the menu offers a trial
+        // seat even before one exists (probe provisions it via
+        // `ssh railway.new` under the user's own key). An unexpired trial
+        // seat already in the list covers this; the row hides then.
+        let live_trial = seats.iter().any(|s| {
+            s.config.kind == Some(zeron_proto::CloudSeatKind::Railway) && !s.config.expired()
+        });
+        if cloud_seats.peek().is_some() || !live_trial {
             menu = menu
                 .child(popover::menu_separator())
                 .child(popover::menu_heading(&theme, "Cloud seat"));
+            if !live_trial {
+                menu = menu.child(
+                    popover::menu_row(&theme, false, "seat-menu-railway")
+                        .id("seat-menu-railway")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .cursor_pointer()
+                        .child(
+                            icon(icons::CLOUD)
+                                .size(px(13.0))
+                                .flex_none()
+                                .text_color(theme.accent),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(div().truncate().child("Railway trial"))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(crate::typography::ui_rems(9.5))
+                                        .text_color(theme.text_faint)
+                                        .child("60-minute free seat — your ssh key"),
+                                ),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.seat_menu = false;
+                            this.start_railway_trial(cx);
+                        })),
+                );
+            }
             for (ix, seat) in cloud_seats.enumerate() {
                 menu = menu.child(seat_row(seat, ix, "cloud", &theme, cx));
             }

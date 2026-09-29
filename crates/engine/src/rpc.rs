@@ -3935,6 +3935,8 @@ impl RpcService for EngineRpc {
                     .seat(&p.seat_id)
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
                 let out = crate::cloud::seat_exec(
+                    &self.http,
+                    &cloud,
                     &seat,
                     &p.command,
                     std::time::Duration::from_secs(p.timeout_secs.unwrap_or(120).min(600)),
@@ -4053,6 +4055,15 @@ impl RpcService for EngineRpc {
                 let cloud = self.cloud()?.clone();
                 let automation: zeron_proto::CloudAutomation = serde_json::from_value(p.automation)
                     .map_err(|e| RpcError::BadParams(e.to_string()))?;
+                // Trial seats die at the hour — automations can never bind
+                // to one, no matter what the client sends.
+                if let Some(seat) = automation.seat_id.as_deref().and_then(|id| cloud.seat(id))
+                    && seat.kind == Some(zeron_proto::CloudSeatKind::Railway)
+                {
+                    return Err(RpcError::Failed(
+                        "automations can't target a Railway trial — pick a Boat, VPS, or local seat".into(),
+                    ));
+                }
                 // Stamp next_run_at when it's unset so the scheduler picks the
                 // row up without waiting for a restart.
                 let mut automation = automation;
@@ -4116,6 +4127,8 @@ impl RpcService for EngineRpc {
                             .unwrap_or_else(|| "agent".into());
                         let prog = command.split_whitespace().next().unwrap_or("agent");
                         let out = crate::cloud::seat_exec(
+                            &self.http,
+                            &cloud,
                             &seat,
                             &format!("pkill {signal} -x {prog} 2>/dev/null || true"),
                             std::time::Duration::from_secs(10),
@@ -4175,6 +4188,108 @@ impl RpcService for EngineRpc {
                             )
                             .await;
                         }
+                        // Boat destroy deletes the sandbox for real —
+                        // billing ends and the seat unbinds so the next run
+                        // provisions a fresh box.
+                        if matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box))
+                            && let (Some(token), Some(box_id)) =
+                                (cloud.box_token(&seat.id), seat.box_id.clone())
+                        {
+                            let api =
+                                crate::boat::boat(&self.http, &token, seat.box_endpoint.as_deref());
+                            let _ = api.destroy(&box_id).await;
+                            cloud.update_seat(&seat.id, |seat| {
+                                seat.box_id = None;
+                                seat.ssh_endpoint = None;
+                            });
+                        }
+                    }
+                    // Boat "Stop" (seat level) — snapshot & archive: billing
+                    // off, resumable. The spec's hard rule: never leave a
+                    // Boat box running after Stop.
+                    "sleep" => {
+                        let seat_id = p
+                            .seat_id
+                            .clone()
+                            .or_else(|| cloud.run_for_chat(&p.chat_id).map(|r| r.seat_id.clone()))
+                            .ok_or_else(|| RpcError::BadParams("sleep needs seatId".into()))?;
+                        let seat = cloud
+                            .seat(&seat_id)
+                            .ok_or_else(|| RpcError::Failed(format!("no such seat: {seat_id}")))?;
+                        match seat.kind {
+                            Some(zeron_proto::CloudSeatKind::Box) => {
+                                let token = cloud.box_token(&seat.id).ok_or_else(|| {
+                                    RpcError::Failed("seat has no Boat token".into())
+                                })?;
+                                let box_id = seat.box_id.clone().ok_or_else(|| {
+                                    RpcError::Failed("seat has no sandbox yet".into())
+                                })?;
+                                let _ = self.sessions.interrupt(&p.chat_id).await;
+                                crate::boat::boat(&self.http, &token, seat.box_endpoint.as_deref())
+                                    .stop(&box_id)
+                                    .await
+                                    .map_err(RpcError::Failed)?;
+                                for run in cloud.runs() {
+                                    if run.seat_id == seat_id
+                                        && matches!(
+                                            run.status,
+                                            zeron_proto::CloudRunStatus::Working
+                                                | zeron_proto::CloudRunStatus::Queued
+                                        )
+                                    {
+                                        cloud.update_run(&run.id, |r| {
+                                            r.status = zeron_proto::CloudRunStatus::Stopped;
+                                            r.finished_at = Some(Utc::now());
+                                        });
+                                    }
+                                }
+                            }
+                            _ => {
+                                return Err(RpcError::Failed(
+                                    "sleep is only meaningful for Boat seats".into(),
+                                ));
+                            }
+                        }
+                    }
+                    // Wake a sleeping Boat sandbox — Resume on the bot bar.
+                    "wake" => {
+                        let seat_id = p
+                            .seat_id
+                            .clone()
+                            .ok_or_else(|| RpcError::BadParams("wake needs seatId".into()))?;
+                        let seat = cloud
+                            .seat(&seat_id)
+                            .ok_or_else(|| RpcError::Failed(format!("no such seat: {seat_id}")))?;
+                        match seat.kind {
+                            Some(zeron_proto::CloudSeatKind::Box) => {
+                                let token = cloud.box_token(&seat.id).ok_or_else(|| {
+                                    RpcError::Failed("seat has no Boat token".into())
+                                })?;
+                                let box_id = seat.box_id.clone().ok_or_else(|| {
+                                    RpcError::Failed("seat has no sandbox yet".into())
+                                })?;
+                                crate::boat::boat(&self.http, &token, seat.box_endpoint.as_deref())
+                                    .resume(&box_id)
+                                    .await
+                                    .map_err(RpcError::Failed)?;
+                            }
+                            _ => {
+                                return Err(RpcError::Failed(
+                                    "wake is only meaningful for Boat seats".into(),
+                                ));
+                            }
+                        }
+                    }
+                    // The one-shot "Keep this computer (Boat token)" card —
+                    // once shown it's never re-asked, whichever way the user
+                    // answered.
+                    "markKeepPrompted" => {
+                        let seat_id = p.seat_id.clone().ok_or_else(|| {
+                            RpcError::BadParams("markKeepPrompted needs seatId".into())
+                        })?;
+                        cloud.update_seat(&seat_id, |seat| {
+                            seat.keep_prompted_at = Some(Utc::now());
+                        });
                     }
                     other => {
                         return Err(RpcError::BadParams(format!(
@@ -4182,6 +4297,52 @@ impl RpcService for EngineRpc {
                         )));
                     }
                 }
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLOUD_GITHUB_REPOS => {
+                #[derive(Default, serde::Deserialize)]
+                #[serde(rename_all = "camelCase", default)]
+                struct ReposParams {
+                    seat_id: Option<String>,
+                    query: Option<String>,
+                }
+                let p: ReposParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                // PAT resolution order: the named seat's own key, then the
+                // shared PAT — the picker's "existing GitHub integration".
+                let pat = p
+                    .seat_id
+                    .as_deref()
+                    .and_then(|id| cloud.github_pat(id))
+                    .or_else(|| cloud.github_pat(crate::cloud::CloudStore::SHARED_GITHUB_KEY))
+                    .ok_or_else(|| {
+                        RpcError::Failed(
+                            "no GitHub token yet — add a PAT in Settings → Cloud computer".into(),
+                        )
+                    })?;
+                let gh = crate::cloud::github(&self.http, &pat);
+                let (repos, orgs) = tokio::join!(gh.repos(p.query.as_deref()), gh.orgs());
+                RpcReply::value(&serde_json::json!({
+                    "repos": repos.map_err(RpcError::Failed)?,
+                    "orgs": orgs.unwrap_or_default(),
+                }))
+            }
+            methods::CLOUD_GITHUB_SAVE => {
+                #[derive(Default, serde::Deserialize)]
+                #[serde(rename_all = "camelCase", default)]
+                struct SaveParams {
+                    pat: String,
+                }
+                let p: SaveParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                // Verify first — the settings rule is save-only-on-success.
+                let gh = crate::cloud::github(&self.http, p.pat.trim());
+                gh.viewer().await.map_err(RpcError::Failed)?;
+                cloud.set_seat_token(
+                    crate::cloud::CloudStore::SHARED_GITHUB_KEY,
+                    "githubPat",
+                    Some(p.pat.trim().to_string()),
+                );
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::CLOUD_SSH_COMMAND => {
@@ -4207,8 +4368,41 @@ impl RpcService for EngineRpc {
                             )
                         }))
                     }
+                    // Railway: the trial VM *is* the ssh target — `ssh -tt`
+                    // straight to railway.new lands in the workspace shell.
+                    Some(zeron_proto::CloudSeatKind::Railway) => {
+                        if seat.expired() {
+                            return Err(RpcError::Failed(
+                                "this trial seat's hour ended — claim it or start a new one".into(),
+                            ));
+                        }
+                        RpcReply::value(&serde_json::json!({
+                            "command": format!(
+                                "ssh -tt {} sh -lc {}",
+                                crate::railway::RAILWAY_HOST,
+                                crate::cloud::shell_word(&format!("cd {} && exec bash", seat.workspace()))
+                            )
+                        }))
+                    }
+                    // Boat: the sandbox's provider-minted sshEndpoint, when
+                    // the probe surfaced one (registered key required).
+                    Some(zeron_proto::CloudSeatKind::Box) => {
+                        let endpoint = seat.ssh_endpoint.clone().ok_or_else(|| {
+                            RpcError::Failed(
+                                "this Boat box has no SSH endpoint yet — run once or re-probe"
+                                    .into(),
+                            )
+                        })?;
+                        RpcReply::value(&serde_json::json!({
+                            "command": format!(
+                                "ssh -tt {} sh -lc {}",
+                                endpoint,
+                                crate::cloud::shell_word(&format!("cd {} && exec bash", seat.workspace()))
+                            )
+                        }))
+                    }
                     _ => Err(RpcError::Failed(
-                        "interactive shell needs an SSH seat".into(),
+                        "interactive shell needs an SSH, Railway, or Boat seat".into(),
                     )),
                 }
             }

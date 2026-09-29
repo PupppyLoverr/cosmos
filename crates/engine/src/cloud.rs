@@ -80,6 +80,30 @@ pub struct SeatConfig {
     /// the transcript backfills on reconnect.
     #[serde(default)]
     pub detached: bool,
+    /// Boat provider sandbox id (`bx_…`) once a box exists — distinct from the
+    /// seat's own id; `None` until the first run/probe creates one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_id: Option<String>,
+    /// Public `host:port` the provider stamped for direct SSH (Boat
+    /// `sshEndpoint`); enables the Shell pane's real PTY command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_endpoint: Option<String>,
+    /// Railway trial deadline — the seat dies here (60-minute build window);
+    /// the header chip and banner count down to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Railway's "keep it" link (`railway.com/ssh-signup?code=…`) — opens in
+    /// the user's browser, never embedded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_url: Option<String>,
+    /// A URL the seat serves for previews (Railway's `*.up.railway.app`
+    /// preview; Boat's hosted-port URL) — the Open-preview action's target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
+    /// When the seat's own keep-prompt was last dismissed ("Keep this
+    /// computer" → Boat) — persists "asked once" across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_prompted_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_probe: Option<SeatProbe>,
 }
@@ -102,9 +126,33 @@ impl SeatConfig {
             .unwrap_or_else(|| "/workspace".to_string())
     }
 
+    /// A Railway trial seat past its 60-minute build window — the seat is
+    /// dead (or in the 24h claim grace); runs must not dispatch to it.
+    pub fn expired(&self) -> bool {
+        self.kind == Some(CloudSeatKind::Railway)
+            && self
+                .expires_at
+                .is_some_and(|deadline| deadline <= Utc::now())
+    }
+
     /// The seat's honest capability surface — every pane gates on this.
     pub fn capabilities(&self) -> SeatCapabilities {
         match self.kind {
+            Some(CloudSeatKind::Railway) => {
+                let alive = self.ssh_alias.is_some() && !self.expired();
+                SeatCapabilities {
+                    exec: alive,
+                    shell: alive,
+                    files: alive,
+                    git: alive,
+                    pull_requests: self.repo.is_some(),
+                    computer: self.cua_endpoint.is_some(),
+                    simulator: false,
+                    // Detached (`nohup`) runs outlive the app — bounded by
+                    // the trial's own expiry, which the countdown covers.
+                    keeps_running: alive && self.detached,
+                }
+            }
             Some(CloudSeatKind::Ssh) => SeatCapabilities {
                 exec: self.ssh_alias.is_some(),
                 shell: self.ssh_alias.is_some(),
@@ -127,13 +175,17 @@ impl SeatConfig {
                 keeps_running: true,
             },
             Some(CloudSeatKind::Box) => SeatCapabilities {
-                exec: self.box_endpoint.is_some(),
-                shell: false,
-                files: self.box_endpoint.is_some(),
-                git: self.box_endpoint.is_some(),
+                // Real exec once a sandbox exists (`/commands`); the token
+                // alone is enough for the first run to provision one.
+                exec: self.box_id.is_some(),
+                // Direct ssh lands on the sandbox once the provider stamps an
+                // endpoint; otherwise the Shell pane is a command log.
+                shell: self.ssh_endpoint.is_some(),
+                files: self.box_id.is_some(),
+                git: self.box_id.is_some(),
                 pull_requests: self.repo.is_some(),
                 computer: self.cua_endpoint.is_some(),
-                simulator: self.simulator_endpoint.is_some(),
+                simulator: false,
                 // A hosted box outlives the desktop by definition.
                 keeps_running: true,
             },
@@ -372,15 +424,25 @@ impl CloudStore {
         self.persist_keys();
     }
 
+    /// The shared GitHub PAT lives under a reserved seat key — "the existing
+    /// GitHub integration" the repo picker + GitHub seats fall back to.
+    /// Never serialized beyond the keys file.
+    pub const SHARED_GITHUB_KEY: &'static str = "_github";
+
     pub fn github_pat(&self, seat_id: &str) -> Option<String> {
-        self.inner
-            .state
-            .read()
-            .unwrap()
+        let state = self.inner.state.read().unwrap();
+        state
             .keys
             .seat_tokens
             .get(seat_id)
             .and_then(|s| s.github_pat.clone())
+            .or_else(|| {
+                state
+                    .keys
+                    .seat_tokens
+                    .get(Self::SHARED_GITHUB_KEY)
+                    .and_then(|s| s.github_pat.clone())
+            })
     }
 
     pub fn box_token(&self, seat_id: &str) -> Option<String> {
@@ -417,9 +479,23 @@ impl CloudStore {
             .cloned();
         match field {
             "box" => secrets.and_then(|s| s.box_token).is_some(),
-            "github" => secrets.and_then(|s| s.github_pat).is_some(),
+            "github" => {
+                secrets.and_then(|s| s.github_pat.clone()).is_some()
+                    || self.github_pat_shared().is_some()
+            }
             _ => false,
         }
+    }
+
+    fn github_pat_shared(&self) -> Option<String> {
+        self.inner
+            .state
+            .read()
+            .unwrap()
+            .keys
+            .seat_tokens
+            .get(Self::SHARED_GITHUB_KEY)
+            .and_then(|s| s.github_pat.clone())
     }
 
     // ── providers ────────────────────────────────────────────────────────
@@ -661,6 +737,7 @@ impl CloudStore {
                 serde_json::to_value(p).unwrap_or_default()
             })
             .collect();
+        let has_shared_github = self.github_pat_shared().is_some();
         drop(state);
         serde_json::json!({
             "seats": seats,
@@ -668,7 +745,21 @@ impl CloudStore {
             "automations": self.automations(),
             "defaultSeat": self.default_seat().map(|s| s.id),
             "runs": self.runs(),
+            // Whether the shared GitHub PAT exists — the repo picker's
+            // "token present" flag (never the token itself).
+            "hasGithubPat": has_shared_github,
         })
+    }
+
+    /// Persist a mutation on one seat's config (probe folds, keep-prompt
+    /// stamps, box-id binding) without touching its secrets.
+    pub fn update_seat(&self, seat_id: &str, f: impl FnOnce(&mut SeatConfig)) {
+        let mut state = self.inner.state.write().unwrap();
+        if let Some(seat) = state.config.seats.iter_mut().find(|s| s.id == seat_id) {
+            f(seat);
+        }
+        drop(state);
+        self.persist_config();
     }
 }
 
@@ -757,11 +848,34 @@ pub async fn probe_seat(
         image_digest: None,
         controllable: false,
         keeps_running: false,
+        sleeping: false,
         probed_at: Utc::now(),
     };
     let capabilities = seat.capabilities();
     probe.keeps_running = capabilities.keeps_running;
     match seat.kind {
+        Some(CloudSeatKind::Railway) => {
+            if seat.expired() {
+                probe.detail = Some("trial hour ended — claim the box or start a new trial".into());
+                return probe;
+            }
+            match crate::railway::probe().await {
+                Ok(trial) => {
+                    probe.online = true;
+                    probe.detail = trial.detail.or_else(|| Some("railway.new trial VM".into()));
+                    // A fresh manifest can extend or clarify the deadline and
+                    // claim link — fold them into the stored seat.
+                    if trial.expires_at.is_some() || trial.claim_url.is_some() {
+                        let mut seat = seat.clone();
+                        seat.expires_at = trial.expires_at.or(seat.expires_at);
+                        seat.claim_url = trial.claim_url.or(seat.claim_url);
+                        seat.preview_url = trial.preview_url.or(seat.preview_url);
+                        store.save_seat(seat);
+                    }
+                }
+                Err(e) => probe.detail = Some(e),
+            }
+        }
         Some(CloudSeatKind::Ssh) => {
             let Some(alias) = seat.ssh_alias.clone() else {
                 probe.detail = Some("no SSH alias configured".into());
@@ -818,32 +932,83 @@ pub async fn probe_seat(
         }
         Some(CloudSeatKind::Box) => {
             let Some(token) = store.box_token(&seat.id) else {
-                probe.detail = Some("no Box token configured".into());
+                probe.detail = Some("no Boat token configured".into());
                 return probe;
             };
-            match seat.box_endpoint.clone() {
-                Some(endpoint) => {
-                    let url = format!("{}/healthz", endpoint.trim_end_matches('/'));
-                    match http
-                        .get(&url)
-                        .bearer_auth(&token)
-                        .timeout(PROBE_TIMEOUT)
-                        .send()
-                        .await
-                    {
-                        Ok(r) if r.status().is_success() => {
-                            probe.online = true;
-                            probe.detail = Some("box online".into());
+            let client = crate::boat::boat(http, &token, seat.box_endpoint.as_deref());
+            match seat.box_id.clone() {
+                // Bound box: its state machine IS the health signal —
+                // ready/idle/running = online, archived = sleeping.
+                Some(box_id) => match client.sandbox(&box_id).await {
+                    Ok(sandbox) => {
+                        probe.sleeping = sandbox.sleeping();
+                        probe.online = sandbox.usable();
+                        probe.detail = Some(match sandbox.state.as_str() {
+                            "archived" | "archiving" => "sleeping — billing off".into(),
+                            "provisioning" | "init" | "cloning" => "provisioning…".into(),
+                            "error" | "cancelled" => {
+                                sandbox.error.clone().unwrap_or_else(|| "box failed".into())
+                            }
+                            state => format!("{state} — {}", sandbox.name),
+                        });
+                        // Stale fields the provider mints: ssh endpoint and
+                        // preview URL refresh the seat config on probe.
+                        if sandbox.ssh_endpoint.is_some()
+                            && sandbox.ssh_endpoint != seat.ssh_endpoint
+                        {
+                            let mut seat = seat.clone();
+                            seat.ssh_endpoint = sandbox.ssh_endpoint;
+                            store.save_seat(seat);
                         }
-                        Ok(r) => probe.detail = Some(format!("box answered HTTP {}", r.status())),
-                        Err(e) => probe.detail = Some(format!("box unreachable: {e}")),
                     }
-                }
-                None => {
-                    // Token-only seat: Box is opaque without an exec endpoint —
-                    // honest "configured" state, not a fake online signal.
-                    probe.detail = Some("token saved; set an exec endpoint to probe".into());
-                }
+                    Err(e) => probe.detail = Some(e),
+                },
+                // No box yet — "create-or-list": a bare list answers the
+                // token check; only when nothing exists do we mint a probe
+                // box (ttl 5m) and destroy it, so a ping never bills.
+                None => match client.sandboxes().await {
+                    Ok(list) => {
+                        if let Some(live) = list
+                            .iter()
+                            .find(|s| s.usable() || s.sleeping())
+                            .or_else(|| list.first())
+                        {
+                            probe.detail = Some(format!(
+                                "token ok — {} sandbox{}; first run reuses `{}`",
+                                list.len(),
+                                if list.len() == 1 { "" } else { "es" },
+                                live.id
+                            ));
+                            // Bind the newest box so the first run reuses it
+                            // instead of minting a second billable sandbox.
+                            let mut seat = seat.clone();
+                            seat.box_id = Some(live.id.clone());
+                            seat.ssh_endpoint = live.ssh_endpoint.clone();
+                            store.save_seat(seat);
+                            probe.online = live.usable();
+                            probe.sleeping = live.sleeping();
+                        } else {
+                            // Spec's ping: create a probe sandbox, confirm
+                            // the token can mint one, then destroy it — a
+                            // bare ping never leaves a billable box behind.
+                            let ping = client
+                                .create("cosmos-probe", &format!("probe-{}", crate::new_id()))
+                                .await;
+                            match ping {
+                                Ok(sandbox) => {
+                                    probe.online = true;
+                                    probe.detail = Some(format!(
+                                        "token ok — created + destroyed probe {}",
+                                        sandbox.id
+                                    ));
+                                    let _ = client.destroy(&sandbox.id).await;
+                                }
+                                Err(e) => probe.detail = Some(e),
+                            }
+                        }
+                    }
+                    Err(e) => probe.detail = Some(e),
+                },
             }
         }
         None => probe.detail = Some("no backend selected".into()),
@@ -905,13 +1070,27 @@ pub async fn ssh_exec(
     })
 }
 
-/// `docker exec <container> sh -lc <command>` on the seat.
+/// `docker exec <container> sh -lc <command>` on the seat — or, for
+/// Railway/Boat, the backend's own exec surface (plain `ssh railway.new`,
+/// or Boat's `/commands` endpoint).
 pub async fn seat_exec(
+    http: &reqwest::Client,
+    store: &CloudStore,
     seat: &SeatConfig,
     command: &str,
     timeout: Duration,
 ) -> Result<ExecOutcome, String> {
     match seat.kind {
+        Some(CloudSeatKind::Railway) => {
+            let alias = seat
+                .ssh_alias
+                .clone()
+                .unwrap_or_else(|| crate::railway::RAILWAY_HOST.into());
+            if seat.expired() {
+                return Err("Railway trial seat expired — claim it or start a new trial".into());
+            }
+            ssh_exec(&alias, command, timeout).await
+        }
         Some(CloudSeatKind::Ssh) => {
             let alias = seat
                 .ssh_alias
@@ -925,7 +1104,18 @@ pub async fn seat_exec(
             ssh_exec(&alias, &remote, timeout).await
         }
         Some(CloudSeatKind::Box) => {
-            Err("Box exec needs a provider endpoint — set one in Settings → Cloud computer".into())
+            let (Some(token), Some(box_id)) = (store.box_token(&seat.id), seat.box_id.clone())
+            else {
+                return Err("Boat seat has no box yet — it provisions on first run".into());
+            };
+            let out = crate::boat::boat(http, &token, seat.box_endpoint.as_deref())
+                .exec(&box_id, command, None, timeout)
+                .await?;
+            Ok(ExecOutcome {
+                code: out.exit_code.unwrap_or(if out.success { 0 } else { -1 }),
+                stdout: out.stdout,
+                stderr: out.stderr,
+            })
         }
         Some(CloudSeatKind::GitHub) => {
             Err("GitHub seats have no shell — runs go through workflow dispatch".into())
@@ -943,20 +1133,34 @@ pub struct ExecStream {
     pub stderr: tokio::process::ChildStderr,
 }
 
-/// Spawn `docker exec <container> sh -lc <command>` streaming.
+/// Spawn a streaming command on the seat. SSH seats wrap in `docker exec`;
+/// Railway execs directly on the trial VM (no container indirection — the
+/// ssh session IS the box).
 pub async fn seat_exec_stream(seat: &SeatConfig, command: &str) -> Result<ExecStream, String> {
-    let alias = match seat.kind {
-        Some(CloudSeatKind::Ssh) => seat
-            .ssh_alias
-            .clone()
-            .ok_or_else(|| "seat has no SSH alias".to_string())?,
-        _ => return Err("streaming exec needs an SSH seat".to_string()),
+    let (alias, remote) = match seat.kind {
+        Some(CloudSeatKind::Ssh) => (
+            seat.ssh_alias
+                .clone()
+                .ok_or_else(|| "seat has no SSH alias".to_string())?,
+            format!(
+                "docker exec {} sh -lc {}",
+                shell_word(&seat.container_name()),
+                shell_word(command)
+            ),
+        ),
+        Some(CloudSeatKind::Railway) => {
+            if seat.expired() {
+                return Err("Railway trial seat expired".into());
+            }
+            (
+                seat.ssh_alias
+                    .clone()
+                    .unwrap_or_else(|| crate::railway::RAILWAY_HOST.into()),
+                command.to_string(),
+            )
+        }
+        _ => return Err("streaming exec needs an SSH or Railway seat".to_string()),
     };
-    let remote = format!(
-        "docker exec {} sh -lc {}",
-        shell_word(&seat.container_name()),
-        shell_word(command)
-    );
     let mut child = tokio::process::Command::new("ssh")
         .args([
             "-o",
@@ -1009,8 +1213,44 @@ pub struct RemoteEntry {
     pub size: Option<u64>,
 }
 
+/// Parse `ls -la --time-style=+%s` output into remote entries (shared by the
+/// SSH/docker exec and Boat `/commands` listings).
+fn parse_ls(stdout: &str, base: &str) -> Vec<RemoteEntry> {
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(mode) = parts.next() else { continue };
+        let mut skipped = 0usize;
+        // mode links owner group size time name
+        let name = loop {
+            skipped += 1;
+            if skipped > 6 {
+                break None;
+            }
+            let _ = parts.next();
+            if skipped == 4 {
+                // size consumed; next token is time, then name
+                let _ = parts.next();
+                break parts.next();
+            }
+        };
+        let Some(name) = name else { continue };
+        if name == "." || name == ".." {
+            continue;
+        }
+        entries.push(RemoteEntry {
+            path: format!("{base}/{name}"),
+            name: name.to_string(),
+            is_dir: mode.starts_with('d'),
+            size: None,
+        });
+    }
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+    entries
+}
+
 /// `ls`-style listing of `dir` on the seat. GitHub seats list via the
-/// contents API; SSH seats parse `ls -la`.
+/// contents API; SSH/Railway/Boat seats exec `ls -la`.
 pub async fn list_dir(
     http: &reqwest::Client,
     store: &CloudStore,
@@ -1018,9 +1258,11 @@ pub async fn list_dir(
     dir: &str,
 ) -> Result<Vec<RemoteEntry>, String> {
     match seat.kind {
-        Some(CloudSeatKind::Ssh) => {
+        Some(CloudSeatKind::Ssh) | Some(CloudSeatKind::Railway) | Some(CloudSeatKind::Box) => {
             let base = join_remote(&seat.workspace(), dir);
             let out = seat_exec(
+                http,
+                store,
                 seat,
                 &format!(
                     "cd {} && ls -la --time-style=+%s 2>/dev/null | tail -n +2",
@@ -1032,37 +1274,7 @@ pub async fn list_dir(
             if out.code != 0 {
                 return Err(out.stderr.lines().next().unwrap_or("ls failed").to_string());
             }
-            let mut entries = Vec::new();
-            for line in out.stdout.lines() {
-                let mut parts = line.split_whitespace();
-                let Some(mode) = parts.next() else { continue };
-                let mut skipped = 0usize;
-                // mode links owner group size time name
-                let name = loop {
-                    skipped += 1;
-                    if skipped > 6 {
-                        break None;
-                    }
-                    let _ = parts.next();
-                    if skipped == 4 {
-                        // size consumed; next token is time, then name
-                        let _ = parts.next();
-                        break parts.next();
-                    }
-                };
-                let Some(name) = name else { continue };
-                if name == "." || name == ".." {
-                    continue;
-                }
-                entries.push(RemoteEntry {
-                    path: format!("{base}/{name}"),
-                    name: name.to_string(),
-                    is_dir: mode.starts_with('d'),
-                    size: None,
-                });
-            }
-            entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
-            Ok(entries)
+            Ok(parse_ls(&out.stdout, &base))
         }
         Some(CloudSeatKind::GitHub) => {
             let repo = seat.repo.clone().ok_or("seat has no repo")?;
@@ -1072,7 +1284,6 @@ pub async fn list_dir(
             let reference = seat.branch.as_deref().unwrap_or("HEAD");
             github(http, &pat).contents(&repo, dir, reference).await
         }
-        Some(CloudSeatKind::Box) => Err("Box file listing needs a provider endpoint".into()),
         None => Err("seat has no backend".into()),
     }
 }
@@ -1086,8 +1297,10 @@ pub async fn read_file(
 ) -> Result<(String, bool), String> {
     const CAP: usize = 256 * 1024;
     match seat.kind {
-        Some(CloudSeatKind::Ssh) => {
+        Some(CloudSeatKind::Ssh) | Some(CloudSeatKind::Railway) | Some(CloudSeatKind::Box) => {
             let out = seat_exec(
+                http,
+                store,
                 seat,
                 &format!("head -c {CAP} -- {}", shell_word(path)),
                 PROBE_TIMEOUT,
@@ -1117,7 +1330,6 @@ pub async fn read_file(
                 truncated || size > CAP as u64,
             ))
         }
-        Some(CloudSeatKind::Box) => Err("Box file reads need a provider endpoint".into()),
         None => Err("seat has no backend".into()),
     }
 }
@@ -1130,9 +1342,11 @@ pub async fn git_status(
     seat: &SeatConfig,
 ) -> Result<serde_json::Value, String> {
     match seat.kind {
-        Some(CloudSeatKind::Ssh) => {
+        Some(CloudSeatKind::Ssh) | Some(CloudSeatKind::Railway) | Some(CloudSeatKind::Box) => {
             let ws = seat.workspace();
             let status = seat_exec(
+                http,
+                store,
                 seat,
                 &format!(
                     "cd {} && git status --porcelain=v1 -b && git log -1 --format=%H 2>/dev/null",
@@ -1150,6 +1364,8 @@ pub async fn git_status(
                     .to_string());
             }
             let diff = seat_exec(
+                http,
+                store,
                 seat,
                 &format!(
                     "cd {} && git diff --stat HEAD 2>/dev/null | tail -n 60",
@@ -1193,12 +1409,14 @@ pub async fn git_diff(
     path: Option<&str>,
 ) -> Result<String, String> {
     match seat.kind {
-        Some(CloudSeatKind::Ssh) => {
+        Some(CloudSeatKind::Ssh) | Some(CloudSeatKind::Railway) | Some(CloudSeatKind::Box) => {
             let ws = seat.workspace();
             let path_arg = path
                 .map(|p| format!("-- {}", shell_word(p)))
                 .unwrap_or_default();
             let out = seat_exec(
+                http,
+                store,
                 seat,
                 &format!("cd {} && git diff HEAD -- . {}", shell_word(&ws), path_arg),
                 PROBE_TIMEOUT,
@@ -1735,6 +1953,126 @@ impl<'a> GitHub<'a> {
         }
         Err(Self::error(resp).await)
     }
+
+    /// The repo picker's row shape — `full_name`, freshness, privacy.
+    /// `GET /user/repos?sort=pushed` serves recents; `GET /search/repositories`
+    /// serves typed queries; org repos ride `/orgs/{org}/repos`.
+    pub async fn repos(&self, query: Option<&str>) -> Result<Vec<RepoHit>, String> {
+        let mut out = Vec::new();
+        match query.map(str::trim).filter(|q| !q.is_empty()) {
+            // Typed query → the search API: `in:name,description` keeps the
+            // hits owner/name shaped; user/affiliation qualifier keeps the
+            // result inside what the token can actually reach.
+            Some(q) => {
+                let search = format!("{q} in:name,description fork:true");
+                let resp = self
+                    .get(&format!(
+                        "/search/repositories?q={}&sort=updated&per_page=30",
+                        url_query(&search)
+                    ))
+                    .send()
+                    .await
+                    .map_err(|e| format!("github: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(Self::error(resp).await);
+                }
+                let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                for item in v["items"].as_array().cloned().unwrap_or_default() {
+                    out.push(RepoHit::from_value(item));
+                }
+            }
+            // No query → the token's own recently-pushed repos (recents).
+            None => {
+                let resp = self
+                    .get("/user/repos?sort=pushed&per_page=30&affiliation=owner,collaborator,organization_member")
+                    .send()
+                    .await
+                    .map_err(|e| format!("github: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(Self::error(resp).await);
+                }
+                let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                for item in v.as_array().cloned().unwrap_or_default() {
+                    out.push(RepoHit::from_value(item));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `GET /user` — the PAT verify ping (save-only-on-success rule).
+    pub async fn viewer(&self) -> Result<String, String> {
+        let resp = self
+            .get("/user")
+            .send()
+            .await
+            .map_err(|e| format!("github: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(Self::error(resp).await);
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(v["login"]
+            .as_str()
+            .map(|l| format!("github token works — {l}"))
+            .unwrap_or_else(|| "github token works".into()))
+    }
+
+    /// `GET /user/orgs` — orgs the token can see, for the picker's grouping.
+    pub async fn orgs(&self) -> Result<Vec<String>, String> {
+        let resp = self
+            .get("/user/orgs?per_page=50")
+            .send()
+            .await
+            .map_err(|e| format!("github: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(Self::error(resp).await);
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(v.as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|o| o["login"].as_str().map(str::to_string))
+            .collect())
+    }
+}
+
+/// One repo-picker hit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RepoHit {
+    pub full_name: String,
+    pub default_branch: String,
+    pub private: bool,
+    pub pushed_at: Option<String>,
+    pub description: Option<String>,
+}
+
+impl RepoHit {
+    fn from_value(v: serde_json::Value) -> Self {
+        Self {
+            full_name: v["full_name"].as_str().unwrap_or_default().to_string(),
+            default_branch: v["default_branch"].as_str().unwrap_or("main").to_string(),
+            private: v["private"].as_bool().unwrap_or(false),
+            pushed_at: v["pushed_at"].as_str().map(str::to_string),
+            description: v["description"].as_str().map(str::to_string),
+        }
+    }
+}
+
+/// Percent-encode a GitHub search query (`q=…` value only).
+fn url_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1946,6 +2284,7 @@ impl Scheduler {
                     repo: seat.repo.clone(),
                     workspace_path: Some(seat.workspace()),
                     model_label: None,
+                    expires_at: seat.expires_at,
                 })
             }
             None => None,
@@ -2010,6 +2349,10 @@ impl Scheduler {
     /// (5s ssh ping, or a repo read for GitHub seats).
     async fn seat_reachable(&self, seat: &SeatConfig) -> bool {
         match seat.kind {
+            // Railway trials die at the hour — automations never target them
+            // (the save path rejects them too; belt and braces for rows
+            // written by older builds).
+            Some(CloudSeatKind::Railway) => false,
             Some(CloudSeatKind::Ssh) => match &seat.ssh_alias {
                 Some(alias) => ssh_exec(alias, "true", Duration::from_secs(6))
                     .await
@@ -2023,7 +2366,18 @@ impl Scheduler {
                     _ => false,
                 }
             }
-            Some(CloudSeatKind::Box) => seat.box_endpoint.is_some(),
+            Some(CloudSeatKind::Box) => {
+                match (self.store.box_token(&seat.id), seat.box_id.clone()) {
+                    (Some(token), Some(box_id)) => {
+                        crate::boat::boat(&self.http, &token, seat.box_endpoint.as_deref())
+                            .sandbox(&box_id)
+                            .await
+                            .map(|s| s.usable() || s.sleeping())
+                            .unwrap_or(false)
+                    }
+                    _ => false,
+                }
+            }
             None => false,
         }
     }

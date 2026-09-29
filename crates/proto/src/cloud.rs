@@ -13,8 +13,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CloudSeatKind {
-    /// A token-authenticated hosted box (exec over the provider's HTTP API
-    /// when an endpoint is configured; otherwise config-only).
+    /// Railway's free trial VM (`ssh railway.new`): identified by the user's
+    /// SSH key — never a shared Cosmos account. Sixty-minute build window,
+    /// then a 24h claim grace; the seat carries `expires_at` + `claim_url`.
+    Railway,
+    /// A Boat (boat.dev) sandbox: the user's `boat_…` API token drives the
+    /// hosted box's lifecycle (create/stop/resume/destroy) and exec
+    /// (`/commands`), files (`/files`), prompts (`/prompt`), and desktop
+    /// preview (`/desktop`) over the provider's HTTP API.
     Box,
     /// BYO VPS: an `~/.ssh/config` alias on this desktop to an x86_64 Linux
     /// host running Docker; workspaces are `cosmos-cloud-<workspace>`
@@ -28,9 +34,21 @@ pub enum CloudSeatKind {
 impl CloudSeatKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Box => "Box",
+            Self::Railway => "Railway trial",
+            Self::Box => "Boat",
             Self::Ssh => "VPS (SSH)",
             Self::GitHub => "GitHub workspace",
+        }
+    }
+
+    /// Short seat-chip prefix: `Cloud · Railway` / `Cloud · Boat` / `VPS` /
+    /// `GitHub agent`.
+    pub fn chip(self) -> &'static str {
+        match self {
+            Self::Railway => "Cloud · Railway",
+            Self::Box => "Cloud · Boat",
+            Self::Ssh => "Cloud · VPS",
+            Self::GitHub => "GitHub agent",
         }
     }
 }
@@ -58,6 +76,10 @@ pub struct CloudSeatBinding {
     /// or the seat CLI's own login ("seat CLI login").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_label: Option<String>,
+    /// Railway trial deadline — the header chip counts down to it; every
+    /// device sees the same bound hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// The right-rail pane kinds for a cloud workspace session. One pane is
@@ -94,7 +116,7 @@ impl CloudPane {
     pub fn label(self) -> &'static str {
         match self {
             Self::Computer => "Computer",
-            Self::Simulator => "Android Simulator",
+            Self::Simulator => "iOS Simulator",
             Self::Files => "Files",
             Self::Changes => "Changes",
             Self::Shell => "Shell",
@@ -328,6 +350,10 @@ pub struct SeatProbe {
     /// honest "runs only while the desktop app is open" banner.
     #[serde(default)]
     pub keeps_running: bool,
+    /// The seat is alive but stopped — Boat's snapshot-paused ("Sleeping")
+    /// state: billing off, resumable. Renders as the amber dot.
+    #[serde(default)]
+    pub sleeping: bool,
     pub probed_at: DateTime<Utc>,
 }
 

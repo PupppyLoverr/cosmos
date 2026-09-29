@@ -17,6 +17,7 @@ use zeron_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
+pub mod boat;
 mod browser;
 pub mod change_requests;
 pub mod chat2_host;
@@ -31,6 +32,7 @@ mod model_catalogs;
 pub mod pairing;
 pub mod profile;
 pub mod project_actions;
+pub mod railway;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
