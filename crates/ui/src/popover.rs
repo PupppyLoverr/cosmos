@@ -1465,6 +1465,7 @@ impl gpui::Render for MenuScrollbarDragGhost {
 /// wake-ups scheduled so the fade lands without any further input.
 #[derive(Default)]
 pub struct MenuScrollbarState {
+    persistent: bool,
     list_hovered: bool,
     bar_hovered: bool,
     grab: Option<f32>,
@@ -1478,6 +1479,13 @@ pub struct MenuScrollbarState {
 }
 
 impl MenuScrollbarState {
+    /// Keep the rail rendered whenever its owner has overflowing content.
+    /// Menus retain the default transient treatment; persistent owners opt in
+    /// explicitly.
+    pub fn set_persistent(&mut self, persistent: bool) {
+        self.persistent = persistent;
+    }
+
     /// Record scroll activity from the live handle. Call once per render
     /// before [`Self::metrics`]/[`Self::render_rail`]; a changed offset marks
     /// the rail as recently scrolled.
@@ -1735,14 +1743,23 @@ impl MenuScrollbarState {
     /// different listeners. Either way `.id(...)` comes first (hover needs
     /// element state).
     pub fn render_rail(&self, theme: &Theme, metrics: MenuScrollbarMetrics) -> Option<Div> {
-        if !self.visible() {
+        if !self.persistent && !self.visible() {
             return None;
         }
         let active = self.active();
-        let thumb_width = if active {
-            MENU_SCROLLBAR_HOVER_THUMB_WIDTH
+        let emphasized = active || self.scroll_countdown(Instant::now());
+        let (thumb_width, thumb_color) = if self.persistent {
+            (
+                if emphasized { 6.0 } else { 4.0 },
+                theme.text.opacity(if emphasized { 0.5 } else { 0.28 }),
+            )
+        } else if active {
+            (
+                MENU_SCROLLBAR_HOVER_THUMB_WIDTH,
+                theme.text_faint.opacity(0.68),
+            )
         } else {
-            MENU_SCROLLBAR_THUMB_WIDTH
+            (MENU_SCROLLBAR_THUMB_WIDTH, theme.text_faint.opacity(0.5))
         };
         Some(
             div()
@@ -1753,7 +1770,7 @@ impl MenuScrollbarState {
                 .w(px(MENU_SCROLLBAR_HIT_WIDTH))
                 // Post-scroll fade: full while hovered/held, then 1 → 0
                 // across the fade window (see [`MenuScrollbarState::fade`]).
-                .opacity(self.fade())
+                .opacity(if self.persistent { 1.0 } else { self.fade() })
                 // The thumb is an absolute child inside a fixed-width hit
                 // rail, so hover expansion never reflows rows. Hovering the
                 // thumb itself brightens it on top of the strip-hover
@@ -1767,8 +1784,8 @@ impl MenuScrollbarState {
                         .w(px(thumb_width))
                         .h(px(metrics.thumb_height))
                         .rounded(px(thumb_width / 2.0))
-                        .bg(theme.text_faint.opacity(if active { 0.68 } else { 0.5 }))
-                        .hover(|s| s.bg(theme.text_faint.opacity(0.85))),
+                        .bg(thumb_color)
+                        .hover(|s| s.bg(theme.text.opacity(0.5))),
                 ),
         )
     }

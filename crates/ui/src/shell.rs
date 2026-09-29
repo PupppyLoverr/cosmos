@@ -2419,7 +2419,11 @@ impl Shell {
             chat_status_hover: None,
             chat_hover_resync: false,
             sidebar_scroll: gpui::ScrollHandle::new(),
-            sidebar_bar: popover::MenuScrollbarState::default(),
+            sidebar_bar: {
+                let mut bar = popover::MenuScrollbarState::default();
+                bar.set_persistent(true);
+                bar
+            },
             pinned_session_drag: None,
             pinned_session_drag_generation: 0,
             sidebar_session_transfer: None,
