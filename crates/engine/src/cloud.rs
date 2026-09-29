@@ -284,39 +284,83 @@ struct CloudState {
     config: CloudConfigFile,
     keys: CloudKeysFile,
     runs: RunsFile,
+    load_error: Option<String>,
 }
 
 impl CloudStore {
     pub fn load(dir: &Path) -> Self {
-        let read = |name: &str| -> Option<serde_json::Value> {
-            serde_json::from_slice(&std::fs::read(dir.join(name)).ok()?).ok()
+        let mut errors = Vec::new();
+        let read = |name: &str, errors: &mut Vec<String>| -> Option<serde_json::Value> {
+            let path = dir.join(name);
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(error) => {
+                    errors.push(format!("{name}: {error}"));
+                    return None;
+                }
+            };
+            match serde_json::from_slice(&bytes) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    errors.push(format!("{name}: malformed JSON ({error})"));
+                    None
+                }
+            }
         };
-        let config = read(CONFIG_FILE)
-            .and_then(|v| serde_json::from_value(v).ok())
+        let config = read(CONFIG_FILE, &mut errors)
+            .and_then(|v| match serde_json::from_value(v) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    errors.push(format!("{CONFIG_FILE}: invalid shape ({error})"));
+                    None
+                }
+            })
             .unwrap_or_default();
-        let keys = read(KEYS_FILE)
-            .and_then(|v| serde_json::from_value(v).ok())
+        let keys = read(KEYS_FILE, &mut errors)
+            .and_then(|v| match serde_json::from_value(v) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    errors.push(format!("{KEYS_FILE}: invalid shape ({error})"));
+                    None
+                }
+            })
             .unwrap_or_default();
-        let runs = read(RUNS_FILE)
-            .and_then(|v| serde_json::from_value(v).ok())
+        let runs = read(RUNS_FILE, &mut errors)
+            .and_then(|v| match serde_json::from_value(v) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    errors.push(format!("{RUNS_FILE}: invalid shape ({error})"));
+                    None
+                }
+            })
             .unwrap_or_default();
+        let load_error = (!errors.is_empty()).then(|| errors.join("; "));
+        if let Some(error) = &load_error {
+            tracing::error!(error, "cloud store load failed");
+        }
         Self {
             inner: Arc::new(CloudStoreInner {
                 dir: dir.to_path_buf(),
-                state: RwLock::new(CloudState { config, keys, runs }),
+                state: RwLock::new(CloudState {
+                    config,
+                    keys,
+                    runs,
+                    load_error,
+                }),
             }),
         }
     }
 
-    fn write<T: ?Sized + Serialize>(dir: &Path, name: &str, value: &T, _secret: bool) {
+    fn write<T: ?Sized + Serialize>(
+        dir: &Path,
+        name: &str,
+        value: &T,
+        _secret: bool,
+    ) -> Result<(), String> {
         let path = dir.join(name);
-        let bytes = match serde_json::to_vec_pretty(value) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(%e, "cloud store encode failed");
-                return;
-            }
-        };
+        let bytes = serde_json::to_vec_pretty(value)
+            .map_err(|e| format!("cloud store encode {name}: {e}"))?;
         let staging = path.with_extension("partial");
         let result = (|| {
             use std::io::Write;
@@ -333,24 +377,25 @@ impl CloudStore {
             std::fs::rename(&staging, &path)
         })();
         if let Err(e) = result {
-            tracing::warn!(%e, file = name, "cloud store write failed");
             let _ = std::fs::remove_file(&staging);
+            return Err(format!("cloud store write {name}: {e}"));
         }
+        Ok(())
     }
 
-    fn persist_config(&self) {
+    fn persist_config(&self) -> Result<(), String> {
         let state = self.inner.state.read().unwrap();
-        Self::write(&self.inner.dir, CONFIG_FILE, &state.config, false);
+        Self::write(&self.inner.dir, CONFIG_FILE, &state.config, false)
     }
 
-    fn persist_keys(&self) {
+    fn persist_keys(&self) -> Result<(), String> {
         let state = self.inner.state.read().unwrap();
-        Self::write(&self.inner.dir, KEYS_FILE, &state.keys, true);
+        Self::write(&self.inner.dir, KEYS_FILE, &state.keys, true)
     }
 
-    fn persist_runs(&self) {
+    fn persist_runs(&self) -> Result<(), String> {
         let state = self.inner.state.read().unwrap();
-        Self::write(&self.inner.dir, RUNS_FILE, &state.runs, false);
+        Self::write(&self.inner.dir, RUNS_FILE, &state.runs, false)
     }
 
     // ── seats ────────────────────────────────────────────────────────────
@@ -378,7 +423,7 @@ impl CloudStore {
             .or_else(|| state.config.seats.first().cloned())
     }
 
-    pub fn save_seat(&self, seat: SeatConfig) {
+    pub fn save_seat(&self, seat: SeatConfig) -> Result<(), String> {
         let mut state = self.inner.state.write().unwrap();
         match state.config.seats.iter_mut().find(|s| s.id == seat.id) {
             Some(existing) => {
@@ -389,10 +434,10 @@ impl CloudStore {
             None => state.config.seats.push(seat),
         }
         drop(state);
-        self.persist_config();
+        self.persist_config()
     }
 
-    pub fn remove_seat(&self, id: &str) {
+    pub fn remove_seat(&self, id: &str) -> Result<(), String> {
         let mut state = self.inner.state.write().unwrap();
         state.config.seats.retain(|s| s.id != id);
         state.keys.seat_tokens.remove(id);
@@ -400,22 +445,27 @@ impl CloudStore {
             state.config.default_seat = None;
         }
         drop(state);
-        self.persist_config();
-        self.persist_keys();
+        self.persist_config()?;
+        self.persist_keys()
     }
 
-    pub fn record_probe(&self, seat_id: &str, probe: SeatProbe) {
+    pub fn record_probe(&self, seat_id: &str, probe: SeatProbe) -> Result<(), String> {
         let mut state = self.inner.state.write().unwrap();
         if let Some(seat) = state.config.seats.iter_mut().find(|s| s.id == seat_id) {
             seat.last_probe = Some(probe);
         }
         drop(state);
-        self.persist_config();
+        self.persist_config()
     }
 
     // ── seat secrets ─────────────────────────────────────────────────────
 
-    pub fn set_seat_token(&self, seat_id: &str, field: &str, value: Option<String>) {
+    pub fn set_seat_token(
+        &self,
+        seat_id: &str,
+        field: &str,
+        value: Option<String>,
+    ) -> Result<(), String> {
         let mut state = self.inner.state.write().unwrap();
         let secrets = state
             .keys
@@ -436,7 +486,7 @@ impl CloudStore {
             state.keys.seat_tokens.remove(seat_id);
         }
         drop(state);
-        self.persist_keys();
+        self.persist_keys()
     }
 
     /// The shared GitHub PAT lives under a reserved seat key — "the existing
@@ -550,7 +600,11 @@ impl CloudStore {
     }
 
     /// Save the non-secret row + (when `key` is `Some`) the key itself.
-    pub fn save_provider(&self, mut config: ProviderConfig, key: Option<String>) {
+    pub fn save_provider(
+        &self,
+        mut config: ProviderConfig,
+        key: Option<String>,
+    ) -> Result<(), String> {
         let mut state = self.inner.state.write().unwrap();
         if let Some(key) = key.filter(|k| !k.trim().is_empty())
             && let Some(provider) = config.provider
@@ -571,11 +625,11 @@ impl CloudStore {
             None => state.config.providers.push(config),
         }
         drop(state);
-        self.persist_config();
-        self.persist_keys();
+        self.persist_config()?;
+        self.persist_keys()
     }
 
-    pub fn remove_provider(&self, provider: ByokProvider) {
+    pub fn remove_provider(&self, provider: ByokProvider) -> Result<(), String> {
         let mut state = self.inner.state.write().unwrap();
         state
             .config
@@ -583,8 +637,8 @@ impl CloudStore {
             .retain(|p| p.provider != Some(provider));
         state.keys.provider_keys.remove(provider.id());
         drop(state);
-        self.persist_config();
-        self.persist_keys();
+        self.persist_config()?;
+        self.persist_keys()
     }
 
     /// Provider keys a cloud run should export to the seat — only rows the
@@ -762,6 +816,7 @@ impl CloudStore {
             })
             .collect();
         let has_shared_github = self.github_pat_shared().is_some();
+        let load_error = state.load_error.clone();
         drop(state);
         serde_json::json!({
             "seats": seats,
@@ -772,6 +827,7 @@ impl CloudStore {
             // Whether the shared GitHub PAT exists — the repo picker's
             // "token present" flag (never the token itself).
             "hasGithubPat": has_shared_github,
+            "loadError": load_error,
         })
     }
 
@@ -783,7 +839,20 @@ impl CloudStore {
             f(seat);
         }
         drop(state);
-        self.persist_config();
+        let _ = self.persist_config();
+    }
+
+    pub fn try_update_seat(
+        &self,
+        seat_id: &str,
+        f: impl FnOnce(&mut SeatConfig),
+    ) -> Result<(), String> {
+        let mut state = self.inner.state.write().unwrap();
+        if let Some(seat) = state.config.seats.iter_mut().find(|s| s.id == seat_id) {
+            f(seat);
+        }
+        drop(state);
+        self.persist_config()
     }
 
     /// `<data>/seat-backups/` — workspace snapshots pulled off dying seats
@@ -959,13 +1028,47 @@ pub async fn stage_credential(
         return Err(format!("{} too large to stage", local.display()));
     }
     use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     let dir = remote.rsplit_once('/').map(|(d, _)| d).unwrap_or("~");
-    let cmd = format!(
-        "mkdir -p {dir} && printf '%s' {} | base64 -d > {remote} && chmod 600 {remote}",
-        shell_word(&b64)
-    );
-    let out = seat_exec(http, store, seat, &cmd, Duration::from_secs(30)).await?;
+    let out = match seat.kind {
+        Some(CloudSeatKind::Railway) | Some(CloudSeatKind::Ssh) => {
+            let alias = seat
+                .ssh_alias
+                .clone()
+                .unwrap_or_else(|| crate::railway::RAILWAY_HOST.into());
+            let cmd = format!(
+                "mkdir -p {} && base64 -d > {} && chmod 600 {}",
+                shell_word(dir),
+                shell_word(remote),
+                shell_word(remote)
+            );
+            let remote_cmd = if seat.kind == Some(CloudSeatKind::Ssh) {
+                format!(
+                    "docker exec {} sh -lc {}",
+                    shell_word(&seat.container_name()),
+                    shell_word(&cmd)
+                )
+            } else {
+                cmd
+            };
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            ssh_exec_stdin(&alias, &remote_cmd, b64.as_bytes(), Duration::from_secs(30)).await?
+        }
+        Some(CloudSeatKind::Box) => {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let temp = format!("/tmp/cosmos-credential-{}.b64", crate::new_id());
+            let cmd = format!(
+                "trap 'rm -f {}' EXIT && printf '%s' {} > {} && base64 -d {} > {} && chmod 600 {}",
+                shell_word(&temp),
+                shell_word(&b64),
+                shell_word(&temp),
+                shell_word(&temp),
+                shell_word(remote),
+                shell_word(remote),
+            );
+            seat_exec(http, store, seat, &cmd, Duration::from_secs(30)).await?
+        }
+        _ => return Err("seat cannot stage credentials".into()),
+    };
     if out.code == 0 {
         Ok(())
     } else {
@@ -975,6 +1078,30 @@ pub async fn stage_credential(
             .next()
             .unwrap_or("credential write failed")
             .to_string())
+    }
+}
+
+pub async fn cleanup_staged_credentials(
+    http: &reqwest::Client,
+    store: &CloudStore,
+    seat: &SeatConfig,
+    remotes: &[&str],
+) {
+    if !matches!(
+        seat.kind,
+        Some(CloudSeatKind::Railway) | Some(CloudSeatKind::Box)
+    ) {
+        return;
+    }
+    for remote in remotes {
+        let _ = seat_exec(
+            http,
+            store,
+            seat,
+            &format!("rm -f {}", shell_word(remote)),
+            Duration::from_secs(20),
+        )
+        .await;
     }
 }
 
@@ -1132,7 +1259,7 @@ pub async fn probe_seat(
                 probe.detail = Some("trial hour ended — claim the box or start a new trial".into());
                 return probe;
             }
-            match crate::railway::probe().await {
+            match crate::railway::probe_with_existing_deadline(seat.expires_at.is_some()).await {
                 Ok(trial) => {
                     probe.online = true;
                     probe.detail = trial.detail.or_else(|| Some("railway.new trial VM".into()));
@@ -1143,7 +1270,7 @@ pub async fn probe_seat(
                         seat.expires_at = trial.expires_at.or(seat.expires_at);
                         seat.claim_url = trial.claim_url.or(seat.claim_url);
                         seat.preview_url = trial.preview_url.or(seat.preview_url);
-                        store.save_seat(seat);
+                        let _ = store.save_seat(seat);
                     }
                 }
                 Err(e) => probe.detail = Some(e),
@@ -1336,6 +1463,47 @@ pub async fn ssh_exec(
     .await
     .map_err(|_| format!("ssh {alias} timed out"))?
     .map_err(|e| format!("could not run ssh: {e}"))?;
+    Ok(ExecOutcome {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+pub async fn ssh_exec_stdin(
+    alias: &str,
+    command: &str,
+    input: &[u8],
+    timeout: Duration,
+) -> Result<ExecOutcome, String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            alias,
+            command,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run ssh: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(input)
+            .await
+            .map_err(|e| format!("could not write ssh stdin: {e}"))?;
+    }
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| format!("ssh {alias} timed out"))?
+        .map_err(|e| format!("could not run ssh: {e}"))?;
     Ok(ExecOutcome {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -1747,6 +1915,20 @@ pub fn github<'a>(http: &'a reqwest::Client, pat: &'a str) -> GitHub<'a> {
 pub struct RepoInfo {
     pub full_name: String,
     pub default_branch: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RepoPage {
+    pub items: Vec<RepoHit>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OrgPage {
+    pub items: Vec<String>,
+    pub truncated: bool,
 }
 
 /// One PR row for the list pane.
@@ -2230,47 +2412,69 @@ impl<'a> GitHub<'a> {
     /// The repo picker's row shape — `full_name`, freshness, privacy.
     /// `GET /user/repos?sort=pushed` serves recents; `GET /search/repositories`
     /// serves typed queries; org repos ride `/orgs/{org}/repos`.
-    pub async fn repos(&self, query: Option<&str>) -> Result<Vec<RepoHit>, String> {
+    pub async fn repos(&self, query: Option<&str>) -> Result<RepoPage, String> {
         let mut out = Vec::new();
+        let mut truncated = false;
         match query.map(str::trim).filter(|q| !q.is_empty()) {
             // Typed query → the search API: `in:name,description` keeps the
             // hits owner/name shaped; user/affiliation qualifier keeps the
             // result inside what the token can actually reach.
             Some(q) => {
                 let search = format!("{q} in:name,description fork:true");
-                let resp = self
-                    .get(&format!(
-                        "/search/repositories?q={}&sort=updated&per_page=30",
-                        url_query(&search)
-                    ))
-                    .send()
-                    .await
-                    .map_err(|e| format!("github: {e}"))?;
-                if !resp.status().is_success() {
-                    return Err(Self::error(resp).await);
-                }
-                let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-                for item in v["items"].as_array().cloned().unwrap_or_default() {
-                    out.push(RepoHit::from_value(item));
+                for page in 1..=5 {
+                    let resp = self
+                        .get(&format!(
+                            "/search/repositories?q={}&sort=updated&per_page=100&page={page}",
+                            url_query(&search)
+                        ))
+                        .send()
+                        .await
+                        .map_err(|e| format!("github: {e}"))?;
+                    if !resp.status().is_success() {
+                        return Err(Self::error(resp).await);
+                    }
+                    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                    let items = v["items"].as_array().cloned().unwrap_or_default();
+                    let len = items.len();
+                    out.extend(items.into_iter().map(RepoHit::from_value));
+                    if len < 100 {
+                        break;
+                    }
+                    if page == 5 {
+                        truncated = true;
+                    }
                 }
             }
             // No query → the token's own recently-pushed repos (recents).
             None => {
-                let resp = self
-                    .get("/user/repos?sort=pushed&per_page=30&affiliation=owner,collaborator,organization_member")
-                    .send()
-                    .await
-                    .map_err(|e| format!("github: {e}"))?;
-                if !resp.status().is_success() {
-                    return Err(Self::error(resp).await);
-                }
-                let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-                for item in v.as_array().cloned().unwrap_or_default() {
-                    out.push(RepoHit::from_value(item));
+                for page in 1..=5 {
+                    let resp = self
+                        .get(&format!(
+                            "/user/repos?sort=pushed&per_page=100&page={page}&affiliation=owner,collaborator,organization_member"
+                        ))
+                        .send()
+                        .await
+                        .map_err(|e| format!("github: {e}"))?;
+                    if !resp.status().is_success() {
+                        return Err(Self::error(resp).await);
+                    }
+                    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                    let items = v.as_array().cloned().unwrap_or_default();
+                    let len = items.len();
+                    out.extend(items.into_iter().map(RepoHit::from_value));
+                    if len < 100 {
+                        break;
+                    }
+                    if page == 5 {
+                        truncated = true;
+                    }
                 }
             }
         }
-        Ok(out)
+        Ok(RepoPage {
+            items: out,
+            truncated,
+        })
     }
 
     /// `GET /user` — the PAT verify ping (save-only-on-success rule).
@@ -2291,22 +2495,37 @@ impl<'a> GitHub<'a> {
     }
 
     /// `GET /user/orgs` — orgs the token can see, for the picker's grouping.
-    pub async fn orgs(&self) -> Result<Vec<String>, String> {
-        let resp = self
-            .get("/user/orgs?per_page=50")
-            .send()
-            .await
-            .map_err(|e| format!("github: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(Self::error(resp).await);
+    pub async fn orgs(&self) -> Result<OrgPage, String> {
+        let mut out = Vec::new();
+        let mut truncated = false;
+        for page in 1..=5 {
+            let resp = self
+                .get(&format!("/user/orgs?per_page=100&page={page}"))
+                .send()
+                .await
+                .map_err(|e| format!("github: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(Self::error(resp).await);
+            }
+            let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let items = v.as_array().cloned().unwrap_or_default();
+            let len = items.len();
+            out.extend(
+                items
+                    .iter()
+                    .filter_map(|o| o["login"].as_str().map(str::to_string)),
+            );
+            if len < 100 {
+                break;
+            }
+            if page == 5 {
+                truncated = true;
+            }
         }
-        let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-        Ok(v.as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|o| o["login"].as_str().map(str::to_string))
-            .collect())
+        Ok(OrgPage {
+            items: out,
+            truncated,
+        })
     }
 }
 

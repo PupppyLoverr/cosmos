@@ -78,6 +78,8 @@ pub struct CloudSeatsPage {
     /// under the repo field; picking one writes `owner/name` into it.
     repo_hits: Vec<RepoHit>,
     repo_orgs: Vec<String>,
+    repo_truncated: bool,
+    repo_orgs_error: Option<String>,
     /// Generation counter kills stale debounced searches (300ms).
     repo_search_gen: u64,
     /// `pick_repo` writes the field programmatically — suppress the search
@@ -117,6 +119,8 @@ impl CloudSeatsPage {
                 .new(|cx| ComposerInput::new("GitHub PAT — shared (repo + workflow scope)", cx)),
             repo_hits: Vec::new(),
             repo_orgs: Vec::new(),
+            repo_truncated: false,
+            repo_orgs_error: None,
             repo_search_gen: 0,
             suppress_repo_edit: false,
             probing: None,
@@ -260,8 +264,21 @@ impl CloudSeatsPage {
                         page.repo_orgs =
                             serde_json::from_value(v.get("orgs").cloned().unwrap_or_default())
                                 .unwrap_or_default();
+                        page.repo_truncated = v
+                            .get("truncated")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        page.repo_orgs_error = v
+                            .get("orgsError")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
                     }
-                    Err(_) => page.repo_hits.clear(),
+                    Err(_) => {
+                        page.repo_hits.clear();
+                        page.repo_orgs.clear();
+                        page.repo_truncated = false;
+                        page.repo_orgs_error = None;
+                    }
                 }
                 cx.notify();
             })
@@ -740,6 +757,22 @@ impl CloudSeatsPage {
                                 ))),
                         );
                     }
+                    if self.repo_truncated {
+                        col = col.child(
+                            div()
+                                .text_size(crate::typography::ui_rems(10.0))
+                                .text_color(theme.text_muted)
+                                .child("Showing first 500 — refine search"),
+                        );
+                    }
+                    if let Some(error) = &self.repo_orgs_error {
+                        col = col.child(
+                            div()
+                                .text_size(crate::typography::ui_rems(10.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(format!("Organizations: {error}"))),
+                        );
+                    }
                     col
                 })
                 .child(popover::dialog_field(
@@ -823,6 +856,7 @@ impl Render for CloudSeatsPage {
             .ready()
             .map(|v| v.seats.clone())
             .unwrap_or_default();
+        let load_error = self.view.ready().and_then(|view| view.load_error.clone());
         let mut card = widgets::section_card(&theme);
         if seats.is_empty() {
             card = card.child(
@@ -865,6 +899,9 @@ impl Render for CloudSeatsPage {
                 .line_height(px(20.0)),
             )
             .child(card);
+        if let Some(error) = load_error {
+            column = column.child(widgets::error_strip(&theme, error));
+        }
         if self.draft_kind.is_none() {
             column = column.child(
                 div().flex().flex_row().gap(px(8.0)).pt(px(4.0)).children(

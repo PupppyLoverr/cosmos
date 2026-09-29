@@ -59,6 +59,7 @@ pub struct CloudView {
     pub runs: Vec<CloudRun>,
     /// The shared GitHub PAT exists (the repo picker's token flag).
     pub has_github_pat: bool,
+    pub load_error: Option<String>,
 }
 
 impl CloudView {
@@ -82,16 +83,26 @@ impl CloudView {
     /// trial identity); Boat needs only a token — the box provisions lazily.
     pub fn seat_ready(seat: &SeatRow) -> bool {
         match seat.config.kind {
-            Some(CloudSeatKind::Ssh) => seat.config.ssh_alias.is_some(),
-            Some(CloudSeatKind::Railway) => !seat.config.expired(),
-            Some(CloudSeatKind::Box) => {
-                seat.has_box_token
-                    || seat.config.box_endpoint.is_some()
-                    || seat.config.box_id.is_some()
+            Some(CloudSeatKind::Ssh) => {
+                seat.config.ssh_alias.is_some()
+                    && seat
+                        .config
+                        .last_probe
+                        .as_ref()
+                        .map(|probe| probe.online)
+                        .unwrap_or(true)
             }
+            Some(CloudSeatKind::Railway) => {
+                seat.config.ssh_alias.is_some() && !seat.config.expired()
+            }
+            Some(CloudSeatKind::Box) => seat.has_box_token,
             Some(CloudSeatKind::GitHub) => seat.config.repo.is_some() && seat.has_github_pat,
             None => false,
         }
+    }
+
+    pub fn seat_runnable(seat: &SeatRow) -> bool {
+        Self::seat_ready(seat) && seat.config.kind != Some(CloudSeatKind::GitHub)
     }
 
     /// Model chip label for a seat-bound run: the cloud BYOK default model,
@@ -104,6 +115,55 @@ impl CloudView {
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| "Seat CLI login".into())
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    fn seat(kind: CloudSeatKind) -> SeatRow {
+        SeatRow {
+            config: SeatConfig {
+                kind: Some(kind),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn seat_readiness_matches_credential_and_probe_requirements() {
+        let mut ssh = seat(CloudSeatKind::Ssh);
+        assert!(!CloudView::seat_ready(&ssh));
+        ssh.config.ssh_alias = Some("devbox".into());
+        assert!(CloudView::seat_ready(&ssh));
+        ssh.config.last_probe = Some(SeatProbe {
+            online: false,
+            ..Default::default()
+        });
+        assert!(!CloudView::seat_ready(&ssh));
+
+        let mut railway = seat(CloudSeatKind::Railway);
+        railway.config.ssh_alias = Some("railway.new".into());
+        railway.config.expires_at = Some(Utc::now() + Duration::minutes(5));
+        assert!(CloudView::seat_ready(&railway));
+        assert!(CloudView::seat_runnable(&railway));
+        railway.config.expires_at = Some(Utc::now() - Duration::minutes(1));
+        assert!(!CloudView::seat_ready(&railway));
+
+        let mut boat = seat(CloudSeatKind::Box);
+        boat.config.box_id = Some("stale-box".into());
+        assert!(!CloudView::seat_ready(&boat));
+        boat.has_box_token = true;
+        assert!(CloudView::seat_ready(&boat));
+
+        let mut github = seat(CloudSeatKind::GitHub);
+        github.config.repo = Some("owner/repo".into());
+        github.has_github_pat = true;
+        assert!(CloudView::seat_ready(&github));
+        assert!(!CloudView::seat_runnable(&github));
     }
 }
 
@@ -270,6 +330,7 @@ pub struct CloudRail {
     _state_sub: Subscription,
     /// Railway countdown ticker — 1s re-render while a deadline is live.
     _countdown: Option<Task<()>>,
+    _refresh: Option<Task<()>>,
 }
 
 impl CloudRail {
@@ -337,6 +398,7 @@ impl CloudRail {
             _input_sub: input_sub,
             _state_sub: state_sub,
             _countdown: None,
+            _refresh: None,
         };
         // Live countdown: while a Railway deadline is ahead of the clock the
         // rail re-renders once a second so the chip/banner stay honest.
@@ -364,6 +426,25 @@ impl CloudRail {
                 }
             }));
         }
+        let state_for_refresh = rail.state.clone();
+        rail._refresh = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(30))
+                    .await;
+                let alive = this
+                    .update(cx, |_, cx| {
+                        state_for_refresh.update(cx, |state, cx| {
+                            state.refresh_cloud(Some(std::time::Duration::from_secs(30)), cx);
+                        });
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        }));
         rail.load_seat(cx);
         rail.ensure_loaded(cx);
         rail

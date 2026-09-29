@@ -574,7 +574,7 @@ impl AutomationsPage {
             return;
         };
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let _ = engine
+            let result = engine
                 .client()
                 .call(
                     methods::CLOUD_AUTOMATION_SAVE,
@@ -592,9 +592,15 @@ impl AutomationsPage {
                 )
                 .await;
             this.update(cx, |page, cx| {
-                page.load(cx);
-                page.state
-                    .update(cx, |state, cx| state.refresh_cloud(None, cx));
+                match result {
+                    Ok(_) => {
+                        page.error = None;
+                        page.load(cx);
+                        page.state
+                            .update(cx, |state, cx| state.refresh_cloud(None, cx));
+                    }
+                    Err(err) => page.error = Some(err.to_string()),
+                }
                 cx.notify();
             })
             .ok();
@@ -606,7 +612,7 @@ impl AutomationsPage {
             return;
         };
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let _ = engine
+            let result = engine
                 .client()
                 .call(
                     methods::CLOUD_AUTOMATION_REMOVE,
@@ -614,9 +620,15 @@ impl AutomationsPage {
                 )
                 .await;
             this.update(cx, |page, cx| {
-                page.load(cx);
-                page.state
-                    .update(cx, |state, cx| state.refresh_cloud(None, cx));
+                match result {
+                    Ok(_) => {
+                        page.error = None;
+                        page.load(cx);
+                        page.state
+                            .update(cx, |state, cx| state.refresh_cloud(None, cx));
+                    }
+                    Err(err) => page.error = Some(err.to_string()),
+                }
                 cx.notify();
             })
             .ok();

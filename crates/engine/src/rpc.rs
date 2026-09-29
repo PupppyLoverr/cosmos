@@ -3772,16 +3772,22 @@ impl RpcService for EngineRpc {
                 if seat.id.trim().is_empty() {
                     return Err(RpcError::BadParams("seat needs an id".into()));
                 }
-                cloud.save_seat(seat.clone());
+                cloud.save_seat(seat.clone()).map_err(RpcError::Failed)?;
                 if let Some(secrets) = p.secrets {
                     if let Some(token) = secrets.get("boxToken").and_then(|v| v.as_str()) {
-                        cloud.set_seat_token(&seat.id, "boxToken", Some(token.to_string()));
+                        cloud
+                            .set_seat_token(&seat.id, "boxToken", Some(token.to_string()))
+                            .map_err(RpcError::Failed)?;
                     }
                     if let Some(token) = secrets.get("githubPat").and_then(|v| v.as_str()) {
-                        cloud.set_seat_token(&seat.id, "githubPat", Some(token.to_string()));
+                        cloud
+                            .set_seat_token(&seat.id, "githubPat", Some(token.to_string()))
+                            .map_err(RpcError::Failed)?;
                     }
                     if let Some(token) = secrets.get("cuaToken").and_then(|v| v.as_str()) {
-                        cloud.set_seat_token(&seat.id, "cuaToken", Some(token.to_string()));
+                        cloud
+                            .set_seat_token(&seat.id, "cuaToken", Some(token.to_string()))
+                            .map_err(RpcError::Failed)?;
                     }
                 }
                 RpcReply::value(&serde_json::json!({ "ok": true }))
@@ -3793,7 +3799,9 @@ impl RpcService for EngineRpc {
                     seat_id: String,
                 }
                 let p: P = parse_params(params)?;
-                self.cloud()?.remove_seat(&p.seat_id);
+                self.cloud()?
+                    .remove_seat(&p.seat_id)
+                    .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::CLOUD_PROBE_SEAT => {
@@ -3808,7 +3816,9 @@ impl RpcService for EngineRpc {
                     .seat(&p.seat_id)
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
                 let probe = crate::cloud::probe_seat(&self.http, &cloud, &seat).await;
-                cloud.record_probe(&seat.id, probe.clone());
+                cloud
+                    .record_probe(&seat.id, probe.clone())
+                    .map_err(RpcError::Failed)?;
                 RpcReply::value(&probe)
             }
             methods::CLOUD_VERIFY_PROVIDER => {
@@ -3856,16 +3866,18 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e))?;
                 }
-                cloud.save_provider(
-                    crate::cloud::ProviderConfig {
-                        provider: Some(provider),
-                        base_url: p.base_url.filter(|b| !b.trim().is_empty()),
-                        model: p.model.filter(|m| !m.trim().is_empty()),
-                        use_for_cloud: p.use_for_cloud,
-                        has_key: false,
-                    },
-                    p.key,
-                );
+                cloud
+                    .save_provider(
+                        crate::cloud::ProviderConfig {
+                            provider: Some(provider),
+                            base_url: p.base_url.filter(|b| !b.trim().is_empty()),
+                            model: p.model.filter(|m| !m.trim().is_empty()),
+                            use_for_cloud: p.use_for_cloud,
+                            has_key: false,
+                        },
+                        p.key,
+                    )
+                    .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::CLOUD_REMOVE_PROVIDER => {
@@ -3876,7 +3888,9 @@ impl RpcService for EngineRpc {
                 let p: P = parse_params(params)?;
                 let provider = zeron_proto::ByokProvider::from_id(&p.provider)
                     .ok_or_else(|| RpcError::BadParams("unknown provider".into()))?;
-                self.cloud()?.remove_provider(provider);
+                self.cloud()?
+                    .remove_provider(provider)
+                    .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::CLOUD_LIST_DIR => {
@@ -4198,11 +4212,13 @@ impl RpcService for EngineRpc {
                         {
                             let api =
                                 crate::boat::boat(&self.http, &token, seat.box_endpoint.as_deref());
-                            let _ = api.destroy(&box_id).await;
-                            cloud.update_seat(&seat.id, |seat| {
-                                seat.box_id = None;
-                                seat.ssh_endpoint = None;
-                            });
+                            api.destroy(&box_id).await.map_err(RpcError::Failed)?;
+                            cloud
+                                .try_update_seat(&seat.id, |seat| {
+                                    seat.box_id = None;
+                                    seat.ssh_endpoint = None;
+                                })
+                                .map_err(RpcError::Failed)?;
                         }
                     }
                     // Boat "Stop" (seat level) — snapshot & archive: billing
@@ -4323,9 +4339,16 @@ impl RpcService for EngineRpc {
                     })?;
                 let gh = crate::cloud::github(&self.http, &pat);
                 let (repos, orgs) = tokio::join!(gh.repos(p.query.as_deref()), gh.orgs());
+                let repos = repos.map_err(RpcError::Failed)?;
+                let (orgs, orgs_error) = match orgs {
+                    Ok(orgs) => (orgs.items, None),
+                    Err(error) => (Vec::new(), Some(error)),
+                };
                 RpcReply::value(&serde_json::json!({
-                    "repos": repos.map_err(RpcError::Failed)?,
-                    "orgs": orgs.unwrap_or_default(),
+                    "repos": repos.items,
+                    "truncated": repos.truncated,
+                    "orgs": orgs,
+                    "orgsError": orgs_error,
                 }))
             }
             methods::CLOUD_GITHUB_SAVE => {
@@ -4339,11 +4362,13 @@ impl RpcService for EngineRpc {
                 // Verify first — the settings rule is save-only-on-success.
                 let gh = crate::cloud::github(&self.http, p.pat.trim());
                 gh.viewer().await.map_err(RpcError::Failed)?;
-                cloud.set_seat_token(
-                    crate::cloud::CloudStore::SHARED_GITHUB_KEY,
-                    "githubPat",
-                    Some(p.pat.trim().to_string()),
-                );
+                cloud
+                    .set_seat_token(
+                        crate::cloud::CloudStore::SHARED_GITHUB_KEY,
+                        "githubPat",
+                        Some(p.pat.trim().to_string()),
+                    )
+                    .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::CLOUD_SSH_COMMAND => {

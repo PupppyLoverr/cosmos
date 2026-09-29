@@ -37,7 +37,7 @@ pub struct RailwayTrial {
 /// Extract the trial fields from whatever Railway printed on stderr — the
 /// documented JSON manifest first, then a URL-pattern fallback for the
 /// human-format welcome banner.
-fn parse_manifest(stderr: &str) -> RailwayTrial {
+fn parse_manifest(stderr: &str, assign_fallback_deadline: bool) -> RailwayTrial {
     let mut trial = RailwayTrial::default();
     // The manifest is one JSON object; tolerate leading/trailing noise and
     // multi-line pretty prints by trying every brace-balanced slice.
@@ -120,7 +120,7 @@ fn parse_manifest(stderr: &str) -> RailwayTrial {
         }
     }
     // No deadline in the manifest → the documented 60-minute window.
-    if trial.expires_at.is_none() {
+    if assign_fallback_deadline && trial.expires_at.is_none() {
         trial.expires_at = Some(Utc::now() + chrono::Duration::minutes(60));
     }
     trial
@@ -195,12 +195,32 @@ async fn railway_ssh(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_deadline_is_only_assigned_when_requested() {
+        let without_fallback = parse_manifest(r#"{"claimUrl":"https://example.test"}"#, false);
+        assert!(without_fallback.expires_at.is_none());
+
+        let with_fallback = parse_manifest(r#"{"claimUrl":"https://example.test"}"#, true);
+        assert!(with_fallback.expires_at.is_some());
+
+        let explicit = parse_manifest(r#"{"expiresAt":"2030-01-01T00:00:00Z"}"#, true);
+        assert_eq!(
+            explicit.expires_at,
+            Some("2030-01-01T00:00:00Z".parse().unwrap())
+        );
+    }
+}
+
 /// Provision-or-attach the trial: the SSH key identifies the box, so a
 /// repeat connect reattaches to the SAME VM (until it dies or is claimed).
 /// The manifest on stderr carries the deadline + claim link.
 pub async fn provision() -> Result<RailwayTrial, String> {
     let out = railway_ssh("echo __cosmos_alive && uname -sm && pwd", PROVISION_TIMEOUT).await?;
-    let mut trial = parse_manifest(&out.stderr);
+    let mut trial = parse_manifest(&out.stderr, true);
     if out.code != 0 || !out.stdout.contains("__cosmos_alive") {
         return Err(ssh_failure(&out));
     }
@@ -219,8 +239,12 @@ pub async fn provision() -> Result<RailwayTrial, String> {
 /// Cheap liveness + manifest refresh — the deadline can move when a box is
 /// claimed or reattached.
 pub async fn probe() -> Result<RailwayTrial, String> {
+    probe_with_existing_deadline(false).await
+}
+
+pub async fn probe_with_existing_deadline(existing_deadline: bool) -> Result<RailwayTrial, String> {
     let out = railway_ssh("echo __cosmos_alive", PROBE_TIMEOUT).await?;
-    let trial = parse_manifest(&out.stderr);
+    let trial = parse_manifest(&out.stderr, !existing_deadline);
     if out.code != 0 {
         return Err(ssh_failure(&out));
     }

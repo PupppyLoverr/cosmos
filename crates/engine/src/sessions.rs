@@ -1826,9 +1826,24 @@ async fn drive_remote_run(
     // opencode/grok/pi/hermes stores — staged per run so the harness auths
     // on the box and keeps working after the laptop closes. A staging miss
     // only warns; BYOK env keys may still cover the harness.
-    for (local, remote) in crate::cloud::harness_credentials(&command) {
+    let staged_remotes = crate::cloud::harness_credentials(&command)
+        .into_iter()
+        .map(|(local, remote)| (local, remote))
+        .collect::<Vec<_>>();
+    for (local, remote) in &staged_remotes {
         if let Err(e) = crate::cloud::stage_credential(&http, &store, &seat, &local, remote).await {
             tracing::warn!(seat = %seat.id, file = %local.display(), error = %e, "credential staging failed");
+            write_transcript_note(
+                &doc,
+                &inner.device_id,
+                &format!(
+                    "Couldn't stage {} login on the seat: {e}",
+                    local
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("harness")
+                ),
+            );
         }
     }
 
@@ -1872,6 +1887,16 @@ async fn drive_remote_run(
                     &mut cancel_rx,
                 )
                 .await;
+                crate::cloud::cleanup_staged_credentials(
+                    &http,
+                    &store,
+                    &seat,
+                    &staged_remotes
+                        .iter()
+                        .map(|(_, path)| *path)
+                        .collect::<Vec<_>>(),
+                )
+                .await;
             }
             Ok(out) => {
                 let message = out
@@ -1898,6 +1923,16 @@ async fn drive_remote_run(
                     zeron_proto::CloudRunStatus::Error,
                     Some(e),
                 );
+                crate::cloud::cleanup_staged_credentials(
+                    &http,
+                    &store,
+                    &seat,
+                    &staged_remotes
+                        .iter()
+                        .map(|(_, path)| *path)
+                        .collect::<Vec<_>>(),
+                )
+                .await;
             }
         }
         return;
@@ -1915,6 +1950,16 @@ async fn drive_remote_run(
                 zeron_proto::CloudRunStatus::Error,
                 Some(e),
             );
+            crate::cloud::cleanup_staged_credentials(
+                &http,
+                &store,
+                &seat,
+                &staged_remotes
+                    .iter()
+                    .map(|(_, path)| *path)
+                    .collect::<Vec<_>>(),
+            )
+            .await;
             return;
         }
     };
@@ -1925,8 +1970,23 @@ async fn drive_remote_run(
     let mut text = String::new();
     let mut buf = [0u8; 8192];
     let mut interrupted = false;
+    let mut expired = false;
+    let deadline = seat.expires_at.map(|deadline| {
+        let seconds = (deadline - Utc::now()).num_seconds().max(0) as u64;
+        tokio::time::Instant::now() + std::time::Duration::from_secs(seconds)
+    });
     loop {
         tokio::select! {
+            _ = async {
+                match deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                expired = true;
+                let _ = stream.child.kill().await;
+                break;
+            }
             _ = cancel_rx.changed() => {
                 interrupted = true;
                 let _ = stream.child.kill().await;
@@ -1972,7 +2032,9 @@ async fn drive_remote_run(
         .await
         .map(|s| s.code().unwrap_or(-1))
         .unwrap_or(-1);
-    if interrupted {
+    if expired {
+        terminal_cloud_run(&inner, &store, &chat_id, &run_id, &mut segment, &text);
+    } else if interrupted {
         if let Some(segment) = segment {
             let _ = segment.finish(
                 &[MessagePart::Text {
@@ -2043,6 +2105,16 @@ async fn drive_remote_run(
             Some(message),
         );
     }
+    crate::cloud::cleanup_staged_credentials(
+        &http,
+        &store,
+        &seat,
+        &staged_remotes
+            .iter()
+            .map(|(_, path)| *path)
+            .collect::<Vec<_>>(),
+    )
+    .await;
 }
 
 /// Boat seats run the provider's integrated agent: provision (or wake) the
@@ -2119,7 +2191,29 @@ async fn drive_boat_run(
                         id
                     }
                     Err(e) => {
-                        fail(format!("Boat box never came ready: {e}"));
+                        let mut destroyed = false;
+                        let mut destroy_error = String::new();
+                        for attempt in 0..3 {
+                            match api.destroy(&s.id).await {
+                                Ok(()) => {
+                                    destroyed = true;
+                                    break;
+                                }
+                                Err(error) => {
+                                    destroy_error = error;
+                                    if attempt < 2 {
+                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                    }
+                                }
+                            }
+                        }
+                        if destroyed {
+                            fail(format!("created but not ready; destroyed ({e})"));
+                        } else {
+                            fail(format!(
+                                "created but not ready; destroy failed: {destroy_error} (readiness: {e})"
+                            ));
+                        }
                         return;
                     }
                 },
@@ -2161,8 +2255,24 @@ async fn drive_boat_run(
                 use base64::Engine as _;
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 let ws = crate::cloud::shell_word(&seat.workspace());
-                let staged = "/tmp/cosmos-restore.tgz.b64";
-                if let Err(e) = api.write_file(&box_id, staged, b64.as_bytes()).await {
+                let staged = format!("/tmp/cosmos-restore-{run_id}.tgz.b64");
+                let _ = api
+                    .exec(
+                        &box_id,
+                        "rm -f /tmp/cosmos-restore-*.tgz.b64",
+                        None,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await;
+                if let Err(e) = api.write_file(&box_id, &staged, b64.as_bytes()).await {
+                    let _ = api
+                        .exec(
+                            &box_id,
+                            &format!("rm -f {staged}"),
+                            None,
+                            std::time::Duration::from_secs(30),
+                        )
+                        .await;
                     note(format!(
                         "Couldn't upload the Railway backup to this box ({e}) — starting fresh."
                     ));
@@ -2171,7 +2281,7 @@ async fn drive_boat_run(
                         .exec(
                             &box_id,
                             &format!(
-                                "mkdir -p {ws} && base64 -d {staged} | tar xzf - -C {ws} && rm -f {staged}"
+                                "trap 'rm -f {staged}' EXIT; mkdir -p {ws} && base64 -d {staged} | tar xzf - -C {ws}"
                             ),
                             None,
                             std::time::Duration::from_secs(300),
@@ -2200,9 +2310,43 @@ async fn drive_boat_run(
         }
     }
 
+    let staged_remotes =
+        crate::cloud::harness_credentials(seat.harness_command.as_deref().unwrap_or("claude"))
+            .into_iter()
+            .collect::<Vec<_>>();
+    for (local, remote) in &staged_remotes {
+        if let Err(e) = crate::cloud::stage_credential(&http, &store, &seat, local, remote).await {
+            tracing::warn!(seat = %seat.id, file = %local.display(), error = %e, "credential staging failed");
+            write_transcript_note(
+                &doc,
+                &inner.device_id,
+                &format!(
+                    "Couldn't stage {} login on the seat: {e}",
+                    local
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("harness")
+                ),
+            );
+        }
+    }
+    let cleanup = || async {
+        crate::cloud::cleanup_staged_credentials(
+            &http,
+            &store,
+            &seat,
+            &staged_remotes
+                .iter()
+                .map(|(_, path)| *path)
+                .collect::<Vec<_>>(),
+        )
+        .await;
+    };
+
     // Kick the integrated agent. The prompt response carries the
     // conversation handle; events stream the transcript we mirror.
     if let Err(e) = api.prompt(&box_id, "claude", &prompt, None).await {
+        cleanup().await;
         fail(format!("Boat couldn't start the agent: {e}"));
         return;
     }
@@ -2216,6 +2360,7 @@ async fn drive_boat_run(
     loop {
         if *cancel_rx.borrow() || interrupt_token.is_cancelled() {
             let _ = api.interrupt(&box_id).await;
+            cleanup().await;
             if let Some(segment) = segment {
                 let _ = segment.finish(
                     &[MessagePart::Text {
@@ -2239,7 +2384,16 @@ async fn drive_boat_run(
                     .or_else(|| v.get("items"))
                     .and_then(|e| e.as_array())
                     .cloned()
-                    .unwrap_or_default();
+                    .ok_or_else(
+                        || "boat: unexpected response from /sandboxes/{id}/events: missing events",
+                    );
+                let items = match items {
+                    Ok(items) => items,
+                    Err(error) => {
+                        fail(error.to_string());
+                        return;
+                    }
+                };
                 let mut grew = false;
                 let mut done = false;
                 for event in items {
@@ -2295,6 +2449,7 @@ async fn drive_boat_run(
                                 );
                             }
                             fail(msg);
+                            cleanup().await;
                             return;
                         }
                         _ => {}
@@ -2330,6 +2485,7 @@ async fn drive_boat_run(
                         );
                     }
                     finish(SessionStatus::Idle, zeron_proto::CloudRunStatus::Done, None);
+                    cleanup().await;
                     return;
                 }
             }
@@ -2344,6 +2500,7 @@ async fn drive_boat_run(
                     .unwrap_or(false)
                 {
                     fail(format!("the Boat box died mid-run: {e}"));
+                    cleanup().await;
                     return;
                 }
             }
@@ -2360,6 +2517,7 @@ async fn drive_boat_run(
                 );
             }
             fail("no agent events for 10 minutes — the run likely stalled on the box".into());
+            cleanup().await;
             return;
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -2384,6 +2542,7 @@ async fn tail_remote_log(
         zeron_doc::SegmentWriter::begin(doc, &entry_id, &inner.device_id, now_ms()).ok();
     let mut mirrored: u64 = 0;
     let mut text = String::new();
+    let mut ssh_255_streak = 0u8;
     loop {
         if *cancel_rx.borrow() {
             let _ = segment.take().and_then(|s| {
@@ -2414,6 +2573,18 @@ async fn tail_remote_log(
             .await
         {
             Ok(out) => {
+                if out.code == 255 {
+                    ssh_255_streak = ssh_255_streak.saturating_add(1);
+                } else {
+                    ssh_255_streak = 0;
+                }
+                if ssh_255_streak >= 3
+                    || out.stderr.contains("Permission denied")
+                    || out.stdout.contains("Permission denied")
+                {
+                    terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, &text);
+                    return;
+                }
                 let mut alive = false;
                 let mut chunk = String::new();
                 for line in out.stdout.lines() {
@@ -2473,6 +2644,14 @@ async fn tail_remote_log(
                 }
             }
             Err(e) => {
+                if e.contains("expired")
+                    || e.contains("Permission denied")
+                    || (matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Railway))
+                        && e.contains("Railway"))
+                {
+                    terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, &text);
+                    return;
+                }
                 tracing::warn!(seat = %seat.id, error = %e, "cloud run log tail failed");
             }
         }
@@ -2481,6 +2660,36 @@ async fn tail_remote_log(
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
         }
     }
+}
+
+const CLOUD_EXPIRY_MESSAGE: &str =
+    "Cloud seat expired — the run was cut off. Reprovision the seat to continue.";
+
+fn terminal_cloud_run(
+    inner: &Arc<Inner>,
+    store: &crate::cloud::CloudStore,
+    chat_id: &str,
+    run_id: &str,
+    segment: &mut Option<zeron_doc::SegmentWriter>,
+    text: &str,
+) {
+    let _ = segment.take().and_then(|s| {
+        s.finish(
+            &[MessagePart::Text {
+                id: "t0".into(),
+                text: text.to_string(),
+            }],
+            zeron_doc::MessageStatus::Aborted,
+        )
+        .ok()
+    });
+    inner.set_status(chat_id, SessionStatus::Errored, false);
+    store.update_run(run_id, |run| {
+        run.status = zeron_proto::CloudRunStatus::Error;
+        run.error = Some(CLOUD_EXPIRY_MESSAGE.to_string());
+        run.finished_at = Some(Utc::now());
+    });
+    lock(&inner.runs).remove(chat_id);
 }
 
 /// An honest error line in the transcript when a remote run can't even start.
@@ -2495,6 +2704,22 @@ fn write_remote_error(doc: &crate::doc_host::DocWriter, device_id: &str, message
         created_at: now_ms(),
         device_id: device_id.to_string(),
         status: Some(zeron_doc::MessageStatus::Aborted),
+        continuation_of: None,
+        duration_ms: None,
+    });
+}
+
+fn write_transcript_note(doc: &crate::doc_host::DocWriter, device_id: &str, message: &str) {
+    let _ = doc.push_message(&SessionMessageEntry {
+        id: new_id(),
+        role: zeron_doc::MessageRole::Assistant,
+        parts: vec![MessagePart::Text {
+            id: "t0".into(),
+            text: message.to_string(),
+        }],
+        created_at: now_ms(),
+        device_id: device_id.to_string(),
+        status: Some(zeron_doc::MessageStatus::Complete),
         continuation_of: None,
         duration_ms: None,
     });
