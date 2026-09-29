@@ -588,10 +588,13 @@ impl CloudStore {
     }
 
     /// Provider keys a cloud run should export to the seat — only rows the
-    /// user toggled "use this key for Cloud sessions" on.
+    /// user toggled "use this key for Cloud sessions" on. With no cloud
+    /// Anthropic key, a live Claude subscription login is forwarded as
+    /// `CLAUDE_CODE_OAUTH_TOKEN` so `claude` on the seat runs under the
+    /// user's existing account — no separate BYOK setup needed.
     pub fn cloud_env(&self) -> Vec<(String, String)> {
         let state = self.inner.state.read().unwrap();
-        state
+        let mut env: Vec<(String, String)> = state
             .config
             .providers
             .iter()
@@ -612,7 +615,13 @@ impl CloudStore {
                 };
                 Some((env.to_string(), key.clone()))
             })
-            .collect()
+            .collect();
+        let has_anthropic = env.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY");
+        drop(state);
+        if !has_anthropic && let Some(token) = claude_oauth_token() {
+            env.push(("CLAUDE_CODE_OAUTH_TOKEN".into(), token));
+        }
+        env
     }
 
     // ── automations ──────────────────────────────────────────────────────
@@ -797,13 +806,41 @@ impl CloudStore {
     }
 }
 
+/// The local Claude Code subscription token (`claudeAiOauth.accessToken`
+/// in `$CLAUDE_CONFIG_DIR/.credentials.json` / `~/.claude/.credentials.json`),
+/// skipped when expired. macOS keychain-held logins miss here — fine, the
+/// env var just isn't injected. Never stored; read fresh per dispatch.
+fn claude_oauth_token() -> Option<String> {
+    let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs_like_home().join(".claude"));
+    let text = std::fs::read_to_string(dir.join(".credentials.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let oauth = v.get("claudeAiOauth")?;
+    if let Some(expires_ms) = oauth.get("expiresAt").and_then(|e| e.as_i64()) {
+        if expires_ms <= Utc::now().timestamp_millis() {
+            return None;
+        }
+    }
+    oauth
+        .get("accessToken")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn dirs_like_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// Pull `seat`'s workspace to `seat-backups/<id>.tar.gz` — the Railway
 /// trial safeguard the scheduler fires ~10 minutes before `expires_at`.
 /// Heavy build dirs are excluded; a cap guards memory (`output()` buffers).
-pub async fn snapshot_workspace(
-    store: &CloudStore,
-    seat: &SeatConfig,
-) -> Result<PathBuf, String> {
+pub async fn snapshot_workspace(store: &CloudStore, seat: &SeatConfig) -> Result<PathBuf, String> {
     let path = store.backups_dir().join(format!("{}.tar.gz", seat.id));
     let ws = shell_word(&seat.workspace());
     let tar = format!(
