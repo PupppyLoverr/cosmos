@@ -4975,6 +4975,7 @@ impl Render for ComposerInput {
 #[derive(Debug, Clone)]
 pub enum ComposerEvent {
     WorkspaceCommand(WorkspaceCommand),
+    StartRailwayTrial,
     /// Arm the shared-element transition before the draft route is replaced
     /// by the newly-created session. Emitting this before `select_chat` keeps
     /// the first destination frame on the same timeline as the source frame.
@@ -5768,14 +5769,6 @@ pub struct Composer {
     /// another chat's request when the user navigates quickly.
     interrupting: HashSet<String>,
     interrupt_tasks: HashMap<String, Task<()>>,
-    /// The new-session destination — `None` = This computer; `Some(row)` =
-    /// a cloud seat (or GitHub agent) to run the session on. The pick stores
-    /// the seat row the engine reported (capabilities + credential flags)
-    /// and mints the `CloudSeatBinding` at send.
-    seat_pick: Option<crate::cloud::SeatRow>,
-    /// The seat picker popover's open state; the seat rows themselves come
-    /// from the shared `AppState::cloud` view (`refresh_cloud`).
-    seat_menu: bool,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -6267,8 +6260,6 @@ impl Composer {
             send_task: None,
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
-            seat_pick: None,
-            seat_menu: false,
             editing_queued: None,
             queue_edit_lease_id: None,
             queue_edit_base_text_hash: None,
@@ -9478,23 +9469,9 @@ impl Composer {
         self.state.read(cx).cloud_view()
     }
 
-    /// The seat chip label: This computer | Cloud — {seat} | GitHub — {seat}.
-    fn seat_chip_label(&self) -> SharedString {
-        match &self.seat_pick {
-            None => "This computer".into(),
-            Some(seat) => {
-                let prefix = match seat.config.kind {
-                    Some(zeron_proto::CloudSeatKind::GitHub) => "GitHub",
-                    _ => "Cloud",
-                };
-                SharedString::from(format!("{prefix} — {}", seat.config.label))
-            }
-        }
-    }
-
     /// Mint the `CloudSeatBinding` the chat row persists.
     fn seat_binding(&self, cx: &App) -> Option<zeron_proto::CloudSeatBinding> {
-        let seat = self.seat_pick.as_ref()?;
+        let seat = self.state.read(cx).active_cloud_seat()?;
         Some(zeron_proto::CloudSeatBinding {
             seat_id: seat.config.id.clone(),
             kind: seat.config.kind.unwrap_or(zeron_proto::CloudSeatKind::Ssh),
@@ -9511,7 +9488,7 @@ impl Composer {
     /// One-click trial on-ramp: create a Railway seat row, provision the VM
     /// via `ssh railway.new` (the probe stamps deadline/claim/preview), then
     /// pick it — the send path just sees a bound seat.
-    fn start_railway_trial(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn start_railway_trial(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -9563,7 +9540,15 @@ impl Composer {
                 match (probe, view) {
                     (Ok(_), Some(view)) => {
                         if let Some(row) = view.seats.iter().find(|s| s.config.id == seat_id) {
-                            composer.seat_pick = Some(row.clone());
+                            composer.state.update(cx, |state, cx| {
+                                state.cloud_seat_pick = Some(row.clone());
+                                state.cloud_mode = true;
+                                crate::settings::update(
+                                    crate::settings::SavePolicy::Debounced,
+                                    cx,
+                                    |settings| settings.cloud_mode = true,
+                                );
+                            });
                         }
                     }
                     (Err(err), _) => {
@@ -9579,285 +9564,6 @@ impl Composer {
             .ok();
         })
         .detach();
-    }
-
-    /// The seat chip + menu — the new-session canvas's first destination
-    /// choice: This computer | Cloud seat | GitHub agent.
-    fn render_seat_selector(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx).clone();
-        let cloud_icon = match self.seat_pick.as_ref().and_then(|s| s.config.kind) {
-            Some(zeron_proto::CloudSeatKind::GitHub) => icons::GIT_BRANCH,
-            Some(_) => icons::CLOUD,
-            None => icons::MONITOR,
-        };
-        let unready = self
-            .seat_pick
-            .as_ref()
-            .is_some_and(|seat| !crate::cloud::CloudView::seat_ready(seat));
-        let chip = div()
-            .id("picker-seat")
-            .h(px(20.0))
-            .max_w(px(280.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .px(px(8.0))
-            .rounded(px(6.0))
-            .text_size(crate::typography::ui_rems(12.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(if unready {
-                theme.warning
-            } else {
-                motion::hover_blend(
-                    "picker-seat",
-                    theme.text_muted.opacity(0.7),
-                    theme.text.opacity(0.8),
-                )
-            })
-            .bg(if self.seat_menu {
-                theme.element_hover
-            } else {
-                motion::hover_blend(
-                    "picker-seat",
-                    gpui::transparent_black(),
-                    theme.element_hover,
-                )
-            })
-            .on_hover(motion::hover_listener("picker-seat"))
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.seat_menu = !this.seat_menu;
-                if this.seat_menu {
-                    this.load_cloud_view(cx);
-                }
-                cx.notify();
-            }))
-            .child(
-                icon(cloud_icon)
-                    .size(px(12.0))
-                    .flex_none()
-                    .text_color(theme.text_muted.opacity(0.7)),
-            )
-            .child(div().min_w_0().truncate().child(self.seat_chip_label()))
-            .child(
-                icon(icons::ALT_ARROW_DOWN)
-                    .size(px(12.0))
-                    .flex_none()
-                    .text_color(theme.text_muted.opacity(0.5)),
-            );
-        let menu = self.seat_menu.then(|| self.render_seat_menu(&theme, cx));
-        div()
-            .relative()
-            .mr_auto()
-            .child(chip)
-            .when_some(menu, |el, menu| {
-                el.child(div().absolute().top(px(24.0)).left(px(0.0)).child(menu))
-            })
-            .into_any_element()
-    }
-
-    /// The seat menu's three groups: This computer, then Box/SSH seats
-    /// ("Cloud seat"), then GitHub-repo seats ("GitHub agent").
-    fn render_seat_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let theme = theme.for_popup();
-        let mut menu = popover::popover_card(&theme).w(px(240.0));
-        // This computer — the default local session.
-        let fade = SharedString::from("seat-menu-local");
-        menu = menu.child(
-            popover::menu_row(&theme, self.seat_pick.is_none(), fade)
-                .id("seat-menu-local")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .child(
-                    icon(icons::MONITOR)
-                        .size(px(13.0))
-                        .flex_none()
-                        .text_color(theme.text_muted),
-                )
-                .child(div().flex_1().min_w_0().truncate().child("This computer"))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(crate::typography::ui_rems(10.0))
-                        .text_color(theme.text_faint)
-                        .child("local"),
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.seat_pick = None;
-                    this.seat_menu = false;
-                    cx.notify();
-                })),
-        );
-        let seats: Vec<crate::cloud::SeatRow> = self
-            .cloud_view(cx)
-            .map(|v| v.seats.clone())
-            .unwrap_or_default();
-        let mut cloud_seats = seats
-            .iter()
-            .filter(|s| !matches!(s.config.kind, Some(zeron_proto::CloudSeatKind::GitHub)))
-            .peekable();
-        let mut github_seats = seats
-            .iter()
-            .filter(|s| matches!(s.config.kind, Some(zeron_proto::CloudSeatKind::GitHub)))
-            .peekable();
-        let seat_row = |seat: &crate::cloud::SeatRow,
-                        ix: usize,
-                        group: &'static str,
-                        theme: &Theme,
-                        cx: &mut Context<Self>| {
-            let seat_id = seat.config.id.clone();
-            let seat_row_data = seat.clone();
-            let ready = crate::cloud::CloudView::seat_ready(seat);
-            let picked = self
-                .seat_pick
-                .as_ref()
-                .is_some_and(|p| p.config.id == seat_id);
-            let fade = SharedString::from(format!("seat-menu-{group}-{ix}"));
-            let icon_path = if group == "github" {
-                icons::GIT_BRANCH
-            } else {
-                icons::CLOUD
-            };
-            let mut row = popover::menu_row(theme, picked, fade)
-                .id(SharedString::from(format!("seat-menu-{group}-{ix}")))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .child(
-                    icon(icon_path)
-                        .size(px(13.0))
-                        .flex_none()
-                        .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(SharedString::from(seat.config.label.clone())),
-                );
-            if !ready {
-                // Visible but marked — the spec's "Cloud option visible,
-                // Start disabled" gate lives here and at send().
-                row = row.child(
-                    div()
-                        .flex_none()
-                        .text_size(crate::typography::ui_rems(9.5))
-                        .text_color(theme.warning)
-                        .child("needs credentials"),
-                );
-            }
-            row.cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.seat_pick = Some(seat_row_data.clone());
-                    this.seat_menu = false;
-                    cx.notify();
-                }))
-        };
-        // Railway is the on-ramp for EVERY user — the menu offers a trial
-        // seat even before one exists (probe provisions it via
-        // `ssh railway.new` under the user's own key). An unexpired trial
-        // seat already in the list covers this; the row hides then.
-        let live_trial = seats.iter().any(|s| {
-            s.config.kind == Some(zeron_proto::CloudSeatKind::Railway) && !s.config.expired()
-        });
-        if cloud_seats.peek().is_some() || !live_trial {
-            menu = menu
-                .child(popover::menu_separator())
-                .child(popover::menu_heading(&theme, "Cloud seat"));
-            if !live_trial {
-                menu = menu.child(
-                    popover::menu_row(&theme, false, "seat-menu-railway")
-                        .id("seat-menu-railway")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .cursor_pointer()
-                        .child(
-                            icon(icons::CLOUD)
-                                .size(px(13.0))
-                                .flex_none()
-                                .text_color(theme.accent),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .child(div().truncate().child("Railway trial"))
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(crate::typography::ui_rems(9.5))
-                                        .text_color(theme.text_faint)
-                                        .child("60-minute free seat — your ssh key"),
-                                ),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.seat_menu = false;
-                            this.start_railway_trial(cx);
-                        })),
-                );
-            }
-            for (ix, seat) in cloud_seats.enumerate() {
-                menu = menu.child(seat_row(seat, ix, "cloud", &theme, cx));
-            }
-        }
-        if github_seats.peek().is_some() {
-            menu = menu
-                .child(popover::menu_separator())
-                .child(popover::menu_heading(&theme, "GitHub agent"));
-            for (ix, seat) in github_seats.enumerate() {
-                menu = menu.child(seat_row(seat, ix, "github", &theme, cx));
-            }
-        }
-        // The empty state keeps Cloud selectable-looking — the seats are
-        // missing, not the feature. One explanatory line per the spec.
-        if seats.is_empty() {
-            menu = menu
-                .child(popover::menu_separator())
-                .child(
-                    div()
-                        .px(px(8.0))
-                        .py(px(6.0))
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.text_muted)
-                        .child(
-                            "No cloud seats yet — add one in Settings → Cloud \
-                             computer to run agents off this computer.",
-                        ),
-                )
-                .child(
-                    popover::menu_row(&theme, false, "seat-menu-settings")
-                        .id("seat-menu-settings")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .cursor_pointer()
-                        .child(
-                            icon(icons::SETTINGS_MINIMALISTIC)
-                                .size(px(13.0))
-                                .flex_none()
-                                .text_color(theme.text_muted),
-                        )
-                        .child(div().flex_1().min_w_0().truncate().child("Configure seats"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.seat_menu = false;
-                            cx.emit(ComposerEvent::WorkspaceCommand(
-                                WorkspaceCommand::CloudComputer,
-                            ));
-                            cx.notify();
-                        })),
-                );
-        }
-        menu.into_any_element()
     }
 
     /// Queue a Run doc command with an optimistic echo — or, with the agent
@@ -9998,7 +9704,7 @@ impl Composer {
         // unprovisioned seat (missing token/host/repo) keeps the option
         // visible while blocking Start with one line of copy.
         let cloud_seat = self.seat_binding(cx);
-        if let Some(seat) = &self.seat_pick
+        if let Some(seat) = self.state.read(cx).active_cloud_seat()
             && is_new
             && !crate::cloud::CloudView::seat_ready(seat)
         {
@@ -12115,11 +11821,6 @@ impl Render for Composer {
                 pickers.render_new_thread_target_selectors(cx)
             })
         });
-        // The destination pick (This computer | Cloud seat | GitHub agent)
-        // sits at the row's left; `mr_auto` keeps the existing checkout/project
-        // selectors pinned right under `justify_end`.
-        let seat_selector =
-            (new_thread_chrome_opacity > 0.0).then(|| self.render_seat_selector(cx));
         let new_thread_git_selectors = (new_thread_chrome_opacity > 0.0)
             .then(|| {
                 self.pickers.update(cx, |pickers, cx| {
@@ -12177,7 +11878,6 @@ impl Render for Composer {
                     .items_start()
                     .justify_end()
                     .opacity(new_thread_chrome_opacity)
-                    .children(seat_selector)
                     .children(new_thread_target_selectors),
             )
         } else if new_thread_chrome > 0.0 {
@@ -12191,7 +11891,6 @@ impl Render for Composer {
                     .items_start()
                     .justify_end()
                     .opacity(new_thread_chrome_opacity)
-                    .children(seat_selector)
                     .children(new_thread_target_selectors),
             )
         } else {

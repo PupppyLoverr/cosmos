@@ -790,6 +790,11 @@ pub struct AppState {
     cloud_task: Option<Task<()>>,
     /// When the last successful `CloudGetConfig` landed (staleness checks).
     cloud_fetched_at: Option<std::time::Instant>,
+    /// Whether new sessions target a cloud seat instead of this computer.
+    pub cloud_mode: bool,
+    /// The selected cloud seat for new sessions. This is intentionally
+    /// session-local; the mode persists, but a seat is refreshed from config.
+    pub cloud_seat_pick: Option<crate::cloud::SeatRow>,
 }
 
 /// Text/reasoning growth changes the transcript without changing session
@@ -862,6 +867,8 @@ impl AppState {
             cloud: crate::popover::Loadable::Idle,
             cloud_task: None,
             cloud_fetched_at: None,
+            cloud_mode: false,
+            cloud_seat_pick: None,
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -1938,6 +1945,12 @@ impl AppState {
     /// never-fetched state — callers gate on `cloud_seats().is_empty()`).
     pub fn cloud_view(&self) -> Option<&crate::cloud::CloudView> {
         self.cloud.ready()
+    }
+
+    pub fn active_cloud_seat(&self) -> Option<&crate::cloud::SeatRow> {
+        self.cloud_mode
+            .then_some(self.cloud_seat_pick.as_ref())
+            .flatten()
     }
 
     /// Configured seats (empty until the first fetch lands).

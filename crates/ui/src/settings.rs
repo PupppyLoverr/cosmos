@@ -672,6 +672,7 @@ pub struct UiSettings {
         std::collections::HashMap<zeron_proto::HarnessId, SkillCompletionSettings>,
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
+    pub cloud_mode: bool,
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
     /// folder inherently). Kept for file compatibility; no longer read.
     pub sidebar_grouped: bool,
@@ -849,6 +850,7 @@ impl Default for UiSettings {
             window_geometry: None,
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
+            cloud_mode: false,
             sidebar_grouped: false,
             sidebar_organization: SidebarOrganization::InOneList,
             sidebar_sort: SidebarSort::LastUpdated,
@@ -2241,6 +2243,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
             window_geometry: None,
+            cloud_mode: false,
             sidebar_width: 300.0,
             sidebar_collapsed: true,
             sidebar_grouped: true,

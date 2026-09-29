@@ -216,7 +216,11 @@ pub fn run_app(config: UiConfig) {
         cx.register_url_scheme("zeron").detach();
         cx.register_url_scheme("cosmos").detach();
 
-        let state = cx.new(|_| state::AppState::new());
+        let state = cx.new(|_| {
+            let mut state = state::AppState::new();
+            state.cloud_mode = ui_settings.cloud_mode;
+            state
+        });
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {

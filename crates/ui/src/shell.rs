@@ -1929,6 +1929,8 @@ pub struct Shell {
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
     /// Hover/drag + scroll-linger state of the dropdown's floating rail.
     spaces_menu_bar: popover::MenuScrollbarState,
+    /// The cloud destination picker below the Agent/Cloud mode toggle.
+    cloud_seat_menu: popover::Popup<()>,
     /// Persisted organization/sort/metadata controls beside the project filter.
     sidebar_view_menu: popover::Popup<spaces::SidebarViewMenu>,
     /// Natural-tab-order focus target for the icon-only view-options button.
@@ -1941,6 +1943,8 @@ pub struct Shell {
     chat_status_hover: Option<String>,
     /// Scroll position of the sidebar lists region (drives its edge fades).
     sidebar_scroll: gpui::ScrollHandle,
+    /// Hover/drag + scroll-linger state of the sidebar sessions rail.
+    sidebar_bar: popover::MenuScrollbarState,
     /// In-flight reorder for the pinned section only.
     pinned_session_drag: Option<PinnedSessionDragState>,
     pinned_session_drag_generation: u64,
@@ -2118,11 +2122,15 @@ impl Shell {
         // Every send glides the prompt to the viewport top and reserves the
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
+            let composer = composer.clone();
             let transcript = transcript.clone();
             move |this: &mut Shell, _, event: &ComposerEvent, cx| match event {
                 ComposerEvent::WorkspaceCommand(command) => {
                     this.pending_workspace_command = Some(*command);
                     cx.notify();
+                }
+                ComposerEvent::StartRailwayTrial => {
+                    composer.update(cx, |composer, cx| composer.start_railway_trial(cx));
                 }
                 ComposerEvent::NewThreadTransitionStarted => {
                     // Route observation drives the dock once selection commits.
@@ -2398,12 +2406,14 @@ impl Shell {
             pending_workspace_command: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_bar: popover::MenuScrollbarState::default(),
+            cloud_seat_menu: popover::Popup::default(),
             sidebar_view_menu: popover::Popup::default(),
             sidebar_view_trigger_focus: cx.focus_handle().tab_stop(true),
             sidebar_pinned_heights: Vec::new(),
             project_icons: Default::default(),
             chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
+            sidebar_bar: popover::MenuScrollbarState::default(),
             pinned_session_drag: None,
             pinned_session_drag_generation: 0,
             sidebar_session_transfer: None,
@@ -7996,7 +8006,361 @@ impl Shell {
         )
     }
 
+    fn set_cloud_mode(&mut self, cloud_mode: bool, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            state.cloud_mode = cloud_mode;
+            if !cloud_mode {
+                state.cloud_seat_pick = None;
+            }
+        });
+        settings::update(SavePolicy::Debounced, cx, |settings| {
+            settings.cloud_mode = cloud_mode;
+        });
+        if cloud_mode {
+            self.state.update(cx, |state, cx| {
+                if state.cloud_seat_pick.is_none()
+                    && let Some(seat) = state
+                        .cloud_seats()
+                        .iter()
+                        .find(|seat| crate::cloud::CloudView::seat_ready(seat))
+                        .cloned()
+                {
+                    state.cloud_seat_pick = Some(seat);
+                }
+                state.refresh_cloud(Some(Duration::from_secs(10)), cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn render_cloud_mode_toggle(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let cloud_mode = self.state.read(cx).cloud_mode;
+        let segment =
+            |id: &'static str, label: &'static str, icon_path: &'static str, active: bool| {
+                div()
+                    .id(id)
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(6.0))
+                    .rounded(px(6.0))
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(if active {
+                        theme.text
+                    } else {
+                        motion::hover_blend(id, theme.text_muted, theme.text)
+                    })
+                    .bg(if active {
+                        theme.glass_hover()
+                    } else {
+                        motion::hover_blend(
+                            id,
+                            theme.glass_hover().opacity(0.0),
+                            theme.glass_hover().opacity(0.8),
+                        )
+                    })
+                    .on_hover(motion::hover_listener(id))
+                    .cursor_pointer()
+                    .child(icon(icon_path).size(px(13.0)).flex_none())
+                    .child(label)
+            };
+        let agent = segment("sidebar-agent-mode", "Agent", icons::MONITOR, !cloud_mode)
+            .on_click(cx.listener(|this, _, _, cx| this.set_cloud_mode(false, cx)));
+        let cloud = segment("sidebar-cloud-mode", "Cloud", icons::CLOUD, cloud_mode)
+            .on_click(cx.listener(|this, _, _, cx| this.set_cloud_mode(true, cx)));
+        div()
+            .mx(px(Theme::SPACE_SM))
+            .mt(px(Theme::SPACE_SM))
+            .mb(px(2.0))
+            .h(px(28.0))
+            .flex()
+            .flex_row()
+            .gap(px(2.0))
+            .rounded(px(8.0))
+            .bg(theme.glass().opacity(0.45))
+            .child(agent)
+            .child(cloud)
+            .into_any_element()
+    }
+
+    fn close_cloud_seat_menu(&mut self, cx: &mut Context<Self>) {
+        if self.cloud_seat_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.cloud_seat_menu);
+            cx.notify();
+        }
+    }
+
+    fn render_cloud_seat_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let theme = theme.for_popup();
+        let seats = self
+            .state
+            .read(cx)
+            .cloud_view()
+            .map(|view| view.seats.clone())
+            .unwrap_or_default();
+        let picked = self
+            .state
+            .read(cx)
+            .cloud_seat_pick
+            .as_ref()
+            .map(|seat| seat.config.id.clone());
+        let mut menu = popover::popover_card(&theme)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.close_cloud_seat_menu(cx);
+            }))
+            .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM));
+        let mut cloud_seats = seats
+            .iter()
+            .filter(|seat| !matches!(seat.config.kind, Some(zeron_proto::CloudSeatKind::GitHub)))
+            .peekable();
+        let mut github_seats = seats
+            .iter()
+            .filter(|seat| matches!(seat.config.kind, Some(zeron_proto::CloudSeatKind::GitHub)))
+            .peekable();
+        let seat_row = |seat: &crate::cloud::SeatRow,
+                        ix: usize,
+                        group: &'static str,
+                        theme: &Theme,
+                        cx: &mut Context<Self>| {
+            let seat_data = seat.clone();
+            let selected = picked.as_deref() == Some(seat.config.id.as_str());
+            let ready = crate::cloud::CloudView::seat_ready(seat);
+            let mut row = popover::menu_row(
+                theme,
+                selected,
+                SharedString::from(format!("sidebar-seat-{group}-{ix}")),
+            )
+            .id(SharedString::from(format!("sidebar-seat-{group}-{ix}")))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                icon(if group == "github" {
+                    icons::GIT_BRANCH
+                } else {
+                    icons::CLOUD
+                })
+                .size(px(13.0))
+                .flex_none()
+                .text_color(theme.text_muted),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(SharedString::from(seat.config.label.clone())),
+            );
+            if !ready {
+                row = row.child(
+                    div()
+                        .flex_none()
+                        .text_size(crate::typography::ui_rems(9.5))
+                        .text_color(theme.warning)
+                        .child("needs credentials"),
+                );
+            }
+            row.cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.state.update(cx, |state, _| {
+                        state.cloud_seat_pick = Some(seat_data.clone());
+                        state.cloud_mode = true;
+                    });
+                    this.close_cloud_seat_menu(cx);
+                    cx.notify();
+                }))
+        };
+        let live_trial = seats.iter().any(|seat| {
+            seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway) && !seat.config.expired()
+        });
+        if cloud_seats.peek().is_some() || !live_trial {
+            menu = menu
+                .child(popover::menu_separator())
+                .child(popover::menu_heading(&theme, "Cloud seat"));
+            if !live_trial {
+                menu = menu.child(
+                    popover::menu_row(&theme, false, "sidebar-seat-railway")
+                        .id("sidebar-seat-railway")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .cursor_pointer()
+                        .child(
+                            icon(icons::CLOUD)
+                                .size(px(13.0))
+                                .flex_none()
+                                .text_color(theme.accent),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(div().truncate().child("Railway trial"))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(crate::typography::ui_rems(9.5))
+                                        .text_color(theme.text_faint)
+                                        .child("60-minute free seat — your ssh key"),
+                                ),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_cloud_seat_menu(cx);
+                            this.composer
+                                .update(cx, |composer, cx| composer.start_railway_trial(cx));
+                        })),
+                );
+            }
+            for (ix, seat) in cloud_seats.enumerate() {
+                menu = menu.child(seat_row(seat, ix, "cloud", &theme, cx));
+            }
+        }
+        if github_seats.peek().is_some() {
+            menu = menu
+                .child(popover::menu_separator())
+                .child(popover::menu_heading(&theme, "GitHub agent"));
+            for (ix, seat) in github_seats.enumerate() {
+                menu = menu.child(seat_row(seat, ix, "github", &theme, cx));
+            }
+        }
+        if seats.is_empty() {
+            menu = menu
+                .child(popover::menu_separator())
+                .child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(6.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_muted)
+                        .child("No cloud seats yet — add one in Settings → Cloud computer."),
+                )
+                .child(
+                    popover::menu_row(&theme, false, "sidebar-seat-settings")
+                        .id("sidebar-seat-settings")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .cursor_pointer()
+                        .child(
+                            icon(icons::SETTINGS_MINIMALISTIC)
+                                .size(px(13.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                        )
+                        .child(div().flex_1().min_w_0().truncate().child("Configure seats"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_cloud_seat_menu(cx);
+                            this.open_settings(SettingsSection::CloudComputer, cx);
+                        })),
+                );
+        }
+        menu.into_any_element()
+    }
+
+    fn render_cloud_seat_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let seat = self.state.read(cx).active_cloud_seat().cloned();
+        let label: SharedString = match seat.as_ref() {
+            Some(seat) if seat.config.kind == Some(zeron_proto::CloudSeatKind::GitHub) => {
+                format!("GitHub — {}", seat.config.label).into()
+            }
+            Some(seat) if seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway) => {
+                let minutes = seat
+                    .config
+                    .expires_at
+                    .map(|at| at.signed_duration_since(Utc::now()).num_minutes().max(0))
+                    .unwrap_or(0);
+                format!("Railway trial — {minutes}m").into()
+            }
+            Some(seat) => format!("Cloud — {}", seat.config.label).into(),
+            None => "Choose a seat…".into(),
+        };
+        let open = self.cloud_seat_menu.is_open();
+        let trigger = div()
+            .id("sidebar-cloud-seat")
+            .h(px(26.0))
+            .mx(px(Theme::SPACE_SM))
+            .px(px(Theme::SPACE_SM))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(Theme::SPACE_SM))
+            .rounded(px(6.0))
+            .text_size(crate::typography::ui_rems(12.0))
+            .text_color(if open { theme.text } else { theme.text_muted })
+            .bg(if open {
+                theme.glass_hover()
+            } else {
+                motion::hover_blend(
+                    "sidebar-cloud-seat",
+                    theme.glass_hover().opacity(0.0),
+                    theme.glass_hover().opacity(0.8),
+                )
+            })
+            .on_hover(motion::hover_listener("sidebar-cloud-seat"))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.cloud_seat_menu.note_trigger_press()),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.cloud_seat_menu.take_press_was_open() {
+                    this.close_cloud_seat_menu(cx);
+                } else {
+                    this.state.update(cx, |state, cx| {
+                        state.refresh_cloud(Some(Duration::from_secs(10)), cx);
+                    });
+                    this.cloud_seat_menu.open(());
+                    let _ = window;
+                    cx.notify();
+                }
+            }))
+            .child(icon(icons::CLOUD).size(px(13.0)).flex_none())
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(
+                icon(icons::ALT_ARROW_DOWN)
+                    .size(px(13.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+            );
+        if self.cloud_seat_menu.get().is_some() {
+            let closing = self.cloud_seat_menu.closing_since();
+            trigger
+                .relative()
+                .child(popover::anchored_menu_below(
+                    "sidebar-cloud-seat-menu",
+                    self.render_cloud_seat_menu(theme, cx),
+                    closing,
+                ))
+                .into_any_element()
+        } else {
+            trigger.into_any_element()
+        }
+    }
+
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if self.state.read(cx).cloud_mode && self.state.read(cx).cloud_seat_pick.is_none() {
+            self.state.update(cx, |state, cx| {
+                if state.cloud_seat_pick.is_none()
+                    && let Some(seat) = state
+                        .cloud_seats()
+                        .iter()
+                        .find(|seat| crate::cloud::CloudView::seat_ready(seat))
+                        .cloned()
+                {
+                    state.cloud_seat_pick = Some(seat);
+                }
+                state.refresh_cloud(Some(Duration::from_secs(10)), cx);
+            });
+        }
         if self.sidebar_session_transfer.as_ref().is_some_and(|drag| {
             !cx.has_active_drag() || !self.sidebar_session_transfer_is_valid(&drag.payload, cx)
         }) {
@@ -8316,53 +8680,68 @@ impl Shell {
         // rode the previous frame's offset, so the last frame of a content
         // shrink (row archived while scrolled) left a phantom fade stuck
         // over an unscrollable list (user report).
+        let sidebar_scrollbar = popover::rail(self, "sidebar-scrollbar", theme, cx);
         let sidebar_lists = crate::edge_fade::edge_faded(
             SIDEBAR_GLASS_FADE_BAND,
             true,
             true,
             div().relative().flex_1().min_h_0().child(
                 div()
-                    .id("sidebar-lists")
+                    .id("sidebar-lists-host")
                     .relative()
                     .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.sidebar_scroll)
-                    .on_drag_move::<SidebarSessionDrag>(cx.listener(
-                        move |this, event: &gpui::DragMoveEvent<SidebarSessionDrag>, _, cx| {
-                            if let Some(transfer) = this.sidebar_session_transfer.as_mut() {
-                                transfer.viewport = Some(event.bounds);
-                            }
-                            if !event.bounds.contains(&event.event.position) {
-                                if let Some(transfer) = this.sidebar_session_transfer.as_mut() {
-                                    transfer.preview = None;
-                                }
-                                return;
-                            }
-                            let payload = event.drag(cx).clone();
-                            this.track_pinned_session_drag_pointer(
-                                payload,
-                                f32::from(event.event.position.y),
-                                f32::from(event.bounds.top()),
-                                f32::from(event.bounds.bottom()),
-                                cx,
-                            );
-                        },
-                    ))
-                    // Empty space and Archived are not transfer targets.
-                    .on_drop::<SidebarSessionDrag>(cx.listener(
-                        |this, _: &SidebarSessionDrag, _, cx| {
-                            this.cancel_sidebar_session_transfer(cx);
-                        },
-                    ))
-                    .px(px(Theme::SPACE_SM))
-                    .flex()
-                    .flex_col()
-                    // No "Sessions" header (user request) — the list
-                    // is the whole column; a little air stands in.
-                    .pt(px(SIDEBAR_LIST_PAD_TOP))
-                    .child(active_list)
-                    .children(archived_section)
-                    .children(moving_row),
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if this.sidebar_bar.set_list_hovered(*hovered) {
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .id("sidebar-lists")
+                            .relative()
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.sidebar_scroll)
+                            .on_drag_move::<SidebarSessionDrag>(cx.listener(
+                                move |this,
+                                      event: &gpui::DragMoveEvent<SidebarSessionDrag>,
+                                      _,
+                                      cx| {
+                                    if let Some(transfer) = this.sidebar_session_transfer.as_mut() {
+                                        transfer.viewport = Some(event.bounds);
+                                    }
+                                    if !event.bounds.contains(&event.event.position) {
+                                        if let Some(transfer) =
+                                            this.sidebar_session_transfer.as_mut()
+                                        {
+                                            transfer.preview = None;
+                                        }
+                                        return;
+                                    }
+                                    let payload = event.drag(cx).clone();
+                                    this.track_pinned_session_drag_pointer(
+                                        payload,
+                                        f32::from(event.event.position.y),
+                                        f32::from(event.bounds.top()),
+                                        f32::from(event.bounds.bottom()),
+                                        cx,
+                                    );
+                                },
+                            ))
+                            .on_drop::<SidebarSessionDrag>(cx.listener(
+                                |this, _: &SidebarSessionDrag, _, cx| {
+                                    this.cancel_sidebar_session_transfer(cx);
+                                },
+                            ))
+                            .px(px(Theme::SPACE_SM))
+                            .flex()
+                            .flex_col()
+                            .pt(px(SIDEBAR_LIST_PAD_TOP))
+                            .child(active_list)
+                            .children(archived_section)
+                            .children(moving_row),
+                    )
+                    .children(sidebar_scrollbar),
             ),
         )
         .fade_overflow_y(&self.sidebar_scroll);
@@ -8374,11 +8753,15 @@ impl Shell {
             .flex_col()
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
-            .child(filter_row)
-            .child(sidebar_lists)
+            .child(self.render_cloud_mode_toggle(theme, cx))
+            .when(self.state.read(cx).cloud_mode, |el| {
+                el.child(self.render_cloud_seat_row(theme, cx))
+            })
             // Boards — always visible sidebar destinations (Automations,
             // Kanban) for local + cloud runs.
             .child(self.render_boards_nav(theme, cx))
+            .child(filter_row)
+            .child(sidebar_lists)
             // Global connection pill (durable-by-design UI truth): appears
             // whenever the edge posture is degraded; hidden while healthy —
             // appearing IS the signal.
@@ -8482,7 +8865,7 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .border_t_1()
+            .border_b_1()
             .border_color(theme.border.opacity(0.6))
             .pt(px(Theme::SPACE_SM))
             .child(automations)

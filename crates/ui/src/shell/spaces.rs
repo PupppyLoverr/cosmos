@@ -2128,6 +2128,22 @@ impl popover::ScrollRailHost for Shell {
     fn rail_scroll(&self) -> Option<gpui::ScrollHandle> {
         self.spaces_menu.get().map(|menu| menu.list_scroll.clone())
     }
+
+    fn rail_bar_for(&mut self, id: &'static str) -> &mut popover::MenuScrollbarState {
+        if id == "sidebar-scrollbar" {
+            &mut self.sidebar_bar
+        } else {
+            &mut self.spaces_menu_bar
+        }
+    }
+
+    fn rail_scroll_for(&self, id: &'static str) -> Option<gpui::ScrollHandle> {
+        if id == "sidebar-scrollbar" {
+            Some(self.sidebar_scroll.clone())
+        } else {
+            self.spaces_menu.get().map(|menu| menu.list_scroll.clone())
+        }
+    }
 }
 
 impl Shell {

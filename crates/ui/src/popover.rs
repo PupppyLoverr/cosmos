@@ -1801,12 +1801,20 @@ pub trait ScrollRailHost: 'static {
     /// The rail's hover/drag interaction state.
     fn rail_bar(&mut self) -> &mut MenuScrollbarState;
 
+    fn rail_bar_for(&mut self, _id: &'static str) -> &mut MenuScrollbarState {
+        self.rail_bar()
+    }
+
     /// The scroll handle feeding the rail. `None` for handle-less owners
     /// (virtualized lists, the terminal), which override [`Self::rail_metrics`]
     /// and [`Self::rail_press`]/[`Self::rail_drag_to`] to work from their own
     /// geometry.
     fn rail_scroll(&self) -> Option<ScrollHandle> {
         None
+    }
+
+    fn rail_scroll_for(&self, _id: &'static str) -> Option<ScrollHandle> {
+        self.rail_scroll()
     }
 
     /// Record this frame's scroll activity and return the rail geometry.
@@ -1820,6 +1828,12 @@ pub trait ScrollRailHost: 'static {
         self.rail_bar().metrics(&scroll)
     }
 
+    fn rail_metrics_for(&mut self, id: &'static str) -> Option<MenuScrollbarMetrics> {
+        let scroll = self.rail_scroll_for(id)?;
+        self.rail_bar_for(id).note_scroll(&scroll);
+        self.rail_bar_for(id).metrics(&scroll)
+    }
+
     /// A press landed on the rail at window-y `pointer_y`; `true` when it
     /// engaged a drag (the event is then consumed). The default presses
     /// [`Self::rail_scroll`]'s handle; handle-less owners engage via
@@ -1830,6 +1844,11 @@ pub trait ScrollRailHost: 'static {
             .is_some_and(|scroll| self.rail_bar().begin_press(&scroll, pointer_y))
     }
 
+    fn rail_press_for(&mut self, id: &'static str, pointer_y: Pixels) -> bool {
+        self.rail_scroll_for(id)
+            .is_some_and(|scroll| self.rail_bar_for(id).begin_press(&scroll, pointer_y))
+    }
+
     /// An engaged drag moved to window-y `pointer_y`; `true` when it moved
     /// the scroll position. The default drags [`Self::rail_scroll`]'s handle;
     /// handle-less owners apply [`MenuScrollbarState::drag_target_in`]
@@ -1837,6 +1856,11 @@ pub trait ScrollRailHost: 'static {
     fn rail_drag_to(&mut self, pointer_y: Pixels) -> bool {
         self.rail_scroll()
             .is_some_and(|scroll| self.rail_bar().drag_to(&scroll, pointer_y))
+    }
+
+    fn rail_drag_to_for(&mut self, id: &'static str, pointer_y: Pixels) -> bool {
+        self.rail_scroll_for(id)
+            .is_some_and(|scroll| self.rail_bar_for(id).drag_to(&scroll, pointer_y))
     }
 }
 
@@ -1855,21 +1879,21 @@ pub fn rail<V: ScrollRailHost>(
     theme: &Theme,
     cx: &mut Context<V>,
 ) -> Option<AnyElement> {
-    let metrics = host.rail_metrics()?;
-    schedule_scrollbar_hide(host.rail_bar(), cx);
-    let strip = host.rail_bar().render_rail(theme, metrics)?;
+    let metrics = host.rail_metrics_for(id)?;
+    schedule_scrollbar_hide(host.rail_bar_for(id), cx);
+    let strip = host.rail_bar_for(id).render_rail(theme, metrics)?;
     Some(
         strip
             .id(id)
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                if this.rail_bar().set_bar_hovered(*hovered) {
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if this.rail_bar_for(id).set_bar_hovered(*hovered) {
                     cx.notify();
                 }
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                    if this.rail_press(event.position.y) {
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    if this.rail_press_for(id, event.position.y) {
                         cx.stop_propagation();
                         cx.notify();
                     }
@@ -1880,23 +1904,23 @@ pub fn rail<V: ScrollRailHost>(
                 cx.new(|_| MenuScrollbarDragGhost)
             })
             .on_drag_move(cx.listener(
-                |this, event: &gpui::DragMoveEvent<MenuScrollbarDrag>, _, cx| {
-                    if this.rail_drag_to(event.event.position.y) {
+                move |this, event: &gpui::DragMoveEvent<MenuScrollbarDrag>, _, cx| {
+                    if this.rail_drag_to_for(id, event.event.position.y) {
                         cx.notify();
                     }
                 },
             ))
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    this.rail_bar().end_press();
+                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                    this.rail_bar_for(id).end_press();
                     cx.notify();
                 }),
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    this.rail_bar().end_press();
+                cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                    this.rail_bar_for(id).end_press();
                     cx.notify();
                 }),
             )
