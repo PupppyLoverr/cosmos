@@ -104,6 +104,21 @@ pub struct SeatConfig {
     /// computer" → Boat) — persists "asked once" across restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_prompted_at: Option<DateTime<Utc>>,
+    /// Local path of the workspace snapshot pulled off this seat before a
+    /// Railway trial died (`seat-backups/<id>.tar.gz` under the data dir) —
+    /// a later seat restores it so trial work is never lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_at: Option<DateTime<Utc>>,
+    /// Rate-limits snapshot retries — a failed pull retries every ~2 minutes
+    /// until the seat dies at its deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_attempted_at: Option<DateTime<Utc>>,
+    /// Stamped when this seat ingested a snapshot from a previous seat —
+    /// one restore per seat so manual edits aren't clobbered on reruns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_probe: Option<SeatProbe>,
 }
@@ -761,6 +776,86 @@ impl CloudStore {
         drop(state);
         self.persist_config();
     }
+
+    /// `<data>/seat-backups/` — workspace snapshots pulled off dying seats
+    /// (the Railway trial safeguard). Local only; never synced.
+    pub fn backups_dir(&self) -> PathBuf {
+        let dir = self.inner.dir.join("seat-backups");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// The newest Railway workspace snapshot on this device — what a fresh
+    /// seat (Boat) restores so the trial's work carries over.
+    pub fn latest_railway_backup(&self) -> Option<PathBuf> {
+        self.seats()
+            .into_iter()
+            .filter(|s| s.kind == Some(CloudSeatKind::Railway) && s.backup_path.is_some())
+            .max_by_key(|s| s.backup_at)
+            .and_then(|s| s.backup_path.map(PathBuf::from))
+            .filter(|p| p.exists())
+    }
+}
+
+/// Pull `seat`'s workspace to `seat-backups/<id>.tar.gz` — the Railway
+/// trial safeguard the scheduler fires ~10 minutes before `expires_at`.
+/// Heavy build dirs are excluded; a cap guards memory (`output()` buffers).
+pub async fn snapshot_workspace(
+    store: &CloudStore,
+    seat: &SeatConfig,
+) -> Result<PathBuf, String> {
+    let path = store.backups_dir().join(format!("{}.tar.gz", seat.id));
+    let ws = shell_word(&seat.workspace());
+    let tar = format!(
+        "cd {ws} && tar czf - \
+         --exclude=node_modules --exclude=target --exclude=dist \
+         --exclude=.next --exclude=.cache --exclude='*.log' ."
+    );
+    let output = match seat.kind {
+        Some(CloudSeatKind::Railway) => {
+            let alias = seat
+                .ssh_alias
+                .clone()
+                .unwrap_or_else(|| crate::railway::RAILWAY_HOST.into());
+            tokio::time::timeout(
+                Duration::from_secs(240),
+                tokio::process::Command::new("ssh")
+                    .args([
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "ConnectTimeout=15",
+                        "-o",
+                        "StrictHostKeyChecking=accept-new",
+                        alias.as_str(),
+                        tar.as_str(),
+                    ])
+                    .output(),
+            )
+            .await
+            .map_err(|_| "workspace snapshot timed out".to_string())?
+            .map_err(|e| format!("could not run ssh: {e}"))?
+        }
+        _ => return Err("snapshots only support Railway seats".into()),
+    };
+    if !output.status.success() {
+        return Err(format!(
+            "snapshot failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .next()
+                .unwrap_or("ssh error")
+        ));
+    }
+    const MAX_SNAPSHOT: usize = 512 * 1024 * 1024;
+    if output.stdout.is_empty() {
+        return Err("snapshot was empty".into());
+    }
+    if output.stdout.len() > MAX_SNAPSHOT {
+        return Err("workspace too large to snapshot (>512 MB)".into());
+    }
+    std::fs::write(&path, &output.stdout).map_err(|e| format!("write snapshot: {e}"))?;
+    Ok(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -2251,8 +2346,10 @@ impl Scheduler {
         })
     }
 
-    /// One scheduler pass: claim due automations and fire each.
+    /// One scheduler pass: snapshot any Railway seat nearing its deadline,
+    /// then claim due automations and fire each.
     async fn tick(&self) -> Result<(), EngineError> {
+        self.backup_sweep().await;
         for automation in self.store.claim_due(Utc::now()) {
             if let Err(e) = self.fire(&automation).await {
                 tracing::warn!(automation = %automation.id, error = %e, "automation fire failed");
@@ -2260,6 +2357,44 @@ impl Scheduler {
             }
         }
         Ok(())
+    }
+
+    /// Railway safeguard: ~10 minutes before a trial expires, pull the
+    /// workspace down to `seat-backups/` so a Boat seat can restore it.
+    /// One snapshot per seat; failures retry on a ~2-minute cadence until
+    /// the deadline kills the box (which ends retries naturally).
+    async fn backup_sweep(&self) {
+        let now = Utc::now();
+        for seat in self.store.seats() {
+            if seat.kind != Some(CloudSeatKind::Railway) || seat.backup_path.is_some() {
+                continue;
+            }
+            let Some(deadline) = seat.expires_at else {
+                continue;
+            };
+            let remaining = (deadline - now).num_seconds();
+            if !(0..=600).contains(&remaining) {
+                continue;
+            }
+            if seat
+                .backup_attempted_at
+                .is_some_and(|t| (now - t).num_seconds() < 120)
+            {
+                continue;
+            }
+            self.store.update_seat(&seat.id, |s| {
+                s.backup_attempted_at = Some(now);
+            });
+            match snapshot_workspace(&self.store, &seat).await {
+                Ok(path) => self.store.update_seat(&seat.id, |s| {
+                    s.backup_path = Some(path.to_string_lossy().into_owned());
+                    s.backup_at = Some(now);
+                }),
+                Err(e) => {
+                    tracing::warn!(seat = %seat.id, error = %e, "railway workspace snapshot failed")
+                }
+            }
+        }
     }
 
     /// Fire one automation: probe the seat (cloud runs only), create the

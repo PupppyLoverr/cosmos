@@ -1978,6 +1978,24 @@ async fn drive_remote_run(
             zeron_proto::CloudRunStatus::Done,
             None,
         );
+        // A finished Railway run is the moment work exists worth keeping —
+        // snapshot now so an expired-trial restore works even if the app
+        // never lives to see the T-10m sweep.
+        if seat.kind == Some(zeron_proto::CloudSeatKind::Railway) {
+            let store = store.clone();
+            let seat = seat.clone();
+            tokio::spawn(async move {
+                match crate::cloud::snapshot_workspace(&store, &seat).await {
+                    Ok(path) => store.update_seat(&seat.id, |s| {
+                        s.backup_path = Some(path.to_string_lossy().into_owned());
+                        s.backup_at = Some(Utc::now());
+                    }),
+                    Err(e) => {
+                        tracing::warn!(seat = %seat.id, error = %e, "post-run snapshot failed")
+                    }
+                }
+            });
+        }
     } else {
         let message = format!("seat run exited {status}");
         if let Some(segment) = segment {
@@ -2087,6 +2105,72 @@ async fn drive_boat_run(
     store.update_run(&run_id, |run| {
         run.remote_ref = Some(format!("boat:{box_id}"));
     });
+
+    // Migration path: a never-restored Boat box ingests the newest Railway
+    // trial snapshot, so work survives the trial's 60-minute death. The
+    // upload rides `/files` as base64 (the only write surface), then exec
+    // extracts it into the seat workspace.
+    if seat.restored_at.is_none()
+        && let Some(backup) = store.latest_railway_backup()
+    {
+        let note = |text: String| {
+            let _ = doc.push_message(&SessionMessageEntry {
+                id: new_id(),
+                role: zeron_doc::MessageRole::Assistant,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text,
+                }],
+                created_at: now_ms(),
+                device_id: inner.device_id.clone(),
+                status: Some(zeron_doc::MessageStatus::Complete),
+                continuation_of: None,
+                duration_ms: None,
+            });
+        };
+        match std::fs::read(&backup) {
+            Ok(bytes) => {
+                use base64::Engine as _;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let ws = crate::cloud::shell_word(&seat.workspace());
+                let staged = "/tmp/cosmos-restore.tgz.b64";
+                if let Err(e) = api.write_file(&box_id, staged, b64.as_bytes()).await {
+                    note(format!(
+                        "Couldn't upload the Railway backup to this box ({e}) — starting fresh."
+                    ));
+                } else {
+                    match api
+                        .exec(
+                            &box_id,
+                            &format!(
+                                "mkdir -p {ws} && base64 -d {staged} | tar xzf - -C {ws} && rm -f {staged}"
+                            ),
+                            None,
+                            std::time::Duration::from_secs(300),
+                        )
+                        .await
+                    {
+                        Ok(r) if r.success => {
+                            store.update_seat(&seat.id, |s| {
+                                s.restored_at = Some(Utc::now());
+                            });
+                            note("Restored this workspace from the Railway trial backup — your earlier work is here.".to_string());
+                        }
+                        Ok(r) => note(format!(
+                            "Railway backup upload worked but extract failed ({}) — starting fresh.",
+                            r.stderr.lines().next().unwrap_or("tar error")
+                        )),
+                        Err(e) => note(format!(
+                            "Couldn't extract the Railway backup ({e}) — starting fresh."
+                        )),
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "railway backup unreadable — skipping restore")
+            }
+        }
+    }
 
     // Kick the integrated agent. The prompt response carries the
     // conversation handle; events stream the transcript we mirror.

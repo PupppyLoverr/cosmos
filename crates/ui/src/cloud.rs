@@ -3073,6 +3073,9 @@ impl Render for CloudRail {
             .and_then(|s| s.config.last_probe.as_ref())
             .is_some_and(|p| p.sleeping);
         let claim_url = seat_row.as_ref().and_then(|s| s.config.claim_url.clone());
+        let backed_up = seat_row
+            .as_ref()
+            .is_some_and(|s| s.config.backup_at.is_some());
         let not_persistent = !self.capabilities().keeps_running && !sleeping && !railway_expired;
         // The "Keep this computer" card shows once: a Railway (or
         // desk-bound) seat that finished a run and has never been asked.
@@ -3163,9 +3166,11 @@ impl Render for CloudRail {
                         .border_color(theme.border)
                         .text_size(crate::typography::ui_rems(10.5))
                         .text_color(theme.danger)
-                        .child(
-                            "Trial ended — claim the VM from the link or start a new seat",
-                        ),
+                        .child(if backed_up {
+                            "Trial ended — workspace backed up locally; a Boat seat restores it on its first run"
+                        } else {
+                            "Trial ended — claim the VM from the link or start a new seat"
+                        }),
                 )
             })
             .when(is_boat && sleeping, |el| {

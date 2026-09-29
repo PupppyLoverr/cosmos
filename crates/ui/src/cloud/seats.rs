@@ -433,14 +433,20 @@ impl CloudSeatsPage {
                 .unwrap_or_else(|| "no ssh alias".into()),
             Some(CloudSeatKind::Railway) => {
                 // Status + time left per spec; the claim URL surfaces on the
-                // seat's card actions when one was minted.
+                // seat's card actions when one was minted. A saved snapshot
+                // (pulled ~10 min before expiry) is what a Boat seat restores.
+                let backup = if seat.config.backup_at.is_some() {
+                    " · workspace backed up locally"
+                } else {
+                    ""
+                };
                 match seat.config.expires_at {
                     Some(at) => {
                         let left = at.signed_duration_since(chrono::Utc::now());
                         if left.num_seconds() <= 0 {
-                            "trial ended".into()
+                            format!("trial ended{backup}")
                         } else {
-                            format!("trial · {}m left", left.num_minutes())
+                            format!("trial · {}m left{backup}", left.num_minutes())
                         }
                     }
                     None => "railway.new trial — probe to provision".into(),

@@ -320,6 +320,23 @@ impl<'a> Boat<'a> {
         self.get(&format!("/sandboxes/{id}/commands/{pid}")).await
     }
 
+    /// `PUT /sandboxes/{id}/files?path=` — write raw bytes (used to land the
+    /// base64 text of a workspace snapshot before exec extracts it).
+    pub async fn write_file(&self, id: &str, path: &str, bytes: &[u8]) -> Result<(), String> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/sandboxes/{id}/files?path={}", urlencoding(path))))
+            .bearer_auth(self.token)
+            .header("Content-Type", "application/octet-stream")
+            .timeout(TIMEOUT)
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .map_err(|e| format!("boat unreachable: {e}"))?;
+        self.read::<serde_json::Value>(resp).await?;
+        Ok(())
+    }
+
     /// `GET /sandboxes/{id}/files?path=` — file contents (utf8).
     pub async fn read_file(&self, id: &str, path: &str) -> Result<String, String> {
         let v = self
