@@ -39,6 +39,8 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 pub struct ToolContext {
     /// workspace root — all file tools are confined to it
     pub workspace: PathBuf,
+    /// Additional roots granted by --add-dir.
+    pub allowed_roots: Vec<PathBuf>,
     /// sandbox executable (zsandbox.exe)
     pub sandbox_bin: Option<PathBuf>,
     /// meridian binary for memory_* tools
@@ -75,6 +77,7 @@ pub struct ToolContext {
 pub struct McpServerCfg {
     pub command: String,
     pub args: Vec<String>,
+    pub env: HashMap<String, String>,
 }
 
 impl ToolContext {
@@ -85,6 +88,7 @@ impl ToolContext {
         let ws = strip_verbatim(&ws);
         ToolContext {
             workspace: ws,
+            allowed_roots: Vec::new(),
             sandbox_bin: None,
             meridian_bin: None,
             meridian_vault: None,
@@ -145,7 +149,12 @@ pub fn resolve(ctx: &ToolContext, path: &str) -> Result<PathBuf> {
     };
     let norm = normalize(&joined);
     let root = normalize(&ctx.workspace);
-    if !norm.starts_with(&root) {
+    let extra = ctx
+        .allowed_roots
+        .iter()
+        .map(|p| normalize(p))
+        .any(|p| norm.starts_with(&p));
+    if !norm.starts_with(&root) && !extra {
         anyhow::bail!("path escapes workspace: {path}");
     }
     Ok(norm)

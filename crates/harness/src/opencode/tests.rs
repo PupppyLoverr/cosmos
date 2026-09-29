@@ -1238,6 +1238,24 @@ fn stall_env_and_startup_env_parse() {
 }
 
 #[test]
+fn silence_watchdog_allows_text_but_not_active_tools() {
+    let now = tokio::time::Instant::now();
+    let five_minutes = Duration::from_secs(5 * 60);
+    assert!(silence_expired(
+        now - five_minutes,
+        now,
+        five_minutes,
+        false
+    ));
+    assert!(!silence_expired(
+        now - five_minutes,
+        now,
+        five_minutes,
+        true
+    ));
+}
+
+#[test]
 fn directory_header_percent_encodes() {
     assert_eq!(
         encode_directory("/home/u/my project"),
@@ -1274,13 +1292,13 @@ fn v2_frames_normalize_to_v1_payloads() {
             ]
         );
     }
-    // Terminal failure = error chip + idle (both shapes captured live).
+    // Terminal failure is settled directly by the harness.
     let out = normalize_v2_frame(
         json!({"id":"evt_3","type":"session.execution.failed","data":{
             "sessionID":"ses_1","error":{"type":"provider.auth","message":""}}}),
         &mut tools,
     );
-    assert_eq!(out.len(), 2);
+    assert_eq!(out.len(), 1);
     // Empty message (live shape) falls back to the error type.
     assert_eq!(
         out[0],
@@ -1288,15 +1306,12 @@ fn v2_frames_normalize_to_v1_payloads() {
             "sessionID":"ses_1",
             "error":{"name":"provider.auth","data":{"message":"provider.auth"}}}}),
     );
-    // The interrupt's step-level echo is NOT a provider error.
-    assert!(
-        normalize_v2_frame(
-            json!({"id":"evt_4","type":"session.step.failed","data":{
-            "sessionID":"ses_1","error":{"type":"aborted","message":"Step interrupted"}}}),
-            &mut tools,
-        )
-        .is_empty()
+    let out = normalize_v2_frame(
+        json!({"id":"evt_4","type":"session.step.failed","data":{
+        "sessionID":"ses_1","error":{"type":"aborted","message":"Step interrupted"}}}),
+        &mut tools,
     );
+    assert_eq!(out[0]["properties"]["error"]["name"], "MessageAbortedError");
     // Streaming: the step registers its assistant message, then text flows
     // as a part delta keyed by message + kind + ordinal.
     let out = normalize_v2_frame(
@@ -1635,13 +1650,32 @@ async fn prompt_error_and_interrupt_before_busy_still_settle() {
     let mut wire = TurnWire::start(false).await;
     wire.request("/prompt_async").await;
     wire.bus.send(json!({"type":"session.error", "properties":{"sessionID":"fixture", "error":{"name":"ProviderError", "data":{"message":"bad model"}}}})).unwrap();
-    wire.idle();
-    assert_eq!(wire.done().await.0, DoneStatus::Errored);
+    let mut saw_error = false;
+    let mut saw_done = None;
+    while let Some(event) = wire.events.recv().await {
+        let event = event.unwrap();
+        match event {
+            AgentEvent::Error { message } => {
+                saw_error = message == "bad model";
+            }
+            AgentEvent::Done { status, error, .. } => {
+                saw_done = Some((status, error));
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_error);
+    assert_eq!(
+        saw_done,
+        Some((DoneStatus::Errored, Some("bad model".to_owned())))
+    );
 
     let mut wire = TurnWire::start(false).await;
     wire.request("/prompt_async").await;
     wire.interrupt.cancel();
     wire.request("/abort").await;
+    wire.bus.send(json!({"type":"session.error", "properties":{"sessionID":"fixture", "error":{"name":"MessageAbortedError", "data":{"message":"provider stopped"}}}})).unwrap();
     wire.idle();
     assert_eq!(wire.done().await.0, DoneStatus::Interrupted);
 }
@@ -1694,7 +1728,7 @@ async fn v2_external_interrupt_is_not_reported_as_success() {
 }
 
 #[tokio::test]
-async fn v2_recovered_step_failure_does_not_poison_successful_execution() {
+async fn v2_step_failure_settles_the_turn() {
     let mut wire = TurnWire::start_proto(false, true).await;
     wire.request("/api/model").await;
     wire.request("/prompt").await;
@@ -1703,18 +1737,9 @@ async fn v2_recovered_step_failure_does_not_poison_successful_execution() {
         "session.step.failed",
         json!({"sessionID":"fixture","error":{"type":"provider.rate_limit","message":"Retrying"}}),
     );
-    wire.v2(
-        "session.step.started",
-        json!({"sessionID":"fixture","assistantMessageID":"recovered"}),
-    );
-    wire.v2("session.text.ended",json!({"sessionID":"fixture","assistantMessageID":"recovered","ordinal":0,"text":"Recovered"}));
-    wire.v2(
-        "session.execution.succeeded",
-        json!({"sessionID":"fixture"}),
-    );
     let (status, text) = wire.done().await;
-    assert_eq!(status, DoneStatus::Completed);
-    assert_eq!(text, "Recovered");
+    assert_eq!(status, DoneStatus::Errored);
+    assert!(text.is_empty());
 }
 
 #[test]

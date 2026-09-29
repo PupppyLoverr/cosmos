@@ -101,17 +101,31 @@ impl Session {
                     .find(|e| e.kind == "user")
                     .and_then(|e| e.data["text"].as_str().map(|s| s.to_string()))
                     .unwrap_or_default();
+                let cwd = events
+                    .iter()
+                    .find(|e| e.kind == "session_start")
+                    .and_then(|e| e.data["cwd"].as_str())
+                    .unwrap_or_default();
                 out.push(json!({
                     "id": p.file_stem().unwrap().to_string_lossy(),
                     "harness": events[0].harness,
                     "started": events[0].ts,
                     "events": events.len(),
                     "preview": first_user.chars().take(80).collect::<String>(),
+                    "cwd": cwd,
                 }));
             }
         }
         out.sort_by(|a, b| a["started"].as_str().cmp(&b["started"].as_str()));
         out
+    }
+
+    pub fn latest_for_cwd(home: &Path, cwd: &Path) -> Option<String> {
+        Self::list(home)
+            .into_iter()
+            .rev()
+            .find(|v| v["cwd"].as_str() == cwd.to_str())
+            .and_then(|v| v["id"].as_str().map(str::to_owned))
     }
 
     /// Export as markdown or raw jsonl.

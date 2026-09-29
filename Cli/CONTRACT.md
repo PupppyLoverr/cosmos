@@ -18,7 +18,7 @@ contents; run `bash` only inside the sandbox; ask before anything the permission
 
 ## 1. Runtime home and config
 
-`COSMOS_CLI_HOME` (env) defaults to `%USERPROFILE%\.cosmos-cli`. It contains:
+`COSMOS_CLI_HOME` (env) defaults to `~/.cosmos-cli`. It contains:
 
 ```
 config.toml      sessions\<id>.jsonl      worktrees\<session>\<task_id>\
@@ -32,9 +32,12 @@ with any `base_url` must work (covers Ollama, llama.cpp, vLLM, LM Studio, OpenRo
 `[models.<alias>]` maps `provider`, `id`, `context`, `price {input, cache_read, cache_write,
 output}` (USD per 1M tokens). `[permissions] allow`/`ask` name tools; anything else is denied.
 `[subagents] max_parallel` caps `task` concurrency. `[tools.bash] shell = "auto"` picks
-Git Bash `bash.exe` when found, else `powershell.exe -NoProfile -NonInteractive -Command`.
+Use the platform's POSIX shell when available; Windows may use PowerShell non-interactively.
 `[bridge] large_read_lines` (default 200) and `summarizer_model` (empty = deterministic
 extractor). `[[hooks]] event matcher command` registers shell hooks.
+Project MCP servers are discovered from `.mcp.json` in the working directory. User-level
+MCP configuration is read from `~/.cosmos-cli/mcp.json` when present, using the
+`{"mcpServers":{"name":{"command":"…","args":[],"env":{}}}}` shape.
 
 ## 2. Tools
 
@@ -102,7 +105,7 @@ it (OpenAI and xAI do; unknown endpoints ignore unknown fields).
 
 ## 5. Sandbox
 
-One implementation: `zsandbox.exe` from `rust-tui\crates\zsandbox`, used by all three
+One implementation: `zsandbox` from `rust-tui/crates/zsandbox`, used by all three
 harnesses:
 
 ```

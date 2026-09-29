@@ -16,10 +16,10 @@ import { Icon } from './bits';
 function stylesFor(t: Theme) {
   return StyleSheet.create({
     body: { ...type.transcript, color: t.text },
-    paragraph: { marginTop: 0, marginBottom: spacing(2) },
-    heading1: { ...type.title3, color: t.text, marginTop: spacing(2), marginBottom: spacing(1) },
-    heading2: { ...type.headline, color: t.text, marginTop: spacing(2), marginBottom: spacing(1) },
-    heading3: { ...type.callout, color: t.text, fontWeight: '600', marginTop: spacing(1.5), marginBottom: spacing(0.5) },
+    paragraph: { marginTop: 0, marginBottom: spacing(1) },
+    heading1: { fontSize: 18, lineHeight: 24, fontWeight: '600', color: t.text, marginTop: spacing(2), marginBottom: spacing(1) },
+    heading2: { fontSize: 16, lineHeight: 22, fontWeight: '600', color: t.text, marginTop: spacing(2), marginBottom: spacing(1) },
+    heading3: { fontSize: 15, lineHeight: 21, color: t.text, fontWeight: '600', marginTop: spacing(1.5), marginBottom: spacing(0.5) },
     heading4: { ...type.subhead, color: t.text, fontWeight: '600' },
     heading5: { ...type.footnote, color: t.text, fontWeight: '600' },
     heading6: { ...type.footnote, color: t.textSecondary, fontWeight: '600' },
@@ -34,6 +34,8 @@ function stylesFor(t: Theme) {
       color: t.text,
       backgroundColor: t.codeBg,
       borderRadius: 4,
+      paddingVertical: 2,
+      paddingHorizontal: 3,
     },
     code_block: {
       fontFamily: type.mono.fontFamily,
@@ -41,10 +43,9 @@ function stylesFor(t: Theme) {
       lineHeight: 17,
       color: t.text,
       backgroundColor: t.codeBg,
-      borderRadius: radii.md,
+      borderRadius: 4,
       borderCurve: 'continuous',
-      borderWidth: StyleSheet.hairlineWidth,
-      borderColor: t.separator,
+      borderWidth: 0,
       padding: spacing(2.5),
       marginVertical: spacing(1.5),
     },
@@ -54,10 +55,9 @@ function stylesFor(t: Theme) {
       lineHeight: 17,
       color: t.text,
       backgroundColor: t.codeBg,
-      borderRadius: radii.md,
+      borderRadius: 4,
       borderCurve: 'continuous',
-      borderWidth: StyleSheet.hairlineWidth,
-      borderColor: t.separator,
+      borderWidth: 0,
       padding: spacing(2.5),
       marginVertical: spacing(1.5),
     },
@@ -71,9 +71,9 @@ function stylesFor(t: Theme) {
     },
     bullet_list: { marginVertical: spacing(1) },
     ordered_list: { marginVertical: spacing(1) },
-    list_item: { marginVertical: spacing(0.5), flexDirection: 'row', alignItems: 'flex-start' },
-    bullet_list_icon: { color: t.textTertiary, marginLeft: spacing(1), marginRight: spacing(1.5), fontSize: 12, lineHeight: 22 },
-    ordered_list_icon: { color: t.textTertiary, marginLeft: spacing(1), marginRight: spacing(1.5), fontSize: 13, lineHeight: 22 },
+    list_item: { marginVertical: 0, flexDirection: 'row', alignItems: 'flex-start', lineHeight: 21 },
+    bullet_list_icon: { color: t.textTertiary, marginLeft: spacing(1), marginRight: spacing(1.5), fontSize: 12, lineHeight: 21 },
+    ordered_list_icon: { color: t.textTertiary, marginLeft: spacing(1), marginRight: spacing(1.5), fontSize: 13, lineHeight: 21 },
     hr: { backgroundColor: t.separator, height: StyleSheet.hairlineWidth, marginVertical: spacing(2.5) },
     table: { borderColor: t.separator, borderRadius: radii.sm },
     thead: { backgroundColor: t.fill },
@@ -120,7 +120,7 @@ export function Md({ children, streaming }: { children: string; streaming?: bool
       );
     };
     return { fence: renderCodeBlock, code_block: renderCodeBlock };
-  }, [t, style]);
+  }, [t]);
   const text = streaming ? sealIncompleteMarkdown(children) : children;
   return (
     <Markdown

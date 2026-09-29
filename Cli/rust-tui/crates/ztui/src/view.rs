@@ -12,6 +12,8 @@
 //!   /model …  Interactively choose …   ← menus open *below* the status line
 //! ```
 
+use std::collections::HashMap;
+
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
@@ -293,17 +295,80 @@ pub fn plan_line(r: &zproviders::RateLimits) -> Option<String> {
 
 pub fn usage(app: &App) -> Vec<Line<'static>> {
     let u = &app.usage;
-    let cost = u.cum_usd.map(|c| format!("${c:.4}")).unwrap_or_else(|| "no charge / unpriced".into());
-    let mut out = vec![
-        Line::from(vec![sp(" "), Span::styled("Usage", theme::bold(Style::new())), dim(format!("  {} turn{}", u.turns, if u.turns == 1 { "" } else { "s" }))]),
-        Line::from(vec![dim("   Input     "), sp(kfmt(u.input)), dim(format!("   cache read {} · write {}", kfmt(u.cache_read), kfmt(u.cache_write)))]),
-        Line::from(vec![dim("   Output    "), sp(kfmt(u.output))]),
-        Line::from(vec![dim("   Cost      "), sp(cost)]),
-    ];
+    let mut out = cost_lines(
+        u.input,
+        u.output,
+        u.cache_read,
+        u.cache_write,
+        u.cum_usd,
+        &u.model_usd,
+        u.turns,
+        app.session_started.elapsed().as_secs_f64(),
+    );
     if let Some(p) = app.rate.as_ref().and_then(plan_line) {
         out.push(Line::from(vec![dim("   Plan      "), sp(p)]));
     }
     out
+}
+
+pub fn cost_lines(
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    total: Option<f64>,
+    models: &HashMap<String, f64>,
+    turns: u64,
+    wall_seconds: f64,
+) -> Vec<Line<'static>> {
+    let total = total.map(|v| format!("${v:.4}")).unwrap_or_else(|| "unpriced".into());
+    let mut out = vec![
+        Line::from(vec![sp(" "), Span::styled("Cost", theme::bold(Style::new()))]),
+        Line::from(vec![dim("   Input       "), sp(kfmt(input))]),
+        Line::from(vec![dim("   Output      "), sp(kfmt(output))]),
+        Line::from(vec![dim("   Cache read  "), sp(kfmt(cache_read))]),
+        Line::from(vec![dim("   Cache write "), sp(kfmt(cache_write))]),
+        Line::from(vec![dim("   USD total   "), sp(total)]),
+        Line::from(vec![dim("   Turns       "), sp(turns.to_string())]),
+        Line::from(vec![dim("   Wall time   "), sp(format_wall(wall_seconds))]),
+    ];
+    if models.len() > 1 {
+        for (model, usd) in models {
+            out.push(Line::from(vec![dim(format!("   {model:<12}")), sp(format!("${usd:.4}"))]));
+        }
+    }
+    out
+}
+
+fn format_wall(seconds: f64) -> String {
+    if seconds < 60.0 {
+        format!("{seconds:.1}s")
+    } else {
+        format!("{:.1}m", seconds / 60.0)
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::cost_lines;
+    use std::collections::HashMap;
+
+    #[test]
+    fn formats_full_cost_breakdown() {
+        let mut models = HashMap::new();
+        models.insert("alpha".into(), 0.12);
+        models.insert("beta".into(), 0.03);
+        let text = cost_lines(100, 20, 30, 4, Some(0.15), &models, 2, 61.2)
+            .into_iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Input"));
+        assert!(text.contains("$0.1500"));
+        assert!(text.contains("alpha"));
+        assert!(text.contains("2"));
+        assert!(text.contains("1.0m"));
+    }
 }
 
 pub fn context(app: &App) -> Vec<Line<'static>> {

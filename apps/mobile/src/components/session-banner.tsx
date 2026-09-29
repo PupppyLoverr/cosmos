@@ -1,9 +1,9 @@
 import React from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import Animated, { FadeInDown, FadeOutDown } from 'react-native-reanimated';
-import { alpha, motion, radii, spacing, type, useTheme } from '../lib/theme';
+import { motion, spacing, type, useTheme } from '../lib/theme';
 import { useReduceMotion } from '../lib/motion';
-import { Icon, Pulse } from './bits';
+import { Pulse } from './bits';
 
 type SessionBannerProps = {
   kind: 'error' | 'input' | 'controlling';
@@ -17,12 +17,9 @@ export function SessionBanner({ kind, title, body, onPress, actions }: SessionBa
   const t = useTheme();
   const reduce = useReduceMotion();
   const color = kind === 'error' ? t.danger : kind === 'input' ? t.warning : t.link;
-  const icon = kind === 'error' ? 'exclamationmark.triangle.fill' : kind === 'input' ? 'hand.raised.fill' : undefined;
   const content = (
     <>
-      <View style={[styles.iconTile, { backgroundColor: alpha(color, 0.18) }]}>
-        {kind === 'controlling' ? <Pulse color={color} /> : <Icon name={icon!} size={15} color={color} />}
-      </View>
+      {kind === 'controlling' ? <Pulse color={color} /> : <View style={[styles.dot, { backgroundColor: color }]} />}
       <View style={styles.copy}>
         <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]} numberOfLines={1}>{title}</Text>
         {body ? <Text style={[type.footnote, { color: t.textSecondary }]} numberOfLines={1}>{body}</Text> : null}
@@ -35,7 +32,7 @@ export function SessionBanner({ kind, title, body, onPress, actions }: SessionBa
     <Animated.View
       entering={reduce ? undefined : FadeInDown.duration(motion.fadeIn)}
       exiting={reduce ? undefined : FadeOutDown}
-      style={[styles.container, { backgroundColor: alpha(color, 0.12) }]}
+      style={[styles.container, { borderBottomColor: t.separator }]}
       accessibilityRole={accessibilityRole}
       accessibilityLabel={`${title}${body ? `. ${body}` : ''}`}
     >
@@ -56,15 +53,15 @@ export function SessionBanner({ kind, title, body, onPress, actions }: SessionBa
 }
 
 const styles = StyleSheet.create({
-  container: { minHeight: 52, borderRadius: radii.lg, borderCurve: 'continuous', overflow: 'hidden' },
+  container: { minHeight: 44, borderBottomWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
   pressable: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: spacing(2.5),
-    minHeight: 52,
-    paddingHorizontal: spacing(3),
-    paddingVertical: spacing(2),
+    gap: spacing(1.5),
+    minHeight: 44,
+    paddingHorizontal: spacing(1.5),
+    paddingVertical: spacing(1),
   },
-  iconTile: { width: 28, height: 28, borderRadius: radii.control, alignItems: 'center', justifyContent: 'center' },
+  dot: { width: 6, height: 6, borderRadius: 3 },
   copy: { flex: 1, minWidth: 0, gap: 1 },
 });

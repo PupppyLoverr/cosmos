@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import * as LiveActivity from 'expo-live-activity';
 import { harnessLabel } from '../components/harness-mark';
 import { useCosmos, useSnapshot } from './client';
+import { DESKTOP_OFFLINE } from './rpc';
 import type { Chat, Session } from './protocol';
 
 const LIVE_STATUSES = new Set<Session['status']>(['working', 'awaitingInput', 'errored']);
@@ -84,9 +85,11 @@ export function useLiveActivity(): void {
     : liveSubtitle;
   const activityState = useMemo<ActivityState | null>(() => {
     if (!focused) return null;
-    const stateSubtitle = connection.status === 'disconnected'
-      ? 'Cosmos not connected'
-      : subtitle;
+    const stateSubtitle = connection.detail === DESKTOP_OFFLINE && connection.status !== 'connected'
+      ? 'Desktop asleep · resumes on wake'
+      : connection.status === 'disconnected'
+        ? 'Cosmos not connected'
+        : subtitle;
     const displayedSubtitle = appState === 'background'
       ? `${stateSubtitle} · as of ${timeLabel(new Date())}`
       : stateSubtitle;
@@ -98,7 +101,7 @@ export function useLiveActivity(): void {
       imageName: 'cosmos_mark',
       dynamicIslandImageName: 'cosmos_island',
     };
-  }, [appState, connection.status, focused, focusedTitle, subtitle]);
+  }, [appState, connection.status, connection.detail, focused, focusedTitle, subtitle]);
 
   useEffect(() => {
     if (Platform.OS !== 'ios') return;

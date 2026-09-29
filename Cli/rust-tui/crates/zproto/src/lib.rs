@@ -174,6 +174,9 @@ pub struct RunOpts {
     pub max_usd: Option<f64>,
     pub cwd: Option<String>,
     pub resume: Option<String>,
+    pub add_dirs: Vec<String>,
+    pub system_prompt: Option<String>,
+    pub append_system_prompt: Option<String>,
     pub approve_plan: bool,
     pub allow_escalation: Vec<String>,
     pub sandbox: Option<String>,
@@ -198,7 +201,7 @@ impl OutputMode {
         match s {
             "text" => Some(Self::Text),
             "json" => Some(Self::Json),
-            "json-stream" => Some(Self::JsonStream),
+            "json-stream" | "stream-json" => Some(Self::JsonStream),
             _ => None,
         }
     }

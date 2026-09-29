@@ -26,8 +26,16 @@ pub fn run(
         if h.event != event || !matches(&h.matcher, tool) {
             continue;
         }
-        let spawned = std::process::Command::new("cmd")
-            .args(["/c", &h.command])
+        let mut command = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/c", &h.command]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", &h.command]);
+            c
+        };
+        let spawned = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())

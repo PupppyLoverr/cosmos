@@ -26,13 +26,14 @@ Cli/
 ```
 cd rust-tui        && cargo build --workspace        # zcli, zcli-welcome, zsandbox
 cd meridian-bridge && cargo build                    # meridian + clients tests
-cd zdev            && bun install && bun run build   # zdev → dist/zdev.exe
-cd go-ssh          && go build -o zagy.exe .         # zagy
+cd zdev            && bun install && bun run build   # zdev → dist/zdev
+cd go-ssh          && go build -o zagy .             # zagy
 ```
 
 ## Use
 
-All binaries are installed globally in `C:\Users\ravth\bin` (on PATH):
+All binaries are installed globally in a directory on `$PATH` (for example
+`$HOME/.local/bin`):
 `zcli`, `zagy`, `zdev`, `meridian`, `zsandbox` — all single-file executables.
 `zdev-ui` remains as a compat alias for `zdev ui` (the TUI is in-process now).
 
@@ -55,8 +56,9 @@ Live models route through 9Router (`ROUTER9_API_KEY` is set at User scope):
 `r9gem` = ag/gemini-3.8-flash. `fixture` needs no key. 9Router is also in
 both CLIs' BYOK lists as `router9/<route>`.
 
-zdev and zcli share one setup. Keys live in the Windows Credential Manager
-(or `credentials.json`), the ChatGPT sign-in is in `credentials.json`, and
+zdev and zcli share one setup. Keys use macOS Keychain, Linux
+`credentials.json` fallback, or the platform credential store; the ChatGPT
+sign-in is in `credentials.json`, and
 both read the same models.dev catalog and `live_models.json`. A key added in
 either CLI works in the other. zdev's TUI streams replies into scrollback
 paragraph by paragraph, so long answers never tear the screen. It supports
@@ -120,9 +122,9 @@ behaviour is tested against the alacritty terminal emulator.
 
 ## Shared state
 
-All harnesses read `COSMOS_CLI_HOME` (default `%USERPROFILE%\.cosmos-cli`):
+All harnesses read `COSMOS_CLI_HOME` (default `~/.cosmos-cli`):
 `sessions/<id>.jsonl` event logs, `worktrees/`, `skills/`. Memory lives in the
-Meridian vault (`MERIDIAN_VAULT`, default `%USERPROFILE%\.meridian\vault`),
+Meridian vault (`MERIDIAN_VAULT`, default `~/.meridian/vault`),
 append-only markdown bullets (`decision|preference|map|correction|playbook`)
 searched over BM25 — never touches Meridian's app vault.
 

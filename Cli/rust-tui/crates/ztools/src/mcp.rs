@@ -14,9 +14,10 @@ struct Mcp {
 }
 
 impl Mcp {
-    fn spawn(cmd: &str, args: &[String]) -> Result<Self> {
+    fn spawn(cmd: &str, args: &[String], env: &std::collections::HashMap<String, String>) -> Result<Self> {
         let child = Command::new(cmd)
             .args(args)
+            .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -52,7 +53,7 @@ fn with_server(
         .get(server)
         .cloned()
         .with_context(|| format!("unknown MCP server {server}"))?;
-    let mut m = Mcp::spawn(&cfg.command, &cfg.args)?;
+    let mut m = Mcp::spawn(&cfg.command, &cfg.args, &cfg.env)?;
     let _ = m.rpc(
         "initialize",
         json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"zcli","version":"0.1.0"}}),

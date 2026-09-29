@@ -1,4 +1,4 @@
-//! zsandbox.exe — CLI front-end over the zsandbox library.
+//! zsandbox — CLI front-end over the zsandbox library.
 //!
 //!   zsandbox exec --workspace <dir> --net deny|allow --timeout <s> -- <argv...>
 

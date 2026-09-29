@@ -6,14 +6,14 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { Alert, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
 import * as Haptics from 'expo-haptics';
-import { desktopDisplayName, useCosmos, useSnapshot } from '../lib/client';
+import { useCosmos, useSnapshot } from '../lib/client';
 import { HarnessId, ReasoningLevel, SandboxLevel } from '../lib/protocol';
 import { PickedFile, ensureDecodable, fileToBase64Chunks } from '../lib/attachments';
 import { showMenu } from '../lib/menu';
 import { spacing, type, useTheme } from '../lib/theme';
 import { Icon, Notice } from '../components/bits';
 import { CircleButton, TopBar, useDockInset } from '../components/chrome';
-import { HarnessMark, harnessLabel } from '../components/harness-mark';
+import { harnessLabel } from '../components/harness-mark';
 import { Composer, ComposerChip } from '../components/composer';
 import { Screen } from '../components/surface';
 
@@ -39,7 +39,6 @@ export default function NewSessionScreen() {
   const spaces = useSnapshot(client.spaces);
   const connection = useSnapshot(client.connection);
   const [harnesses, setHarnesses] = useState<{ id: HarnessId; name?: string }[]>([]);
-  const [modelsFor, setModelsFor] = useState<{ harness: HarnessId; list: { id: string; name?: string }[] }>({ harness: 'opencode', list: [] });
   const [harness, setHarness] = useState<HarnessId>('opencode');
   const [model, setModel] = useState<string | null>(null);
   const [sandbox, setSandbox] = useState<SandboxLevel>('workspace-write');
@@ -61,17 +60,6 @@ export default function NewSessionScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, online]);
 
-  useEffect(() => {
-    if (!online || !harness) return;
-    let cancelled = false;
-    void client.listModels(harness)
-      .then((list) => { if (!cancelled) setModelsFor({ harness, list }); })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [client, online, harness]);
-  const models = modelsFor.harness === harness ? modelsFor.list : [];
-  const modelName = model ? (models.find((m) => m.id === model)?.name ?? model) : 'Default';
-
   const spaceChoices = useMemo(
     () => [
       { id: null as string | null, label: 'Current checkout' },
@@ -83,8 +71,6 @@ export default function NewSessionScreen() {
   const harnessChoices = harnesses.length ? harnesses.filter((h) => h.id !== 'mock') : [{ id: harness }];
   const harnessName = harnesses.find((h) => h.id === harness)?.name ?? harnessLabel(harness) ?? String(harness);
   const access = ACCESS.find((a) => a.id === sandbox)!;
-  const desktopName = connection.desktop ? desktopDisplayName(connection.desktop) : undefined;
-
   const back = () => { if (router.canGoBack()) router.back(); else router.replace('/'); };
 
   // Start = create the chat, upload anything attached, dispatch the first turn,
@@ -127,18 +113,16 @@ export default function NewSessionScreen() {
         <TopBar
           left={<CircleButton icon="chevron.left" label="Back" onPress={back} />}
           title="New session"
-          subtitle={desktopName}
+          center
         />
 
         <View style={styles.hero}>
           {!online ? (
             <Notice kind="warning" title="Desktop offline" body="Reconnect a desktop to start a session." />
           ) : null}
-          <Text accessibilityRole="header" style={[styles.question, { color: t.text }]}>What should we work on?</Text>
           <Pressable onPress={pickSpace} accessibilityRole="button" accessibilityLabel={`Workspace, ${space.label}`} style={({ pressed }) => [styles.space, { opacity: pressed ? 0.6 : 1 }]}>
-            <Icon name="folder" size={18} color={t.textSecondary} />
             <Text style={[styles.spaceLabel, { color: t.textSecondary }]} numberOfLines={1}>{space.label}</Text>
-            <Icon name="chevron.up.chevron.down" size={12} color={t.textTertiary} />
+            <Icon name="chevron.down" size={12} color={t.textTertiary} />
           </Pressable>
 
           {!typed && online ? (
@@ -149,11 +133,10 @@ export default function NewSessionScreen() {
                   onPress={() => { void Haptics.selectionAsync(); setDraft(p.label); setTyped(true); }}
                   accessibilityRole="button"
                   accessibilityLabel={p.label}
-                  style={({ pressed }) => [styles.prompt, { backgroundColor: t.floating, boxShadow: t.floatShadow, opacity: pressed ? 0.7 : 1 }]}
+                  style={({ pressed }) => [styles.prompt, { borderBottomColor: t.separator, opacity: pressed ? 0.55 : 1 }]}
                 >
-                  <Icon name={p.icon} size={16} color={t.textSecondary} />
-                  <Text style={[type.subhead, { color: t.text }]} numberOfLines={1}>{p.label}</Text>
-                  <Icon name="chevron.right" size={11} color={t.textTertiary} weight="semibold" />
+                  <Icon name={p.icon} size={18} color={t.textTertiary} />
+                  <Text style={[type.body, { color: t.text, flex: 1 }]} numberOfLines={2}>{p.label}</Text>
                 </Pressable>
               ))}
             </View>
@@ -164,7 +147,7 @@ export default function NewSessionScreen() {
           key={draft}
           initialText={draft}
           autoFocus
-          placeholder="Ask Cosmos"
+          placeholder="Describe the task…"
           onChangeText={(v) => setTyped(v.length > 0)}
           running={false}
           sending={busy}
@@ -178,29 +161,17 @@ export default function NewSessionScreen() {
           chips={
             <>
               <ComposerChip
-                icon={sandbox === 'danger-full-access' ? 'exclamationmark.shield' : 'lock.shield'}
-                tone={sandbox === 'danger-full-access' ? 'warning' : undefined}
                 label={access.label}
                 accessibilityLabel={`Access, ${access.label}`}
                 onPress={() => showMenu('Access', ACCESS.map((a) => ({ label: a.label, checked: a.id === sandbox, onPress: () => setSandbox(a.id) })), ACCESS.map((a) => `${a.label}: ${a.hint}`).join('\n'))}
               />
               <ComposerChip
-                leading={<HarnessMark harness={harness} size={17} plain />}
                 label={harnessName}
                 accessibilityLabel={`Harness, ${harnessName}`}
                 onPress={() => showMenu('Harness', harnessChoices.map((h) => {
                   const name = h.name ?? harnessLabel(h.id) ?? String(h.id);
                   return { label: name, checked: h.id === harness, onPress: () => { setHarness(h.id); setModel(null); } };
                 }))}
-              />
-              <ComposerChip
-                icon="bolt"
-                label={modelName}
-                accessibilityLabel={`Model, ${modelName}`}
-                onPress={() => showMenu('Model', [
-                  { label: 'Default', checked: !model, onPress: () => setModel(null) },
-                  ...models.map((m) => ({ label: m.name ?? m.id, checked: m.id === model, onPress: () => setModel(m.id) })),
-                ])}
               />
             </>
           }
@@ -212,10 +183,9 @@ export default function NewSessionScreen() {
 
 const styles = StyleSheet.create({
   flex: { flex: 1 },
-  hero: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: spacing(6), gap: spacing(2) },
-  question: { fontSize: 24, fontWeight: '500', lineHeight: 30, textAlign: 'center', letterSpacing: -0.2 },
+  hero: { flex: 1, justifyContent: 'flex-start', alignItems: 'center', paddingHorizontal: spacing(6), paddingTop: spacing(3), gap: spacing(2) },
   space: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), minHeight: 44, maxWidth: '85%' },
-  spaceLabel: { fontSize: 20, lineHeight: 26 },
-  prompts: { gap: spacing(2.5), marginTop: spacing(6), alignItems: 'center' },
-  prompt: { flexDirection: 'row', alignItems: 'center', gap: spacing(2.5), minHeight: 44, paddingHorizontal: spacing(4), borderRadius: 999 },
+  spaceLabel: { fontSize: 15, fontWeight: '500', lineHeight: 20 },
+  prompts: { width: '100%', marginTop: spacing(3), alignItems: 'stretch' },
+  prompt: { flexDirection: 'row', alignItems: 'center', gap: spacing(2.5), minHeight: 44, paddingVertical: spacing(2), borderBottomWidth: StyleSheet.hairlineWidth },
 });

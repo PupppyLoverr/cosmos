@@ -6,19 +6,13 @@ import Constants from 'expo-constants';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../../lib/client';
 import { backdropPresets, edge, familyById, spacing, surfaceOptions, type, useTheme, useThemePrefs } from '../../lib/theme';
 import { Group, Row, StatusDot } from '../../components/bits';
-import { CircleButton, ScreenTitle, TopBar } from '../../components/chrome';
+import { CircleButton, TopBar } from '../../components/chrome';
 import { HarnessMark } from '../../components/harness-mark';
 import { Screen } from '../../components/surface';
 import { ensureNotificationPermission } from '../../lib/notify';
 import { markOnboardingUnseen } from '../../lib/onboarding-store';
+import { describeLink } from '../../lib/connection-state';
 
-function connectionLabel(status: string, detail?: string) {
-  if (status === 'connected') return 'Online';
-  if (status === 'connecting') return 'Connecting…';
-  if (status === 'reconnecting') return 'Reconnecting…';
-  if (status === 'disconnected') return 'Offline';
-  return detail ?? 'Error';
-}
 
 export default function SettingsScreen() {
   const t = useTheme();
@@ -41,14 +35,15 @@ export default function SettingsScreen() {
   const openAppearance = () => router.push('/settings/appearance');
   const initials = (auth?.user.name || auth?.user.email || '?')
     .split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]!.toUpperCase()).join('');
-  const dot = connection.status === 'connected' ? 'connected'
-    : connection.status === 'connecting' || connection.status === 'reconnecting' ? 'awaitingInput' : undefined;
+  const link = describeLink(connection);
+  const dot = link.tone === 'online' ? 'connected'
+    : link.tone === 'pending' ? 'awaitingInput'
+    : link.tone === 'attention' ? 'errored' : undefined;
 
   return (
     <Screen>
-      <TopBar left={<CircleButton icon="chevron.left" label="Back" onPress={() => router.back()} />} />
+      <TopBar left={<CircleButton icon="chevron.left" label="Back" onPress={() => router.back()} />} title="Settings" center />
       <ScrollView contentContainerStyle={styles.content}>
-        <ScreenTitle style={styles.title}>Settings</ScreenTitle>
 
         <Group>
           {auth ? (
@@ -57,7 +52,7 @@ export default function SettingsScreen() {
               title={auth.user.name || auth.user.email}
               subtitle={auth.user.name ? auth.user.email : 'Signed in with Woozlit'}
               leading={(
-                <View style={[styles.avatar, { backgroundColor: t.floating }]}>
+                <View style={[styles.avatar, { backgroundColor: t.surface }]}>
                   <Text style={[type.subhead, { color: t.text, fontWeight: '600' }]}>{initials}</Text>
                 </View>
               )}
@@ -78,9 +73,9 @@ export default function SettingsScreen() {
           <Row
             icon={connection.desktop?.kind === 'local' ? 'wifi' : 'globe'}
             title={connection.desktop ? desktopDisplayName(connection.desktop) : 'Not linked'}
-            value={connectionLabel(connection.status, connection.detail)}
+            value={link.label}
             trailing={<StatusDot status={dot} size={8} />}
-            onPress={() => router.push('/desktops')}
+            onPress={() => router.push(link.needsPair ? '/pair' : '/desktops')}
             chevron
           />
           <Row icon="qrcode.viewfinder" title="Pair a desktop" onPress={() => router.push('/pair')} chevron />

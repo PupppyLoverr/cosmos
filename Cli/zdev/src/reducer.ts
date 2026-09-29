@@ -146,15 +146,26 @@ export function applyUpdate(state: State, u: any): State {
       return { ...state, items };
     }
     case "usage": {
+      const input = u.input ?? 0;
+      const output = u.output ?? 0;
+      const cacheRead = u.cache_read ?? 0;
+      const cacheWrite = u.cache_write ?? 0;
+      const model = String(u.model ?? "");
+      const turnUsd = typeof u.turn_usd === "number" ? u.turn_usd : (u.usd ?? 0);
+      const models = { ...state.usage.models };
+      if (model && Number.isFinite(turnUsd)) models[model] = (models[model] ?? 0) + turnUsd;
       return {
         ...state,
         usage: {
-          input: u.input ?? 0,
-          output: u.output ?? 0,
-          cache_read: u.cache_read ?? 0,
-          cache_write: u.cache_write ?? 0,
+          ...state.usage,
+          input: state.usage.input + input,
+          output: state.usage.output + output,
+          cache_read: state.usage.cache_read + cacheRead,
+          cache_write: state.usage.cache_write + cacheWrite,
           usd: u.usd ?? null,
           cum_usd: u.cum_usd ?? null,
+          turns: state.usage.turns + 1,
+          models,
         },
       };
     }

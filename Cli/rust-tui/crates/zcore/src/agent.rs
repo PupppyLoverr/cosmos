@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use zproto::{Block, Chunk, Event, Message, OutputMode, Role, RunOpts, Usage};
 use zproviders::{complete, ProviderCfg, ProviderKind, Request};
@@ -195,6 +195,14 @@ fn default_provider() -> ProviderCfg {
     }
 }
 
+fn load_prompt(value: &str) -> Result<String> {
+    if let Some(path) = value.strip_prefix('@') {
+        return Ok(std::fs::read_to_string(path)
+            .with_context(|| format!("read system prompt {path}"))?);
+    }
+    Ok(value.to_owned())
+}
+
 impl Agent {
     /// Create or resume an agent. `harness` is `zcli`/`zdev`/`zagy`.
     pub fn new(opts: &RunOpts, harness: &str, cwd: &Path) -> Result<Agent> {
@@ -221,6 +229,12 @@ impl Agent {
         };
 
         let mut ctx = ToolContext::new(&workspace);
+        ctx.allowed_roots = opts
+            .add_dirs
+            .iter()
+            .map(PathBuf::from)
+            .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+            .collect();
         ctx.mcp_servers = cfg.mcp_servers();
         ctx.large_read_lines = cfg.bridge.large_read_lines;
         ctx.no_sandbox = opts.no_sandbox;
@@ -235,9 +249,20 @@ impl Agent {
             // full still sandboxed unless --no-sandbox
         }
 
-        let (session, messages) = if let Some(id) = &opts.resume {
-            let s = Session::open(&home, id)?;
-            let msgs = Session::replay(&home, id)?;
+        let resume_id = match opts.resume.as_deref() {
+            Some("__latest__") => Some(
+                Session::latest_for_cwd(&home, &workspace)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "no previous session in {} to continue",
+                        workspace.display()
+                    ))?,
+            ),
+            Some(id) => Some(id.to_owned()),
+            None => None,
+        };
+        let (session, messages) = if let Some(id) = resume_id {
+            let s = Session::open(&home, &id)?;
+            let msgs = Session::replay(&home, &id)?;
             (s, msgs)
         } else {
             (Session::create(&home, harness)?, Vec::new())
@@ -249,12 +274,28 @@ impl Agent {
 
         let (boot, boot_tokens, _warnings) = boot_context(&workspace);
         let tools = tool_specs();
-        let mut system = vec![boot];
-        if !crate::system_snippet().is_empty() && !system[0].contains("You are Cosmos") {
+        let mut system = if let Some(prompt) = &opts.system_prompt {
+            vec![load_prompt(prompt)?]
+        } else {
+            vec![boot]
+        };
+        if opts.system_prompt.is_none()
+            && !crate::system_snippet().is_empty()
+            && !system[0].contains("You are Cosmos")
+        {
             system.insert(0, crate::system_snippet());
         }
         if let Some(p) = crate::project_instructions(&workspace) {
             system.push(p);
+        }
+        if !opts.add_dirs.is_empty() {
+            system.push(format!(
+                "Additional tool roots granted for this run: {}",
+                opts.add_dirs.join(", ")
+            ));
+        }
+        if let Some(prompt) = &opts.append_system_prompt {
+            system.push(load_prompt(prompt)?);
         }
         let prices = provider.prices;
         let context_window = provider.context;
@@ -497,6 +538,7 @@ impl Agent {
                 "input": usage.input, "cache_read": usage.cache_read,
                 "cache_write": usage.cache_write, "output": usage.output,
                 "usd": cost, "cum_usd": self.cum_usd,
+                "model": self.model_alias, "turn_usd": cost,
             }),
         );
         emit(&uev);
@@ -1189,6 +1231,7 @@ pub fn run_headless(
             "model": agent.model_alias, "mode": agent.mode.name(),
             "sandbox": sandbox_state, "boot_tokens": agent.boot_tokens,
             "resume": opts.resume,
+            "cwd": agent.ctx.workspace,
         }),
     );
     emit(&ev);

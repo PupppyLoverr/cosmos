@@ -31,6 +31,14 @@ const OFFER_TTL: Duration = Duration::from_secs(5 * 60);
 const GRANTS_FILE: &str = "paired-phones.json";
 /// Grant tokens are 256-bit random (two uuid4s), hex.
 const TOKEN_BYTES: usize = 32;
+/// A paired phone stays trusted for six months from the QR scan, then must
+/// pair again. Fixed from creation (not sliding) so an always-connected phone
+/// still re-proves physical presence at the desktop twice a year.
+const GRANT_TTL: Duration = Duration::from_secs(180 * 24 * 60 * 60);
+
+fn grant_expired(grant: &PhoneGrant, now: i64) -> bool {
+    now.saturating_sub(grant.created_at) >= GRANT_TTL.as_millis() as i64
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -98,6 +106,8 @@ pub enum PairingError {
     Mismatch,
     #[error("unknown phone grant")]
     UnknownGrant,
+    #[error("phone pairing expired after six months — scan a fresh desktop QR")]
+    GrantExpired,
 }
 
 #[derive(Default)]
@@ -205,15 +215,32 @@ impl PairingStore {
 
     /// Present a stored grant token on a fresh relay conn (reconnect path).
     pub fn authorize(&self, token: &str, conn_id: &str) -> bool {
+        self.authorize_checked(token, conn_id).is_ok()
+    }
+
+    /// `authorize` with the reason on failure, so the phone can tell an
+    /// expired pairing from a revoked one. Expired grants are deleted.
+    pub fn authorize_checked(&self, token: &str, conn_id: &str) -> Result<(), PairingError> {
+        self.authorize_at(token, conn_id, now_ms())
+    }
+
+    fn authorize_at(&self, token: &str, conn_id: &str, now: i64) -> Result<(), PairingError> {
         let mut state = lock(&self.state);
-        let Some(grant) = state.grants.iter_mut().find(|g| g.token == token) else {
-            return false;
+        let Some(idx) = state.grants.iter().position(|g| g.token == token) else {
+            return Err(PairingError::UnknownGrant);
         };
-        grant.last_used_at = Some(now_ms());
+        if grant_expired(&state.grants[idx], now) {
+            let id = state.grants.remove(idx).id;
+            state.conns.retain(|_, g| *g != id);
+            self.persist_locked(&state);
+            return Err(PairingError::GrantExpired);
+        }
+        let grant = &mut state.grants[idx];
+        grant.last_used_at = Some(now);
         let id = grant.id.clone();
         state.conns.insert(conn_id.to_string(), id);
         self.persist_locked(&state);
-        true
+        Ok(())
     }
 
     /// Gate check: is this relay conn carrying an authorized phone?
@@ -251,6 +278,7 @@ impl PairingStore {
                     "label": g.label,
                     "createdAt": g.created_at,
                     "lastUsedAt": g.last_used_at,
+                    "expiresAt": g.created_at.saturating_add(GRANT_TTL.as_millis() as i64),
                 })
             })
             .collect()
@@ -355,12 +383,14 @@ impl RpcService for RelayGate {
                     device_token: String,
                 }
                 let p: AuthorizePhoneParams = zeron_rpc::parse_params(params)?;
-                if self.pairing.authorize(&p.device_token, &self.conn_id) {
-                    RpcReply::value(&serde_json::json!({ "ok": true }))
-                } else {
-                    Err(RpcError::Failed(
+                match self.pairing.authorize_checked(&p.device_token, &self.conn_id) {
+                    Ok(()) => RpcReply::value(&serde_json::json!({ "ok": true })),
+                    Err(PairingError::GrantExpired) => {
+                        Err(RpcError::Failed(PairingError::GrantExpired.to_string()))
+                    }
+                    Err(_) => Err(RpcError::Failed(
                         "phone not paired — scan the desktop QR".into(),
-                    ))
+                    )),
                 }
             }
             _ => {
@@ -435,5 +465,39 @@ mod tests {
         let reopened = PairingStore::open("dev-1", &path);
         assert!(reopened.authorize(&grant.token, "conn-9"));
         assert_eq!(reopened.list().len(), 1);
+    }
+
+    #[test]
+    fn grant_valid_until_six_months_then_expires() {
+        let store = store();
+        let (code, _) = store.issue();
+        let grant = store.redeem(&code, "conn-1", None).unwrap();
+        let ttl = GRANT_TTL.as_millis() as i64;
+        assert!(store
+            .authorize_at(&grant.token, "conn-2", grant.created_at + ttl - 1)
+            .is_ok());
+        assert!(matches!(
+            store.authorize_at(&grant.token, "conn-3", grant.created_at + ttl),
+            Err(PairingError::GrantExpired)
+        ));
+        // Expiry deletes the grant and its live conns: re-pairing is the only way back.
+        assert!(!store.conn_authorized("conn-2"));
+        assert!(store.list().is_empty());
+        assert!(matches!(
+            store.authorize_checked(&grant.token, "conn-4"),
+            Err(PairingError::UnknownGrant)
+        ));
+    }
+
+    #[test]
+    fn repeated_reconnects_keep_grant_alive() {
+        let store = store();
+        let (code, _) = store.issue();
+        let grant = store.redeem(&code, "conn-1", None).unwrap();
+        for i in 0..5 {
+            store.drop_conn(&format!("conn-{i}"));
+            assert!(store.authorize(&grant.token, &format!("conn-{}", i + 1)));
+        }
+        assert_eq!(store.list().len(), 1);
     }
 }

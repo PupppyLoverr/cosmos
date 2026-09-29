@@ -103,10 +103,15 @@ fn write_requires_prior_read_state() {
 #[test]
 fn workspace_escape_denied() {
     let (_dir, mut c) = ctx();
+    let edit_path = if cfg!(windows) {
+        r"..\evil.txt"
+    } else {
+        "../evil.txt"
+    };
     for tool_input in [
         ("read", json!({"path": "../outside.txt"})),
         ("write", json!({"path": "../outside.txt", "content": "x"})),
-        ("edit", json!({"path": "..\\evil.txt", "edits": []})),
+        ("edit", json!({"path": edit_path, "edits": []})),
         ("ls", json!({"path": ".."})),
     ] {
         let out = run(&mut c, tool_input.0, &tool_input.1);

@@ -231,6 +231,8 @@ pub struct McpEntry {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,6 +322,19 @@ impl Config {
             // anthropic/claude-opus-5-5 written without a [models] table)
             if cfg.default_model.is_none() {
                 cfg.default_model = Some("fixture".into());
+            }
+        }
+        if let Ok(file) = std::env::current_dir().map(|p| p.join(".mcp.json")) {
+            if let Ok(text) = std::fs::read_to_string(file) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(servers) = value.get("mcpServers").and_then(|v| v.as_object()) {
+                        for (name, server) in servers {
+                            if let Ok(entry) = serde_json::from_value::<McpEntry>(server.clone()) {
+                                cfg.mcp.entry(name.clone()).or_insert(entry);
+                            }
+                        }
+                    }
+                }
             }
         }
         cfg
@@ -492,6 +507,7 @@ impl Config {
                     McpServerCfg {
                         command: v.command.clone(),
                         args: v.args.clone(),
+                        env: v.env.clone(),
                     },
                 )
             })

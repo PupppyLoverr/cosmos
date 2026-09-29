@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,9 @@ type Agent struct {
 	Tools       []any
 	Allowed     []string
 	CumUSD      float64
+	ModelUSD    map[string]float64
+	Turns       uint64
+	StartedAt   time.Time
 	LastUsage   Usage
 	BootTokens  int
 	Asker       func(tool string) bool
@@ -73,7 +77,11 @@ func systemSnippet() string {
 }
 
 func bootContext(workspace string) (string, int) {
-	mer := findBin([]string{"meridian.exe", "meridian"}, "MERIDIAN_BIN")
+	names := []string{"meridian"}
+	if runtime.GOOS == "windows" {
+		names = []string{"meridian.exe", "meridian"}
+	}
+	mer := findBin(names, "MERIDIAN_BIN")
 	if mer == "" {
 		return systemSnippet(), 0
 	}
@@ -89,6 +97,14 @@ func bootContext(workspace string) (string, int) {
 	return strv(v, "context"), int(numv(v, "tokens"))
 }
 
+func promptValue(value string) (string, error) {
+	if strings.HasPrefix(value, "@") {
+		b, err := os.ReadFile(strings.TrimPrefix(value, "@"))
+		return string(b), err
+	}
+	return value, nil
+}
+
 func runHooks(cfg *Config, event, tool string, payload any, session string) (string, bool) {
 	ev, _ := json.Marshal(map[string]any{
 		"event": event, "tool": tool, "data": payload, "session": session})
@@ -99,7 +115,12 @@ func runHooks(cfg *Config, event, tool string, payload any, session string) (str
 		if h.Matcher != "" && h.Matcher != "*" && h.Matcher != tool {
 			continue
 		}
-		c := exec.Command("cmd", "/c", h.Command)
+		var c *exec.Cmd
+		if runtime.GOOS == "windows" {
+			c = exec.Command("cmd", "/c", h.Command)
+		} else {
+			c = exec.Command("sh", "-c", h.Command)
+		}
 		c.Stdin = strings.NewReader(string(ev))
 		out, err := c.Output()
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -139,6 +160,21 @@ func NewAgent(opts *RunOpts, harness, cwd string) (*Agent, error) {
 		mode = "agent"
 	}
 	ctx := NewToolCtx(ws)
+	if raw, err := os.ReadFile(filepath.Join(ws, ".mcp.json")); err == nil {
+		var project struct {
+			MCPServers map[string]any `json:"mcpServers"`
+		}
+		if json.Unmarshal(raw, &project) == nil {
+			for name, server := range project.MCPServers {
+				ctx.MCPServers[name] = server
+			}
+		}
+	}
+	for _, d := range opts.AddDirs {
+		if p, err := filepath.Abs(d); err == nil {
+			ctx.AllowedRoots = append(ctx.AllowedRoots, p)
+		}
+	}
 	ctx.LargeReadLines = cfg.LargeRead
 	ctx.NoSandbox = opts.NoSandbox
 	ctx.Home = home
@@ -156,10 +192,25 @@ func NewAgent(opts *RunOpts, harness, cwd string) (*Agent, error) {
 		Opts: opts, Home: home, Cfg: cfg, Workspace: ws,
 		Provider: pcfg, ModelAlias: alias + " (" + pcfg.Model + ")",
 		Mode: mode, Ctx: ctx, Allowed: cfg.allowedHosts(),
-		LogW: os.Stderr,
+		LogW:      os.Stderr,
+		ModelUSD:  map[string]float64{},
+		StartedAt: time.Now(),
 	}
-	if opts.Resume != "" {
-		s, err := sessionOpen(home, opts.Resume)
+	resume := opts.Resume
+	if resume == "__latest__" {
+		list := sessionList(home)
+		for i := len(list) - 1; i >= 0; i-- {
+			if list[i]["cwd"] == ws {
+				resume, _ = list[i]["id"].(string)
+				break
+			}
+		}
+		if resume == "__latest__" {
+			return nil, fmt.Errorf("no previous session in %s to continue", ws)
+		}
+	}
+	if resume != "" {
+		s, err := sessionOpen(home, resume)
 		if err != nil {
 			return nil, err
 		}
@@ -171,10 +222,26 @@ func NewAgent(opts *RunOpts, harness, cwd string) (*Agent, error) {
 	}
 	boot, tokens := bootContext(ws)
 	a.BootTokens = tokens
-	if strings.Contains(boot, "You are Cosmos") {
+	if opts.SystemPrompt != "" {
+		prompt, err := promptValue(opts.SystemPrompt)
+		if err != nil {
+			return nil, err
+		}
+		a.System = []string{prompt}
+	} else if strings.Contains(boot, "You are Cosmos") {
 		a.System = []string{boot}
 	} else {
 		a.System = []string{systemSnippet(), boot}
+	}
+	if len(opts.AddDirs) > 0 {
+		a.System = append(a.System, "Additional tool roots granted for this run: "+strings.Join(opts.AddDirs, ", "))
+	}
+	if opts.AppendSystemPrompt != "" {
+		prompt, err := promptValue(opts.AppendSystemPrompt)
+		if err != nil {
+			return nil, err
+		}
+		a.System = append(a.System, prompt)
 	}
 	var specs []map[string]any
 	json.Unmarshal([]byte(ToolsJSON), &specs)
@@ -390,7 +457,9 @@ func (a *Agent) Turn(emit func(Event)) (bool, error) {
 	cost := a.cost(usage)
 	if cost != nil {
 		a.CumUSD += *cost
+		a.ModelUSD[a.ModelAlias] += *cost
 	}
+	a.Turns++
 	tc := []any{}
 	for _, c := range calls {
 		tc = append(tc, map[string]any{"id": c["id"], "name": c["name"], "input": c["input"]})
@@ -404,7 +473,8 @@ func (a *Agent) Turn(emit func(Event)) (bool, error) {
 	emit(a.Session.append("usage", map[string]any{
 		"input": usage.Input, "cache_read": usage.CacheRead,
 		"cache_write": usage.CacheWrite, "output": usage.Output,
-		"usd": usd, "cum_usd": a.CumUSD}))
+		"usd": usd, "cum_usd": a.CumUSD,
+		"model": a.ModelAlias, "turn_usd": usd}))
 	costStr := "$?"
 	if cost != nil {
 		costStr = fmt.Sprintf("$%.4f", *cost)

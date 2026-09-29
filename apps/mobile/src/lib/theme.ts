@@ -506,25 +506,25 @@ export const edge = spacing(4);
 
 // One family (SF Pro / Roboto). Titles 28–34 semibold, body 16, meta 13.
 export const type = {
-  largeTitle: { fontSize: 34, fontWeight: '600', letterSpacing: 0.2, lineHeight: 41 },
+  largeTitle: { fontSize: 28, fontWeight: '600', letterSpacing: 0.2, lineHeight: 34 },
   title: { fontSize: 28, fontWeight: '600', lineHeight: 34 },
   title2: { fontSize: 22, fontWeight: '600', lineHeight: 28 },
   title3: { fontSize: 20, fontWeight: '600', lineHeight: 25 },
   headline: { fontSize: 17, fontWeight: '600', lineHeight: 22 },
-  body: { fontSize: 16, fontWeight: '400', lineHeight: 22 },
+  body: { fontSize: 15, fontWeight: '400', lineHeight: 21 },
   callout: { fontSize: 16, fontWeight: '400', lineHeight: 21 },
   subhead: { fontSize: 15, fontWeight: '400', lineHeight: 20 },
   footnote: { fontSize: 13, fontWeight: '400', lineHeight: 18 },
   caption: { fontSize: 12, fontWeight: '400', lineHeight: 16 },
   caption2: { fontSize: 11, fontWeight: '500', lineHeight: 13, letterSpacing: 0.3 },
   /** Secondary metadata under a title: harness · desktop · time. */
-  meta: { fontSize: 13, fontWeight: '400', lineHeight: 18 },
+  meta: { fontSize: 12.5, fontWeight: '400', lineHeight: 17 },
   /** Session card title. */
-  sessionTitle: { fontSize: 16, fontWeight: '600', lineHeight: 21 },
-  composer: { fontSize: 16, fontWeight: '400', lineHeight: 22 },
+  sessionTitle: { fontSize: 15, fontWeight: '500', lineHeight: 20 },
+  composer: { fontSize: 15, fontWeight: '400', lineHeight: 21 },
   /** Transcript body. Scales with Dynamic Type. */
-  transcript: { fontSize: 16, fontWeight: '400', lineHeight: 23 },
-  mono: { fontSize: 13, fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }), lineHeight: 18 },
+  transcript: { fontSize: 15, fontWeight: '400', lineHeight: 21 },
+  mono: { fontSize: 12.5, fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }), lineHeight: 17 },
 } as const satisfies Record<string, TextStyle>;
 
 export const shadows = {

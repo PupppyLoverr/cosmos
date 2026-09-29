@@ -24,7 +24,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -47,6 +48,37 @@ use crate::{
 /// when their transport dies, so a shared static label wedges the first
 /// respawn inside the TTL window with `session_unavailable`.
 const SESSION_LABEL_PREFIX: &str = "cosmos";
+
+fn select_frontmost_window(
+    windows: &[Value],
+    cg_frontmost: Option<crate::macos_focus::FrontmostWindow>,
+    own_pid: i64,
+    driver_pid: Option<i64>,
+) -> Option<(Value, &'static str)> {
+    let eligible = |window: &&Value| {
+        window.get("minimized").and_then(Value::as_bool) != Some(true)
+            && window.get("is_on_screen").and_then(Value::as_bool) != Some(false)
+            && window.get("pid").and_then(Value::as_i64) != Some(own_pid)
+            && window.get("pid").and_then(Value::as_i64) != driver_pid
+    };
+    if let Some(frontmost) = cg_frontmost
+        && let Some(window) = windows.iter().filter(eligible).find(|window| {
+            window.get("pid").and_then(Value::as_i64) == Some(frontmost.pid as i64)
+                && window.get("window_id").and_then(Value::as_i64) == Some(frontmost.window_id)
+        })
+    {
+        return Some((window.clone(), "cg-frontmost"));
+    }
+
+    windows
+        .iter()
+        .filter(eligible)
+        .max_by_key(|window| window.get("z_index").and_then(Value::as_i64).unwrap_or(0))
+        .cloned()
+        .map(|window| (window, "z-index-fallback"))
+}
+
+static FAST_INPUT_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Clone)]
 struct CachedElement {
@@ -822,6 +854,64 @@ impl CuaBackend {
             .and_then(|app| app.get("active").and_then(Value::as_bool))
     }
 
+    async fn fast_input_args(&self, tool: &str, call_args: &Value) -> Option<Value> {
+        if !fast_input_enabled()
+            || !is_fast_input_tool(tool)
+            || has_ax_target(call_args)
+            || call_args.get("scope").and_then(Value::as_str) == Some("desktop")
+        {
+            return None;
+        }
+        if matches!(tool, "click" | "double_click" | "right_click")
+            && (call_args.get("x").and_then(Value::as_f64).is_none()
+                || call_args.get("y").and_then(Value::as_f64).is_none())
+        {
+            return None;
+        }
+        let pid = call_args.get("pid").and_then(Value::as_i64)?;
+        let requested_window_id = call_args.get("window_id").and_then(Value::as_i64);
+        let ignore_pids = self
+            .client
+            .child_pid()
+            .map(|pid| vec![pid as i32])
+            .unwrap_or_default();
+        let frontmost =
+            tokio::task::spawn_blocking(move || crate::macos_focus::frontmost_window(&ignore_pids));
+        let (windows, frontmost) = tokio::join!(self.list_windows(Some(pid)), frontmost);
+        let frontmost = frontmost.ok().flatten()?;
+        let windows = windows.ok()?;
+        let target_window = frontmost_window(&windows, pid, requested_window_id)?;
+        let target_window_id = target_window.get("window_id").and_then(Value::as_i64)?;
+        if !frontmost_target_is_eligible(tool, &frontmost, pid, target_window) {
+            return None;
+        }
+
+        let mut fast_args = call_args.clone();
+        fast_args["scope"] = json!("desktop");
+        if let (Some(x), Some(y), Some(bounds)) = (
+            call_args.get("x").and_then(Value::as_f64),
+            call_args.get("y").and_then(Value::as_f64),
+            window_frame(target_window),
+        ) {
+            let (x, y) = window_to_screen(bounds, x, y);
+            fast_args["x"] = json!(x);
+            fast_args["y"] = json!(y);
+        } else if call_args.get("x").is_some() || call_args.get("y").is_some() {
+            return None;
+        }
+        if let Some(object) = fast_args.as_object_mut() {
+            object.remove("pid");
+            object.remove("window_id");
+        }
+        tracing::debug!(
+            tool,
+            pid,
+            window_id = target_window_id,
+            "using fast desktop-scoped input route"
+        );
+        Some(fast_args)
+    }
+
     /// Poll app activation; an unavailable list_apps response stops polling.
     async fn wait_for_app_active(&self, pid: i64) -> bool {
         for _ in 0..15 {
@@ -842,38 +932,37 @@ impl CuaBackend {
         let own_pid = std::process::id() as i64;
         let driver_pid = self.client.child_pid().map(|p| p as i64);
         let windows = self.list_windows(None).await?;
-        let mut best: Option<&Value> = None;
-        let mut best_z = i64::MIN;
-        let mut any_z = false;
-        for window in &windows {
-            if window.get("minimized").and_then(Value::as_bool) == Some(true) {
-                continue;
-            }
-            let pid = window.get("pid").and_then(Value::as_i64);
-            if pid == Some(own_pid) || (driver_pid.is_some() && pid == driver_pid) {
-                continue;
-            }
-            match window.get("z_index").and_then(Value::as_i64) {
-                Some(z) => {
-                    any_z = true;
-                    if z > best_z {
-                        best_z = z;
-                        best = Some(window);
-                    }
-                }
-                None => {
-                    if best.is_none() && !any_z {
-                        best = Some(window);
-                    }
-                }
-            }
+        let mut ignore_pids = vec![own_pid as i32];
+        if let Some(pid) = driver_pid {
+            ignore_pids.push(pid as i32);
         }
-        best.cloned().ok_or_else(|| {
-            ComputerError::refused(
+        let cg_frontmost =
+            tokio::task::spawn_blocking(move || crate::macos_focus::frontmost_window(&ignore_pids))
+                .await
+                .ok()
+                .flatten();
+        let Some((window, source)) =
+            select_frontmost_window(&windows, cg_frontmost, own_pid, driver_pid)
+        else {
+            return Err(ComputerError::refused(
                 "no_window",
                 "No foreground application window is available to observe.",
-            )
-        })
+            ));
+        };
+        let selected_pid = window.get("pid").and_then(|value| value.as_i64());
+        let selected_window_id = window.get("window_id").and_then(|value| value.as_i64());
+        let selected_owner = window.get("app_name").and_then(|value| value.as_str());
+        let selected_z_index = window.get("z_index").and_then(|value| value.as_i64());
+        tracing::debug!(
+            target: "zeron_computer",
+            pid = ?selected_pid,
+            window_id = ?selected_window_id,
+            owner = ?selected_owner,
+            z_index = ?selected_z_index,
+            source,
+            "selected computer observe window"
+        );
+        Ok(window)
     }
 
     /// Resolve a pid (+optional window_id) to a concrete window record.
@@ -943,27 +1032,41 @@ impl CuaBackend {
     }
 
     #[cfg(target_os = "macos")]
-    async fn ax_window_for_pid(&self, pid: i64) -> Option<Value> {
-        let window = self.window_for(pid, None).await.ok()?;
-        self.window_is_ax_resolvable(&window)
-            .await
-            .then_some(window)
-    }
-
-    #[cfg(target_os = "macos")]
     async fn wait_for_ax_window(&self, pid: i64) -> Option<Value> {
-        for attempt in 0..=16 {
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut interval = std::time::Duration::from_millis(60);
+        let mut attempts = 0_u32;
+        loop {
+            attempts += 1;
             if let Ok(windows) = self.list_windows(Some(pid)).await {
                 for window in windows {
                     if self.window_is_ax_resolvable(&window).await {
+                        tracing::debug!(
+                            target: "zeron_computer",
+                            pid,
+                            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                            attempts,
+                            "launch_app AX readiness succeeded"
+                        );
                         return Some(window);
                     }
                 }
             }
-            if attempt < 16 {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
             }
+            tokio::time::sleep(interval.min(deadline - now)).await;
+            interval = (interval * 3 / 2).min(std::time::Duration::from_millis(300));
         }
+        tracing::debug!(
+            target: "zeron_computer",
+            pid,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            attempts,
+            "launch_app AX readiness timed out"
+        );
         None
     }
 
@@ -974,10 +1077,31 @@ impl CuaBackend {
         launch_args: &Value,
         summary: &mut String,
     ) {
-        if self.ax_window_for_pid(pid).await.is_some() {
+        let probe_started = Instant::now();
+        let visible = self.list_windows(Some(pid)).await.ok().and_then(|windows| {
+            windows.into_iter().find(|window| {
+                window.get("minimized").and_then(Value::as_bool) != Some(true)
+                    && window.get("is_on_screen").and_then(Value::as_bool) != Some(false)
+            })
+        });
+        tracing::debug!(
+            target: "zeron_computer",
+            pid,
+            elapsed_ms = probe_started.elapsed().as_secs_f64() * 1000.0,
+            visible = visible.is_some(),
+            "launch_app existing-window probe"
+        );
+        if let Some(window) = visible {
+            *summary = render_launch_summary(summary, pid, std::slice::from_ref(&window));
+            tracing::debug!(
+                target: "zeron_computer",
+                pid,
+                "launch_app skipped open and AX readiness for visible window"
+            );
             return;
         }
 
+        let open_started = Instant::now();
         let reopened = if let Some(bundle_id) = launch_args.get("bundle_id").and_then(Value::as_str)
         {
             tokio::process::Command::new("open")
@@ -994,12 +1118,29 @@ impl CuaBackend {
         } else {
             false
         };
+        tracing::debug!(
+            target: "zeron_computer",
+            pid,
+            elapsed_ms = open_started.elapsed().as_secs_f64() * 1000.0,
+            reopened,
+            "launch_app open completed"
+        );
 
-        if reopened && self.wait_for_ax_window(pid).await.is_some() {
-            let windows = self.list_windows(Some(pid)).await.unwrap_or_default();
-            *summary = render_launch_summary(summary, pid, &windows);
+        if reopened && let Some(window) = self.wait_for_ax_window(pid).await {
+            *summary = render_launch_summary(summary, pid, std::slice::from_ref(&window));
             summary.push_str(" [reopened: app was running with no document window]");
         } else {
+            let final_list_started = Instant::now();
+            let windows = self.list_windows(Some(pid)).await.unwrap_or_default();
+            tracing::debug!(
+                target: "zeron_computer",
+                pid,
+                elapsed_ms = final_list_started.elapsed().as_secs_f64() * 1000.0,
+                "launch_app final list_windows completed"
+            );
+            if !windows.is_empty() {
+                *summary = render_launch_summary(summary, pid, &windows);
+            }
             summary.push_str(
                 " — app is running but exposes no accessibility window; try computer_invoke_menu with the app's menu bar or relaunch",
             );
@@ -1230,6 +1371,7 @@ impl CuaBackend {
     /// normalize the outcome. `request.delivery` was already gated by the
     /// service — forward it verbatim.
     async fn act_inner(&self, request: &ActionRequest) -> Result<ActionOutcome, ComputerError> {
+        let action_started = Instant::now();
         let args = &request.args;
         let delivery = request.delivery.as_str();
         let (tool, mut call_args) = match request.tool.as_str() {
@@ -1441,6 +1583,8 @@ impl CuaBackend {
         let mut element_fallback_note = None;
         let mut menu_path_note = None;
         let mut native_menu_note = None;
+        let mut fast_route_fallback = false;
+        let mut action_route = "window";
         let result = if tool == "invoke_menu" {
             let native = self
                 .native_menu
@@ -1482,6 +1626,21 @@ impl CuaBackend {
                     self.call(tool, call_args.clone()).await
                 }
                 None => self.call(tool, call_args.clone()).await,
+            }
+        } else if let Some(fast_args) = self.fast_input_args(tool, &call_args).await {
+            action_route = "fast-desktop";
+            match self.call(tool, fast_args).await {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    fast_route_fallback = true;
+                    action_route = "window";
+                    tracing::debug!(
+                        tool,
+                        error = %error,
+                        "fast desktop-scoped input route failed; retrying window route"
+                    );
+                    self.call(tool, call_args.clone()).await
+                }
             }
         } else {
             self.call(tool, call_args.clone()).await
@@ -1629,6 +1788,9 @@ impl CuaBackend {
         if let Some(note) = element_fallback_note {
             summary.push_str(&note);
         }
+        if fast_route_fallback {
+            summary.push_str(" (fast input route unavailable; used window route)");
+        }
         #[cfg(target_os = "macos")]
         if tool == "launch_app"
             && let Some(pid) = pid_from_launch_result(&result)
@@ -1636,6 +1798,12 @@ impl CuaBackend {
             self.reopen_running_app_if_needed(pid, &call_args, &mut summary)
                 .await;
         }
+        tracing::debug!(
+            tool,
+            route = action_route,
+            elapsed_ms = action_started.elapsed().as_secs_f64() * 1000.0,
+            "computer action completed"
+        );
         Ok(ActionOutcome {
             summary,
             details,
@@ -1693,19 +1861,20 @@ impl CuaBackend {
         alternates.sort_by_key(|w| {
             std::cmp::Reverse(w.get("z_index").and_then(Value::as_i64).unwrap_or(0))
         });
+        let retries = futures::future::join_all(alternates.iter().map(|candidate| {
+            self.window_state_inner(
+                candidate,
+                semantic,
+                screenshot,
+                max_elements,
+                max_dimension,
+                screenshot_dir,
+                query,
+            )
+        }))
+        .await;
         let mut resolvable = Vec::new();
-        for candidate in alternates {
-            let retry = self
-                .window_state_inner(
-                    candidate,
-                    semantic,
-                    screenshot,
-                    max_elements,
-                    max_dimension,
-                    screenshot_dir,
-                    query,
-                )
-                .await;
+        for retry in retries {
             let Ok(state) = retry else { continue };
             if Self::is_ax_unresolved_state(&state) {
                 continue;
@@ -1796,6 +1965,109 @@ fn strip_nulls(value: &mut Value) {
     }
 }
 
+fn fast_input_enabled() -> bool {
+    *FAST_INPUT_ENABLED
+        .get_or_init(|| std::env::var("ZERON_COMPUTER_FAST_INPUT").as_deref() != Ok("0"))
+}
+
+fn is_fast_input_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "click" | "double_click" | "right_click" | "type_text" | "press_key" | "hotkey" | "scroll"
+    )
+}
+
+fn has_ax_target(args: &Value) -> bool {
+    ["element_index", "element_token", "snapshot_id", "target"]
+        .iter()
+        .any(|key| args.get(*key).is_some_and(|value| !value.is_null()))
+}
+
+fn window_frame(window: &Value) -> Option<ElementFrame> {
+    let bounds = window.get("bounds")?;
+    Some(ElementFrame {
+        x: bounds.get("x")?.as_f64()?,
+        y: bounds.get("y")?.as_f64()?,
+        w: bounds.get("width")?.as_f64()?,
+        h: bounds.get("height")?.as_f64()?,
+    })
+}
+
+fn frontmost_window(
+    windows: &[Value],
+    pid: i64,
+    requested_window_id: Option<i64>,
+) -> Option<&Value> {
+    let visible = windows
+        .iter()
+        .filter(|window| {
+            window.get("minimized").and_then(Value::as_bool) != Some(true)
+                && window.get("is_on_screen").and_then(Value::as_bool) != Some(false)
+                && window.get("z_index").and_then(Value::as_i64).is_some()
+        })
+        .collect::<Vec<_>>();
+    let global_front_window = visible
+        .iter()
+        .max_by_key(|window| window.get("z_index").and_then(Value::as_i64).unwrap_or(0))?;
+    if global_front_window.get("pid").and_then(Value::as_i64) != Some(pid) {
+        return None;
+    }
+    let front_window = visible
+        .iter()
+        .filter(|window| window.get("pid").and_then(Value::as_i64) == Some(pid))
+        .max_by_key(|window| window.get("z_index").and_then(Value::as_i64).unwrap_or(0))?;
+    let target_window = match requested_window_id {
+        Some(window_id) => windows
+            .iter()
+            .find(|window| window.get("window_id").and_then(Value::as_i64) == Some(window_id))?,
+        None => *front_window,
+    };
+    if target_window.get("pid").and_then(Value::as_i64) != Some(pid)
+        || target_window.get("minimized").and_then(Value::as_bool) == Some(true)
+        || target_window.get("is_on_screen").and_then(Value::as_bool) == Some(false)
+    {
+        return None;
+    }
+    Some(target_window)
+}
+
+fn window_to_screen(frame: ElementFrame, x: f64, y: f64) -> (f64, f64) {
+    (frame.x + x, frame.y + y)
+}
+
+fn is_keyboard_fast_input_tool(tool: &str) -> bool {
+    matches!(tool, "type_text" | "press_key" | "hotkey")
+}
+
+fn frontmost_window_matches(
+    frontmost: &crate::macos_focus::FrontmostWindow,
+    target_pid: i64,
+    target_window_id: i64,
+) -> bool {
+    i32::try_from(target_pid).ok() == Some(frontmost.pid) && target_window_id == frontmost.window_id
+}
+
+fn frontmost_target_is_eligible(
+    tool: &str,
+    frontmost: &crate::macos_focus::FrontmostWindow,
+    target_pid: i64,
+    target_window: &Value,
+) -> bool {
+    if target_window.get("pid").and_then(Value::as_i64) != Some(target_pid)
+        || target_window.get("minimized").and_then(Value::as_bool) == Some(true)
+        || target_window.get("is_on_screen").and_then(Value::as_bool) == Some(false)
+    {
+        return false;
+    }
+    if is_keyboard_fast_input_tool(tool) {
+        return i32::try_from(target_pid).ok() == Some(frontmost.pid);
+    }
+    let Some(target_window_id) = target_window.get("window_id").and_then(Value::as_i64) else {
+        return false;
+    };
+    frontmost_window_matches(frontmost, target_pid, target_window_id)
+}
+
 fn str_arg(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::to_string)
 }
@@ -1810,6 +2082,233 @@ fn num_arg(args: &Value, key: &str) -> Option<f64> {
 
 fn bool_arg(args: &Value, key: &str) -> Option<bool> {
     args.get(key).and_then(Value::as_bool)
+}
+
+#[cfg(test)]
+mod fast_input_tests {
+    use super::*;
+
+    #[test]
+    fn window_to_screen_preserves_window_relative_coordinates() {
+        let frame = ElementFrame {
+            x: 165.0,
+            y: 86.0,
+            w: 586.0,
+            h: 488.0,
+        };
+        assert_eq!(window_to_screen(frame, 293.0, 317.2), (458.0, 403.2));
+    }
+
+    #[test]
+    fn observe_selection_prefers_exact_cg_frontmost_identity() {
+        let windows = vec![
+            json!({"pid": 10, "window_id": 1, "z_index": 99, "is_on_screen": true}),
+            json!({"pid": 10, "window_id": 2, "z_index": 1, "is_on_screen": true}),
+        ];
+        let cg = crate::macos_focus::FrontmostWindow {
+            window_id: 2,
+            pid: 10,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let (selected, source) = select_frontmost_window(&windows, Some(cg), 99, None).unwrap();
+        assert_eq!(selected["window_id"], 2);
+        assert_eq!(source, "cg-frontmost");
+    }
+
+    #[test]
+    fn observe_selection_falls_back_to_highest_visible_z_index() {
+        let windows = vec![
+            json!({"pid": 10, "window_id": 1, "z_index": 2, "is_on_screen": true}),
+            json!({"pid": 20, "window_id": 2, "z_index": 8, "is_on_screen": true}),
+            json!({"pid": 30, "window_id": 3, "z_index": 99, "is_on_screen": false}),
+        ];
+        let (selected, source) = select_frontmost_window(
+            &windows,
+            Some(crate::macos_focus::FrontmostWindow {
+                window_id: 99,
+                pid: 999,
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }),
+            40,
+            None,
+        )
+        .unwrap();
+        assert_eq!(selected["window_id"], 2);
+        assert_eq!(source, "z-index-fallback");
+    }
+
+    #[test]
+    fn observe_selection_ignores_cosmos_and_driver_windows() {
+        let windows = vec![
+            json!({"pid": 40, "window_id": 1, "z_index": 100, "is_on_screen": true}),
+            json!({"pid": 50, "window_id": 2, "z_index": 90, "is_on_screen": true}),
+            json!({"pid": 60, "window_id": 3, "z_index": 80, "is_on_screen": true}),
+        ];
+        let (selected, _) = select_frontmost_window(&windows, None, 40, Some(50)).unwrap();
+        assert_eq!(selected["window_id"], 3);
+    }
+
+    #[test]
+    fn fast_input_excludes_ax_targets() {
+        assert!(has_ax_target(&json!({"element_index": 1})));
+        assert!(has_ax_target(&json!({"element_token": "s1:1"})));
+        assert!(has_ax_target(&json!({"snapshot_id": "s1"})));
+        assert!(has_ax_target(&json!({"target": {"display_id": "primary"}})));
+        assert!(!has_ax_target(&json!({"x": 1, "y": 2})));
+    }
+
+    #[test]
+    fn fast_input_tool_inventory_is_limited_to_input_actions() {
+        assert!(is_fast_input_tool("click"));
+        assert!(is_fast_input_tool("double_click"));
+        assert!(is_fast_input_tool("right_click"));
+        assert!(is_fast_input_tool("type_text"));
+        assert!(is_fast_input_tool("press_key"));
+        assert!(is_fast_input_tool("hotkey"));
+        assert!(is_fast_input_tool("scroll"));
+        assert!(!is_fast_input_tool("drag"));
+        assert!(!is_fast_input_tool("invoke_menu"));
+    }
+
+    #[test]
+    fn frontmost_window_requires_active_visible_target() {
+        let windows = vec![
+            json!({"pid": 10, "window_id": 1, "z_index": 8, "is_on_screen": true}),
+            json!({"pid": 20, "window_id": 2, "z_index": 7, "is_on_screen": true}),
+        ];
+        assert_eq!(
+            frontmost_window(&windows, 10, Some(1))
+                .and_then(|window| window.get("window_id"))
+                .and_then(Value::as_i64),
+            Some(1)
+        );
+        assert!(frontmost_window(&windows, 20, Some(2)).is_none());
+        assert!(frontmost_window(&windows, 10, Some(2)).is_none());
+    }
+
+    #[test]
+    fn frontmost_window_rejects_minimized_and_hidden_targets() {
+        let minimized = vec![
+            json!({"pid": 10, "window_id": 1, "z_index": 8, "minimized": true}),
+            json!({"pid": 20, "window_id": 2, "z_index": 7, "is_on_screen": true}),
+        ];
+        assert!(frontmost_window(&minimized, 10, Some(1)).is_none());
+
+        let hidden = vec![
+            json!({"pid": 10, "window_id": 1, "z_index": 8, "is_on_screen": false}),
+            json!({"pid": 20, "window_id": 2, "z_index": 7, "is_on_screen": true}),
+        ];
+        assert!(frontmost_window(&hidden, 10, Some(1)).is_none());
+    }
+
+    #[test]
+    fn frontmost_window_matches_pid_and_window_id() {
+        let frontmost = crate::macos_focus::FrontmostWindow {
+            window_id: 112,
+            pid: 12,
+            x: 165.0,
+            y: 86.0,
+            width: 586.0,
+            height: 488.0,
+        };
+        assert!(frontmost_window_matches(&frontmost, 12, 112));
+        assert!(!frontmost_window_matches(&frontmost, 12, 113));
+    }
+
+    #[test]
+    fn same_pid_different_window_allows_keyboard_fast_route() {
+        let frontmost = crate::macos_focus::FrontmostWindow {
+            pid: 12,
+            window_id: 113,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let target = json!({
+            "pid": 12,
+            "window_id": 112,
+            "is_on_screen": true
+        });
+        assert!(frontmost_target_is_eligible(
+            "type_text",
+            &frontmost,
+            12,
+            &target
+        ));
+        assert!(frontmost_target_is_eligible(
+            "press_key",
+            &frontmost,
+            12,
+            &target
+        ));
+        assert!(frontmost_target_is_eligible(
+            "hotkey", &frontmost, 12, &target
+        ));
+    }
+
+    #[test]
+    fn same_pid_different_window_rejects_pointer_fast_route() {
+        let frontmost = crate::macos_focus::FrontmostWindow {
+            pid: 12,
+            window_id: 113,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let target = json!({
+            "pid": 12,
+            "window_id": 112,
+            "is_on_screen": true
+        });
+        assert!(!frontmost_target_is_eligible(
+            "click", &frontmost, 12, &target
+        ));
+    }
+
+    #[test]
+    fn frontmost_window_pid_mismatch_is_not_eligible() {
+        let frontmost = crate::macos_focus::FrontmostWindow {
+            pid: 11,
+            window_id: 112,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        assert!(!frontmost_window_matches(&frontmost, 12, 112));
+    }
+
+    #[test]
+    fn minimized_target_window_is_not_eligible() {
+        let frontmost = crate::macos_focus::FrontmostWindow {
+            pid: 12,
+            window_id: 112,
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let target = json!({
+            "pid": 12,
+            "window_id": 112,
+            "minimized": true,
+            "is_on_screen": true
+        });
+        assert!(!frontmost_target_is_eligible(
+            "press_key",
+            &frontmost,
+            12,
+            &target
+        ));
+    }
 }
 
 /// `structuredContent.elements[i]` → typed element. Tolerant of missing

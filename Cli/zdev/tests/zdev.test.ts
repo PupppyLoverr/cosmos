@@ -14,6 +14,7 @@ import * as repair from "../src/repair";
 import * as compact from "../src/compact";
 import * as ckpt from "../src/ckpt";
 import * as world from "../src/world";
+import { costFormatterTestValue } from "../src/cost";
 
 const tmps: string[] = [];
 function tmpdir(): string {
@@ -28,6 +29,15 @@ afterEach(() => {
       fs.rmSync(d, { recursive: true, force: true });
     } catch {}
   }
+});
+
+test("cost formatter includes full session breakdown", () => {
+  const text = costFormatterTestValue();
+  expect(text).toContain("Input: 100");
+  expect(text).toContain("USD total: $0.1500");
+  expect(text).toContain("alpha: $0.1200");
+  expect(text).toContain("Turns: 2");
+  expect(text).toContain("Wall time: 1.0m");
 });
 
 test("read hashlines", () => {

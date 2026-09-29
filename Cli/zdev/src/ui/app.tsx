@@ -24,6 +24,7 @@ import { DIM, GRAY, GREEN, ROSE } from "../theme";
 import * as t from "../tools";
 import type { Item, Model, PermissionReq, Usage } from "../types";
 import { emptyState } from "../types";
+import { formatCost } from "../cost";
 import { ZdevDriver } from "./driver";
 import { KeyParser, lineEnd, lineStart, verticalMove, wordLeft, wordRight, type Key } from "./keys";
 import {
@@ -507,6 +508,13 @@ export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitRe
           }
           return push({ kind: "assistant", id: nextId(), text: lines.join("\n") });
         }
+        case "cost": {
+          return push({
+            kind: "assistant",
+            id: nextId(),
+            text: formatCost(tr.usage),
+          });
+        }
         case "context": {
           const used = tr.usage.input + tr.usage.cache_read + tr.usage.cache_write;
           if (!ctxLimit) return say(`~${used.toLocaleString()} tokens in context (window size unknown for this model)`);
@@ -520,6 +528,7 @@ export function App({ boot, onExit, onDriver }: { boot: Boot; onExit: (r: ExitRe
           return setPopup({ kind: "resume", sessions, sel: 0 });
         }
         case "init":
+          store.initProject(driver.agent?.workspace ?? process.cwd());
           return sendPrompt("/init", INIT_PROMPT);
         case "review":
           return sendPrompt(args ? `/review ${args}` : "/review", REVIEW_PROMPT + (args ? ` Focus: ${args}` : ""));

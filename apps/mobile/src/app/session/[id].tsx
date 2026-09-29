@@ -1,14 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useLocalSearchParams, router } from 'expo-router';
+import { LinearGradient } from 'expo-linear-gradient';
 import { desktopDisplayName, useCosmos, useSnapshot } from '../../lib/client';
+import { describeLink } from '../../lib/connection-state';
 import { SessionMessageEntry, TranscriptUpdate, isComputerCall, type Chat } from '../../lib/protocol';
 import { applyTranscriptUpdate } from '../../lib/transcript';
 import { PickedFile, ensureDecodable, fileToBase64Chunks } from '../../lib/attachments';
 import { notifySessionEvent } from '../../lib/notify';
 import { spacing, type, useTheme, type Theme } from '../../lib/theme';
 import { MessageView } from '../../components/transcript';
-import { Composer, ComposerChip } from '../../components/composer';
+import { Composer } from '../../components/composer';
 import { Button, EmptyState, Icon, Notice, Pulse } from '../../components/bits';
 import { harnessLabel } from '../../components/harness-mark';
 import { Screen } from '../../components/surface';
@@ -21,20 +23,21 @@ function entryKeyExtractor(entry: SessionMessageEntry): string {
 }
 
 /** Compact header: title with the harness + live status beneath, iMessage-style. */
-function HeaderTitle({ title, chat, status, desktop, t }: { title: string; chat?: Chat; status: string; desktop?: string; t: Theme }) {
-  const parts = [harnessLabel(chat?.config?.harness), desktop].filter(Boolean);
-  const live = status === 'working' || status === 'awaitingInput';
-  const sub = live
-    ? (status === 'working' ? 'Working' : 'Needs your input')
-    : (parts.join(' · ') || 'Cosmos');
+function HeaderTitle({ title, chat, status, t }: { title: string; chat?: Chat; status: string; t: Theme }) {
+  const live = status !== 'idle';
+  const sub = status === 'working' ? 'Working'
+    : status === 'awaitingInput' ? 'Needs you'
+      : status === 'errored' ? 'Failed'
+        : harnessLabel(chat?.config?.harness);
+  const subColor = status === 'working' ? t.link : status === 'awaitingInput' ? t.warning : status === 'errored' ? t.danger : t.textTertiary;
   return (
     <View style={styles.headerTitle} accessibilityRole="header" accessibilityLabel={`${title}, ${sub}`}>
       <View style={styles.headerMain}>
         <Text style={[type.headline, { color: t.text, flexShrink: 1 }]} numberOfLines={1}>{title}</Text>
       </View>
       <View style={styles.headerSub}>
-        {live ? <Pulse color={status === 'working' ? t.link : t.warning} /> : null}
-        <Text style={[type.caption, { color: live ? (status === 'working' ? t.link : t.warning) : t.textTertiary }]} numberOfLines={1}>
+        {live ? <Pulse color={subColor} /> : null}
+        <Text style={[type.meta, { color: subColor }]} numberOfLines={1}>
           {sub}
         </Text>
       </View>
@@ -83,14 +86,20 @@ export default function SessionScreen() {
 
   useEffect(() => {
     if (!client.raw() || connection.status !== 'connected') return;
+    let live = true;
     const stream = client.raw()!.stream('WatchDocMessages', { chatId }, (item) => {
       setStreamLost(false);
       setEntries((prev) => applyTranscriptUpdate(prev, item as TranscriptUpdate));
       setLoaded(true);
     });
     const settle = setTimeout(() => setLoaded(true), 1500);
-    stream.done.catch(() => setStreamLost(true));
-    return () => { clearTimeout(settle); stream.cancel(); };
+    stream.done.catch(() => { if (live) setStreamLost(true); });
+    return () => {
+      live = false;
+      clearTimeout(settle);
+      stream.cancel();
+      setStreamLost(false);
+    };
   }, [chatId, connection.status, client, streamEpoch]);
 
   useEffect(() => {
@@ -159,11 +168,20 @@ export default function SessionScreen() {
     }
   };
 
-  const onAnswer = (requestId: string, answers: { questionId: string; labels: string[] }[]) => {
+  const onAnswer = useCallback((requestId: string, answers: { questionId: string; labels: string[] }[]) => {
     void client.respondInput(chatId, requestId, answers).catch((e) =>
       Alert.alert("Couldn't send answer", e instanceof Error ? e.message : String(e)),
     );
-  };
+  }, [client, chatId]);
+
+  const renderEntry = useCallback(({ item, index }: { item: SessionMessageEntry; index: number }) => (
+    <MessageView
+      entry={item}
+      onAnswer={onAnswer}
+      grouped={reversed[index + 1]?.role === item.role}
+      arrive={item.id === freshId}
+    />
+  ), [onAnswer, reversed, freshId]);
 
   const stop = () => void client.interrupt(chatId);
   const watch = () => router.push({ pathname: '/watch/[chatId]', params: { chatId } });
@@ -217,16 +235,16 @@ export default function SessionScreen() {
     ]);
   };
 
-  const desktopName = connection.status === 'connected' && connection.desktop ? desktopDisplayName(connection.desktop) : undefined;
-  const base = baseConfig();
-
+  const link = describeLink(connection, connection.desktop ? desktopDisplayName(connection.desktop) : 'your desktop');
   return (
     <Screen>
       <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <TopBar
           left={<CircleButton icon="chevron.left" label="Back" onPress={back} />}
-          title={<HeaderTitle title={title} chat={chat} status={status} desktop={desktopName} t={t} />}
+          title={<HeaderTitle title={title} chat={chat} status={status} t={t} />}
           right={<CircleButton icon="ellipsis" label="Session options" onPress={sessionMenu} />}
+          center
+          divider
         />
 
         {streamLost && connection.status === 'connected' ? (
@@ -238,15 +256,15 @@ export default function SessionScreen() {
         ) : connection.status !== 'connected' && entries.length === 0 ? (
           <View style={[styles.fill, styles.center]}>
             <EmptyState
-              title={connection.status === 'connecting' || connection.status === 'reconnecting' ? 'Connecting to the desktop…' : 'Desktop offline'}
-              body={connection.detail}
-              actionLabel="Desktops"
-              onAction={() => router.push('/desktops')}
+              title={link.title}
+              body={link.body}
+              actionLabel={link.needsPair ? 'Pair again' : 'Desktops'}
+              onAction={() => router.push(link.needsPair ? '/pair' : '/desktops')}
             />
           </View>
         ) : entries.length === 0 ? (
           <View style={[styles.fill, styles.center]}>
-            <Text style={[styles.question, { color: t.text }]}>What should we work on?</Text>
+            <Text style={[type.footnote, { color: t.textTertiary }]}>Send a message to start.</Text>
           </View>
         ) : (
           <View style={styles.fill}>
@@ -255,18 +273,15 @@ export default function SessionScreen() {
               data={reversed}
               inverted
               keyExtractor={entryKeyExtractor}
-              renderItem={({ item, index }) => (
-                <MessageView
-                  entry={item}
-                  onAnswer={onAnswer}
-                  grouped={reversed[index + 1]?.role === item.role}
-                  arrive={item.id === freshId}
-                />
-              )}
+              renderItem={renderEntry}
+              initialNumToRender={12}
+              maxToRenderPerBatch={8}
+              windowSize={11}
               contentContainerStyle={{ paddingTop: spacing(2), paddingBottom: spacing(3) }}
               maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 160 }}
               onScroll={(e) => {
                 const nextAtBottom = e.nativeEvent.contentOffset.y < 120;
+                if (nextAtBottom === atBottomRef.current) return;
                 atBottomRef.current = nextAtBottom;
                 setAtBottom(nextAtBottom);
                 if (nextAtBottom) setNewEntryCount(0);
@@ -274,6 +289,11 @@ export default function SessionScreen() {
               scrollEventThrottle={64}
               keyboardDismissMode="interactive"
               keyboardShouldPersistTaps="handled"
+            />
+            <LinearGradient
+              pointerEvents="none"
+              colors={[t.background, 'transparent']}
+              style={styles.transcriptFade}
             />
             {!atBottom ? (
               <View style={styles.jumpWrap} pointerEvents="box-none">
@@ -300,11 +320,11 @@ export default function SessionScreen() {
             ) : (
               <SessionBanner
                 kind="controlling"
-                title="Controlling your desktop"
+                title="Computer use"
                 actions={(
                   <>
-                    <Button title="Watch" size="sm" variant="secondary" icon="display" onPress={watch} />
-                    <Button title="Stop" size="sm" variant="secondary" onPress={stop} />
+                    <Pressable onPress={watch} hitSlop={8}><Text style={[type.footnote, { color: t.text, fontWeight: '600' }]}>Watch</Text></Pressable>
+                    <Pressable onPress={stop} hitSlop={8}><Text style={[type.footnote, { color: t.danger, fontWeight: '600' }]}>Stop</Text></Pressable>
                   </>
                 )}
               />
@@ -322,36 +342,9 @@ export default function SessionScreen() {
           onSend={(text) => void send(text)}
           onStop={stop}
           bottomInset={dockInset}
-          placeholder={connection.status !== 'connected' ? 'Desktop offline' : undefined}
-          chips={
-            <>
-              <ComposerChip
-                icon={base.sandbox === 'danger-full-access' ? 'exclamationmark.shield' : 'lock.shield'}
-                tone={base.sandbox === 'danger-full-access' ? 'warning' : undefined}
-                label={ACCESS_LABEL[base.sandbox] ?? base.sandbox}
-                accessibilityLabel={`Access, ${ACCESS_LABEL[base.sandbox] ?? base.sandbox}`}
-                onPress={chat ? () => showMenu('Access', (['read-only', 'workspace-write', 'danger-full-access'] as const).map((s) => ({
-                  label: ACCESS_LABEL[s]!,
-                  checked: base.sandbox === s,
-                  onPress: () => void client.setChatConfig(chatId, { ...base, sandbox: s }),
-                }))) : undefined}
-              />
-              <ComposerChip
-                icon="bolt"
-                label={base.model ?? 'Default'}
-                accessibilityLabel={`Model, ${base.model ?? 'default'}`}
-                onPress={() => void openModel()}
-              />
-              {chat?.branch ? (
-                <ComposerChip
-                  icon="git.branch"
-                  label={chat.branch}
-                  accessibilityLabel={`Branch ${chat.branch}`}
-                  accessibilityHint="The branch this session is on. Changing the checkout stays on the desktop."
-                />
-              ) : null}
-            </>
-          }
+          placeholder={connection.status !== 'connected'
+            ? (link.tone === 'asleep' ? 'Desktop asleep — reconnects on wake' : link.label)
+            : entries.length ? 'Follow up…' : 'Message'}
         />
       </KeyboardAvoidingView>
     </Screen>
@@ -368,10 +361,11 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   center: { alignItems: 'center', justifyContent: 'center', padding: spacing(6) },
   question: { fontSize: 24, fontWeight: '500', lineHeight: 30, textAlign: 'center' },
-  headerTitle: { alignItems: 'flex-start', minWidth: 0 },
+  headerTitle: { alignItems: 'center', minWidth: 0 },
   headerMain: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), minWidth: 0 },
   headerSub: { flexDirection: 'row', alignItems: 'center', gap: spacing(1.5), marginTop: 1 },
+  transcriptFade: { position: 'absolute', top: 0, left: 0, right: 0, height: 24 },
   jumpWrap: { position: 'absolute', bottom: spacing(3), left: 0, right: 0, alignItems: 'center' },
   jump: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing(1.5), minWidth: 44, paddingHorizontal: spacing(3.5), minHeight: 44, borderRadius: 999 },
-  bannerWrap: { paddingHorizontal: spacing(3), paddingTop: spacing(2) },
+  bannerWrap: { paddingHorizontal: spacing(3), paddingTop: spacing(1) },
 });

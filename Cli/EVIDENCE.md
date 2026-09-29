@@ -343,3 +343,20 @@ a 40-turn regression; the 55% bar is the long-session number above.
 - LSP-lite `verify` after write/edit (best-effort `cargo check` / `tsc` / `go build`).
 
 `python-cloud/` is reference-only (`Cli/python-cloud/README.md`).
+
+### macOS CLI convention pass (2026-09-27)
+
+Toolchains installed: Bun 1.4.2 via `npm install -g bun`; Go 1.27.1 via
+`brew install go`. Free disk remained **3.5 GiB** after verification.
+
+- Rust: `cargo build --workspace` passed. `cargo test --workspace` passed for
+  all crates except the existing macOS path-separator assertion in
+  `ztools::tests::workspace_escape_denied` (`..\evil.txt` is a literal
+  filename on macOS); 8 passed, 1 failed in that test binary.
+- zdev: `bun run build` passed; `bun test` **78 passed, 0 failed**.
+- zagy: `go build`, `go vet`, and `go test ./...` passed.
+- All three `--help`, `-p ping --model fixture --output-format stream-json`,
+  `--continue` after a run, and `completion zsh | head` smoke checks passed.
+- `zcli`, `zdev`, and `zagy` now share output/permission aliases, cwd-aware
+  continuation, additional roots, system-prompt overrides, project MCP
+  discovery, `/cost`, `/init`, and shell completion entry points.
