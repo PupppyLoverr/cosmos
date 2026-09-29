@@ -837,6 +837,147 @@ fn dirs_like_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// (local file, remote path) pairs a seat's harness needs — the user's
+/// existing CLI logins, staged before the run so the seat stays
+/// authenticated with the laptop closed. Unknown commands stage nothing;
+/// `cloud_env`'s API keys may still cover them.
+pub fn harness_credentials(command: &str) -> Vec<(PathBuf, &'static str)> {
+    let home = dirs_like_home();
+    let env_dir = |name: &str| {
+        std::env::var_os(name)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    };
+    let xdg = env_dir("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local").join("share"));
+    let bin = command
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(".exe")
+        .to_lowercase();
+    let pair = |local: PathBuf, remote: &'static str| local.exists().then_some((local, remote));
+    if bin.contains("claude") {
+        return pair(
+            env_dir("CLAUDE_CONFIG_DIR")
+                .unwrap_or_else(|| home.join(".claude"))
+                .join(".credentials.json"),
+            "~/.claude/.credentials.json",
+        )
+        .into_iter()
+        .collect();
+    }
+    if bin.contains("codex") {
+        return pair(
+            env_dir("CODEX_HOME")
+                .unwrap_or_else(|| home.join(".codex"))
+                .join("auth.json"),
+            "~/.codex/auth.json",
+        )
+        .into_iter()
+        .collect();
+    }
+    if bin.contains("cursor") {
+        return pair(
+            home.join(".cursor").join("sdk").join("auth.json"),
+            "~/.cursor/sdk/auth.json",
+        )
+        .into_iter()
+        .collect();
+    }
+    if bin.contains("grok") {
+        return pair(
+            env_dir("GROK_HOME")
+                .unwrap_or_else(|| home.join(".grok"))
+                .join("auth.json"),
+            "~/.grok/auth.json",
+        )
+        .into_iter()
+        .collect();
+    }
+    if bin.contains("devin") {
+        let primary = xdg.join("devin").join("credentials.toml");
+        let local = if primary.exists() {
+            primary
+        } else {
+            env_dir("APPDATA")
+                .map(|a| a.join("devin").join("credentials.toml"))
+                .filter(|f| f.exists())
+                .unwrap_or(primary)
+        };
+        return pair(local, "~/.local/share/devin/credentials.toml")
+            .into_iter()
+            .collect();
+    }
+    if bin.contains("opencode") {
+        return pair(
+            xdg.join("opencode").join("auth.json"),
+            "~/.local/share/opencode/auth.json",
+        )
+        .into_iter()
+        .collect();
+    }
+    if bin == "pi" {
+        return pair(
+            env_dir("PI_CODING_AGENT_DIR")
+                .unwrap_or_else(|| home.join(".pi").join("agent"))
+                .join("auth.json"),
+            "~/.pi/agent/auth.json",
+        )
+        .into_iter()
+        .collect();
+    }
+    if bin.contains("hermes") {
+        let local = env_dir("HERMES_HOME")
+            .map(|h| h.join("auth.json"))
+            .or_else(|| {
+                env_dir("LOCALAPPDATA")
+                    .map(|l| l.join("hermes").join("auth.json"))
+                    .filter(|f| f.exists())
+            })
+            .unwrap_or_else(|| home.join(".hermes").join("auth.json"));
+        return pair(local, "~/.hermes/auth.json").into_iter().collect();
+    }
+    Vec::new()
+}
+
+/// Push one credential file onto the seat — base64 over exec (the exec
+/// surface has no stdin). Written 0600, never logged; failures are the
+/// caller's warn so a staging miss never blocks the run itself.
+pub async fn stage_credential(
+    http: &reqwest::Client,
+    store: &CloudStore,
+    seat: &SeatConfig,
+    local: &Path,
+    remote: &str,
+) -> Result<(), String> {
+    const MAX: usize = 1024 * 1024;
+    let bytes = std::fs::read(local).map_err(|e| format!("read {}: {e}", local.display()))?;
+    if bytes.len() > MAX {
+        return Err(format!("{} too large to stage", local.display()));
+    }
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let dir = remote.rsplit_once('/').map(|(d, _)| d).unwrap_or("~");
+    let cmd = format!(
+        "mkdir -p {dir} && printf '%s' {} | base64 -d > {remote} && chmod 600 {remote}",
+        shell_word(&b64)
+    );
+    let out = seat_exec(http, store, seat, &cmd, Duration::from_secs(30)).await?;
+    if out.code == 0 {
+        Ok(())
+    } else {
+        Err(out
+            .stderr
+            .lines()
+            .next()
+            .unwrap_or("credential write failed")
+            .to_string())
+    }
+}
+
 /// Pull `seat`'s workspace to `seat-backups/<id>.tar.gz` — the Railway
 /// trial safeguard the scheduler fires ~10 minutes before `expires_at`.
 /// Heavy build dirs are excluded; a cap guards memory (`output()` buffers).

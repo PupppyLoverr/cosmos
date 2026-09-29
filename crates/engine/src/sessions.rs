@@ -1804,6 +1804,16 @@ async fn drive_remote_run(
         ""
     );
 
+    // The user's existing CLI logins ride to the seat — `~/.codex/auth.json`,
+    // opencode/grok/pi/hermes stores — staged per run so the harness auths
+    // on the box and keeps working after the laptop closes. A staging miss
+    // only warns; BYOK env keys may still cover the harness.
+    for (local, remote) in crate::cloud::harness_credentials(&command) {
+        if let Err(e) = crate::cloud::stage_credential(&http, &store, &seat, &local, remote).await {
+            tracing::warn!(seat = %seat.id, file = %local.display(), error = %e, "credential staging failed");
+        }
+    }
+
     if seat.detached {
         // Detached: nohup into a per-run log on the seat, then tail it. The
         // process belongs to the seat's init tree, so closing this app (or
