@@ -8744,6 +8744,7 @@ impl Shell {
         let sidebar_lists = div()
             .id("sidebar-lists-host")
             .relative()
+            .size_full()
             .flex_1()
             .min_h_0()
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
