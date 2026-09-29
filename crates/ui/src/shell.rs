@@ -8681,70 +8681,64 @@ impl Shell {
         // shrink (row archived while scrolled) left a phantom fade stuck
         // over an unscrollable list (user report).
         let sidebar_scrollbar = popover::rail(self, "sidebar-scrollbar", theme, cx);
-        let sidebar_lists = crate::edge_fade::edge_faded(
-            SIDEBAR_GLASS_FADE_BAND,
-            true,
-            true,
-            div().relative().flex_1().min_h_0().child(
-                div()
-                    .id("sidebar-lists-host")
-                    .relative()
-                    .size_full()
-                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                        if this.sidebar_bar.set_list_hovered(*hovered) {
-                            cx.notify();
-                        }
-                    }))
-                    .child(
-                        div()
-                            .id("sidebar-lists")
-                            .relative()
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.sidebar_scroll)
-                            .on_drag_move::<SidebarSessionDrag>(cx.listener(
-                                move |this,
-                                      event: &gpui::DragMoveEvent<SidebarSessionDrag>,
-                                      _,
-                                      cx| {
+        let sidebar_lists = div()
+            .id("sidebar-lists-host")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if this.sidebar_bar.set_list_hovered(*hovered) {
+                    cx.notify();
+                }
+            }))
+            .child(
+                crate::edge_fade::edge_faded(
+                    SIDEBAR_GLASS_FADE_BAND,
+                    true,
+                    true,
+                    div()
+                        .id("sidebar-lists")
+                        .relative()
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.sidebar_scroll)
+                        .on_drag_move::<SidebarSessionDrag>(cx.listener(
+                            move |this, event: &gpui::DragMoveEvent<SidebarSessionDrag>, _, cx| {
+                                if let Some(transfer) = this.sidebar_session_transfer.as_mut() {
+                                    transfer.viewport = Some(event.bounds);
+                                }
+                                if !event.bounds.contains(&event.event.position) {
                                     if let Some(transfer) = this.sidebar_session_transfer.as_mut() {
-                                        transfer.viewport = Some(event.bounds);
+                                        transfer.preview = None;
                                     }
-                                    if !event.bounds.contains(&event.event.position) {
-                                        if let Some(transfer) =
-                                            this.sidebar_session_transfer.as_mut()
-                                        {
-                                            transfer.preview = None;
-                                        }
-                                        return;
-                                    }
-                                    let payload = event.drag(cx).clone();
-                                    this.track_pinned_session_drag_pointer(
-                                        payload,
-                                        f32::from(event.event.position.y),
-                                        f32::from(event.bounds.top()),
-                                        f32::from(event.bounds.bottom()),
-                                        cx,
-                                    );
-                                },
-                            ))
-                            .on_drop::<SidebarSessionDrag>(cx.listener(
-                                |this, _: &SidebarSessionDrag, _, cx| {
-                                    this.cancel_sidebar_session_transfer(cx);
-                                },
-                            ))
-                            .px(px(Theme::SPACE_SM))
-                            .flex()
-                            .flex_col()
-                            .pt(px(SIDEBAR_LIST_PAD_TOP))
-                            .child(active_list)
-                            .children(archived_section)
-                            .children(moving_row),
-                    )
-                    .children(sidebar_scrollbar),
-            ),
-        )
-        .fade_overflow_y(&self.sidebar_scroll);
+                                    return;
+                                }
+                                let payload = event.drag(cx).clone();
+                                this.track_pinned_session_drag_pointer(
+                                    payload,
+                                    f32::from(event.event.position.y),
+                                    f32::from(event.bounds.top()),
+                                    f32::from(event.bounds.bottom()),
+                                    cx,
+                                );
+                            },
+                        ))
+                        .on_drop::<SidebarSessionDrag>(cx.listener(
+                            |this, _: &SidebarSessionDrag, _, cx| {
+                                this.cancel_sidebar_session_transfer(cx);
+                            },
+                        ))
+                        .px(px(Theme::SPACE_SM))
+                        .flex()
+                        .flex_col()
+                        .pt(px(SIDEBAR_LIST_PAD_TOP))
+                        .child(active_list)
+                        .children(archived_section)
+                        .children(moving_row),
+                )
+                .fade_overflow_y(&self.sidebar_scroll),
+            )
+            .children(sidebar_scrollbar);
 
         div()
             .w(px(self.settings.sidebar_width))

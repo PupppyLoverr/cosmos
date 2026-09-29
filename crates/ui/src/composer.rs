@@ -9704,6 +9704,17 @@ impl Composer {
         // unprovisioned seat (missing token/host/repo) keeps the option
         // visible while blocking Start with one line of copy.
         let cloud_seat = self.seat_binding(cx);
+        if is_new
+            && self.state.read(cx).cloud_mode
+            && self.state.read(cx).active_cloud_seat().is_none()
+        {
+            self.failure = Some(
+                "Cloud mode is on — choose a seat in the sidebar (or switch to Agent).".into(),
+            );
+            self.failure_key = Some(key.clone());
+            cx.notify();
+            return;
+        }
         if let Some(seat) = self.state.read(cx).active_cloud_seat()
             && is_new
             && !crate::cloud::CloudView::seat_ready(seat)
