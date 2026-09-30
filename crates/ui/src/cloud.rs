@@ -3191,11 +3191,11 @@ impl Render for CloudRail {
             .is_some_and(|s| s.config.kind == Some(CloudSeatKind::Railway))
             || self.binding.kind == CloudSeatKind::Railway;
         let railway_expired = is_railway
-            && self
-                .binding
-                .expires_at
-                .map(|at| at <= chrono::Utc::now())
-                .unwrap_or(false);
+            && (seat_row.as_ref().is_some_and(|s| s.config.expired())
+                || self
+                    .binding
+                    .expires_at
+                    .is_some_and(|at| at <= chrono::Utc::now()));
         let is_boat = seat_row
             .as_ref()
             .is_some_and(|s| s.config.kind == Some(CloudSeatKind::Box));
@@ -3338,15 +3338,21 @@ impl Render for CloudRail {
                                 .text_size(crate::typography::ui_rems(11.5))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
-                                .child("Keep this computer?"),
+                                .child(if railway_expired {
+                                    "Keep going on a persistent PC"
+                                } else {
+                                    "Keep this computer?"
+                                }),
                         )
                         .child(
                             div()
                                 .text_size(crate::typography::ui_rems(10.5))
                                 .text_color(theme.text_muted)
-                                .child(
-                                    "Attach a Boat token to keep a persistent cloud PC — the trial's hour is almost up.",
-                                ),
+                                .child(if railway_expired {
+                                    "The trial hour has ended. Claim the box on Railway, or attach a Boat token for a persistent cloud PC."
+                                } else {
+                                    "Attach a Boat token to keep a persistent cloud PC — the trial's hour is almost up."
+                                }),
                         )
                         .child(
                             div()
@@ -3374,6 +3380,32 @@ impl Render for CloudRail {
                                             this.mark_keep_prompted(cx);
                                             cx.emit(RailEvent::OpenCloudSettings);
                                         })),
+                                )
+                                .when_some(
+                                    railway_expired.then(|| claim_url.clone()).flatten(),
+                                    |row, url| {
+                                        row.child(
+                                            div()
+                                                .id("keep-claim")
+                                                .px(px(8.0))
+                                                .py(px(3.0))
+                                                .rounded(px(5.0))
+                                                .text_size(crate::typography::ui_rems(10.5))
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(theme.accent)
+                                                .bg(crate::motion::hover_blend(
+                                                    "keep-claim",
+                                                    gpui::transparent_black(),
+                                                    theme.element_hover,
+                                                ))
+                                                .on_hover(crate::motion::hover_listener(
+                                                    "keep-claim",
+                                                ))
+                                                .cursor_pointer()
+                                                .child("Claim")
+                                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                                        )
+                                    },
                                 )
                                 .child(
                                     div()
