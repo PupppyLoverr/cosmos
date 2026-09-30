@@ -159,7 +159,7 @@ fn host_message(line: &str) -> String {
     if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end])
     {
-        for key in ["message", "error", "reason", "detail"] {
+        for key in ["message", "description", "error", "reason", "detail"] {
             if let Some(text) = value
                 .get(key)
                 .and_then(|v| v.as_str())
@@ -190,8 +190,12 @@ fn ssh_failure(out: &crate::cloud::ExecOutcome) -> String {
                 || l.contains("capacity")
         })
         .collect();
-    if let Some(line) = host_lines.first() {
-        return redact_trial_banner(line.trim());
+    if let Some(line) = host_lines
+        .iter()
+        .map(|line| redact_trial_banner(line.trim()))
+        .find(|line| !line.is_empty())
+    {
+        return line;
     }
     if stderr.contains("identity") || stderr.contains("Permission denied") {
         return "no SSH key on this machine — run `ssh-keygen -t ed25519`, then retry".into();
@@ -287,7 +291,7 @@ mod tests {
     fn refused_manifest_surfaces_railway_message() {
         let out = crate::cloud::ExecOutcome {
             code: 0,
-            stdout: r#"{"status":"refused","message":"limited. Sign up to keep building."}"#.into(),
+            stdout: r#"{"status":"refused","description":"limited. Sign up to keep building.","human_signup_url":"https://railway.com/ssh-signup?code=x"}"#.into(),
             stderr: String::new(),
         };
         assert_eq!(ssh_failure(&out), "limited. Sign up to keep building.");

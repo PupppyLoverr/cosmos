@@ -9641,6 +9641,7 @@ impl Composer {
                             value
                                 .get("detail")
                                 .and_then(|v| v.as_str())
+                                .filter(|s| !s.trim().is_empty())
                                 .unwrap_or("railway.new refused the connection")
                                 .to_string(),
                         )
