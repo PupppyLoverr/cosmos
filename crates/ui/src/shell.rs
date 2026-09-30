@@ -10608,9 +10608,11 @@ impl Shell {
         let has_spaces = !self.state.read(cx).spaces.is_empty();
         let has_appshots = !self.composer.read(cx).staged_appshots().is_empty();
         let no_project = self.state.read(cx).no_project;
+        // Cloud mode works on the seat — no local folder is needed to start.
+        let cloud_mode = self.state.read(cx).cloud_mode;
         let transcript_geometry_ready = bottom_stack_measurement_matches(
             self.bottom_stack_has_composer.get(),
-            (has_spaces || no_project || has_appshots) && has_selection,
+            (has_spaces || no_project || cloud_mode || has_appshots) && has_selection,
         );
         let ui_settings = settings::current(cx);
         let new_thread_background_setting = ui_settings.new_thread_composer_background;
@@ -10710,7 +10712,7 @@ impl Shell {
                     el.child(div().absolute().inset_0().occlude())
                 })
                 .into_any_element()
-        } else if !has_spaces && !no_project {
+        } else if !has_spaces && !no_project && !cloud_mode {
             // Onboarding (first boot / after the destructive wipe): no folders
             // to work in yet — one clear affordance.
             let _ = faint;
@@ -10872,7 +10874,8 @@ impl Shell {
             .child({
                 let measured = self.bottom_stack.clone();
                 let measured_has_composer = self.bottom_stack_has_composer.clone();
-                let contains_composer = (has_spaces || no_project || has_appshots) && has_selection;
+                let contains_composer =
+                    (has_spaces || no_project || cloud_mode || has_appshots) && has_selection;
                 let composer = self.composer.clone();
                 div()
                     .flex_none()
@@ -10899,27 +10902,30 @@ impl Shell {
                         .inset_0(),
                     )
                     .child(status)
-                    .when(has_spaces || no_project || has_appshots, |el| {
-                        let composer_opacity = self.composer_dock.borrow().opacity();
-                        el.child(crate::composer_dock::docked_composer(
-                            div()
-                                .id("persistent-composer")
-                                .relative()
-                                .w(px(composer_width))
-                                .opacity(composer_opacity)
-                                .mx_auto()
-                                .child(self.composer.clone())
-                                .children(if has_selection {
-                                    self.render_jump_to_bottom(cx)
-                                } else {
-                                    None
-                                }),
-                            self.composer_dock.clone(),
-                            self.viewport_height,
-                            self.reduced_motion,
-                            frame_time,
-                        ))
-                    })
+                    .when(
+                        has_spaces || no_project || cloud_mode || has_appshots,
+                        |el| {
+                            let composer_opacity = self.composer_dock.borrow().opacity();
+                            el.child(crate::composer_dock::docked_composer(
+                                div()
+                                    .id("persistent-composer")
+                                    .relative()
+                                    .w(px(composer_width))
+                                    .opacity(composer_opacity)
+                                    .mx_auto()
+                                    .child(self.composer.clone())
+                                    .children(if has_selection {
+                                        self.render_jump_to_bottom(cx)
+                                    } else {
+                                        None
+                                    }),
+                                self.composer_dock.clone(),
+                                self.viewport_height,
+                                self.reduced_motion,
+                                frame_time,
+                            ))
+                        },
+                    )
                     .child(self.render_terminal_container(window, cx))
             })
             .child(

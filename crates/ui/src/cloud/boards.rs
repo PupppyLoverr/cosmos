@@ -706,7 +706,7 @@ impl KanbanPage {
             }
         }
         // Newest activity first inside each column.
-        cards.sort_by(|a, b| b.at.cmp(&a.at));
+        cards.sort_by_key(|card| std::cmp::Reverse(card.at));
         cards
     }
 
@@ -1013,7 +1013,7 @@ impl KanbanPage {
                 theme,
                 Some(seat_chip_icon(card.seat_kind)),
                 if card.cloud {
-                    seat_chip_label(card.seat_kind).to_string()
+                    card.seat_label.clone()
                 } else {
                     "Local".to_string()
                 },
@@ -1259,7 +1259,7 @@ impl Render for KanbanPage {
             .items_center()
             .gap(px(12.0))
             .px(px(20.0))
-            .pt(px(16.0))
+            .pt(px(Theme::TITLEBAR_HEIGHT + 4.0))
             .pb(px(12.0))
             .child(
                 div()
@@ -1291,7 +1291,7 @@ impl Render for KanbanPage {
         let mut board = div()
             .flex()
             .flex_row()
-            .gap(px(12.0))
+            .gap(px(10.0))
             .px(px(20.0))
             .pb(px(16.0))
             .h_full()
@@ -1334,7 +1334,7 @@ impl Render for KanbanPage {
                     column.label()
                 )))
                 .flex_1()
-                .min_w(px(220.0))
+                .min_w(px(176.0))
                 .max_w(px(340.0))
                 .h_full()
                 .flex()

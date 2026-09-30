@@ -701,7 +701,7 @@ impl SessionsEngine {
                     .then(|| "claude -p".to_string())
             })
             .or_else(|| {
-                matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box)).then(|| String::new())
+                matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box)).then(String::new)
             })
             .ok_or_else(|| {
                 EngineError::Other(
@@ -1842,6 +1842,7 @@ fn prior_turns_recap(entries: &[SessionMessageEntry]) -> String {
 /// commit, then pull a snapshot of the chat's workspace down to this
 /// computer — so the work survives the seat (a trial's hour ending, a box
 /// destroyed) and restores onto whichever seat the chat runs on next.
+#[allow(clippy::too_many_arguments)]
 async fn persist_remote_turn(
     inner: &Arc<Inner>,
     store: &crate::cloud::CloudStore,
@@ -1905,6 +1906,7 @@ async fn persist_remote_turn(
 /// Before a seat turn: the chat's workspace exists (restored from this
 /// computer's backup when the seat came up empty) and the seat's desktop +
 /// `cosmos-computer` are staged. Returns the prompt the harness receives.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_remote_turn(
     inner: &Arc<Inner>,
     store: &crate::cloud::CloudStore,
@@ -1956,6 +1958,7 @@ async fn prepare_remote_turn(
     format!("{brief}{}{}", turn.recap, turn.prompt)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_remote_run(
     inner: Arc<Inner>,
     store: crate::cloud::CloudStore,
@@ -2259,7 +2262,7 @@ async fn drive_remote_run(
                         if let Some(segment) = segment.as_mut() {
                             let _ = segment.sync(&[MessagePart::Text {
                                 id: "t0".into(),
-                                text: text.clone(),
+                                text: preserve_line_breaks(&text),
                             }]);
                         }
                     }
@@ -2296,7 +2299,7 @@ async fn drive_remote_run(
             let _ = segment.finish(
                 &[MessagePart::Text {
                     id: "t0".into(),
-                    text,
+                    text: preserve_line_breaks(&text),
                 }],
                 zeron_doc::MessageStatus::Aborted,
             );
@@ -2314,7 +2317,7 @@ async fn drive_remote_run(
             let _ = segment.finish(
                 &[MessagePart::Text {
                     id: "t0".into(),
-                    text,
+                    text: preserve_line_breaks(&text),
                 }],
                 zeron_doc::MessageStatus::Complete,
             );
@@ -2333,7 +2336,7 @@ async fn drive_remote_run(
             let _ = segment.finish(
                 &[MessagePart::Text {
                     id: "t0".into(),
-                    text: text.clone(),
+                    text: preserve_line_breaks(&text),
                 }],
                 zeron_doc::MessageStatus::Aborted,
             );
@@ -2918,7 +2921,7 @@ async fn tail_remote_log(
                 s.finish(
                     &[MessagePart::Text {
                         id: "t0".into(),
-                        text: text.clone(),
+                        text: preserve_line_breaks(&text),
                     }],
                     zeron_doc::MessageStatus::Aborted,
                 )
@@ -2978,7 +2981,7 @@ async fn tail_remote_log(
                     if let Some(segment) = segment.as_mut() {
                         let _ = segment.sync(&[MessagePart::Text {
                             id: "t0".into(),
-                            text: text.clone(),
+                            text: preserve_line_breaks(&text),
                         }]);
                     }
                     store.update_run(run_id, |run| run.mirrored_bytes = mirrored);
@@ -3002,7 +3005,7 @@ async fn tail_remote_log(
                         s.finish(
                             &[MessagePart::Text {
                                 id: "t0".into(),
-                                text: text.clone(),
+                                text: preserve_line_breaks(&text),
                             }],
                             if done {
                                 zeron_doc::MessageStatus::Complete
@@ -3083,6 +3086,35 @@ fn terminal_cloud_run(
     lock(&inner.runs).remove(chat_id);
 }
 
+/// Seat harnesses print plain terminal text; in the transcript's markdown a
+/// single newline would fold lines into one paragraph. Hard-break them
+/// (outside code fences) so the output reads the way it printed.
+fn preserve_line_breaks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 16);
+    let mut in_fence = false;
+    let mut lines = text.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        let fence = line.trim_start().starts_with("```");
+        if fence {
+            in_fence = !in_fence;
+        }
+        out.push_str(line);
+        if let Some(next) = lines.peek() {
+            let hard = !in_fence
+                && !fence
+                && !line.trim().is_empty()
+                && !next.trim().is_empty()
+                && !line.ends_with("  ")
+                && !next.trim_start().starts_with("```");
+            if hard {
+                out.push_str("  ");
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// An honest error line in the transcript when a remote run can't even start.
 fn write_remote_error(doc: &crate::doc_host::DocWriter, device_id: &str, message: &str) {
     let _ = doc.push_message(&SessionMessageEntry {
@@ -3135,6 +3167,21 @@ fn write_transcript_note(doc: &crate::doc_host::DocWriter, device_id: &str, mess
         continuation_of: None,
         duration_ms: None,
     });
+}
+
+#[cfg(test)]
+mod line_break_tests {
+    use super::preserve_line_breaks;
+
+    #[test]
+    fn plain_lines_hard_break_but_fences_stay_verbatim() {
+        assert_eq!(preserve_line_breaks("a\nb\n\nc"), "a  \nb\n\nc");
+        assert_eq!(
+            preserve_line_breaks("x\n```\nl1\nl2\n```\ny"),
+            "x\n```\nl1\nl2\n```\ny"
+        );
+        assert_eq!(preserve_line_breaks("done"), "done");
+    }
 }
 
 #[cfg(test)]

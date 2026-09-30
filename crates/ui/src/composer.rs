@@ -12008,12 +12008,16 @@ impl Render for Composer {
                         ),
                 )
         };
-        let new_thread_target_selectors = (new_thread_chrome_opacity > 0.0).then(|| {
-            self.pickers.update(cx, |pickers, cx| {
-                pickers.render_new_thread_target_selectors(cx)
-            })
-        });
-        let new_thread_git_selectors = (new_thread_chrome_opacity > 0.0)
+        // Machine + project name a LOCAL destination; a cloud chat's target
+        // is the seat (sidebar) and its repo — hide them in Cloud mode.
+        let local_target = !self.state.read(cx).cloud_mode;
+        let new_thread_target_selectors =
+            (new_thread_chrome_opacity > 0.0 && local_target).then(|| {
+                self.pickers.update(cx, |pickers, cx| {
+                    pickers.render_new_thread_target_selectors(cx)
+                })
+            });
+        let new_thread_git_selectors = (new_thread_chrome_opacity > 0.0 && local_target)
             .then(|| {
                 self.pickers.update(cx, |pickers, cx| {
                     pickers.render_new_thread_git_selectors(cx)

@@ -217,7 +217,10 @@ impl Shell {
             Option<(SharedString, bool)>,
         ) = {
             let state = self.state.read(cx);
-            match state.selected_chat_row() {
+            // Board routes (Kanban, Automations) title themselves — the
+            // selected chat's header would sit on top of theirs.
+            let board = matches!(self.route, super::Route::Kanban | super::Route::Automations);
+            match state.selected_chat_row().filter(|_| !board) {
                 Some(chat) => {
                     let folder = chat
                         .space_id

@@ -38,6 +38,10 @@ SHOTS="${COSMOS_SHOTS:-$C/shots}"
 mkdir -p "$SHOTS"
 
 die() { echo "cosmos-computer: $*" >&2; exit 1; }
+# Background work leaves the caller's session entirely: a harness run rides
+# `ssh -tt`, and the pty hangup at its end would otherwise take the
+# browser's helper processes (and a recording) down with it.
+detach() { if command -v setsid >/dev/null 2>&1; then setsid "$@"; else "$@"; fi; }
 
 wait_ready() {
   i=0
@@ -45,7 +49,7 @@ wait_ready() {
     st=$(cat "$C/desktop.status" 2>/dev/null)
     case "$st" in failed*) die "desktop unavailable — $st (see $C/desktop.log)";; esac
     if [ "$i" -eq 0 ] && [ -z "$st" ] && [ -x "$C/desktop-setup.sh" ]; then
-      nohup sh "$C/desktop-setup.sh" </dev/null >"$C/desktop.log" 2>&1 &
+      detach nohup sh "$C/desktop-setup.sh" </dev/null >"$C/desktop.log" 2>&1 &
     fi
     i=$((i+1)); [ "$i" -gt 180 ] && die "desktop did not come up in 3 minutes (see $C/desktop.log)"
     sleep 1
@@ -74,7 +78,8 @@ browser() {
   for b in chromium chromium-browser google-chrome google-chrome-stable firefox firefox-esr; do
     command -v "$b" >/dev/null 2>&1 && { echo "$b"; return 0; }
   done
-  for b in "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome; do
+  for b in "${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"/chromium-*/chrome-linux*/chrome \
+           "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome; do
     [ -x "$b" ] && { echo "$b"; return 0; }
   done
   return 1
@@ -116,8 +121,13 @@ case "$cmd" in
   open)
     wait_ready
     b=$(browser) || die "no browser on this seat — install chromium or firefox (or: npx playwright install chromium)"
-    case "$b" in *chrom*|*chrome*) set -- --no-sandbox --no-first-run --disable-dev-shm-usage --window-size=1280,800 "$@";; esac
-    nohup "$b" "$@" </dev/null >"$C/browser.log" 2>&1 &
+    # Container-safe Chromium: no sandbox/GPU (root + no /dev/dri), its own
+    # profile, and --test-type to drop the --no-sandbox warning bar.
+    case "$b" in *chrom*|*chrome*) set -- --no-sandbox --disable-gpu --disable-dev-shm-usage --test-type \
+      --no-first-run --no-default-browser-check --user-data-dir="$C/browser-profile" \
+      --disable-session-crashed-bubble --hide-crash-restore-bubble \
+      --window-position=0,0 --window-size=1280,800 "$@";; esac
+    detach nohup "$b" "$@" </dev/null >"$C/browser.log" 2>&1 &
     echo "opened with $b";;
   record)
     wait_ready
@@ -132,8 +142,14 @@ case "$cmd" in
         fi
         [ -f "$C/record.pid" ] && kill -0 "$(cat "$C/record.pid")" 2>/dev/null && die "already recording ($(cat "$C/record.path"))"
         out="${2:-$SHOTS/recording-$(date +%Y%m%d-%H%M%S).mp4}"
-        nohup ffmpeg -nostdin -loglevel error -y -f x11grab -framerate 12 -video_size "$(geometry)" -i "$DISPLAY" -pix_fmt yuv420p -vcodec libx264 -preset veryfast "$out" </dev/null >"$C/record.log" 2>&1 &
-        echo $! >"$C/record.pid"; echo "$out" >"$C/record.path"; echo "recording → $out";;
+        # ffmpeg records its own pid (exec keeps it) — `$!` of a detached
+        # job can be a wrapper's.
+        rm -f "$C/record.pid"
+        detach nohup sh -c 'echo $$ >"$0"; exec "$@"' "$C/record.pid" \
+          ffmpeg -nostdin -loglevel error -y -f x11grab -framerate 12 -video_size "$(geometry)" -i "$DISPLAY" \
+          -pix_fmt yuv420p -vcodec libx264 -preset veryfast "$out" </dev/null >"$C/record.log" 2>&1 &
+        i=0; while [ ! -s "$C/record.pid" ] && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i+1)); done
+        echo "$out" >"$C/record.path"; echo "recording → $out";;
       stop)
         [ -f "$C/record.pid" ] || die "not recording"
         kill -INT "$(cat "$C/record.pid")" 2>/dev/null
@@ -172,17 +188,18 @@ if ! mkdir "$lock" 2>/dev/null; then
 fi
 trap 'rmdir "$lock" 2>/dev/null' EXIT
 st() { echo "$*" >"$C/desktop.status"; }
+D=""; command -v setsid >/dev/null 2>&1 && D="setsid"
 have() { command -v "$1" >/dev/null 2>&1; }
 if ! have Xvfb || ! have xdotool || { ! have import && ! have scrot; }; then
   st installing
   if [ "$(id -u)" = 0 ]; then s=""; elif have sudo && sudo -n true 2>/dev/null; then s="sudo -n"; else st "failed: needs root to install Xvfb + xdotool"; exit 1; fi
   if have apt-get; then
-    pk="xvfb xdotool imagemagick x11-utils wmctrl openbox"
+    pk="xvfb xdotool imagemagick x11-utils x11-xserver-utils wmctrl openbox"
     DEBIAN_FRONTEND=noninteractive $s apt-get install -y -qq --no-install-recommends $pk >/dev/null 2>&1 || {
       $s apt-get update -qq >/dev/null 2>&1
       DEBIAN_FRONTEND=noninteractive $s apt-get install -y -qq --no-install-recommends $pk >/dev/null 2>&1
     }
-  elif have apk; then $s apk add -q xvfb xdotool imagemagick xdpyinfo wmctrl openbox font-dejavu >/dev/null 2>&1
+  elif have apk; then $s apk add -q xvfb xdotool imagemagick xdpyinfo xsetroot wmctrl openbox font-dejavu >/dev/null 2>&1
   elif have dnf; then $s dnf install -y -q xorg-x11-server-Xvfb xdotool ImageMagick xdpyinfo wmctrl openbox >/dev/null 2>&1
   elif have yum; then $s yum install -y -q xorg-x11-server-Xvfb xdotool ImageMagick >/dev/null 2>&1
   else st "failed: no supported package manager (apt/apk/dnf)"; exit 1; fi
@@ -190,14 +207,15 @@ if ! have Xvfb || ! have xdotool || { ! have import && ! have scrot; }; then
 fi
 if [ ! -e /tmp/.X11-unix/X99 ]; then
   st starting
-  nohup Xvfb :99 -screen 0 1280x800x24 -nolisten tcp -ac </dev/null >"$C/xvfb.log" 2>&1 &
+  $D nohup Xvfb :99 -screen 0 1280x800x24 -nolisten tcp -ac </dev/null >"$C/xvfb.log" 2>&1 &
   i=0; while [ ! -e /tmp/.X11-unix/X99 ] && [ "$i" -lt 40 ]; do sleep 0.25; i=$((i+1)); done
   [ -e /tmp/.X11-unix/X99 ] || { st "failed: Xvfb did not start ($(tail -n1 "$C/xvfb.log" 2>/dev/null))"; exit 1; }
 fi
 export DISPLAY=:99
-if ! pgrep -x openbox >/dev/null 2>&1 && ! pgrep -x fluxbox >/dev/null 2>&1; then
+# Our own WM on :99 (tracked by pid — another display's WM doesn't count).
+if ! { [ -f "$C/wm.pid" ] && kill -0 "$(cat "$C/wm.pid")" 2>/dev/null; }; then
   for wm in openbox fluxbox xfwm4 matchbox-window-manager; do
-    if have "$wm"; then nohup "$wm" </dev/null >"$C/wm.log" 2>&1 & break; fi
+    if have "$wm"; then $D nohup "$wm" </dev/null >"$C/wm.log" 2>&1 & echo $! >"$C/wm.pid"; break; fi
   done
 fi
 have xsetroot && xsetroot -solid '#1b1d22' 2>/dev/null
@@ -214,8 +232,8 @@ pub fn bootstrap_command() -> String {
         "C=\"$HOME/.cosmos\"; mkdir -p \"$C/bin\" \"$C/shots\" && \
 printf %s {cli} | base64 -d > \"$C/bin/cosmos-computer\" && chmod +x \"$C/bin/cosmos-computer\" && \
 printf %s {setup} | base64 -d > \"$C/desktop-setup.sh\" && chmod +x \"$C/desktop-setup.sh\" && \
-case \"$(cat \"$C/desktop.status\" 2>/dev/null)\" in ready) [ -e /tmp/.X11-unix/X99 ] || nohup sh \"$C/desktop-setup.sh\" </dev/null >\"$C/desktop.log\" 2>&1 & ;; \
-installing|starting) ;; *) nohup sh \"$C/desktop-setup.sh\" </dev/null >\"$C/desktop.log\" 2>&1 & ;; esac; echo __cosmos_desktop_ok",
+case \"$(cat \"$C/desktop.status\" 2>/dev/null)\" in ready) [ -e /tmp/.X11-unix/X99 ] || $(command -v setsid) nohup sh \"$C/desktop-setup.sh\" </dev/null >\"$C/desktop.log\" 2>&1 & ;; \
+installing|starting) ;; *) $(command -v setsid) nohup sh \"$C/desktop-setup.sh\" </dev/null >\"$C/desktop.log\" 2>&1 & ;; esac; echo __cosmos_desktop_ok",
         cli = shell_word(&b64(CLI_SCRIPT)),
         setup = shell_word(&b64(SETUP_SCRIPT)),
     )
@@ -554,6 +572,19 @@ mod tests {
         }
         let (_, cursor, _) = run(&format!("{} cosmos-computer cursor", env_prefix()));
         assert!(cursor.contains("x:10 y:10"), "{cursor}");
+        // Recording: start, a moment of screen, stop → a finalized mp4.
+        let movie = home.path().join("rec.mp4");
+        let (code, out, err) = run(&format!(
+            "{} cosmos-computer record start {} && sleep 2 && cosmos-computer record stop",
+            env_prefix(),
+            movie.display()
+        ));
+        assert_eq!(code, 0, "{out}{err}");
+        let size = std::fs::metadata(&movie).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            size > 1_000,
+            "recording finalized ({size} bytes): {out}{err}"
+        );
         // The Computer pane's capture path sees the display and its size.
         let (_, screen, _) = run(crate::cloud::LINUX_SCREEN_SCRIPT);
         let parsed = crate::cloud::parse_linux_screen(&screen).expect("screen parse");

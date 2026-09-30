@@ -738,7 +738,7 @@ pub struct CloudRail {
     // Context
     /// Screenshots / recordings the agent saved under `~/.cosmos/shots`.
     evidence: Loadable<Vec<(String, u64)>>,
-    evidence_preview: Option<(String, Loadable<Arc<gpui::Image>>)>,
+    evidence_preview: Option<(String, Loadable<(Arc<gpui::Image>, f32)>)>,
     backup_busy: bool,
     backup_note: Option<Result<String, String>>,
     /// The chat's latest ledger run — drives the bot bar's status + buttons.
@@ -1843,7 +1843,14 @@ impl CloudRail {
                         .decode(b64)
                         .map_err(|e| format!("couldn't read the image: {e}"))
                         .map(|bytes| {
-                            Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes))
+                            // Width / height, so the preview box hugs the shot.
+                            let ratio = zeron_engine::seat_desktop::png_size(&bytes)
+                                .map(|(w, h)| w as f32 / h as f32)
+                                .unwrap_or(1.6);
+                            (
+                                Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes)),
+                                ratio,
+                            )
                         })
                 });
                 if let Some((open, slot)) = rail.evidence_preview.as_mut()
@@ -4143,7 +4150,7 @@ impl CloudRail {
                     );
                     if let Some(slot) = open {
                         list = list.child(match slot {
-                            Loadable::Ready(image) => div()
+                            Loadable::Ready((image, ratio)) => div()
                                 .mx(px(4.0))
                                 .mb(px(6.0))
                                 .rounded(px(8.0))
@@ -4153,6 +4160,7 @@ impl CloudRail {
                                 .child(
                                     gpui::img(image)
                                         .w_full()
+                                        .aspect_ratio(ratio)
                                         .object_fit(gpui::ObjectFit::Contain),
                                 )
                                 .into_any_element(),

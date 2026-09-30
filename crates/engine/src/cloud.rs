@@ -798,11 +798,18 @@ impl CloudStore {
     pub fn claim_due(&self, now: DateTime<Utc>) -> Vec<CloudAutomation> {
         let mut state = self.inner.state.write().unwrap();
         let mut due = Vec::new();
+        let mut scheduled = false;
         for automation in state.config.automations.iter_mut() {
             if !automation.enabled {
                 continue;
             }
-            let due_at = automation.next_run_at.unwrap_or(now);
+            // A row with no next fire (hand-edited config, an older build)
+            // gets scheduled from now — never fired on sight.
+            let Some(due_at) = automation.next_run_at else {
+                automation.next_run_at = next_run(&automation.schedule, now);
+                scheduled = true;
+                continue;
+            };
             if due_at > now {
                 continue;
             }
@@ -810,7 +817,7 @@ impl CloudStore {
             automation.next_run_at = next_run(&automation.schedule, now);
             due.push(automation.clone());
         }
-        if !due.is_empty() {
+        if !due.is_empty() || scheduled {
             drop(state);
             let _ = self.persist_config();
         }
@@ -1937,7 +1944,14 @@ pub async fn probe_seat(
                 probe.detail = Some("trial hour ended — claim the box or start a new trial".into());
                 return probe;
             }
-            match crate::railway::probe_with_existing_deadline(seat.expires_at.is_some()).await {
+            match crate::railway::probe_with_existing_deadline(
+                seat.ssh_alias
+                    .as_deref()
+                    .unwrap_or(crate::railway::RAILWAY_HOST),
+                seat.expires_at.is_some(),
+            )
+            .await
+            {
                 Ok(trial) => {
                     probe.online = true;
                     probe.detail = trial.detail.or_else(|| Some("railway.new trial VM".into()));
@@ -3846,6 +3860,32 @@ mod tests {
             Some("sid")
         );
         assert_eq!(reloaded.harness_session_for_chat("c", "other"), None);
+    }
+
+    #[test]
+    fn unscheduled_automation_is_scheduled_not_fired() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CloudStore::load(dir.path());
+        store.save_automation(CloudAutomation {
+            id: "a".into(),
+            name: "n".into(),
+            prompt: "p".into(),
+            schedule: "hourly".into(),
+            seat_id: None,
+            space_id: None,
+            harness: None,
+            enabled: true,
+            last_run_at: None,
+            next_run_at: None,
+            last_status: None,
+            last_chat_id: None,
+        });
+        let now = at(0);
+        assert!(store.claim_due(now).is_empty());
+        assert_eq!(
+            store.automations()[0].next_run_at,
+            Some(now + chrono::Duration::hours(1))
+        );
     }
 
     #[test]
