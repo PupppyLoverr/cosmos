@@ -314,7 +314,7 @@ impl CloudStore {
                 }
             }
         };
-        let config = read(CONFIG_FILE, &mut errors)
+        let mut config = read(CONFIG_FILE, &mut errors)
             .and_then(|v| match serde_json::from_value(v) {
                 Ok(value) => Some(value),
                 Err(error) => {
@@ -323,6 +323,11 @@ impl CloudStore {
                 }
             })
             .unwrap_or_default();
+        if dedupe_railway_seats(&mut config)
+            && let Err(error) = Self::write(dir, CONFIG_FILE, &config, false)
+        {
+            errors.push(error);
+        }
         let keys = read(KEYS_FILE, &mut errors)
             .and_then(|v| match serde_json::from_value(v) {
                 Ok(value) => Some(value),
@@ -879,6 +884,57 @@ impl CloudStore {
             .and_then(|s| s.backup_path.map(PathBuf::from))
             .filter(|p| p.exists())
     }
+}
+
+fn dedupe_railway_seats(config: &mut CloudConfigFile) -> bool {
+    let railway_seats: Vec<(usize, &SeatConfig)> = config
+        .seats
+        .iter()
+        .enumerate()
+        .filter(|(_, seat)| seat.kind == Some(CloudSeatKind::Railway))
+        .collect();
+    if railway_seats.len() <= 1 {
+        return false;
+    }
+
+    let keep_index = railway_seats
+        .iter()
+        .filter(|(_, seat)| !seat.expired())
+        .max_by_key(|(index, seat)| {
+            (
+                seat.expires_at,
+                seat.last_probe.as_ref().map(|probe| probe.probed_at),
+                *index,
+            )
+        })
+        .or_else(|| {
+            railway_seats.iter().max_by_key(|(index, seat)| {
+                (
+                    seat.last_probe.as_ref().map(|probe| probe.probed_at),
+                    *index,
+                )
+            })
+        })
+        .map(|(index, _)| *index)
+        .unwrap();
+    let keep_id = config.seats[keep_index].id.clone();
+    let removed_default = config.default_seat.as_deref().is_some_and(|default_id| {
+        railway_seats
+            .iter()
+            .any(|(index, seat)| *index != keep_index && seat.id == default_id)
+    });
+    config.seats = config
+        .seats
+        .drain(..)
+        .enumerate()
+        .filter_map(|(index, seat)| {
+            (seat.kind != Some(CloudSeatKind::Railway) || index == keep_index).then_some(seat)
+        })
+        .collect();
+    if removed_default {
+        config.default_seat = Some(keep_id);
+    }
+    true
 }
 
 /// The local Claude Code subscription token (`claudeAiOauth.accessToken`
@@ -3008,6 +3064,102 @@ mod tests {
             reloaded.cloud_env(),
             vec![("ANTHROPIC_API_KEY".to_string(), "sk-ant-secret".to_string())]
         );
+    }
+
+    fn railway_seat(id: &str, expires_at: DateTime<Utc>, probed_at: DateTime<Utc>) -> SeatConfig {
+        SeatConfig {
+            id: id.into(),
+            kind: Some(CloudSeatKind::Railway),
+            expires_at: Some(expires_at),
+            last_probe: Some(SeatProbe {
+                seat_id: id.into(),
+                online: true,
+                detail: None,
+                containers: Vec::new(),
+                image_digest: None,
+                controllable: false,
+                keeps_running: false,
+                sleeping: false,
+                probed_at,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn load_deduplicates_railway_seats_and_preserves_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let older_live = railway_seat(
+            "railway-older-live",
+            now + chrono::Duration::minutes(30),
+            now - chrono::Duration::minutes(2),
+        );
+        let newest_live = railway_seat(
+            "railway-newest-live",
+            now + chrono::Duration::minutes(60),
+            now - chrono::Duration::minutes(1),
+        );
+        let expired = railway_seat("railway-expired", now - chrono::Duration::minutes(1), now);
+        let other = SeatConfig {
+            id: "ssh-seat".into(),
+            kind: Some(CloudSeatKind::Ssh),
+            ..Default::default()
+        };
+        let config = CloudConfigFile {
+            seats: vec![older_live, expired, newest_live, other.clone()],
+            default_seat: Some("railway-expired".into()),
+            ..Default::default()
+        };
+        CloudStore::write(dir.path(), CONFIG_FILE, &config, false).unwrap();
+        let backup = dir.path().join("seat-backups").join("railway.tar.gz");
+        std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        std::fs::write(&backup, b"workspace backup").unwrap();
+
+        let store = CloudStore::load(dir.path());
+        let seats = store.seats();
+        assert_eq!(seats.len(), 2);
+        assert!(seats.iter().any(|seat| seat.id == "railway-newest-live"));
+        assert!(seats.iter().any(|seat| seat.id == "ssh-seat"));
+        assert_eq!(store.default_seat().unwrap().id, "railway-newest-live");
+        assert!(backup.exists());
+
+        let persisted = CloudStore::load(dir.path());
+        assert_eq!(persisted.seats().len(), 2);
+        assert!(
+            persisted
+                .seats()
+                .iter()
+                .any(|seat| seat.id == "railway-newest-live")
+        );
+        assert!(persisted.seats().iter().any(|seat| seat.id == other.id));
+    }
+
+    #[test]
+    fn load_keeps_most_recently_probed_railway_seat_when_all_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let config = CloudConfigFile {
+            seats: vec![
+                railway_seat(
+                    "railway-old-probe",
+                    now - chrono::Duration::minutes(10),
+                    now - chrono::Duration::minutes(5),
+                ),
+                railway_seat(
+                    "railway-recent-probe",
+                    now - chrono::Duration::minutes(2),
+                    now - chrono::Duration::minutes(1),
+                ),
+            ],
+            ..Default::default()
+        };
+        CloudStore::write(dir.path(), CONFIG_FILE, &config, false).unwrap();
+
+        let store = CloudStore::load(dir.path());
+        let seats = store.seats();
+        assert_eq!(seats.len(), 1);
+        assert_eq!(seats[0].id, "railway-recent-probe");
     }
 
     #[test]
