@@ -37,6 +37,7 @@ pub mod registry;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
+pub mod seat_desktop;
 pub mod sessions;
 pub mod sister_apps;
 pub mod source_control;

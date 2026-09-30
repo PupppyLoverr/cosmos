@@ -711,6 +711,30 @@ impl SessionsEngine {
             })?;
 
         let handle = self.doc_handle(chat_id)?;
+        // Conversation continuity: harnesses with a resumable conversation
+        // (Claude Code's session id, OpenCode/Codex "continue last") pick
+        // the thread back up natively once a turn on this seat completed;
+        // otherwise — and on a chat's first turn on a new seat — the prior
+        // turns ride the prompt as a compact recap.
+        let session_id = crate::cloud::harness_session_id(chat_id);
+        let resuming = store.harness_session_for_chat(chat_id, &seat.id).is_some();
+        let is_boat = matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box));
+        let flags = (!is_boat)
+            .then(|| crate::cloud::continuation_flags(&command, &session_id, resuming))
+            .flatten();
+        let session_tag = (!is_boat
+            && crate::cloud::continuation_flags(&command, &session_id, true).is_some())
+        .then(|| session_id.clone());
+        let recap = if resuming && flags.is_some() {
+            String::new()
+        } else {
+            prior_turns_recap(&handle.doc().read_entries().unwrap_or_default())
+        };
+        let command = if is_boat {
+            command
+        } else {
+            crate::cloud::with_continuation(&command, flags.as_deref())
+        };
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
 
@@ -750,6 +774,14 @@ impl SessionsEngine {
             remote_ref: None,
             mirrored_bytes: 0,
             error: None,
+            workspace: Some(seat.workspace()),
+            harness_session: None,
+            prompt: request
+                .prompt
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(|l| l.chars().take(140).collect()),
             started_at: Utc::now(),
             finished_at: None,
             updated_at: Utc::now(),
@@ -765,7 +797,11 @@ impl SessionsEngine {
             run_id.clone(),
             seat,
             command,
-            request.prompt,
+            RemoteTurn {
+                prompt: request.prompt,
+                recap,
+                session_tag,
+            },
             handle.writer(),
             cancel_rx,
             interrupt_token,
@@ -845,6 +881,11 @@ impl SessionsEngine {
         }
         self.inner.note_message(chat_id, prompt);
         Ok(SteerOutcome::Accepted)
+    }
+
+    /// Whether a run (local or seat) is live for this chat.
+    pub fn is_running(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs).contains_key(chat_id)
     }
 
     /// Interrupt the live run, if any. The run settles with a synthetic
@@ -1740,6 +1781,170 @@ fn cursor_unstarted_history(
 /// the run survives this app closing and the driver tails the log while
 /// connected, backfilling on reopen.
 #[allow(clippy::too_many_arguments)]
+/// What one seat turn carries beyond the command: the user's words, a recap
+/// of earlier turns when the harness can't resume natively, and the session
+/// tag to stamp on the ledger once the turn produced output.
+struct RemoteTurn {
+    prompt: String,
+    recap: String,
+    session_tag: Option<String>,
+}
+
+/// A compact recap of the thread so far — the continuity fallback for
+/// harnesses without a resumable session, and for a chat's first turn on a
+/// seat it moved to. Bounded: the last few text turns, clipped.
+fn prior_turns_recap(entries: &[SessionMessageEntry]) -> String {
+    const MAX_TURNS: usize = 8;
+    const MAX_PER_TURN: usize = 700;
+    const MAX_TOTAL: usize = 4_000;
+    let mut turns: Vec<String> = Vec::new();
+    for entry in entries.iter().rev() {
+        let who = match entry.role {
+            zeron_doc::MessageRole::User => "User",
+            zeron_doc::MessageRole::Assistant => "Assistant",
+            _ => continue,
+        };
+        let text: String = entry
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text { text, .. } => Some(text.trim()),
+                _ => None,
+            })
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            continue;
+        }
+        let clipped: String = if text.chars().count() > MAX_PER_TURN {
+            let head: String = text.chars().take(MAX_PER_TURN).collect();
+            format!("{head}…")
+        } else {
+            text
+        };
+        turns.push(format!("{who}: {clipped}"));
+        if turns.len() >= MAX_TURNS || turns.iter().map(String::len).sum::<usize>() > MAX_TOTAL {
+            break;
+        }
+    }
+    if turns.is_empty() {
+        return String::new();
+    }
+    turns.reverse();
+    format!(
+        "<previous-turns>\nEarlier in this thread (most recent last):\n{}\n</previous-turns>\n\n",
+        turns.join("\n\n")
+    )
+}
+
+/// After a seat turn ends: checkpoint a repo-less workspace with a local git
+/// commit, then pull a snapshot of the chat's workspace down to this
+/// computer — so the work survives the seat (a trial's hour ending, a box
+/// destroyed) and restores onto whichever seat the chat runs on next.
+async fn persist_remote_turn(
+    inner: &Arc<Inner>,
+    store: &crate::cloud::CloudStore,
+    http: &reqwest::Client,
+    seat: &crate::cloud::SeatConfig,
+    chat_id: &str,
+    run_id: &str,
+    turn: &RemoteTurn,
+    doc: &crate::doc_host::DocWriter,
+) {
+    let run = store.runs().into_iter().find(|r| r.id == run_id);
+    let produced = run.as_ref().is_some_and(|r| {
+        r.mirrored_bytes > 0 || matches!(r.status, zeron_proto::CloudRunStatus::Done)
+    });
+    if produced && let Some(tag) = turn.session_tag.clone() {
+        store.update_run(run_id, |run| run.harness_session = Some(tag));
+    }
+    if seat.expired() {
+        return;
+    }
+    let workspace = seat.workspace();
+    if seat.repo.is_none() {
+        match crate::cloud::seat_exec(
+            http,
+            store,
+            seat,
+            &crate::cloud::checkpoint_command(&workspace, &turn.prompt),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        {
+            Ok(out) if out.code == 0 && !out.stdout.trim().is_empty() => {
+                tracing::debug!(chat = %chat_id, commit = %out.stdout.trim(), "seat checkpoint");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(chat = %chat_id, error = %e, "seat checkpoint failed"),
+        }
+    }
+    match crate::cloud::backup_chat_workspace(http, store, seat, chat_id, &workspace).await {
+        Ok(backup) => {
+            tracing::info!(chat = %chat_id, bytes = backup.bytes, "chat workspace backed up");
+            let _ = inner;
+        }
+        Err(e) => {
+            tracing::warn!(chat = %chat_id, error = %e, "chat workspace backup failed");
+            // Only say so in the transcript when a repo-less workspace — the
+            // one place the work has no other home — couldn't be saved.
+            if seat.repo.is_none() && produced {
+                write_transcript_note(
+                    doc,
+                    &inner.device_id,
+                    &format!("Couldn't back up this workspace to your computer this turn: {e}"),
+                );
+            }
+        }
+    }
+}
+
+/// Before a seat turn: the chat's workspace exists (restored from this
+/// computer's backup when the seat came up empty) and the seat's desktop +
+/// `cosmos-computer` are staged. Returns the prompt the harness receives.
+async fn prepare_remote_turn(
+    inner: &Arc<Inner>,
+    store: &crate::cloud::CloudStore,
+    http: &reqwest::Client,
+    seat: &crate::cloud::SeatConfig,
+    chat_id: &str,
+    turn: &RemoteTurn,
+    doc: &crate::doc_host::DocWriter,
+) -> String {
+    let workspace = seat.workspace();
+    if let Some(note) = crate::cloud::ensure_chat_workspace(
+        http,
+        store,
+        seat,
+        chat_id,
+        &workspace,
+        seat.repo.is_none(),
+    )
+    .await
+    {
+        write_transcript_note(doc, &inner.device_id, &note);
+    }
+    let desktop = crate::cloud::seat_exec(
+        http,
+        store,
+        seat,
+        &crate::seat_desktop::bootstrap_command(),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    let desktop_ok = matches!(&desktop, Ok(out) if out.stdout.contains("__cosmos_desktop_ok"));
+    if !desktop_ok {
+        tracing::warn!(seat = %seat.id, "seat desktop bootstrap failed");
+    }
+    let brief = if desktop_ok {
+        crate::seat_desktop::agent_brief(&workspace, seat.repo.as_deref())
+    } else {
+        String::new()
+    };
+    format!("{brief}{}{}", turn.recap, turn.prompt)
+}
+
 async fn drive_remote_run(
     inner: Arc<Inner>,
     store: crate::cloud::CloudStore,
@@ -1747,7 +1952,7 @@ async fn drive_remote_run(
     run_id: String,
     seat: crate::cloud::SeatConfig,
     command: String,
-    prompt: String,
+    turn: RemoteTurn,
     doc: crate::doc_host::DocWriter,
     mut cancel_rx: watch::Receiver<bool>,
     interrupt_token: CancellationToken,
@@ -1781,7 +1986,7 @@ async fn drive_remote_run(
             chat_id,
             run_id,
             seat,
-            prompt,
+            turn,
             doc,
             cancel_rx,
             interrupt_token,
@@ -1789,6 +1994,8 @@ async fn drive_remote_run(
         .await;
         return;
     }
+
+    let prompt = prepare_remote_turn(&inner, &store, &http, &seat, &chat_id, &turn, &doc).await;
 
     let env = store
         .cloud_env()
@@ -1825,6 +2032,8 @@ async fn drive_remote_run(
     } else {
         format!("env {env} {user_cmd}")
     };
+    // The seat's display + `cosmos-computer` ride the harness environment.
+    let remote_command = format!("{} {remote_command}", crate::seat_desktop::env_prefix());
     let full = crate::cloud::command_in_workspace(&seat.workspace(), &remote_command);
 
     // The user's existing CLI logins ride to the seat — `~/.codex/auth.json`,
@@ -1902,6 +2111,8 @@ async fn drive_remote_run(
                         .collect::<Vec<_>>(),
                 )
                 .await;
+                persist_remote_turn(&inner, &store, &http, &seat, &chat_id, &run_id, &turn, &doc)
+                    .await;
             }
             Ok(out) => {
                 let message = out
@@ -2087,6 +2298,7 @@ async fn drive_remote_run(
             None,
         );
     } else if !remote_agent_failed(status, &text) {
+        store.update_run(&run_id, |run| run.mirrored_bytes = text.len() as u64);
         if let Some(segment) = segment {
             let _ = segment.finish(
                 &[MessagePart::Text {
@@ -2103,24 +2315,6 @@ async fn drive_remote_run(
             zeron_proto::CloudRunStatus::Done,
             None,
         );
-        // A finished Railway run is the moment work exists worth keeping —
-        // snapshot now so an expired-trial restore works even if the app
-        // never lives to see the T-10m sweep.
-        if seat.kind == Some(zeron_proto::CloudSeatKind::Railway) {
-            let store = store.clone();
-            let seat = seat.clone();
-            tokio::spawn(async move {
-                match crate::cloud::snapshot_workspace(&store, &seat).await {
-                    Ok(path) => store.update_seat(&seat.id, |s| {
-                        s.backup_path = Some(path.to_string_lossy().into_owned());
-                        s.backup_at = Some(Utc::now());
-                    }),
-                    Err(e) => {
-                        tracing::warn!(seat = %seat.id, error = %e, "post-run snapshot failed")
-                    }
-                }
-            });
-        }
     } else {
         let stderr_text = String::from_utf8_lossy(&stderr_tail);
         let message = remote_agent_failure_message(status, &text, &stderr_text);
@@ -2152,12 +2346,16 @@ async fn drive_remote_run(
             .collect::<Vec<_>>(),
     )
     .await;
+    if !expired {
+        persist_remote_turn(&inner, &store, &http, &seat, &chat_id, &run_id, &turn, &doc).await;
+    }
 }
 
 /// Boat seats run the provider's integrated agent: provision (or wake) the
 /// sandbox, POST `/prompt`, then mirror `/events` into the transcript. The
 /// agent process lives on the box — closing this app doesn't kill the run,
 /// so `keeps_running` is honest, not the desktop-lifetime warning.
+#[allow(clippy::too_many_arguments)]
 async fn drive_boat_run(
     inner: Arc<Inner>,
     store: crate::cloud::CloudStore,
@@ -2165,8 +2363,46 @@ async fn drive_boat_run(
     chat_id: String,
     run_id: String,
     seat: crate::cloud::SeatConfig,
-    prompt: String,
+    turn: RemoteTurn,
     doc: crate::doc_host::DocWriter,
+    cancel_rx: watch::Receiver<bool>,
+    interrupt_token: CancellationToken,
+) {
+    drive_boat_turn(
+        inner.clone(),
+        store.clone(),
+        http.clone(),
+        chat_id.clone(),
+        run_id.clone(),
+        seat.clone(),
+        &turn,
+        &doc,
+        cancel_rx,
+        interrupt_token,
+    )
+    .await;
+    // The box id may have been minted this turn — re-read it, keeping the
+    // chat's workspace/repo scope.
+    let Some(live) = store
+        .seat(&seat.id)
+        .map(|s| s.scoped(seat.workspace_path.as_deref(), seat.repo.as_deref()))
+        .filter(|s| s.box_id.is_some())
+    else {
+        return;
+    };
+    persist_remote_turn(&inner, &store, &http, &live, &chat_id, &run_id, &turn, &doc).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_boat_turn(
+    inner: Arc<Inner>,
+    store: crate::cloud::CloudStore,
+    http: reqwest::Client,
+    chat_id: String,
+    run_id: String,
+    seat: crate::cloud::SeatConfig,
+    turn: &RemoteTurn,
+    doc: &crate::doc_host::DocWriter,
     cancel_rx: watch::Receiver<bool>,
     interrupt_token: CancellationToken,
 ) {
@@ -2382,6 +2618,12 @@ async fn drive_boat_run(
 
     // Kick the integrated agent. The prompt response carries the
     // conversation handle; events stream the transcript we mirror.
+    let live_seat = {
+        let mut live = seat.clone();
+        live.box_id = Some(box_id.clone());
+        live
+    };
+    let prompt = prepare_remote_turn(&inner, &store, &http, &live_seat, &chat_id, turn, doc).await;
     if let Err(e) = api.prompt(&box_id, "claude", &prompt, None).await {
         cleanup().await;
         fail(format!("Boat couldn't start the agent: {e}"));

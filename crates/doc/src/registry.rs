@@ -1079,6 +1079,26 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    /// Rebind a chat to another cloud seat (a dead Railway trial's thread
+    /// moving to Boat or a fresh trial). Unlike the create-time stamp this
+    /// overwrites; the caller owns the "moving on purpose" decision.
+    pub fn set_chat_cloud_seat(
+        &mut self,
+        chat_id: &str,
+        cloud_seat: &zeron_proto::CloudSeatBinding,
+    ) -> Result<bool, DocError> {
+        if self.overlay_row(KIND_CHATS, chat_id).is_none() {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("cloudSeat", serde_json::to_value(cloud_seat)?)]),
+        );
+        Ok(true)
+    }
+
     /// Flip the chat's sync room generation (docs/chat2-sync.md M2). The
     /// host calls this in the same breath as seeding the chat2 checkpoint;
     /// LWW per-field like every registry write, so the flip is per-chat and

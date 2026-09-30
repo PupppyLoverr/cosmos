@@ -367,6 +367,21 @@ pub mod methods {
     /// `{seatId}` → `{command}` — the exact local shell line a Terminal pane
     /// spawns for an interactive seat shell (`ssh -tt …`), or an error.
     pub const CLOUD_SSH_COMMAND: &str = "CloudSshCommand";
+    /// `{seatId, workspace?, repo?}` → `{status}` — bring the seat's virtual
+    /// desktop up (installs Xvfb + xdotool when missing) and wait for it.
+    pub const CLOUD_DESKTOP_START: &str = "CloudDesktopStart";
+    /// `{seatId, action: SeatAction}` → `{ok, output}` — the Computer pane's
+    /// "Take control": one click/type/key/scroll/open on the seat desktop.
+    pub const CLOUD_COMPUTER_ACT: &str = "CloudComputerAct";
+    /// `{chatId, seatId}` → `{ok, binding}` — move a chat to another seat
+    /// (a dead trial's thread continuing on Boat); its workspace backup
+    /// restores there on the next run.
+    pub const CLOUD_MOVE_CHAT: &str = "CloudMoveChat";
+    /// `{id}` → `{ok, chatId?}` — fire an automation now, off-schedule.
+    pub const CLOUD_AUTOMATION_RUN_NOW: &str = "CloudAutomationRunNow";
+    /// `{chatId}` → `{ok, backup}` — snapshot a chat's seat workspace to this
+    /// computer now (the Context pane's "Back up now").
+    pub const CLOUD_BACKUP_CHAT: &str = "CloudBackupChat";
 }
 
 #[derive(Debug, thiserror::Error)]

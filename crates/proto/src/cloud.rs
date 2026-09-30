@@ -281,6 +281,18 @@ pub struct CloudRun {
     pub mirrored_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Seat working directory this run executed in (the chat's workspace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The harness-native conversation this run continued or started
+    /// (`claude --session-id`), so the next turn resumes it instead of
+    /// starting cold. Stamped only once a turn completes with output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_session: Option<String>,
+    /// First line of the prompt that started the run — the Kanban card's
+    /// subtitle before a title is generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     pub started_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
@@ -306,6 +318,10 @@ pub struct CloudAutomation {
     /// and the project context for seat runs when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_id: Option<String>,
+    /// Local harness for runs on this computer (`None` = the app default).
+    /// Seat runs use the seat's own harness command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<crate::HarnessId>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -322,6 +338,25 @@ pub struct CloudAutomation {
 
 fn default_enabled() -> bool {
     true
+}
+
+/// A workspace snapshot pulled from a seat down to this computer — how a
+/// cloud workspace's progress survives the seat (a Railway trial dying, a
+/// Boat box destroyed). Restored onto whichever seat next runs the chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceBackup {
+    pub chat_id: String,
+    pub seat_id: String,
+    /// Seat path the snapshot was taken from.
+    pub workspace: String,
+    /// Local `.tar.gz` path under the engine data dir.
+    pub path: String,
+    pub bytes: u64,
+    pub taken_at: DateTime<Utc>,
+    /// Seat the snapshot was last restored onto (restores are once per seat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_to: Option<String>,
 }
 
 /// Seat health as the last probe reported it — drives the bot bar's dot and
