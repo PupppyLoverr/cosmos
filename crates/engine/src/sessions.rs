@@ -1810,6 +1810,16 @@ async fn drive_remote_run(
     } else {
         format!("{command} {prompt_word}")
     };
+    let user_cmd = match seat.repo.as_deref().filter(|r| !r.trim().is_empty()) {
+        Some(repo) => format!(
+            "sh -c {}",
+            crate::cloud::shell_word(&format!(
+                "{} && exec {user_cmd}",
+                crate::cloud::repo_checkout_prelude(repo)
+            ))
+        ),
+        None => user_cmd,
+    };
     let remote_command = if env.is_empty() {
         user_cmd
     } else {

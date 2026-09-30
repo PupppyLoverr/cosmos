@@ -795,6 +795,13 @@ pub struct AppState {
     /// The selected cloud seat for new sessions. This is intentionally
     /// session-local; the mode persists, but a seat is refreshed from config.
     pub cloud_seat_pick: Option<crate::cloud::SeatRow>,
+    /// The GitHub repo new cloud sessions check out on the seat (the
+    /// sidebar folder picker lists repos in Cloud mode). None = the seat's
+    /// plain workspace.
+    pub cloud_repo_pick: Option<zeron_engine::cloud::RepoHit>,
+    /// The connected GitHub account's repos for that picker.
+    pub cloud_repos: crate::popover::Loadable<Vec<zeron_engine::cloud::RepoHit>>,
+    cloud_repos_task: Option<Task<()>>,
     /// Why the last Railway trial start failed, until one succeeds.
     pub cloud_trial_failure: Option<String>,
 }
@@ -879,6 +886,9 @@ impl AppState {
             cloud_fetched_at: None,
             cloud_mode: false,
             cloud_seat_pick: None,
+            cloud_repo_pick: None,
+            cloud_repos: crate::popover::Loadable::Idle,
+            cloud_repos_task: None,
             cloud_trial_failure: None,
             auto_selected: false,
             chats_synced: false,
@@ -1994,6 +2004,38 @@ impl AppState {
     /// Latest ledger run for a chat — the Progress pane and the seat bar.
     pub fn cloud_run_for_chat(&self, chat_id: &str) -> Option<&zeron_proto::CloudRun> {
         self.cloud_view()?.run_for_chat(chat_id)
+    }
+
+    /// Load the connected GitHub account's repos for the Cloud-mode folder
+    /// picker (single-flight; the reply replaces the list).
+    pub fn refresh_cloud_repos(&mut self, cx: &mut Context<Self>) {
+        if self.cloud_repos_task.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        if !matches!(self.cloud_repos, crate::popover::Loadable::Ready(_)) {
+            self.cloud_repos = crate::popover::Loadable::Loading;
+        }
+        self.cloud_repos_task = Some(cx.spawn(async move |this, cx| {
+            let reply = engine
+                .client()
+                .call(methods::CLOUD_GITHUB_REPOS, serde_json::json!({}))
+                .await;
+            this.update(cx, |state, cx| {
+                state.cloud_repos_task = None;
+                state.cloud_repos = match reply {
+                    Ok(value) => crate::popover::Loadable::Ready(
+                        serde_json::from_value(value.get("repos").cloned().unwrap_or_default())
+                            .unwrap_or_default(),
+                    ),
+                    Err(err) => crate::popover::Loadable::Error(err.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Refresh `cloud` from the engine. `stale_after` gates duplicate polls:

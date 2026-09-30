@@ -141,6 +141,18 @@ impl SeatConfig {
             .unwrap_or_else(|| "/workspace".to_string())
     }
 
+    /// The seat as one chat sees it: a chat bound to a repo works in that
+    /// repo's checkout on the seat instead of the seat's default workspace.
+    pub fn scoped(mut self, workspace: Option<&str>, repo: Option<&str>) -> Self {
+        if let Some(workspace) = workspace.map(str::trim).filter(|w| !w.is_empty()) {
+            self.workspace_path = Some(workspace.to_string());
+        }
+        if let Some(repo) = repo.map(str::trim).filter(|r| !r.is_empty()) {
+            self.repo = Some(repo.to_string());
+        }
+        self
+    }
+
     /// A Railway trial seat past its 60-minute build window — the seat is
     /// dead (or in the 24h claim grace); runs must not dispatch to it.
     pub fn expired(&self) -> bool {
@@ -213,6 +225,20 @@ impl SeatConfig {
 pub fn command_in_workspace(workspace: &str, command: &str) -> String {
     let workspace = shell_word(workspace);
     format!("mkdir -p {workspace} && cd {workspace} && {command}")
+}
+
+/// Shell prelude that makes `repo` (`owner/name`) the current checkout: a
+/// first run clones it through `$GITHUB_TOKEN`, later runs reuse it. The
+/// token never lands in `.git/config` — the credential helper reads it from
+/// the run's environment, so the agent can push while the run lives.
+pub fn repo_checkout_prelude(repo: &str) -> String {
+    let url = shell_word(&format!("https://github.com/{repo}.git"));
+    let helper =
+        shell_word("!f() { echo username=x-access-token; echo \"password=$GITHUB_TOKEN\"; }; f");
+    format!(
+        "if [ ! -d .git ]; then git -c credential.helper= -c credential.helper={helper} clone --quiet {url} . || exit 1; fi; \
+git config credential.helper {helper}"
+    )
 }
 
 /// Per-provider row (non-secret); the key itself lives in `cloud-keys.json`.
@@ -422,6 +448,7 @@ impl CloudStore {
     /// Find the seat a chat binding names; tolerant of stale ids.
     pub fn seat_for(&self, binding: &CloudSeatBinding) -> Option<SeatConfig> {
         self.seat(&binding.seat_id)
+            .map(|seat| seat.scoped(binding.workspace_path.as_deref(), binding.repo.as_deref()))
     }
 
     pub fn default_seat(&self) -> Option<SeatConfig> {
@@ -3064,6 +3091,29 @@ pub type SchedulerHandle = Arc<Scheduler>;
 mod tests {
     use super::*;
 
+    #[test]
+    fn scoped_seat_uses_the_chat_checkout() {
+        let seat = SeatConfig {
+            id: "s".into(),
+            workspace_path: Some("/app".into()),
+            ..Default::default()
+        };
+        let scoped = seat.clone().scoped(Some("/app/cosmos"), Some("me/cosmos"));
+        assert_eq!(scoped.workspace(), "/app/cosmos");
+        assert_eq!(scoped.repo.as_deref(), Some("me/cosmos"));
+        let unscoped = seat.scoped(Some(" "), None);
+        assert_eq!(unscoped.workspace(), "/app");
+        assert_eq!(unscoped.repo, None);
+    }
+
+    #[test]
+    fn repo_prelude_keeps_the_token_out_of_the_remote() {
+        let prelude = repo_checkout_prelude("me/cosmos");
+        assert!(prelude.contains("'https://github.com/me/cosmos.git'"));
+        assert!(prelude.contains("$GITHUB_TOKEN"));
+        assert!(!prelude.contains("x-access-token:$GITHUB_TOKEN@"));
+    }
+
     fn at(minute: u32) -> DateTime<Utc> {
         "2026-09-28T10:00:00Z".parse::<DateTime<Utc>>().unwrap()
             + chrono::Duration::minutes(minute as i64)
@@ -3377,12 +3427,12 @@ mod tests {
     }
 }
 
-/// The Woozlit GitHub App's public OAuth client id — device flow needs no
+/// The Cosmos GitHub App's public OAuth client id — device flow needs no
 /// client secret, so nothing sensitive ships in the app.
-pub const WOOZLIT_GITHUB_CLIENT_ID: &str = "Iv23liaAoveu04WztVtq";
+pub const COSMOS_GITHUB_CLIENT_ID: &str = "Iv23lijEVv5jdl2f7RTm";
 
-/// Where a user installs the Woozlit GitHub App on their repos.
-pub const WOOZLIT_GITHUB_INSTALL_URL: &str = "https://github.com/apps/woozlit/installations/new";
+/// Where a user installs the Cosmos GitHub App on their repos.
+pub const COSMOS_GITHUB_INSTALL_URL: &str = "https://github.com/apps/cosmos/installations/new";
 
 #[derive(Debug)]
 pub enum DevicePoll {
@@ -3391,12 +3441,12 @@ pub enum DevicePoll {
     Token(String),
 }
 
-/// Start GitHub's device flow for the Woozlit app.
+/// Start GitHub's device flow for the Cosmos app.
 pub async fn github_device_start(http: &reqwest::Client) -> Result<serde_json::Value, String> {
     let resp = http
         .post("https://github.com/login/device/code")
         .header("Accept", "application/json")
-        .form(&[("client_id", WOOZLIT_GITHUB_CLIENT_ID)])
+        .form(&[("client_id", COSMOS_GITHUB_CLIENT_ID)])
         .send()
         .await
         .map_err(|e| format!("github: {e}"))?;
@@ -3421,7 +3471,7 @@ pub async fn github_device_poll(
         .post("https://github.com/login/oauth/access_token")
         .header("Accept", "application/json")
         .form(&[
-            ("client_id", WOOZLIT_GITHUB_CLIENT_ID),
+            ("client_id", COSMOS_GITHUB_CLIENT_ID),
             ("device_code", device_code),
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ])
@@ -3452,7 +3502,7 @@ fn device_error(v: &serde_json::Value) -> Result<(), String> {
         "expired_token" => "The GitHub code expired — start again".into(),
         "access_denied" => "GitHub access was denied".into(),
         "device_flow_disabled" => {
-            "Device flow is off for the Woozlit GitHub App — enable it in the app settings".into()
+            "Device flow is off for the Cosmos GitHub App — enable it in the app settings".into()
         }
         _ => v
             .get("error_description")

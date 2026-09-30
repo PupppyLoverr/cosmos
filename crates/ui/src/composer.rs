@@ -9515,13 +9515,21 @@ impl Composer {
 
     /// Mint the `CloudSeatBinding` the chat row persists.
     fn seat_binding(&self, cx: &App) -> Option<zeron_proto::CloudSeatBinding> {
-        let seat = self.state.read(cx).active_cloud_seat()?;
+        let state = self.state.read(cx);
+        let seat = state.active_cloud_seat()?;
+        let (repo, workspace_path) = match &state.cloud_repo_pick {
+            Some(pick) => (
+                Some(pick.full_name.clone()),
+                Some(crate::cloud::repo_workspace(&seat.config, &pick.full_name)),
+            ),
+            None => (seat.config.repo.clone(), seat.config.workspace_path.clone()),
+        };
         Some(zeron_proto::CloudSeatBinding {
             seat_id: seat.config.id.clone(),
             kind: seat.config.kind.unwrap_or(zeron_proto::CloudSeatKind::Ssh),
             label: seat.config.label.clone(),
-            repo: seat.config.repo.clone(),
-            workspace_path: seat.config.workspace_path.clone(),
+            repo,
+            workspace_path,
             model_label: self
                 .cloud_view(cx)
                 .map(|view| view.cloud_model_label().to_string()),

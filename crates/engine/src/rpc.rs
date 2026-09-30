@@ -544,6 +544,11 @@ struct CloudProviderParams {
 #[serde(rename_all = "camelCase")]
 struct CloudSeatPathParams {
     seat_id: String,
+    /// The chat's checkout on the seat (repo-bound chats).
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
     #[serde(default)]
     path: Option<String>,
 }
@@ -553,6 +558,11 @@ struct CloudSeatPathParams {
 #[serde(rename_all = "camelCase")]
 struct CloudExecParams {
     seat_id: String,
+    /// The chat's checkout on the seat (repo-bound chats).
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
     command: String,
     #[serde(default)]
     timeout_secs: Option<u64>,
@@ -563,6 +573,11 @@ struct CloudExecParams {
 #[serde(rename_all = "camelCase")]
 struct CloudPrParams {
     seat_id: String,
+    /// The chat's checkout on the seat (repo-bound chats).
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
     number: u64,
 }
 
@@ -3898,6 +3913,7 @@ impl RpcService for EngineRpc {
                 let cloud = self.cloud()?.clone();
                 let seat = cloud
                     .seat(&p.seat_id)
+                    .map(|seat| seat.scoped(p.workspace.as_deref(), p.repo.as_deref()))
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
                 let dir = p.path.clone().unwrap_or_else(|| seat.workspace());
                 let entries = crate::cloud::list_dir(&self.http, &cloud, &seat, &dir)
@@ -3914,6 +3930,7 @@ impl RpcService for EngineRpc {
                 let cloud = self.cloud()?.clone();
                 let seat = cloud
                     .seat(&p.seat_id)
+                    .map(|seat| seat.scoped(p.workspace.as_deref(), p.repo.as_deref()))
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
                 let (content, truncated) =
                     crate::cloud::read_file(&self.http, &cloud, &seat, &path)
@@ -3926,6 +3943,7 @@ impl RpcService for EngineRpc {
                 let cloud = self.cloud()?.clone();
                 let seat = cloud
                     .seat(&p.seat_id)
+                    .map(|seat| seat.scoped(p.workspace.as_deref(), p.repo.as_deref()))
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
                 let status = crate::cloud::git_status(&self.http, &cloud, &seat)
                     .await
@@ -3937,6 +3955,7 @@ impl RpcService for EngineRpc {
                 let cloud = self.cloud()?.clone();
                 let seat = cloud
                     .seat(&p.seat_id)
+                    .map(|seat| seat.scoped(p.workspace.as_deref(), p.repo.as_deref()))
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
                 let diff = crate::cloud::git_diff(&self.http, &cloud, &seat, p.path.as_deref())
                     .await
@@ -3948,6 +3967,7 @@ impl RpcService for EngineRpc {
                 let cloud = self.cloud()?.clone();
                 let seat = cloud
                     .seat(&p.seat_id)
+                    .map(|seat| seat.scoped(p.workspace.as_deref(), p.repo.as_deref()))
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
                 let out = crate::cloud::seat_exec(
                     &self.http,
@@ -3969,6 +3989,7 @@ impl RpcService for EngineRpc {
                 let cloud = self.cloud()?.clone();
                 let seat = cloud
                     .seat(&p.seat_id)
+                    .map(|seat| seat.scoped(p.workspace.as_deref(), p.repo.as_deref()))
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
                 let repo = seat
                     .repo
@@ -3988,6 +4009,7 @@ impl RpcService for EngineRpc {
                 let cloud = self.cloud()?.clone();
                 let seat = cloud
                     .seat(&p.seat_id)
+                    .map(|seat| seat.scoped(p.workspace.as_deref(), p.repo.as_deref()))
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
                 let repo = seat
                     .repo
@@ -4007,6 +4029,7 @@ impl RpcService for EngineRpc {
                 let cloud = self.cloud()?.clone();
                 let seat = cloud
                     .seat(&p.seat_id)
+                    .map(|seat| seat.scoped(p.workspace.as_deref(), p.repo.as_deref()))
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
                 let repo = seat
                     .repo
@@ -4026,6 +4049,7 @@ impl RpcService for EngineRpc {
                 let cloud = self.cloud()?.clone();
                 let seat = cloud
                     .seat(&p.seat_id)
+                    .map(|seat| seat.scoped(p.workspace.as_deref(), p.repo.as_deref()))
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
                 let Some(endpoint) = seat.cua_endpoint.clone() else {
                     if matches!(
@@ -4438,6 +4462,7 @@ impl RpcService for EngineRpc {
                 let cloud = self.cloud()?.clone();
                 let seat = cloud
                     .seat(&p.seat_id)
+                    .map(|seat| seat.scoped(p.workspace.as_deref(), p.repo.as_deref()))
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
                 match seat.kind {
                     Some(zeron_proto::CloudSeatKind::Ssh) => {

@@ -35,6 +35,12 @@ pub mod seats;
 // Wire views (the CloudGetConfig reply shape)
 // ---------------------------------------------------------------------------
 
+/// Where a picked repo is checked out on a seat: `<workspace>/<name>`.
+pub fn repo_workspace(seat: &SeatConfig, full_name: &str) -> String {
+    let name = full_name.rsplit('/').next().unwrap_or(full_name);
+    format!("{}/{name}", seat.workspace().trim_end_matches('/'))
+}
+
 /// One seat row as the engine's `view()` returns it — `SeatConfig` plus the
 /// secret-flags and capabilities the reply injects.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -840,6 +846,7 @@ impl CloudRail {
 
     fn load_seat(&mut self, cx: &mut Context<Self>) {
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         let Some(engine) = self.engine(cx) else {
             self.seat = Loadable::Error("Engine not connected".into());
             return;
@@ -987,6 +994,14 @@ impl CloudRail {
     /// Bot-bar control: stop / pause / resume / approve / destroy. The
     /// engine decides what each op does for this seat kind; the rail only
     /// reports failures honestly.
+    /// The chat's checkout on the seat — every pane reads and runs there.
+    fn scope(&self) -> (Option<String>, Option<String>) {
+        (
+            self.binding.workspace_path.clone(),
+            self.binding.repo.clone(),
+        )
+    }
+
     fn seat_control(&mut self, op: &'static str, cx: &mut Context<Self>) {
         let Some(engine) = self.engine(cx) else {
             self.control_error = Some("Engine not connected".into());
@@ -996,6 +1011,7 @@ impl CloudRail {
         self.control_error = None;
         let chat_id = self.chat_id.clone();
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -1004,7 +1020,7 @@ impl CloudRail {
                     serde_json::json!({
                         "chatId": chat_id,
                         "op": op,
-                        "seatId": seat_id,
+                        "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1,
                     }),
                 )
                 .await;
@@ -1027,6 +1043,7 @@ impl CloudRail {
         self.keep_prompted = Some(true);
         if let Some(engine) = self.engine(cx) {
             let seat_id = self.binding.seat_id.clone();
+            let scope = self.scope();
             self.task = Some(cx.spawn(async move |this, cx| {
                 let _ = engine
                     .client()
@@ -1034,7 +1051,7 @@ impl CloudRail {
                         methods::CLOUD_SEAT_CONTROL,
                         serde_json::json!({
                             "chatId": "",
-                            "seatId": seat_id,
+                            "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1,
                             "op": "markKeepPrompted",
                         }),
                     )
@@ -1061,13 +1078,14 @@ impl CloudRail {
         }
         self.listing = Loadable::Loading;
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         let dir = self.cwd.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(
                     methods::CLOUD_LIST_DIR,
-                    serde_json::json!({ "seatId": seat_id, "path": dir }),
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1, "path": dir }),
                 )
                 .await;
             this.update(cx, |rail, cx| {
@@ -1099,13 +1117,14 @@ impl CloudRail {
                 return;
             };
             let seat_id = self.binding.seat_id.clone();
+            let scope = self.scope();
             let path = entry.path;
             self.task = Some(cx.spawn(async move |this, cx| {
                 let result = engine
                     .client()
                     .call(
                         methods::CLOUD_READ_FILE,
-                        serde_json::json!({ "seatId": seat_id, "path": path }),
+                        serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1, "path": path }),
                     )
                     .await;
                 this.update(cx, |rail, cx| {
@@ -1153,19 +1172,20 @@ impl CloudRail {
         self.status = Loadable::Loading;
         self.diff = Loadable::Loading;
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         self.task = Some(cx.spawn(async move |this, cx| {
             let status = engine
                 .client()
                 .call(
                     methods::CLOUD_GIT_STATUS,
-                    serde_json::json!({ "seatId": seat_id }),
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1 }),
                 )
                 .await;
             let diff = engine
                 .client()
                 .call(
                     methods::CLOUD_GIT_DIFF,
-                    serde_json::json!({ "seatId": seat_id }),
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1 }),
                 )
                 .await;
             this.update(cx, |rail, cx| {
@@ -1207,6 +1227,7 @@ impl CloudRail {
             output: String::new(),
         });
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         let cwd = self.cwd.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -1214,7 +1235,7 @@ impl CloudRail {
                 .call(
                     methods::CLOUD_EXEC,
                     serde_json::json!({
-                        "seatId": seat_id,
+                        "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1,
                         "command": format!("cd {} && {command}", zeron_engine::cloud::shell_word(&cwd)),
                         "timeoutSecs": 120,
                     }),
@@ -1268,12 +1289,13 @@ impl CloudRail {
         }
         self.prs = Loadable::Loading;
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(
                     methods::CLOUD_GITHUB_PRS,
-                    serde_json::json!({ "seatId": seat_id }),
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1 }),
                 )
                 .await;
             this.update(cx, |rail, cx| {
@@ -1297,12 +1319,13 @@ impl CloudRail {
         };
         self.pr_detail = Some((number, Loadable::Loading));
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(
                     methods::CLOUD_GITHUB_PR,
-                    serde_json::json!({ "seatId": seat_id, "number": number }),
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1, "number": number }),
                 )
                 .await;
             this.update(cx, |rail, cx| {
@@ -1327,12 +1350,13 @@ impl CloudRail {
             return;
         };
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(
                     methods::CLOUD_GITHUB_MERGE,
-                    serde_json::json!({ "seatId": seat_id, "number": number }),
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1, "number": number }),
                 )
                 .await;
             this.update(cx, |rail, cx| {
@@ -1454,13 +1478,14 @@ impl CloudRail {
             self.shot = Loadable::Loading;
         }
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         self.screen_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 let result = engine
                     .client()
                     .call(
                         methods::CLOUD_SCREENSHOT,
-                        serde_json::json!({ "seatId": seat_id }),
+                        serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1 }),
                     )
                     .await;
                 let watching = this

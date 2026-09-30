@@ -92,7 +92,7 @@ pub struct CloudSeatsPage {
     /// `pick_repo` writes the field programmatically — suppress the search
     /// that write would otherwise trigger.
     suppress_repo_edit: bool,
-    /// The Woozlit GitHub App device flow while it waits on the user.
+    /// The Cosmos GitHub App device flow while it waits on the user.
     gh_device: Option<GitHubDevice>,
     gh_login: Option<String>,
     gh_task: Option<Task<()>>,
@@ -420,7 +420,7 @@ impl CloudSeatsPage {
         }));
     }
 
-    /// Connect GitHub through the Woozlit GitHub App (device flow): show the
+    /// Connect GitHub through the Cosmos GitHub App (device flow): show the
     /// one-time code, open GitHub, then poll until the user approves.
     fn connect_github(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -1210,7 +1210,7 @@ impl Render for CloudSeatsPage {
             column = column.child(widgets::error_strip(&theme, error.clone()));
         }
 
-        // GitHub via the Woozlit GitHub App — powers the repo picker and
+        // GitHub via the Cosmos GitHub App — powers the repo picker and
         // every GitHub seat without its own token.
         let has_pat = self.view.ready().map(|v| v.has_github_pat).unwrap_or(false);
         let waiting = self.gh_device.as_ref();
@@ -1229,8 +1229,7 @@ impl Render for CloudSeatsPage {
                 None => "Connected — repos, pull requests and GitHub seats use it.".into(),
             }
         } else {
-            "Connect your GitHub account through Woozlit to pick repos and open pull requests."
-                .into()
+            "Connect GitHub to pick repos, run cloud agents on them and open pull requests.".into()
         };
         let mut pat_card = widgets::section_card(&theme);
         let mut actions = div()
@@ -1297,7 +1296,7 @@ impl Render for CloudSeatsPage {
                         .hover(|s| s.text_color(theme.text))
                         .child("Choose repositories")
                         .on_click(|_, _, cx| {
-                            cx.open_url("https://github.com/apps/woozlit/installations/new")
+                            cx.open_url(zeron_engine::cloud::COSMOS_GITHUB_INSTALL_URL)
                         }),
                 )
                 .child(

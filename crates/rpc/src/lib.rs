@@ -339,7 +339,7 @@ pub mod methods {
     /// that the picker and every PAT-less GitHub seat fall back to.
     pub const CLOUD_GITHUB_SAVE: &str = "CloudGitHubSave";
     /// `{}` → `{deviceCode, userCode, verificationUri, interval, expiresIn}` —
-    /// starts the Woozlit GitHub App device flow.
+    /// starts the Cosmos GitHub App device flow.
     pub const CLOUD_GITHUB_DEVICE_START: &str = "CloudGitHubDeviceStart";
     /// `{deviceCode}` → `{status: pending|slow_down|done, login?}` — one poll;
     /// `done` stores the user token as the shared GitHub credential.
