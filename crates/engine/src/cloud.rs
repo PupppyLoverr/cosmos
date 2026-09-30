@@ -1278,7 +1278,20 @@ pub async fn probe_seat(
                         let _ = store.save_seat(seat);
                     }
                 }
-                Err(e) => probe.detail = Some(e),
+                Err(failure) => {
+                    if failure.trial.claim_required {
+                        let now = Utc::now();
+                        let mut updated = seat.clone();
+                        updated.claim_url = failure.trial.claim_url.or(updated.claim_url);
+                        updated.expires_at = Some(
+                            updated
+                                .expires_at
+                                .map_or(now, |expires_at| expires_at.min(now)),
+                        );
+                        let _ = store.save_seat(updated);
+                    }
+                    probe.detail = Some(failure.detail);
+                }
             }
         }
         Some(CloudSeatKind::Ssh) => {
