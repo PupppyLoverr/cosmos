@@ -887,42 +887,101 @@ impl CloudStore {
 }
 
 fn dedupe_railway_seats(config: &mut CloudConfigFile) -> bool {
-    let railway_seats: Vec<(usize, &SeatConfig)> = config
+    let mut railway_seats: Vec<(usize, SeatConfig)> = config
         .seats
         .iter()
         .enumerate()
         .filter(|(_, seat)| seat.kind == Some(CloudSeatKind::Railway))
+        .map(|(index, seat)| (index, seat.clone()))
         .collect();
     if railway_seats.len() <= 1 {
         return false;
     }
 
-    let keep_index = railway_seats
-        .iter()
-        .filter(|(_, seat)| !seat.expired())
-        .max_by_key(|(index, seat)| {
-            (
-                seat.expires_at,
-                seat.last_probe.as_ref().map(|probe| probe.probed_at),
-                *index,
-            )
-        })
-        .or_else(|| {
-            railway_seats.iter().max_by_key(|(index, seat)| {
-                (
-                    seat.last_probe.as_ref().map(|probe| probe.probed_at),
-                    *index,
-                )
-            })
-        })
-        .map(|(index, _)| *index)
-        .unwrap();
+    let now = Utc::now();
+    railway_seats.sort_by_key(|(index, seat)| {
+        let has_backup_metadata = seat.backup_path.is_some()
+            || seat.backup_at.is_some()
+            || seat.backup_attempted_at.is_some()
+            || seat.restored_at.is_some();
+        (
+            seat.expires_at.is_some() || seat.claim_url.is_some() || has_backup_metadata,
+            seat.expires_at.is_some_and(|expires_at| expires_at > now),
+            seat.expires_at,
+            seat.last_probe.as_ref().map(|probe| probe.probed_at),
+            *index,
+        )
+    });
+    let keep_index = railway_seats.last().map(|(index, _)| *index).unwrap();
     let keep_id = config.seats[keep_index].id.clone();
     let removed_default = config.default_seat.as_deref().is_some_and(|default_id| {
         railway_seats
             .iter()
             .any(|(index, seat)| *index != keep_index && seat.id == default_id)
     });
+    let dropped: Vec<SeatConfig> = railway_seats
+        .into_iter()
+        .rev()
+        .filter_map(|(index, seat)| (index != keep_index).then_some(seat))
+        .collect();
+    let kept = &mut config.seats[keep_index];
+    if kept
+        .harness_command
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        kept.harness_command = dropped.iter().find_map(|seat| {
+            seat.harness_command
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        });
+    }
+    if kept
+        .claim_url
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        kept.claim_url = dropped.iter().find_map(|seat| {
+            seat.claim_url
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        });
+    }
+    if kept
+        .preview_url
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        kept.preview_url = dropped.iter().find_map(|seat| {
+            seat.preview_url
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        });
+    }
+    if kept
+        .backup_path
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        kept.backup_path = dropped.iter().find_map(|seat| {
+            seat.backup_path
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        });
+    }
+    if kept.backup_at.is_none() {
+        kept.backup_at = dropped.iter().find_map(|seat| seat.backup_at);
+    }
+    if kept.backup_attempted_at.is_none() {
+        kept.backup_attempted_at = dropped.iter().find_map(|seat| seat.backup_attempted_at);
+    }
+    if kept.restored_at.is_none() {
+        kept.restored_at = dropped.iter().find_map(|seat| seat.restored_at);
+    }
     config.seats = config
         .seats
         .drain(..)
@@ -3084,6 +3143,82 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn load_keeps_provisioned_expired_railway_seat_over_empty_starting_seat() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let mut empty = railway_seat("railway-empty", now, now);
+        empty.expires_at = None;
+        let probe = empty.last_probe.as_mut().unwrap();
+        probe.online = false;
+        probe.detail = Some("railway.new refused the connection".into());
+
+        let mut provisioned = railway_seat(
+            "railway-provisioned",
+            now - chrono::Duration::minutes(1),
+            now - chrono::Duration::minutes(2),
+        );
+        provisioned.claim_url = Some("https://railway.com/claim".into());
+        provisioned.harness_command = Some("opencode run -m opencode/big-pickle".into());
+        provisioned.preview_url = Some("https://preview.railway.app".into());
+        provisioned.backup_path = Some("seat-backups/railway-provisioned.tar.gz".into());
+        provisioned.backup_at = Some(now - chrono::Duration::minutes(1));
+        let config = CloudConfigFile {
+            seats: vec![empty, provisioned],
+            default_seat: Some("railway-empty".into()),
+            ..Default::default()
+        };
+        CloudStore::write(dir.path(), CONFIG_FILE, &config, false).unwrap();
+
+        let store = CloudStore::load(dir.path());
+        let seats = store.seats();
+        assert_eq!(seats.len(), 1);
+        let kept = &seats[0];
+        assert_eq!(kept.id, "railway-provisioned");
+        assert_eq!(
+            kept.harness_command.as_deref(),
+            Some("opencode run -m opencode/big-pickle")
+        );
+        assert_eq!(kept.claim_url.as_deref(), Some("https://railway.com/claim"));
+        assert_eq!(
+            kept.preview_url.as_deref(),
+            Some("https://preview.railway.app")
+        );
+        assert_eq!(
+            kept.backup_path.as_deref(),
+            Some("seat-backups/railway-provisioned.tar.gz")
+        );
+        assert_eq!(store.default_seat().unwrap().id, "railway-provisioned");
+    }
+
+    #[test]
+    fn load_inherits_harness_from_dropped_expired_railway_seat() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let live = railway_seat(
+            "railway-live",
+            now + chrono::Duration::minutes(30),
+            now - chrono::Duration::minutes(2),
+        );
+        let mut expired = railway_seat(
+            "railway-expired-with-harness",
+            now - chrono::Duration::minutes(1),
+            now - chrono::Duration::minutes(1),
+        );
+        expired.harness_command = Some("claude -p".into());
+        let config = CloudConfigFile {
+            seats: vec![live, expired],
+            ..Default::default()
+        };
+        CloudStore::write(dir.path(), CONFIG_FILE, &config, false).unwrap();
+
+        let store = CloudStore::load(dir.path());
+        let seats = store.seats();
+        assert_eq!(seats.len(), 1);
+        assert_eq!(seats[0].id, "railway-live");
+        assert_eq!(seats[0].harness_command.as_deref(), Some("claude -p"));
     }
 
     #[test]
