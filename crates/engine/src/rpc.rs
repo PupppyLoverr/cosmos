@@ -4390,7 +4390,10 @@ impl RpcService for EngineRpc {
                                 "ssh -tt {} docker exec -it {} sh -lc {}",
                                 alias,
                                 seat.container_name(),
-                                crate::cloud::shell_word(&format!("cd {} && exec bash", seat.workspace()))
+                                crate::cloud::shell_word(&crate::cloud::command_in_workspace(
+                                    &seat.workspace(),
+                                    "exec bash",
+                                ))
                             )
                         }))
                     }
@@ -4406,7 +4409,10 @@ impl RpcService for EngineRpc {
                             "command": format!(
                                 "ssh -tt {} sh -lc {}",
                                 crate::railway::RAILWAY_HOST,
-                                crate::cloud::shell_word(&format!("cd {} && exec bash", seat.workspace()))
+                                crate::cloud::shell_word(&crate::cloud::command_in_workspace(
+                                    &seat.workspace(),
+                                    "exec bash",
+                                ))
                             )
                         }))
                     }
@@ -4423,7 +4429,10 @@ impl RpcService for EngineRpc {
                             "command": format!(
                                 "ssh -tt {} sh -lc {}",
                                 endpoint,
-                                crate::cloud::shell_word(&format!("cd {} && exec bash", seat.workspace()))
+                                crate::cloud::shell_word(&crate::cloud::command_in_workspace(
+                                    &seat.workspace(),
+                                    "exec bash",
+                                ))
                             )
                         }))
                     }

@@ -6506,6 +6506,12 @@ impl Composer {
         cx.notify();
     }
 
+    pub(crate) fn clear_failure(&mut self, cx: &mut Context<Self>) {
+        self.failure = None;
+        self.failure_key = None;
+        cx.notify();
+    }
+
     fn add_staged(&mut self, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
         if self.queue_edit_finishing {
             return;
@@ -9503,6 +9509,8 @@ impl Composer {
                             "id": seat_id,
                             "kind": zeron_proto::CloudSeatKind::Railway,
                             "label": "Railway trial",
+                            "sshAlias": "railway.new",
+                            "workspacePath": "/app",
                             // A trial VM dies at the hour regardless — the
                             // detached flag stays honest about what survives
                             // the desktop closing.
@@ -9540,6 +9548,7 @@ impl Composer {
                 match (probe, view) {
                     (Ok(_), Some(view)) => {
                         if let Some(row) = view.seats.iter().find(|s| s.config.id == seat_id) {
+                            composer.clear_failure(cx);
                             composer.state.update(cx, |state, cx| {
                                 state.cloud_seat_pick = Some(row.clone());
                                 state.cloud_mode = true;

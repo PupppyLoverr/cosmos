@@ -8071,6 +8071,10 @@ impl Shell {
     }
 
     fn set_cloud_mode(&mut self, cloud_mode: bool, cx: &mut Context<Self>) {
+        if self.state.read(cx).cloud_mode != cloud_mode {
+            self.composer
+                .update(cx, |composer, cx| composer.clear_failure(cx));
+        }
         self.state.update(cx, |state, _| {
             state.cloud_mode = cloud_mode;
             if !cloud_mode {
@@ -8231,6 +8235,8 @@ impl Shell {
             }
             row.cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    this.composer
+                        .update(cx, |composer, cx| composer.clear_failure(cx));
                     this.state.update(cx, |state, _| {
                         state.cloud_seat_pick = Some(seat_data.clone());
                         state.cloud_mode = true;

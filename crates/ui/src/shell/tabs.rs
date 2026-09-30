@@ -139,6 +139,8 @@ impl Shell {
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
         self.command_palette = None;
         self.route = Route::Chat;
+        self.composer
+            .update(cx, |composer, cx| composer.clear_failure(cx));
         self.focus_composer(cx);
         // Pre-hide before the selection flips so the state change can't
         // auto-create a canvas tab (the panel's observer runs on the same

@@ -154,7 +154,7 @@ impl SeatConfig {
     pub fn capabilities(&self) -> SeatCapabilities {
         match self.kind {
             Some(CloudSeatKind::Railway) => {
-                let alive = self.ssh_alias.is_some() && !self.expired();
+                let alive = !self.expired();
                 SeatCapabilities {
                     exec: alive,
                     shell: alive,
@@ -207,6 +207,12 @@ impl SeatConfig {
             None => SeatCapabilities::default(),
         }
     }
+}
+
+/// Ensure a remote seat's workspace exists before running a command there.
+pub fn command_in_workspace(workspace: &str, command: &str) -> String {
+    let workspace = shell_word(workspace);
+    format!("mkdir -p {workspace} && cd {workspace} && {command}")
 }
 
 /// Per-provider row (non-secret); the key itself lives in `cloud-keys.json`.
@@ -1110,11 +1116,10 @@ pub async fn cleanup_staged_credentials(
 /// Heavy build dirs are excluded; a cap guards memory (`output()` buffers).
 pub async fn snapshot_workspace(store: &CloudStore, seat: &SeatConfig) -> Result<PathBuf, String> {
     let path = store.backups_dir().join(format!("{}.tar.gz", seat.id));
-    let ws = shell_word(&seat.workspace());
-    let tar = format!(
-        "cd {ws} && tar czf - \
-         --exclude=node_modules --exclude=target --exclude=dist \
-         --exclude=.next --exclude=.cache --exclude='*.log' ."
+    let tar = command_in_workspace(
+        &seat.workspace(),
+        "tar czf - --exclude=node_modules --exclude=target --exclude=dist \
+         --exclude=.next --exclude=.cache --exclude='*.log' .",
     );
     let output = match seat.kind {
         Some(CloudSeatKind::Railway) => {
@@ -1705,10 +1710,7 @@ pub async fn list_dir(
                 http,
                 store,
                 seat,
-                &format!(
-                    "cd {} && ls -la --time-style=+%s 2>/dev/null | tail -n +2",
-                    shell_word(&base)
-                ),
+                &command_in_workspace(&base, "ls -la --time-style=+%s 2>/dev/null | tail -n +2"),
                 PROBE_TIMEOUT,
             )
             .await?;
@@ -1789,9 +1791,9 @@ pub async fn git_status(
                 http,
                 store,
                 seat,
-                &format!(
-                    "cd {} && git status --porcelain=v1 -b && git log -1 --format=%H 2>/dev/null",
-                    shell_word(&ws)
+                &command_in_workspace(
+                    &ws,
+                    "git status --porcelain=v1 -b && git log -1 --format=%H 2>/dev/null",
                 ),
                 PROBE_TIMEOUT,
             )
@@ -1808,10 +1810,7 @@ pub async fn git_status(
                 http,
                 store,
                 seat,
-                &format!(
-                    "cd {} && git diff --stat HEAD 2>/dev/null | tail -n 60",
-                    shell_word(&ws)
-                ),
+                &command_in_workspace(&ws, "git diff --stat HEAD 2>/dev/null | tail -n 60"),
                 PROBE_TIMEOUT,
             )
             .await?;
@@ -1859,7 +1858,7 @@ pub async fn git_diff(
                 http,
                 store,
                 seat,
-                &format!("cd {} && git diff HEAD -- . {}", shell_word(&ws), path_arg),
+                &command_in_workspace(&ws, &format!("git diff HEAD -- . {path_arg}")),
                 PROBE_TIMEOUT,
             )
             .await?;
@@ -3011,6 +3010,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(named.container_name(), "custom-box");
+    }
+
+    #[test]
+    fn railway_without_alias_is_ready_until_expired() {
+        let mut seat = SeatConfig {
+            kind: Some(CloudSeatKind::Railway),
+            detached: true,
+            expires_at: Some(Utc::now() + chrono::Duration::minutes(5)),
+            ..Default::default()
+        };
+        let capabilities = seat.capabilities();
+        assert!(capabilities.exec && capabilities.shell && capabilities.files && capabilities.git);
+        assert!(capabilities.keeps_running);
+
+        seat.expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        assert!(!seat.capabilities().exec);
+    }
+
+    #[test]
+    fn workspace_command_creates_the_target_before_entering_it() {
+        assert_eq!(
+            command_in_workspace("/app space", "printf ok"),
+            "mkdir -p '/app space' && cd '/app space' && printf ok"
+        );
     }
 
     #[test]

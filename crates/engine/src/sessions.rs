@@ -1810,17 +1810,12 @@ async fn drive_remote_run(
     } else {
         format!("{command} {prompt_word}")
     };
-    let full = format!(
-        "cd {} && {}{}{}",
-        crate::cloud::shell_word(&seat.workspace()),
-        if env.is_empty() {
-            String::new()
-        } else {
-            format!("env {env} ")
-        },
-        user_cmd,
-        ""
-    );
+    let remote_command = if env.is_empty() {
+        user_cmd
+    } else {
+        format!("env {env} {user_cmd}")
+    };
+    let full = crate::cloud::command_in_workspace(&seat.workspace(), &remote_command);
 
     // The user's existing CLI logins ride to the seat — `~/.codex/auth.json`,
     // opencode/grok/pi/hermes stores — staged per run so the harness auths
@@ -1852,13 +1847,13 @@ async fn drive_remote_run(
         // process belongs to the seat's init tree, so closing this app (or
         // dropping the ssh link) never kills the run — the ledger row lets a
         // later session reattach.
-        let log_path = format!("~/.cosmos/runs/{run_id}.log");
-        let pid_path = format!("~/.cosmos/runs/{run_id}.pid");
+        let log_path = format!("$HOME/.cosmos/runs/{run_id}.log");
+        let detached_command = format!(
+            "{full}; code=$?; printf '%s\\n' \"$code\" > \"$HOME/.cosmos/runs/{run_id}.exit\"; exit \"$code\""
+        );
         let launch = format!(
-            "mkdir -p ~/.cosmos/runs && nohup sh -c {} > {} 2>&1 & pid=$!; echo $pid > {}; echo $pid",
-            crate::cloud::shell_word(&full),
-            crate::cloud::shell_word(&log_path),
-            crate::cloud::shell_word(&pid_path),
+            "mkdir -p \"$HOME/.cosmos/runs\" && {{ nohup sh -c {} > \"$HOME/.cosmos/runs/{run_id}.log\" 2>&1 & pid=$!; printf '%s\\n' \"$pid\" > \"$HOME/.cosmos/runs/{run_id}.pid\"; printf '%s\\n' \"$pid\"; }}",
+            crate::cloud::shell_word(&detached_command),
         );
         match crate::cloud::seat_exec(
             &http,
@@ -1939,7 +1934,7 @@ async fn drive_remote_run(
     }
 
     let stream = crate::cloud::seat_exec_stream(&seat, &full).await;
-    let mut stream = match stream {
+    let stream = match stream {
         Ok(s) => s,
         Err(e) => {
             write_remote_error(&doc, &inner.device_id, &e);
@@ -1965,12 +1960,18 @@ async fn drive_remote_run(
     };
 
     let entry_id = new_id();
-    let mut segment =
-        zeron_doc::SegmentWriter::begin(&doc, &entry_id, &inner.device_id, now_ms()).ok();
+    let mut segment: Option<zeron_doc::SegmentWriter> = None;
     let mut text = String::new();
     let mut buf = [0u8; 8192];
+    let mut err_buf = [0u8; 4096];
+    let mut stderr_tail = Vec::new();
+    let mut stdout_open = true;
+    let mut stderr_open = true;
     let mut interrupted = false;
     let mut expired = false;
+    let mut child = stream.child;
+    let mut stdout = stream.stdout;
+    let mut stderr = stream.stderr;
     let deadline = seat.expires_at.map(|deadline| {
         let seconds = (deadline - Utc::now()).num_seconds().max(0) as u64;
         tokio::time::Instant::now() + std::time::Duration::from_secs(seconds)
@@ -1984,12 +1985,12 @@ async fn drive_remote_run(
                 }
             } => {
                 expired = true;
-                let _ = stream.child.kill().await;
+                let _ = child.kill().await;
                 break;
             }
             _ = cancel_rx.changed() => {
                 interrupted = true;
-                let _ = stream.child.kill().await;
+                let _ = child.kill().await;
                 // Best-effort remote kill so a hung harness can't linger —
                 // seat_exec routes to docker-exec (SSH) or direct ssh
                 // (Railway); the run-id marker matches the detached cmdline.
@@ -2006,14 +2007,23 @@ async fn drive_remote_run(
             }
             _ = interrupt_token.cancelled() => {
                 interrupted = true;
-                let _ = stream.child.kill().await;
+                let _ = child.kill().await;
                 break;
             }
-            read = stream.stdout.read(&mut buf) => {
+            read = stdout.read(&mut buf), if stdout_open => {
                 match read {
-                    Ok(0) => break,
+                    Ok(0) => stdout_open = false,
                     Ok(n) => {
                         text.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        if segment.is_none() && !text.trim().is_empty() {
+                            segment = zeron_doc::SegmentWriter::begin(
+                                &doc,
+                                &entry_id,
+                                &inner.device_id,
+                                now_ms(),
+                            )
+                            .ok();
+                        }
                         if let Some(segment) = segment.as_mut() {
                             let _ = segment.sync(&[MessagePart::Text {
                                 id: "t0".into(),
@@ -2021,13 +2031,28 @@ async fn drive_remote_run(
                             }]);
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => stdout_open = false,
+                }
+            }
+            read = stderr.read(&mut err_buf), if stderr_open => {
+                match read {
+                    Ok(0) => stderr_open = false,
+                    Ok(n) => {
+                        stderr_tail.extend_from_slice(&err_buf[..n]);
+                        if stderr_tail.len() > 65_536 {
+                            let excess = stderr_tail.len() - 65_536;
+                            stderr_tail.drain(..excess);
+                        }
+                    }
+                    Err(_) => stderr_open = false,
                 }
             }
         }
+        if !stdout_open && !stderr_open {
+            break;
+        }
     }
-    let status = stream
-        .child
+    let status = child
         .wait()
         .await
         .map(|s| s.code().unwrap_or(-1))
@@ -2051,7 +2076,7 @@ async fn drive_remote_run(
             zeron_proto::CloudRunStatus::Stopped,
             None,
         );
-    } else if status == 0 {
+    } else if !remote_agent_failed(status, &text) {
         if let Some(segment) = segment {
             let _ = segment.finish(
                 &[MessagePart::Text {
@@ -2087,16 +2112,18 @@ async fn drive_remote_run(
             });
         }
     } else {
-        let message = format!("seat run exited {status}");
+        let stderr_text = String::from_utf8_lossy(&stderr_tail);
+        let message = remote_agent_failure_message(status, &text, &stderr_text);
         if let Some(segment) = segment {
             let _ = segment.finish(
                 &[MessagePart::Text {
                     id: "t0".into(),
-                    text,
+                    text: text.clone(),
                 }],
                 zeron_doc::MessageStatus::Aborted,
             );
         }
+        write_remote_error(&doc, &inner.device_id, &message);
         finish(
             &inner,
             &store,
@@ -2538,8 +2565,7 @@ async fn tail_remote_log(
     cancel_rx: &mut watch::Receiver<bool>,
 ) {
     let entry_id = new_id();
-    let mut segment =
-        zeron_doc::SegmentWriter::begin(doc, &entry_id, &inner.device_id, now_ms()).ok();
+    let mut segment: Option<zeron_doc::SegmentWriter> = None;
     let mut mirrored: u64 = 0;
     let mut text = String::new();
     let mut ssh_255_streak = 0u8;
@@ -2563,11 +2589,11 @@ async fn tail_remote_log(
             lock(&inner.runs).remove(chat_id);
             return;
         }
-        // `tail -c +N` streams from byte N; `kill -0` reports liveness.
+        // `tail -c +N` streams from byte N; the exit marker preserves the
+        // remote command's status after the detached shell has exited.
         let cmd = format!(
-            "tail -c +{} -- {} 2>/dev/null | head -c 262144; echo; kill -0 $(cat ~/.cosmos/runs/{run_id}.pid 2>/dev/null) 2>/dev/null; echo __alive_$?",
+            "tail -c +{} -- \"{log_path}\" 2>/dev/null | head -c 262144; printf '\\n'; if [ -f \"$HOME/.cosmos/runs/{run_id}.exit\" ]; then printf '__exit_%s\\n' \"$(cat \"$HOME/.cosmos/runs/{run_id}.exit\")\"; else kill -0 \"$(cat \"$HOME/.cosmos/runs/{run_id}.pid\" 2>/dev/null)\" 2>/dev/null; echo __alive_$?; fi",
             mirrored + 1,
-            crate::cloud::shell_word(log_path),
         );
         match crate::cloud::seat_exec(http, store, seat, &cmd, std::time::Duration::from_secs(20))
             .await
@@ -2586,18 +2612,30 @@ async fn tail_remote_log(
                     return;
                 }
                 let mut alive = false;
+                let mut remote_exit = None;
                 let mut chunk = String::new();
                 for line in out.stdout.lines() {
                     if let Some(flag) = line.strip_prefix("__alive_") {
                         alive = flag.trim() == "0";
+                    } else if let Some(status) = line.strip_prefix("__exit_") {
+                        remote_exit = status.trim().parse::<i32>().ok();
                     } else {
                         chunk.push_str(line);
                         chunk.push('\n');
                     }
                 }
-                if !chunk.is_empty() {
+                if !chunk.trim().is_empty() {
                     text.push_str(&chunk);
                     mirrored += chunk.len() as u64;
+                    if segment.is_none() {
+                        segment = zeron_doc::SegmentWriter::begin(
+                            doc,
+                            &entry_id,
+                            &inner.device_id,
+                            now_ms(),
+                        )
+                        .ok();
+                    }
                     if let Some(segment) = segment.as_mut() {
                         let _ = segment.sync(&[MessagePart::Text {
                             id: "t0".into(),
@@ -2606,14 +2644,28 @@ async fn tail_remote_log(
                     }
                     store.update_run(run_id, |run| run.mirrored_bytes = mirrored);
                 }
-                if out.code != 0 || !alive {
+                if out.code != 0 || remote_exit.is_some() || !alive {
+                    let done =
+                        out.code == 0 && remote_exit == Some(0) && !remote_agent_failed(0, &text);
+                    let error = (!done).then(|| {
+                        let status = remote_exit.unwrap_or_else(|| out.code.max(1));
+                        let stderr = if remote_exit.is_none() && out.stderr.is_empty() {
+                            "remote agent ended without an exit status".to_string()
+                        } else {
+                            out.stderr.clone()
+                        };
+                        remote_agent_failure_message(status, &text, &stderr)
+                    });
+                    if let Some(message) = error.as_deref() {
+                        write_remote_error(doc, &inner.device_id, message);
+                    }
                     let _ = segment.take().and_then(|s| {
                         s.finish(
                             &[MessagePart::Text {
                                 id: "t0".into(),
                                 text: text.clone(),
                             }],
-                            if out.code == 0 {
+                            if done {
                                 zeron_doc::MessageStatus::Complete
                             } else {
                                 zeron_doc::MessageStatus::Aborted
@@ -2621,7 +2673,6 @@ async fn tail_remote_log(
                         )
                         .ok()
                     });
-                    let done = out.code == 0;
                     inner.set_status(
                         chat_id,
                         if done {
@@ -2637,6 +2688,7 @@ async fn tail_remote_log(
                         } else {
                             zeron_proto::CloudRunStatus::Error
                         };
+                        run.error = error;
                         run.finished_at = Some(Utc::now());
                     });
                     lock(&inner.runs).remove(chat_id);
@@ -2709,6 +2761,27 @@ fn write_remote_error(doc: &crate::doc_host::DocWriter, device_id: &str, message
     });
 }
 
+fn remote_agent_failed(status: i32, stdout: &str) -> bool {
+    status != 0 || stdout.trim().is_empty()
+}
+
+fn remote_agent_failure_message(status: i32, stdout: &str, stderr: &str) -> String {
+    let output = [stdout.trim_end(), stderr.trim_end()]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lines = output.lines().collect::<Vec<_>>();
+    if !lines.is_empty() {
+        return lines[lines.len().saturating_sub(20)..].join("\n");
+    }
+    if status == 0 {
+        "remote agent exited successfully without output".into()
+    } else {
+        format!("seat run exited {status}")
+    }
+}
+
 fn write_transcript_note(doc: &crate::doc_host::DocWriter, device_id: &str, message: &str) {
     let _ = doc.push_message(&SessionMessageEntry {
         id: new_id(),
@@ -2723,6 +2796,40 @@ fn write_transcript_note(doc: &crate::doc_host::DocWriter, device_id: &str, mess
         continuation_of: None,
         duration_ms: None,
     });
+}
+
+#[cfg(test)]
+mod remote_agent_failure_tests {
+    use super::{remote_agent_failed, remote_agent_failure_message};
+
+    #[test]
+    fn failed_stub_remote_surfaces_recent_stderr() {
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "printf '%s\\n' 'Not logged in · Please run /login' >&2; exit 1",
+            ])
+            .output()
+            .expect("run stub remote command");
+        let status = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(remote_agent_failed(status, &stdout));
+        assert_eq!(
+            remote_agent_failure_message(status, &stdout, &stderr),
+            "Not logged in · Please run /login"
+        );
+    }
+
+    #[test]
+    fn successful_remote_without_agent_output_is_a_failure() {
+        assert!(remote_agent_failed(0, " \n"));
+        assert_eq!(
+            remote_agent_failure_message(0, "", ""),
+            "remote agent exited successfully without output"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

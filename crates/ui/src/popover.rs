@@ -340,6 +340,10 @@ pub fn popover_card(theme: &Theme) -> gpui::Div {
         .text_color(theme.text)
 }
 
+pub fn popover_card_opaque(theme: &Theme) -> gpui::Div {
+    popover_card(theme).bg(theme.surface_overlay)
+}
+
 /// [`popover_card`] without the shared inset — for popovers that manage their
 /// own internal panes (the harness/model picker's rail + list split).
 pub fn popover_card_flush(theme: &Theme) -> gpui::Div {

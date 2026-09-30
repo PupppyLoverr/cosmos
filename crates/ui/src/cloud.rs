@@ -92,9 +92,7 @@ impl CloudView {
                         .map(|probe| probe.online)
                         .unwrap_or(true)
             }
-            Some(CloudSeatKind::Railway) => {
-                seat.config.ssh_alias.is_some() && !seat.config.expired()
-            }
+            Some(CloudSeatKind::Railway) => !seat.config.expired(),
             Some(CloudSeatKind::Box) => seat.has_box_token,
             Some(CloudSeatKind::GitHub) => seat.config.repo.is_some() && seat.has_github_pat,
             None => false,
@@ -146,7 +144,6 @@ mod tests {
         assert!(!CloudView::seat_ready(&ssh));
 
         let mut railway = seat(CloudSeatKind::Railway);
-        railway.config.ssh_alias = Some("railway.new".into());
         railway.config.expires_at = Some(Utc::now() + Duration::minutes(5));
         assert!(CloudView::seat_ready(&railway));
         assert!(CloudView::seat_runnable(&railway));
@@ -2830,7 +2827,7 @@ impl CloudRail {
     /// that opens the existing side-chat surface in the shell's pane host.
     fn render_pane_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let caps = self.capabilities();
-        let mut menu = popover::popover_card(&theme.for_popup())
+        let mut menu = popover::popover_card_opaque(&theme.for_popup())
             .absolute()
             .top(px(30.0))
             .left(px(8.0))
