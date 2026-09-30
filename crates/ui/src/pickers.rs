@@ -477,6 +477,10 @@ pub(crate) struct ReturnComposerFocus;
 
 impl gpui::EventEmitter<ReturnComposerFocus> for Pickers {}
 
+pub(crate) struct OpenCloudComputer;
+
+impl gpui::EventEmitter<OpenCloudComputer> for Pickers {}
+
 /// A model picked while bound to thread naming (see [`Pickers::new_for_titles`]);
 /// the owner persists it with `SetTitleSettings`.
 pub struct TitleModelPicked(pub TitleSettings);
@@ -952,10 +956,9 @@ impl Pickers {
     fn effective_model_id<'a>(&'a self, cx: &'a App) -> Option<&'a str> {
         if let Some(title) = &self.title {
             // Only the saved agent's tab shows a selected row.
-            return title
-                .model
-                .as_deref()
-                .filter(|_| title.harness.is_some() && title.harness == self.effective_harness(cx));
+            return title.model.as_deref().filter(|_| {
+                title.harness.is_some() && title.harness == self.effective_harness(cx)
+            });
         }
         if let Some(id) = self.config.model.as_deref() {
             return Some(id);
@@ -2720,10 +2723,13 @@ impl Pickers {
             PickerKind::Device => "picker-device",
         };
         let open = self.open_kind() == Some(kind);
+        let cloud_mode = kind == PickerKind::HarnessModel
+            && self.title.is_none()
+            && self.state.read(cx).cloud_mode;
         // Ghost pill (zeron composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
         // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
         // hover/open wash — no border, no caret; the actions row stays quiet.
-        div()
+        let trigger = div()
             .relative()
             .child(self.measure_trigger(kind, cx))
             .id(id)
@@ -2774,8 +2780,13 @@ impl Pickers {
                 cx.listener(move |this, _, _, _| {
                     this.open.note_trigger_press_matching(|open| *open == kind)
                 }),
-            )
-            .on_click(cx.listener(move |this, _, window, cx| this.toggle(kind, window, cx)))
+            );
+        let trigger = if cloud_mode {
+            trigger.on_click(cx.listener(|_, _, _, cx| cx.emit(OpenCloudComputer)))
+        } else {
+            trigger.on_click(cx.listener(move |this, _, window, cx| this.toggle(kind, window, cx)))
+        };
+        trigger
             .when(icon_loading, |el| {
                 el.child(div().flex_none().child(crate::loaders::mini_glyph_spinner(
                     "picker-chip-loader",
@@ -4978,7 +4989,31 @@ impl Render for Pickers {
         // loaded, so that's a conclusion, not a loading gap) — the chip says
         // so instead of wearing a brand mark for an agent that can't run.
         let no_agents = self.no_agents_available() && self.effective_harness(cx).is_none();
-        let model_label: SharedString = if let Some(title) = &self.title {
+        let cloud_mode = self.title.is_none() && self.state.read(cx).cloud_mode;
+        let cloud_model_label = if cloud_mode {
+            let state = self.state.read(cx);
+            Some(
+                state
+                    .active_cloud_seat()
+                    .and_then(|seat| seat.config.harness_command.as_deref())
+                    .filter(|command| !command.trim().is_empty())
+                    .map(crate::cloud::cloud_harness_label)
+                    .map(SharedString::from)
+                    .unwrap_or_else(|| {
+                        state
+                            .cloud_view()
+                            .map(crate::cloud::CloudView::cloud_model_label)
+                            .unwrap_or_else(|| {
+                                crate::cloud::CloudView::default().cloud_model_label()
+                            })
+                    }),
+            )
+        } else {
+            None
+        };
+        let model_label: SharedString = if let Some(label) = cloud_model_label {
+            label
+        } else if let Some(title) = &self.title {
             // The saved choice, not the tab being browsed.
             match (title.harness, title.model.as_deref()) {
                 (None, _) => "Session agent".into(),
@@ -5070,24 +5105,29 @@ impl Render for Pickers {
         // run's configuration reads without opening anything, and the suffix
         // brightens only when something departs from its default. No suffix
         // when the model has neither a ladder nor options (e.g. Hermes).
-        let chip_suffix = traits_set.filter(|_| self.title.is_none()).map(|summary| {
-            (
-                SharedString::from(summary),
-                traits_active.then(|| theme.text.opacity(0.85)),
-            )
-        });
-        let fast = self.title.is_none() && self.selected_model(cx).is_some_and(|model| {
-            model.options.iter().any(|option| {
-                option.id == "serviceTier"
-                    && self
-                        .resolved(cx)
-                        .model_options
-                        .get(&option.id)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&option.default_choice)
-                        == "fast"
+        let chip_suffix = if cloud_mode {
+            None
+        } else {
+            traits_set.filter(|_| self.title.is_none()).map(|summary| {
+                (
+                    SharedString::from(summary),
+                    traits_active.then(|| theme.text.opacity(0.85)),
+                )
             })
-        });
+        };
+        let fast = self.title.is_none()
+            && self.selected_model(cx).is_some_and(|model| {
+                model.options.iter().any(|option| {
+                    option.id == "serviceTier"
+                        && self
+                            .resolved(cx)
+                            .model_options
+                            .get(&option.id)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&option.default_choice)
+                            == "fast"
+                })
+            });
         let model_chip = self
             .trigger_chip(
                 PickerKind::HarnessModel,

@@ -5827,6 +5827,7 @@ pub struct Composer {
     /// account, and context occupancy — each opening a popover.
     account_usage: Entity<crate::account_usage::AccountUsage>,
     _picker_focus: Subscription,
+    _cloud_settings: Subscription,
     _input_events: Subscription,
 }
 
@@ -5912,6 +5913,14 @@ impl Composer {
                 cx.notify();
             },
         );
+        let cloud_settings = cx.subscribe(
+            &pickers,
+            |_, _, _: &crate::pickers::OpenCloudComputer, cx| {
+                cx.emit(ComposerEvent::WorkspaceCommand(
+                    WorkspaceCommand::CloudComputer,
+                ));
+            },
+        );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
@@ -5989,6 +5998,7 @@ impl Composer {
             observe,
             pickers_observe,
             picker_focus,
+            cloud_settings,
             input_events,
             current_key,
             None,
@@ -6024,6 +6034,14 @@ impl Composer {
             |this: &mut Self, _, _: &crate::pickers::ReturnComposerFocus, cx| {
                 this.focus_pending = true;
                 cx.notify();
+            },
+        );
+        let cloud_settings = cx.subscribe(
+            &pickers,
+            |_, _, _: &crate::pickers::OpenCloudComputer, cx| {
+                cx.emit(ComposerEvent::WorkspaceCommand(
+                    WorkspaceCommand::CloudComputer,
+                ));
             },
         );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
@@ -6094,6 +6112,7 @@ impl Composer {
             observe,
             pickers_observe,
             picker_focus,
+            cloud_settings,
             input_events,
             chat_id.clone(),
             Some(chat_id),
@@ -6132,6 +6151,14 @@ impl Composer {
             |this: &mut Self, _, _: &crate::pickers::ReturnComposerFocus, cx| {
                 this.focus_pending = true;
                 cx.notify();
+            },
+        );
+        let cloud_settings = cx.subscribe(
+            &pickers,
+            |_, _, _: &crate::pickers::OpenCloudComputer, cx| {
+                cx.emit(ComposerEvent::WorkspaceCommand(
+                    WorkspaceCommand::CloudComputer,
+                ));
             },
         );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
@@ -6196,6 +6223,7 @@ impl Composer {
             observe,
             pickers_observe,
             picker_focus,
+            cloud_settings,
             input_events,
             DELEGATE_DRAFT_KEY.to_string(),
             None,
@@ -6213,6 +6241,7 @@ impl Composer {
         observe: Subscription,
         pickers_observe: Subscription,
         picker_focus: Subscription,
+        cloud_settings: Subscription,
         input_events: Subscription,
         current_key: String,
         target_chat: Option<String>,
@@ -6312,6 +6341,7 @@ impl Composer {
             _pickers_observe: pickers_observe,
             account_usage,
             _picker_focus: picker_focus,
+            _cloud_settings: cloud_settings,
             _input_events: input_events,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on

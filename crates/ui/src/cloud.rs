@@ -117,6 +117,31 @@ impl CloudView {
     }
 }
 
+pub fn cloud_harness_label(harness_command: &str) -> String {
+    let words: Vec<&str> = harness_command.split_whitespace().collect();
+    if words.starts_with(&["opencode", "run", "-m", "opencode/big-pickle"]) {
+        return "OpenCode · big-pickle".into();
+    }
+    if words.starts_with(&["claude", "-p"]) {
+        return "Claude Code".into();
+    }
+    if words.starts_with(&["codex", "exec"]) {
+        return "Codex".into();
+    }
+    let Some(first) = words.first() else {
+        return String::new();
+    };
+    let mut chars = first.chars();
+    let Some(initial) = chars.next() else {
+        return String::new();
+    };
+    format!(
+        "{}{}",
+        initial.to_uppercase().collect::<String>(),
+        chars.as_str()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +187,18 @@ mod tests {
         github.has_github_pat = true;
         assert!(CloudView::seat_ready(&github));
         assert!(!CloudView::seat_runnable(&github));
+    }
+
+    #[test]
+    fn cloud_harness_label_uses_seat_command() {
+        assert_eq!(
+            cloud_harness_label("opencode run -m opencode/big-pickle"),
+            "OpenCode · big-pickle"
+        );
+        assert_eq!(cloud_harness_label("claude -p"), "Claude Code");
+        assert_eq!(cloud_harness_label("codex exec"), "Codex");
+        assert_eq!(cloud_harness_label("customAgent run"), "CustomAgent");
+        assert_eq!(cloud_harness_label(""), "");
     }
 }
 
