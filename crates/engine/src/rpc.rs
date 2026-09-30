@@ -4027,9 +4027,24 @@ impl RpcService for EngineRpc {
                 let seat = cloud
                     .seat(&p.seat_id)
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
-                let endpoint = seat.cua_endpoint.clone().ok_or_else(|| {
-                    RpcError::Failed("seat not controllable yet — no CUA endpoint".into())
-                })?;
+                let Some(endpoint) = seat.cua_endpoint.clone() else {
+                    if matches!(
+                        seat.kind,
+                        Some(
+                            zeron_proto::CloudSeatKind::Railway
+                                | zeron_proto::CloudSeatKind::Ssh
+                                | zeron_proto::CloudSeatKind::Box
+                        )
+                    ) {
+                        let screen = crate::cloud::linux_screen(&self.http, &cloud, &seat)
+                            .await
+                            .map_err(RpcError::Failed)?;
+                        return RpcReply::value(&screen);
+                    }
+                    return Err(RpcError::Failed(
+                        "seat not controllable yet — no CUA endpoint".into(),
+                    ));
+                };
                 let mut req = self
                     .http
                     .post(format!(
@@ -4334,7 +4349,8 @@ impl RpcService for EngineRpc {
                     .or_else(|| cloud.github_pat(crate::cloud::CloudStore::SHARED_GITHUB_KEY))
                     .ok_or_else(|| {
                         RpcError::Failed(
-                            "no GitHub token yet — add a PAT in Settings → Cloud computer".into(),
+                            "GitHub isn't connected — connect it in Settings → Cloud computer"
+                                .into(),
                         )
                     })?;
                 let gh = crate::cloud::github(&self.http, &pat);
@@ -4367,6 +4383,52 @@ impl RpcService for EngineRpc {
                         crate::cloud::CloudStore::SHARED_GITHUB_KEY,
                         "githubPat",
                         Some(p.pat.trim().to_string()),
+                    )
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLOUD_GITHUB_DEVICE_START => {
+                let v = crate::cloud::github_device_start(&self.http)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&v)
+            }
+            methods::CLOUD_GITHUB_DEVICE_POLL => {
+                #[derive(Default, serde::Deserialize)]
+                #[serde(rename_all = "camelCase", default)]
+                struct PollParams {
+                    device_code: String,
+                }
+                let p: PollParams = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                match crate::cloud::github_device_poll(&self.http, &p.device_code)
+                    .await
+                    .map_err(RpcError::Failed)?
+                {
+                    crate::cloud::DevicePoll::Pending(status) => {
+                        RpcReply::value(&serde_json::json!({ "status": status }))
+                    }
+                    crate::cloud::DevicePoll::Token(token) => {
+                        let gh = crate::cloud::github(&self.http, &token);
+                        let login = gh.login().await.map_err(RpcError::Failed)?;
+                        cloud
+                            .set_seat_token(
+                                crate::cloud::CloudStore::SHARED_GITHUB_KEY,
+                                "githubPat",
+                                Some(token),
+                            )
+                            .map_err(RpcError::Failed)?;
+                        RpcReply::value(&serde_json::json!({ "status": "done", "login": login }))
+                    }
+                }
+            }
+            methods::CLOUD_GITHUB_DISCONNECT => {
+                let cloud = self.cloud()?.clone();
+                cloud
+                    .set_seat_token(
+                        crate::cloud::CloudStore::SHARED_GITHUB_KEY,
+                        "githubPat",
+                        None,
                     )
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))

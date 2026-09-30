@@ -300,6 +300,204 @@ pub(crate) fn status_dot(theme: &Theme, probe: Option<&SeatProbe>) -> gpui::Stat
         .tooltip(widgets::text_tooltip(label))
 }
 
+/// A headless Linux seat's live console: a monitor frame with the box's
+/// identity, resource gauges and top processes.
+fn render_vm_screen(theme: &Theme, info: &serde_json::Value) -> AnyElement {
+    let field = |k: &str| {
+        info.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("—")
+            .to_string()
+    };
+    let num = |k: &str| {
+        info.get(k)
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+    };
+    let gib = |kb: f64| kb / 1024.0 / 1024.0;
+    let mem = match (num("mem_total_kb"), num("mem_avail_kb")) {
+        (Some(t), Some(a)) if t > 0.0 => {
+            Some(((t - a) / t, format!("{:.1} / {:.1} GB", gib(t - a), gib(t))))
+        }
+        _ => None,
+    };
+    let disk = match (num("disk_total_kb"), num("disk_used_kb")) {
+        (Some(t), Some(u)) if t > 0.0 => Some((u / t, format!("{:.1} / {:.1} GB", gib(u), gib(t)))),
+        _ => None,
+    };
+    let cpus = num("cpus").unwrap_or(1.0).max(1.0);
+    let load = num("load").map(|l| ((l / cpus).min(1.0), format!("{l:.2} load · {cpus:.0} vCPU")));
+    let uptime = num("uptime").map(|s| {
+        let s = s as u64;
+        if s >= 86_400 {
+            format!("up {}d {}h", s / 86_400, (s % 86_400) / 3600)
+        } else if s >= 3600 {
+            format!("up {}h {}m", s / 3600, (s % 3600) / 60)
+        } else {
+            format!("up {}m", s / 60)
+        }
+    });
+    let mono = theme.font_mono.clone();
+    let screen_bg = gpui::hsla(0.0, 0.0, 0.07, 1.0);
+    let screen_text = gpui::hsla(0.0, 0.0, 0.86, 1.0);
+    let screen_muted = gpui::hsla(0.0, 0.0, 0.55, 1.0);
+    let gauge = |label: &'static str, value: Option<(f64, String)>| {
+        let (frac, text) = value.unwrap_or((0.0, "—".into()));
+        let fill = if frac > 0.85 {
+            theme.danger
+        } else if frac > 0.6 {
+            theme.warning
+        } else {
+            theme.success
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .child(div().text_color(screen_muted).child(label))
+                    .child(
+                        div()
+                            .text_color(screen_text)
+                            .child(SharedString::from(text)),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(4.0))
+                    .w_full()
+                    .rounded(px(2.0))
+                    .bg(gpui::hsla(0.0, 0.0, 1.0, 0.08))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(gpui::relative(frac.clamp(0.0, 1.0) as f32))
+                            .rounded(px(2.0))
+                            .bg(fill),
+                    ),
+            )
+    };
+    let prompt = format!("{}@{}", field("user"), field("host"));
+    let mut procs = div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .font_family(mono.clone());
+    procs = procs.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(8.0))
+            .text_size(crate::typography::ui_rems(10.5))
+            .text_color(screen_muted)
+            .child(div().w(px(48.0)).child("PID"))
+            .child(div().w(px(44.0)).child("CPU%"))
+            .child(div().w(px(44.0)).child("MEM%"))
+            .child(div().flex_1().child("COMMAND")),
+    );
+    for p in info
+        .get("procs")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let col = |k: &str| {
+            SharedString::from(p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string())
+        };
+        procs = procs.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(8.0))
+                .text_size(crate::typography::ui_rems(10.5))
+                .text_color(screen_text)
+                .child(div().w(px(48.0)).child(col("pid")))
+                .child(div().w(px(44.0)).child(col("cpu")))
+                .child(div().w(px(44.0)).child(col("mem")))
+                .child(div().flex_1().min_w_0().truncate().child(col("name"))),
+        );
+    }
+    div()
+        .id("vm-screen")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .p(px(12.0))
+        .child(
+            div()
+                .w_full()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(screen_bg)
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .h(px(28.0))
+                        .px(px(10.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .border_b_1()
+                        .border_color(gpui::hsla(0.0, 0.0, 1.0, 0.08))
+                        .child(icon(icons::MONITOR).size(px(12.0)).text_color(screen_muted))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(screen_text)
+                                .child(SharedString::from(field("os"))),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(screen_muted)
+                                .child(SharedString::from(uptime.unwrap_or_default())),
+                        ),
+                )
+                .child(
+                    div()
+                        .p(px(12.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .font_family(mono.clone())
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(screen_text)
+                                .child(SharedString::from(format!(
+                                    "{prompt}  ·  {} {}",
+                                    field("kernel"),
+                                    field("arch")
+                                ))),
+                        )
+                        .child(gauge("CPU", load))
+                        .child(gauge("Memory", mem))
+                        .child(gauge("Disk", disk))
+                        .child(procs)
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(screen_muted)
+                                .child("Headless Linux — no display is running on this seat. Live every 4s."),
+                        ),
+                ),
+        )
+        .into_any_element()
+}
+
 fn pane_empty(theme: &Theme, icon_path: &'static str, title: &str, copy: &str) -> gpui::Div {
     div()
         .size_full()
@@ -411,6 +609,10 @@ pub struct CloudRail {
     analysis: Loadable<Option<String>>,
     // Computer
     shot: Loadable<Option<Arc<gpui::Image>>>,
+    /// Headless Linux seats: the live system snapshot shown in place of a
+    /// desktop capture.
+    vm_info: Option<serde_json::Value>,
+    screen_task: Option<Task<()>>,
     /// The chat's latest ledger run — drives the bot bar's status + buttons.
     run: Option<CloudRun>,
     runs: Vec<CloudRun>,
@@ -540,6 +742,8 @@ impl CloudRail {
             pr_expanded: std::collections::HashSet::new(),
             analysis: Loadable::Idle,
             shot: Loadable::Idle,
+            vm_info: None,
+            screen_task: None,
             run: None,
             runs: Vec::new(),
             model_label: None,
@@ -723,8 +927,8 @@ impl CloudRail {
             surface_pick_row(theme, id, icon_path, title, detail)
         };
         let mut list = div()
-            .w_full()
-            .max_w(px(360.0))
+            .w(px(320.0))
+            .max_w_full()
             .flex()
             .flex_col()
             .gap(px(2.0));
@@ -764,7 +968,9 @@ impl CloudRail {
             .flex_col()
             .items_center()
             .justify_center()
-            .p(px(16.0))
+            .px(px(16.0))
+            .pt(px(16.0))
+            .pb(px(64.0))
             .child(list)
             .into_any_element()
     }
@@ -1236,43 +1442,73 @@ impl CloudRail {
     // -- Computer --
 
     fn capture_shot(&mut self, cx: &mut Context<Self>) {
-        if !self.capabilities().computer {
+        let caps = self.capabilities();
+        if !caps.computer && !caps.shell {
             self.shot = Loadable::Ready(None);
             return;
         }
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        self.shot = Loadable::Loading;
+        if !matches!(self.shot, Loadable::Ready(_)) {
+            self.shot = Loadable::Loading;
+        }
         let seat_id = self.binding.seat_id.clone();
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::CLOUD_SCREENSHOT,
-                    serde_json::json!({ "seatId": seat_id }),
-                )
-                .await;
-            this.update(cx, |rail, cx| {
-                rail.shot = match result {
-                    Ok(value) => {
-                        let image = value
-                            .get("pngBase64")
-                            .and_then(|p| p.as_str())
-                            .and_then(|b64| {
-                                use base64::Engine as _;
-                                base64::engine::general_purpose::STANDARD.decode(b64).ok()
-                            })
-                            .map(|bytes| {
-                                Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes))
-                            });
-                        Loadable::Ready(image)
-                    }
-                    Err(err) => Loadable::Error(err.to_string()),
-                };
-                cx.notify();
-            })
-            .ok();
+        self.screen_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let result = engine
+                    .client()
+                    .call(
+                        methods::CLOUD_SCREENSHOT,
+                        serde_json::json!({ "seatId": seat_id }),
+                    )
+                    .await;
+                let watching = this
+                    .update(cx, |rail, cx| {
+                        match result {
+                            Ok(value) => {
+                                let image = value
+                                    .get("pngBase64")
+                                    .and_then(|p| p.as_str())
+                                    .and_then(|b64| {
+                                        use base64::Engine as _;
+                                        base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                                    })
+                                    .map(|bytes| {
+                                        Arc::new(gpui::Image::from_bytes(
+                                            gpui::ImageFormat::Png,
+                                            bytes,
+                                        ))
+                                    });
+                                rail.vm_info = value.get("system").cloned();
+                                rail.shot = Loadable::Ready(image);
+                            }
+                            Err(err) => {
+                                rail.vm_info = None;
+                                rail.shot = Loadable::Error(err.to_string());
+                            }
+                        }
+                        cx.notify();
+                        rail.pane == CloudPane::Computer
+                            && !rail.picking
+                            && matches!(rail.shot, Loadable::Ready(_))
+                    })
+                    .unwrap_or(false);
+                if !watching {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(4))
+                    .await;
+                let still = this
+                    .update(cx, |rail, _| {
+                        rail.pane == CloudPane::Computer && !rail.picking
+                    })
+                    .unwrap_or(false);
+                if !still {
+                    break;
+                }
+            }
         }));
     }
 
@@ -2700,19 +2936,32 @@ impl CloudRail {
     fn render_computer(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let seat = self.seat.ready().cloned();
         let probe = seat.as_ref().and_then(|s| s.config.last_probe.clone());
+        let _ = probe;
+        let mode: SharedString = match &self.shot {
+            Loadable::Ready(Some(_)) => "Live desktop · refreshes every 4s".into(),
+            Loadable::Ready(None) if self.vm_info.is_some() => "Linux console · no display".into(),
+            Loadable::Error(_) => "Not reachable".into(),
+            Loadable::Ready(None) => "No display".into(),
+            _ => "Connecting…".into(),
+        };
+        let live = matches!(self.shot, Loadable::Ready(Some(_))) || self.vm_info.is_some();
         let mut col = div().size_full().flex().flex_col();
         col = col.child(
             div()
                 .flex_none()
                 .h(px(36.0))
-                .px(px(10.0))
+                .px(px(12.0))
                 .border_b_1()
                 .border_color(theme.border)
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(8.0))
-                .child(status_dot(theme, probe.as_ref()))
+                .child(div().size(px(6.0)).rounded_full().bg(if live {
+                    theme.success
+                } else {
+                    theme.text_muted
+                }))
                 .child(
                     div()
                         .flex_1()
@@ -2720,20 +2969,23 @@ impl CloudRail {
                         .truncate()
                         .text_size(crate::typography::ui_rems(11.5))
                         .text_color(theme.text_muted)
-                        .child(SharedString::from(self.binding.label.clone())),
+                        .child(mode),
                 )
                 .child(
                     div()
                         .id("rail-shot-refresh")
                         .cursor_pointer()
-                        .when(self.capabilities().computer, |el| {
-                            el.on_click(cx.listener(|this, _, _, cx| this.capture_shot(cx)))
-                        })
-                        .opacity(if self.capabilities().computer {
-                            1.0
-                        } else {
-                            0.35
-                        })
+                        .when(
+                            self.capabilities().computer || self.capabilities().shell,
+                            |el| el.on_click(cx.listener(|this, _, _, cx| this.capture_shot(cx))),
+                        )
+                        .opacity(
+                            if self.capabilities().computer || self.capabilities().shell {
+                                1.0
+                            } else {
+                                0.35
+                            },
+                        )
                         .child(
                             icon(icons::REFRESH)
                                 .size(px(13.0))
@@ -2755,6 +3007,10 @@ impl CloudRail {
                         .object_fit(gpui::ObjectFit::Contain),
                 )
                 .into_any_element(),
+            Loadable::Ready(None) if self.vm_info.is_some() => render_vm_screen(
+                theme,
+                self.vm_info.as_ref().unwrap_or(&serde_json::Value::Null),
+            ),
             Loadable::Ready(None) => {
                 let keeps = self.capabilities().keeps_running;
                 pane_empty(
@@ -3172,9 +3428,9 @@ impl CloudRail {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .h(px(30.0))
-            .px(px(10.0))
-            .border_t_1()
+            .h(px(36.0))
+            .px(px(12.0))
+            .border_b_1()
             .border_color(theme.border)
             .child(status_dot(theme, probe.as_ref()))
             .child(

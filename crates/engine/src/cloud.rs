@@ -2605,6 +2605,20 @@ impl<'a> GitHub<'a> {
     }
 
     /// `GET /user` — the PAT verify ping (save-only-on-success rule).
+    /// `GET /user` → the account login.
+    pub async fn login(&self) -> Result<String, String> {
+        let resp = self
+            .get("/user")
+            .send()
+            .await
+            .map_err(|e| format!("github: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(Self::error(resp).await);
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(v["login"].as_str().unwrap_or_default().to_string())
+    }
+
     pub async fn viewer(&self) -> Result<String, String> {
         let resp = self
             .get("/user")
@@ -3360,5 +3374,225 @@ mod tests {
         assert!(store.claim_due(now).is_empty());
         let automation = store.automations().remove(0);
         assert!(automation.next_run_at.unwrap() > now);
+    }
+}
+
+/// The Woozlit GitHub App's public OAuth client id — device flow needs no
+/// client secret, so nothing sensitive ships in the app.
+pub const WOOZLIT_GITHUB_CLIENT_ID: &str = "Iv23liaAoveu04WztVtq";
+
+/// Where a user installs the Woozlit GitHub App on their repos.
+pub const WOOZLIT_GITHUB_INSTALL_URL: &str = "https://github.com/apps/woozlit/installations/new";
+
+#[derive(Debug)]
+pub enum DevicePoll {
+    /// `authorization_pending` or `slow_down`.
+    Pending(String),
+    Token(String),
+}
+
+/// Start GitHub's device flow for the Woozlit app.
+pub async fn github_device_start(http: &reqwest::Client) -> Result<serde_json::Value, String> {
+    let resp = http
+        .post("https://github.com/login/device/code")
+        .header("Accept", "application/json")
+        .form(&[("client_id", WOOZLIT_GITHUB_CLIENT_ID)])
+        .send()
+        .await
+        .map_err(|e| format!("github: {e}"))?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| format!("github: {e}"))?;
+    device_error(&v)?;
+    let field = |k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
+    Ok(serde_json::json!({
+        "deviceCode": field("device_code"),
+        "userCode": field("user_code"),
+        "verificationUri": field("verification_uri"),
+        "interval": v.get("interval").and_then(|i| i.as_u64()).unwrap_or(5),
+        "expiresIn": v.get("expires_in").and_then(|i| i.as_u64()).unwrap_or(900),
+    }))
+}
+
+/// One device-flow token poll.
+pub async fn github_device_poll(
+    http: &reqwest::Client,
+    device_code: &str,
+) -> Result<DevicePoll, String> {
+    let resp = http
+        .post("https://github.com/login/oauth/access_token")
+        .header("Accept", "application/json")
+        .form(&[
+            ("client_id", WOOZLIT_GITHUB_CLIENT_ID),
+            ("device_code", device_code),
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("github: {e}"))?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| format!("github: {e}"))?;
+    parse_device_poll(&v)
+}
+
+fn parse_device_poll(v: &serde_json::Value) -> Result<DevicePoll, String> {
+    if let Some(token) = v.get("access_token").and_then(|t| t.as_str()) {
+        return Ok(DevicePoll::Token(token.to_string()));
+    }
+    match v.get("error").and_then(|e| e.as_str()) {
+        Some(code @ ("authorization_pending" | "slow_down")) => {
+            Ok(DevicePoll::Pending(code.to_string()))
+        }
+        _ => device_error(v).map(|_| DevicePoll::Pending("authorization_pending".into())),
+    }
+}
+
+fn device_error(v: &serde_json::Value) -> Result<(), String> {
+    let Some(code) = v.get("error").and_then(|e| e.as_str()) else {
+        return Ok(());
+    };
+    Err(match code {
+        "expired_token" => "The GitHub code expired — start again".into(),
+        "access_denied" => "GitHub access was denied".into(),
+        "device_flow_disabled" => {
+            "Device flow is off for the Woozlit GitHub App — enable it in the app settings".into()
+        }
+        _ => v
+            .get("error_description")
+            .and_then(|d| d.as_str())
+            .unwrap_or(code)
+            .to_string(),
+    })
+}
+
+#[cfg(test)]
+mod device_flow_tests {
+    use super::*;
+
+    #[test]
+    fn device_poll_states() {
+        let pending = serde_json::json!({"error": "authorization_pending"});
+        assert!(
+            matches!(parse_device_poll(&pending), Ok(DevicePoll::Pending(s)) if s == "authorization_pending")
+        );
+        let done = serde_json::json!({"access_token": "ghu_x", "token_type": "bearer"});
+        assert!(matches!(parse_device_poll(&done), Ok(DevicePoll::Token(t)) if t == "ghu_x"));
+        let disabled = serde_json::json!({"error": "device_flow_disabled"});
+        assert!(
+            parse_device_poll(&disabled)
+                .unwrap_err()
+                .contains("Device flow is off")
+        );
+    }
+}
+
+/// Captures the seat's X display when one is running, otherwise a live
+/// system snapshot — Railway, Boat and VPS seats are headless Linux boxes.
+const LINUX_SCREEN_SCRIPT: &str = r#"
+d=""
+for s in /tmp/.X11-unix/X*; do [ -e "$s" ] && d=":${s##*/X}" && break; done
+if [ -n "$d" ]; then
+  f="/tmp/cosmos-screen-$$.png"
+  if command -v import >/dev/null 2>&1; then DISPLAY=$d import -window root "$f" >/dev/null 2>&1
+  elif command -v scrot >/dev/null 2>&1; then DISPLAY=$d scrot -o "$f" >/dev/null 2>&1
+  fi
+  if [ -s "$f" ]; then echo "__PNG__"; base64 "$f" | tr -d '\n'; echo; rm -f "$f"; exit 0; fi
+  rm -f "$f"
+fi
+echo "__SYS__"
+[ -r /etc/os-release ] && . /etc/os-release
+echo "os=${PRETTY_NAME:-$(uname -s)}"
+echo "kernel=$(uname -r)"
+echo "arch=$(uname -m)"
+echo "host=$(hostname 2>/dev/null || cat /etc/hostname)"
+echo "user=$(id -un 2>/dev/null)"
+echo "cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)"
+echo "uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)"
+echo "load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)"
+awk '/^MemTotal:/{print "mem_total_kb="$2} /^MemAvailable:/{print "mem_avail_kb="$2}' /proc/meminfo 2>/dev/null
+df -Pk / 2>/dev/null | awk 'NR==2{print "disk_total_kb="$2; print "disk_used_kb="$3}'
+echo "display=$d"
+echo "__PROCS__"
+ps -eo pid=,pcpu=,pmem=,comm= --sort=-pcpu 2>/dev/null | head -8
+"#;
+
+pub async fn linux_screen(
+    http: &reqwest::Client,
+    store: &CloudStore,
+    seat: &SeatConfig,
+) -> Result<serde_json::Value, String> {
+    let out = seat_exec(
+        http,
+        store,
+        seat,
+        LINUX_SCREEN_SCRIPT,
+        Duration::from_secs(20),
+    )
+    .await?;
+    parse_linux_screen(&crate::railway::redact_trial_banner(&out.stdout)).ok_or_else(|| {
+        let err = crate::railway::redact_trial_banner(out.stderr.trim());
+        if err.is_empty() {
+            "couldn't reach the seat — it may be stopped or still starting".to_string()
+        } else {
+            err
+        }
+    })
+}
+
+fn parse_linux_screen(stdout: &str) -> Option<serde_json::Value> {
+    let mut lines = stdout.lines().skip_while(|l| {
+        let l = l.trim();
+        l != "__PNG__" && l != "__SYS__"
+    });
+    match lines.next()?.trim() {
+        "__PNG__" => {
+            let png = lines.next()?.trim();
+            (!png.is_empty()).then(|| serde_json::json!({ "pngBase64": png }))
+        }
+        _ => {
+            let mut system = serde_json::Map::new();
+            let mut procs = Vec::new();
+            let mut in_procs = false;
+            for line in lines {
+                if line.trim() == "__PROCS__" {
+                    in_procs = true;
+                    continue;
+                }
+                if in_procs {
+                    let cols: Vec<&str> = line.split_whitespace().collect();
+                    if cols.len() >= 4 {
+                        procs.push(serde_json::json!({
+                            "pid": cols[0],
+                            "cpu": cols[1],
+                            "mem": cols[2],
+                            "name": cols[3..].join(" "),
+                        }));
+                    }
+                } else if let Some((k, v)) = line.split_once('=') {
+                    system.insert(
+                        k.trim().to_string(),
+                        serde_json::Value::String(v.trim().to_string()),
+                    );
+                }
+            }
+            system.insert("procs".into(), serde_json::Value::Array(procs));
+            Some(serde_json::json!({ "system": system }))
+        }
+    }
+}
+
+#[cfg(test)]
+mod linux_screen_tests {
+    use super::*;
+
+    #[test]
+    fn parses_system_snapshot() {
+        let out = "noise\n__SYS__\nos=Ubuntu 24.04 LTS\ncpus=2\nmem_total_kb=2048000\n__PROCS__\n  1  0.5  1.0 node\n 22 12.0  3.1 opencode run\n";
+        let v = parse_linux_screen(out).unwrap();
+        assert_eq!(v["system"]["os"], "Ubuntu 24.04 LTS");
+        assert_eq!(v["system"]["procs"][1]["name"], "opencode run");
+    }
+
+    #[test]
+    fn parses_png_capture() {
+        let v = parse_linux_screen("__PNG__\niVBORw0K\n").unwrap();
+        assert_eq!(v["pngBase64"], "iVBORw0K");
     }
 }

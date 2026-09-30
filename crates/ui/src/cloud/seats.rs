@@ -64,6 +64,11 @@ impl SeatForm {
     }
 }
 
+struct GitHubDevice {
+    user_code: String,
+    verification_uri: String,
+}
+
 pub struct CloudSeatsPage {
     state: Entity<AppState>,
     scroll: widgets::PageScroll,
@@ -87,6 +92,11 @@ pub struct CloudSeatsPage {
     /// `pick_repo` writes the field programmatically — suppress the search
     /// that write would otherwise trigger.
     suppress_repo_edit: bool,
+    /// The Woozlit GitHub App device flow while it waits on the user.
+    gh_device: Option<GitHubDevice>,
+    gh_login: Option<String>,
+    gh_task: Option<Task<()>>,
+    show_pat: bool,
     probing: Option<String>,
     error: Option<String>,
     note: Option<String>,
@@ -127,6 +137,10 @@ impl CloudSeatsPage {
             repo_orgs_error: None,
             repo_search_gen: 0,
             suppress_repo_edit: false,
+            gh_device: None,
+            gh_login: None,
+            gh_task: None,
+            show_pat: false,
             probing: None,
             error: None,
             note: None,
@@ -403,6 +417,140 @@ impl CloudSeatsPage {
                 cx.notify();
             })
             .ok();
+        }));
+    }
+
+    /// Connect GitHub through the Woozlit GitHub App (device flow): show the
+    /// one-time code, open GitHub, then poll until the user approves.
+    fn connect_github(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.error = None;
+        self.note = None;
+        self.gh_task = Some(cx.spawn(async move |this, cx| {
+            let start = engine
+                .client()
+                .call(methods::CLOUD_GITHUB_DEVICE_START, serde_json::json!({}))
+                .await;
+            let start = match start {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = this.update(cx, |page, cx| {
+                        page.error = Some(err.to_string());
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let text = |k: &str| {
+                start
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let device_code = text("deviceCode");
+            let user_code = text("userCode");
+            let uri = text("verificationUri");
+            let mut interval = start
+                .get("interval")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5)
+                .max(1);
+            let expires = start
+                .get("expiresIn")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(900);
+            let _ = this.update(cx, |page, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(user_code.clone()));
+                cx.open_url(&uri);
+                page.gh_device = Some(GitHubDevice {
+                    user_code: user_code.clone(),
+                    verification_uri: uri.clone(),
+                });
+                cx.notify();
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires);
+            while std::time::Instant::now() < deadline {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(interval))
+                    .await;
+                let poll = engine
+                    .client()
+                    .call(
+                        methods::CLOUD_GITHUB_DEVICE_POLL,
+                        serde_json::json!({ "deviceCode": device_code }),
+                    )
+                    .await;
+                let status = match &poll {
+                    Ok(v) => v
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    Err(_) => String::new(),
+                };
+                if status == "slow_down" {
+                    interval += 5;
+                    continue;
+                }
+                if status == "authorization_pending" {
+                    continue;
+                }
+                let _ = this.update(cx, |page, cx| {
+                    page.gh_device = None;
+                    match poll {
+                        Ok(v) => {
+                            let login = v
+                                .get("login")
+                                .and_then(|l| l.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            page.note = Some(format!("GitHub connected as {login}."));
+                            page.gh_login = Some(login);
+                        }
+                        Err(err) => page.error = Some(err.to_string()),
+                    }
+                    page.load(cx);
+                    page.state
+                        .update(cx, |state, cx| state.refresh_cloud(None, cx));
+                    cx.notify();
+                });
+                return;
+            }
+            let _ = this.update(cx, |page, cx| {
+                page.gh_device = None;
+                page.error = Some("The GitHub code expired — connect again".into());
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn disconnect_github(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.gh_device = None;
+        self.gh_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::CLOUD_GITHUB_DISCONNECT, serde_json::json!({}))
+                .await;
+            let _ = this.update(cx, |page, cx| {
+                match result {
+                    Ok(_) => {
+                        page.gh_login = None;
+                        page.note = Some("GitHub disconnected.".into());
+                    }
+                    Err(err) => page.error = Some(err.to_string()),
+                }
+                page.load(cx);
+                page.state
+                    .update(cx, |state, cx| state.refresh_cloud(None, cx));
+                cx.notify();
+            });
         }));
     }
 
@@ -733,9 +881,11 @@ impl CloudSeatsPage {
                         .child(popover::dialog_field(
                             self.form.branch.clone().into_any_element(),
                         ))
-                        .child(popover::dialog_field(
-                            self.form.github_pat.clone().into_any_element(),
-                        ));
+                        .when(self.show_pat, |el| {
+                            el.child(popover::dialog_field(
+                                self.form.github_pat.clone().into_any_element(),
+                            ))
+                        });
                     // Repo picker — debounced hits (or recents on open) under
                     // the field; a click writes `owner/name` + branch.
                     if !self.repo_hits.is_empty() {
@@ -1003,7 +1153,7 @@ impl Render for CloudSeatsPage {
                 widgets::page_subtitle(
                     &theme,
                     "Seats Cosmos attaches to and drives — Cosmos does not host the VM. A Box \
-                     token, an SSH alias to a Linux Docker host, or a GitHub repo + PAT each \
+                     token, an SSH alias to a Linux Docker host, or a connected GitHub repo each \
                      give an agent somewhere to run; SSH keys stay in your agent, tokens stay \
                      in this device's keys file.",
                 )
@@ -1060,10 +1210,57 @@ impl Render for CloudSeatsPage {
             column = column.child(widgets::error_strip(&theme, error.clone()));
         }
 
-        // The shared GitHub PAT — the repo picker's token and the fallback
-        // every GitHub seat without its own PAT rides on.
+        // GitHub via the Woozlit GitHub App — powers the repo picker and
+        // every GitHub seat without its own token.
         let has_pat = self.view.ready().map(|v| v.has_github_pat).unwrap_or(false);
+        let waiting = self.gh_device.as_ref();
+        let status: SharedString = if let Some(device) = waiting {
+            format!(
+                "Enter {} on GitHub to finish — copied to your clipboard.",
+                device.user_code
+            )
+            .into()
+        } else if has_pat {
+            match self.gh_login.as_deref().filter(|l| !l.is_empty()) {
+                Some(login) => {
+                    format!("Connected as {login} — repos, pull requests and GitHub seats use it.")
+                        .into()
+                }
+                None => "Connected — repos, pull requests and GitHub seats use it.".into(),
+            }
+        } else {
+            "Connect your GitHub account through Woozlit to pick repos and open pull requests."
+                .into()
+        };
         let mut pat_card = widgets::section_card(&theme);
+        let mut actions = div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0));
+        if let Some(device) = waiting {
+            let uri = device.verification_uri.clone();
+            actions = actions
+                .child(widgets::badge(&theme, device.user_code.clone()))
+                .child(
+                    popover::btn_ghost(&theme, "Open GitHub", "gh-open")
+                        .id("gh-open")
+                        .on_click(move |_, _, cx| cx.open_url(&uri)),
+                );
+        } else if has_pat {
+            actions = actions.child(
+                popover::btn_ghost(&theme, "Disconnect", "gh-disconnect")
+                    .id("gh-disconnect")
+                    .on_click(cx.listener(|this, _, _, cx| this.disconnect_github(cx))),
+            );
+        } else {
+            actions = actions.child(
+                popover::btn_primary(&theme, "Connect GitHub")
+                    .id("gh-connect")
+                    .on_click(cx.listener(|this, _, _, cx| this.connect_github(cx))),
+            );
+        }
         pat_card = pat_card.child(
             widgets::card_row(&theme, true)
                 .child(widgets::row_tile(&theme, icons::GIT_BRANCH))
@@ -1074,21 +1271,15 @@ impl Render for CloudSeatsPage {
                         .flex()
                         .flex_col()
                         .gap(px(2.0))
-                        .child(widgets::row_title(&theme, "GitHub token (shared)"))
+                        .child(widgets::row_title(&theme, "GitHub"))
                         .child(
                             div()
                                 .text_size(crate::typography::ui_rems(11.5))
                                 .text_color(theme.text_muted)
-                                .child(if has_pat {
-                                    "Saved — repo picker and PAT-less seats use it."
-                                } else {
-                                    "Powers the repo picker and any GitHub seat without its own PAT. Verified before saving."
-                                }),
+                                .child(status),
                         ),
                 )
-                .child(
-                    widgets::badge(&theme, if has_pat { "saved" } else { "none" })
-                ),
+                .child(actions),
         );
         pat_card = pat_card.child(
             div()
@@ -1096,17 +1287,55 @@ impl Render for CloudSeatsPage {
                 .pb(px(12.0))
                 .flex()
                 .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .child(div().flex_1().child(popover::dialog_field(
-                    self.shared_pat.clone().into_any_element(),
-                )))
+                .gap(px(12.0))
+                .text_size(crate::typography::ui_rems(11.5))
                 .child(
-                    popover::btn_primary(&theme, "Verify & save")
-                        .id("pat-save")
-                        .on_click(cx.listener(|this, _, _, cx| this.save_shared_pat(cx))),
+                    div()
+                        .id("gh-install")
+                        .cursor_pointer()
+                        .text_color(theme.text_muted)
+                        .hover(|s| s.text_color(theme.text))
+                        .child("Choose repositories")
+                        .on_click(|_, _, cx| {
+                            cx.open_url("https://github.com/apps/woozlit/installations/new")
+                        }),
+                )
+                .child(
+                    div()
+                        .id("gh-pat-toggle")
+                        .cursor_pointer()
+                        .text_color(theme.text_muted)
+                        .hover(|s| s.text_color(theme.text))
+                        .child(if self.show_pat {
+                            "Hide token option"
+                        } else {
+                            "Use a token instead"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_pat = !this.show_pat;
+                            cx.notify();
+                        })),
                 ),
         );
+        if self.show_pat {
+            pat_card = pat_card.child(
+                div()
+                    .px(px(20.0))
+                    .pb(px(12.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(div().flex_1().child(popover::dialog_field(
+                        self.shared_pat.clone().into_any_element(),
+                    )))
+                    .child(
+                        popover::btn_primary(&theme, "Verify & save")
+                            .id("pat-save")
+                            .on_click(cx.listener(|this, _, _, cx| this.save_shared_pat(cx))),
+                    ),
+            );
+        }
         column = column.child(pat_card);
 
         div()
