@@ -2551,6 +2551,85 @@ async fn drive_boat_run(
     }
 }
 
+#[derive(Default)]
+struct AnsiStripper {
+    state: AnsiState,
+}
+
+#[derive(Default, Clone, Copy)]
+enum AnsiState {
+    #[default]
+    Text,
+    Escape,
+    Csi,
+    Osc,
+    OscEscape,
+}
+
+impl AnsiStripper {
+    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut text = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            match self.state {
+                AnsiState::Text if byte == 0x1b => self.state = AnsiState::Escape,
+                AnsiState::Text => text.push(byte),
+                AnsiState::Escape => {
+                    self.state = match byte {
+                        b'[' => AnsiState::Csi,
+                        b']' => AnsiState::Osc,
+                        _ => {
+                            text.extend_from_slice(&[0x1b, byte]);
+                            AnsiState::Text
+                        }
+                    };
+                }
+                AnsiState::Csi if (0x40..=0x7e).contains(&byte) => {
+                    self.state = AnsiState::Text;
+                }
+                AnsiState::Csi => {}
+                AnsiState::Osc if byte == 0x07 => self.state = AnsiState::Text,
+                AnsiState::Osc if byte == 0x1b => self.state = AnsiState::OscEscape,
+                AnsiState::Osc => {}
+                AnsiState::OscEscape if byte == b'\\' => self.state = AnsiState::Text,
+                AnsiState::OscEscape if byte == 0x07 => self.state = AnsiState::Text,
+                AnsiState::OscEscape if byte == 0x1b => {}
+                AnsiState::OscEscape => self.state = AnsiState::Osc,
+            }
+        }
+        text
+    }
+}
+
+fn parse_remote_tail_output(
+    run_id: &str,
+    stdout: &str,
+) -> Result<(Vec<u8>, bool, Option<i32>), String> {
+    use base64::Engine as _;
+
+    let begin = format!("__cosmos_tail_begin_{run_id}__\n");
+    let end = format!("\n__cosmos_tail_end_{run_id}__");
+    let (_, framed) = stdout
+        .split_once(&begin)
+        .ok_or_else(|| "remote log response has no start marker".to_string())?;
+    let (encoded, metadata) = framed
+        .split_once(&end)
+        .ok_or_else(|| "remote log response has no end marker".to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|err| format!("invalid remote log frame: {err}"))?;
+
+    let mut alive = false;
+    let mut remote_exit = None;
+    for line in metadata.lines() {
+        if let Some(flag) = line.strip_prefix("__alive_") {
+            alive = flag.trim() == "0";
+        } else if let Some(status) = line.strip_prefix("__exit_") {
+            remote_exit = status.trim().parse::<i32>().ok();
+        }
+    }
+    Ok((bytes, alive, remote_exit))
+}
+
 /// Tail a detached run's log on the seat, mirroring new bytes into the doc
 /// until the remote process exits (or the caller cancels).
 async fn tail_remote_log(
@@ -2568,6 +2647,7 @@ async fn tail_remote_log(
     let mut segment: Option<zeron_doc::SegmentWriter> = None;
     let mut mirrored: u64 = 0;
     let mut text = String::new();
+    let mut ansi = AnsiStripper::default();
     let mut ssh_255_streak = 0u8;
     loop {
         if *cancel_rx.borrow() {
@@ -2589,10 +2669,10 @@ async fn tail_remote_log(
             lock(&inner.runs).remove(chat_id);
             return;
         }
-        // `tail -c +N` streams from byte N; the exit marker preserves the
-        // remote command's status after the detached shell has exited.
+        // Base64 frames the log bytes separately from metadata so neither
+        // framing newlines nor line-ending normalization can move the cursor.
         let cmd = format!(
-            "tail -c +{} -- \"{log_path}\" 2>/dev/null | head -c 262144; printf '\\n'; if [ -f \"$HOME/.cosmos/runs/{run_id}.exit\" ]; then printf '__exit_%s\\n' \"$(cat \"$HOME/.cosmos/runs/{run_id}.exit\")\"; else kill -0 \"$(cat \"$HOME/.cosmos/runs/{run_id}.pid\" 2>/dev/null)\" 2>/dev/null; echo __alive_$?; fi",
+            "printf '__cosmos_tail_begin_{run_id}__\\n'; tail -c +{} -- \"{log_path}\" 2>/dev/null | head -c 262144 | base64 | tr -d '\\n'; printf '\\n__cosmos_tail_end_{run_id}__\\n'; if [ -f \"$HOME/.cosmos/runs/{run_id}.exit\" ]; then printf '__exit_%s\\n' \"$(cat \"$HOME/.cosmos/runs/{run_id}.exit\")\"; else kill -0 \"$(cat \"$HOME/.cosmos/runs/{run_id}.pid\" 2>/dev/null)\" 2>/dev/null; echo __alive_$?; fi",
             mirrored + 1,
         );
         match crate::cloud::seat_exec(http, store, seat, &cmd, std::time::Duration::from_secs(20))
@@ -2611,22 +2691,18 @@ async fn tail_remote_log(
                     terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, &text);
                     return;
                 }
-                let mut alive = false;
-                let mut remote_exit = None;
-                let mut chunk = String::new();
-                for line in out.stdout.lines() {
-                    if let Some(flag) = line.strip_prefix("__alive_") {
-                        alive = flag.trim() == "0";
-                    } else if let Some(status) = line.strip_prefix("__exit_") {
-                        remote_exit = status.trim().parse::<i32>().ok();
-                    } else {
-                        chunk.push_str(line);
-                        chunk.push('\n');
-                    }
-                }
-                if !chunk.trim().is_empty() {
-                    text.push_str(&chunk);
+                let (chunk, alive, remote_exit) =
+                    match parse_remote_tail_output(run_id, &out.stdout) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            tracing::warn!(run_id, %error, "failed to parse remote log tail");
+                            (Vec::new(), false, None)
+                        }
+                    };
+                if !chunk.is_empty() {
                     mirrored += chunk.len() as u64;
+                    let clean = ansi.push(&chunk);
+                    text.push_str(&String::from_utf8_lossy(&clean));
                     if segment.is_none() {
                         segment = zeron_doc::SegmentWriter::begin(
                             doc,
@@ -3872,6 +3948,57 @@ async fn drive_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remote_tail_frame(run_id: &str, bytes: &[u8], metadata: &str) -> String {
+        use base64::Engine as _;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        format!(
+            "__cosmos_tail_begin_{run_id}__\n{encoded}\n__cosmos_tail_end_{run_id}__\n{metadata}\n"
+        )
+    }
+
+    #[test]
+    fn remote_log_ansi_stripper_removes_csi_and_osc_sequences() {
+        let mut stripper = AnsiStripper::default();
+        assert_eq!(
+            stripper.push(b"\x1b[0mWrite hello.txt\x1b]0;remote title\x07!"),
+            b"Write hello.txt!"
+        );
+    }
+
+    #[test]
+    fn remote_log_ansi_stripper_handles_sequences_split_across_chunks() {
+        let mut stripper = AnsiStripper::default();
+        assert_eq!(stripper.push(b"\x1b[0"), b"");
+        assert_eq!(stripper.push(b"mHello\x1b]0;title\x1b"), b"Hello");
+        assert_eq!(stripper.push(b"\\!"), b"!");
+    }
+
+    #[test]
+    fn remote_tail_offset_preserves_first_character_after_partial_poll() {
+        let run_id = "offset-test";
+        let first_chunk = b"\x1b[0mworking";
+        let first_stdout = remote_tail_frame(run_id, first_chunk, "__alive_0");
+        let (decoded, alive, exit) = parse_remote_tail_output(run_id, &first_stdout).unwrap();
+        assert_eq!(decoded, first_chunk);
+        assert!(alive);
+        assert_eq!(exit, None);
+
+        let old_reconstructed_offset = String::from_utf8_lossy(first_chunk)
+            .lines()
+            .map(|line| line.len() + 1)
+            .sum::<usize>();
+        let appended = b"Hello!";
+        let mut full_log = first_chunk.to_vec();
+        full_log.extend_from_slice(appended);
+        assert_eq!(&full_log[old_reconstructed_offset..], b"ello!");
+
+        let next_stdout = remote_tail_frame(run_id, &full_log[decoded.len()..], "__exit_0");
+        let (next, _, exit) = parse_remote_tail_output(run_id, &next_stdout).unwrap();
+        assert_eq!(next, appended);
+        assert_eq!(exit, Some(0));
+    }
 
     #[test]
     fn cursor_recovery_converts_rich_messages_before_json_encoding() {

@@ -8070,6 +8070,33 @@ impl Shell {
         )
     }
 
+    fn ensure_cloud_seat_pick(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            let seats = state.cloud_seats().to_vec();
+            let view_loaded = state.cloud_view().is_some();
+            let picked_id = state
+                .cloud_seat_pick
+                .as_ref()
+                .map(|seat| seat.config.id.clone());
+            let picked = picked_id
+                .as_ref()
+                .and_then(|id| seats.iter().find(|seat| seat.config.id == *id))
+                .cloned();
+
+            if let Some(picked) = picked {
+                state.cloud_seat_pick = Some(picked);
+            } else if (picked_id.is_none() || view_loaded)
+                && let Some(seat) = seats
+                    .iter()
+                    .find(|seat| crate::cloud::CloudView::seat_ready(seat))
+                    .cloned()
+            {
+                state.cloud_seat_pick = Some(seat);
+            }
+            state.refresh_cloud(Some(Duration::from_secs(10)), cx);
+        });
+    }
+
     fn set_cloud_mode(&mut self, cloud_mode: bool, cx: &mut Context<Self>) {
         if self.state.read(cx).cloud_mode != cloud_mode {
             self.composer
@@ -8077,26 +8104,12 @@ impl Shell {
         }
         self.state.update(cx, |state, _| {
             state.cloud_mode = cloud_mode;
-            if !cloud_mode {
-                state.cloud_seat_pick = None;
-            }
         });
         settings::update(SavePolicy::Debounced, cx, |settings| {
             settings.cloud_mode = cloud_mode;
         });
         if cloud_mode {
-            self.state.update(cx, |state, cx| {
-                if state.cloud_seat_pick.is_none()
-                    && let Some(seat) = state
-                        .cloud_seats()
-                        .iter()
-                        .find(|seat| crate::cloud::CloudView::seat_ready(seat))
-                        .cloned()
-                {
-                    state.cloud_seat_pick = Some(seat);
-                }
-                state.refresh_cloud(Some(Duration::from_secs(10)), cx);
-            });
+            self.ensure_cloud_seat_pick(cx);
         }
         cx.notify();
     }
@@ -8417,19 +8430,20 @@ impl Shell {
     }
 
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        if self.state.read(cx).cloud_mode && self.state.read(cx).cloud_seat_pick.is_none() {
-            self.state.update(cx, |state, cx| {
-                if state.cloud_seat_pick.is_none()
-                    && let Some(seat) = state
-                        .cloud_seats()
-                        .iter()
-                        .find(|seat| crate::cloud::CloudView::seat_ready(seat))
-                        .cloned()
-                {
-                    state.cloud_seat_pick = Some(seat);
-                }
-                state.refresh_cloud(Some(Duration::from_secs(10)), cx);
-            });
+        let needs_cloud_seat_pick = {
+            let state = self.state.read(cx);
+            state.cloud_mode
+                && state.cloud_seat_pick.as_ref().is_none_or(|picked| {
+                    state.cloud_view().is_some_and(|view| {
+                        !view
+                            .seats
+                            .iter()
+                            .any(|seat| seat.config.id == picked.config.id)
+                    })
+                })
+        };
+        if needs_cloud_seat_pick {
+            self.ensure_cloud_seat_pick(cx);
         }
         if self.sidebar_session_transfer.as_ref().is_some_and(|drag| {
             !cx.has_active_drag() || !self.sidebar_session_transfer_is_valid(&drag.payload, cx)
@@ -9749,6 +9763,15 @@ impl Shell {
         self.diffs.get(&id).cloned()
     }
 
+    fn close_cloud_rail_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        self.cloud_rails
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .any(|rail| rail.update(cx, |rail, cx| rail.close_pane_menu(cx)))
+    }
+
     /// Resolve shell-owned Escape surfaces in capture phase, before focused
     /// descendants such as an integrated terminal can consume the key.
     fn capture_escape_surface(&mut self, cx: &mut Context<Self>) -> bool {
@@ -9762,6 +9785,9 @@ impl Shell {
             || self.space_menu.get().is_some()
             || self.user_menu.get().is_some()
         {
+            return true;
+        }
+        if self.close_cloud_rail_menu(cx) {
             return true;
         }
         if self.rename_dialog.is_some() {

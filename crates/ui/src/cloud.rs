@@ -10,8 +10,9 @@
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, prelude::*, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div, prelude::*,
+    px,
 };
 use serde::Deserialize;
 use zeron_engine::cloud::{PrDetail, PrFile, PrRow, RemoteEntry, SeatConfig};
@@ -311,7 +312,7 @@ pub struct CloudRail {
     /// BYOK label for the model chip (the engine view's cloud default).
     model_label: Option<SharedString>,
     /// The pane "+" menu and the destroy confirmation live on the rail chrome.
-    pane_menu_open: bool,
+    pane_menu: popover::Popup<()>,
     confirm_destroy: bool,
     control_busy: bool,
     control_error: Option<String>,
@@ -328,6 +329,22 @@ pub struct CloudRail {
     /// Railway countdown ticker — 1s re-render while a deadline is live.
     _countdown: Option<Task<()>>,
     _refresh: Option<Task<()>>,
+}
+
+fn cloud_run_finished(previous: Option<&CloudRun>, next: &CloudRun) -> bool {
+    matches!(
+        next.status,
+        CloudRunStatus::Done | CloudRunStatus::Error | CloudRunStatus::Stopped
+    ) && previous.is_none_or(|previous| {
+        previous.id != next.id
+            || matches!(
+                previous.status,
+                CloudRunStatus::Queued
+                    | CloudRunStatus::Working
+                    | CloudRunStatus::WaitingForUser
+                    | CloudRunStatus::NeedsApproval
+            )
+    })
 }
 
 impl CloudRail {
@@ -385,7 +402,7 @@ impl CloudRail {
             shot: Loadable::Idle,
             run: None,
             model_label: None,
-            pane_menu_open: false,
+            pane_menu: popover::Popup::default(),
             confirm_destroy: false,
             control_busy: false,
             control_error: None,
@@ -461,7 +478,12 @@ impl CloudRail {
     /// The pane's first load — seat row, then whatever the pane shows.
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
         match self.pane {
-            CloudPane::Files if matches!(self.listing, Loadable::Idle) => self.load_files(cx),
+            CloudPane::Files
+                if matches!(self.listing, Loadable::Idle)
+                    || self.listing.ready().is_some_and(Vec::is_empty) =>
+            {
+                self.load_files(cx)
+            }
             CloudPane::Changes if matches!(self.status, Loadable::Idle) => self.load_changes(cx),
             CloudPane::PullRequests if matches!(self.prs, Loadable::Idle) => self.load_prs(cx),
             CloudPane::Computer if matches!(self.shot, Loadable::Idle) => self.capture_shot(cx),
@@ -482,13 +504,15 @@ impl CloudRail {
                 .call(methods::CLOUD_GET_CONFIG, serde_json::json!({}))
                 .await;
             this.update(cx, |rail, cx| {
+                let mut run_finished = false;
                 rail.seat = match result {
                     Ok(value) => match serde_json::from_value::<CloudView>(value) {
                         Ok(view) => {
-                            rail.run = view
-                                .run_for_chat(&rail.chat_id)
-                                .cloned()
-                                .or(rail.run.take());
+                            let run = view.run_for_chat(&rail.chat_id).cloned();
+                            run_finished = run
+                                .as_ref()
+                                .is_some_and(|next| cloud_run_finished(rail.run.as_ref(), next));
+                            rail.run = run.or_else(|| rail.run.take());
                             rail.model_label = Some(view.cloud_model_label());
                             match view.seat(&seat_id) {
                                 Some(row) => Loadable::Ready(row.clone()),
@@ -501,6 +525,11 @@ impl CloudRail {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
+                if run_finished
+                    || (rail.pane == CloudPane::Files && matches!(rail.listing, Loadable::Idle))
+                {
+                    rail.load_files(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -511,13 +540,23 @@ impl CloudRail {
     /// pane at a time" rule.
     pub fn set_pane(&mut self, pane: CloudPane, cx: &mut Context<Self>) {
         if self.pane == pane {
-            self.pane_menu_open = false;
+            self.close_pane_menu(cx);
+            self.ensure_loaded(cx);
             return;
         }
         self.pane = pane;
-        self.pane_menu_open = false;
+        self.close_pane_menu(cx);
         self.ensure_loaded(cx);
         cx.notify();
+    }
+
+    pub(crate) fn close_pane_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        let mounted = self.pane_menu.get().is_some();
+        if self.pane_menu.begin_close() {
+            popover::reap_popup(cx, |rail: &mut Self| &mut rail.pane_menu);
+            cx.notify();
+        }
+        mounted
     }
 
     /// Bot-bar control: stop / pause / resume / approve / destroy. The
@@ -588,6 +627,9 @@ impl CloudRail {
             self.listing = Loadable::Error("Engine not connected".into());
             return;
         };
+        if self.seat.ready().is_none() {
+            return;
+        }
         if !self.capabilities().files {
             self.listing = Loadable::Ready(Vec::new());
             return;
@@ -2827,11 +2869,10 @@ impl CloudRail {
     /// that opens the existing side-chat surface in the shell's pane host.
     fn render_pane_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let caps = self.capabilities();
-        let mut menu = popover::popover_card_opaque(&theme.for_popup())
-            .absolute()
-            .top(px(30.0))
-            .left(px(8.0))
-            .w(px(200.0));
+        let mut menu = popover::popover_card_opaque(&theme.for_popup()).w(px(200.0));
+        menu = menu.on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            this.close_pane_menu(cx);
+        }));
         for pane in CloudPane::ALL {
             let disabled = match pane {
                 CloudPane::Simulator => !caps.simulator,
@@ -2897,7 +2938,7 @@ impl CloudRail {
                 )
                 .child(div().flex_1().min_w_0().truncate().child("Side chat"))
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.pane_menu_open = false;
+                    this.close_pane_menu(cx);
                     cx.emit(RailEvent::OpenSideChat);
                 })),
         );
@@ -3085,7 +3126,7 @@ impl Render for CloudRail {
             CloudPane::Tasks => self.render_tasks(&theme, cx),
         };
         // The + button top-left opens the pane menu — the screenshot's IA.
-        let plus = div()
+        let mut plus = div()
             .id("rail-plus")
             .size(px(20.0))
             .flex_none()
@@ -3100,12 +3141,27 @@ impl Render for CloudRail {
                 theme.element_hover,
             ))
             .on_hover(crate::motion::hover_listener("rail-plus"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.pane_menu.note_trigger_press()),
+            )
             .cursor_pointer()
             .child("+")
             .on_click(cx.listener(|this, _, _, cx| {
-                this.pane_menu_open = !this.pane_menu_open;
-                cx.notify();
+                if this.pane_menu.take_press_was_open() {
+                    this.close_pane_menu(cx);
+                } else {
+                    this.pane_menu.open(());
+                    cx.notify();
+                }
             }));
+        if self.pane_menu.get().is_some() {
+            plus = plus.relative().child(popover::anchored_menu_below(
+                "cloud-rail-pane-menu",
+                self.render_pane_menu(&theme, cx),
+                self.pane_menu.closing_since(),
+            ));
+        }
         let header = div()
             .relative()
             .flex_none()
@@ -3127,10 +3183,7 @@ impl Render for CloudRail {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted)
                     .child(SharedString::from(self.pane.label())),
-            )
-            .when(self.pane_menu_open, |el| {
-                el.child(self.render_pane_menu(&theme, cx))
-            });
+            );
         let bot_bar = self.render_bot_bar(&theme, cx);
         let seat_row = self.seat.ready().cloned();
         let is_railway = seat_row
