@@ -795,6 +795,8 @@ pub struct AppState {
     /// The selected cloud seat for new sessions. This is intentionally
     /// session-local; the mode persists, but a seat is refreshed from config.
     pub cloud_seat_pick: Option<crate::cloud::SeatRow>,
+    /// Why the last Railway trial start failed, until one succeeds.
+    pub cloud_trial_failure: Option<String>,
 }
 
 /// Text/reasoning growth changes the transcript without changing session
@@ -877,6 +879,7 @@ impl AppState {
             cloud_fetched_at: None,
             cloud_mode: false,
             cloud_seat_pick: None,
+            cloud_trial_failure: None,
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,

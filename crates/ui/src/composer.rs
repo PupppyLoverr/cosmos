@@ -9634,7 +9634,22 @@ impl Composer {
                 composer.state.update(cx, |state, cx| {
                     state.refresh_cloud(None, cx);
                 });
-                let probe_error = probe.as_ref().err().map(ToString::to_string);
+                let probe_error = match probe.as_ref() {
+                    Err(err) => Some(err.to_string()),
+                    Ok(value) if value.get("online").and_then(|v| v.as_bool()) == Some(false) => {
+                        Some(
+                            value
+                                .get("detail")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("railway.new refused the connection")
+                                .to_string(),
+                        )
+                    }
+                    Ok(_) => None,
+                };
+                composer.state.update(cx, |state, _| {
+                    state.cloud_trial_failure = probe_error.clone();
+                });
                 if let Some(row) = picked_row {
                     if let Some(err) = probe_error {
                         tracing::warn!(error = %err, "railway trial provision failed");

@@ -8464,12 +8464,14 @@ impl Shell {
 
     fn render_cloud_seat_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let seat = self.state.read(cx).active_cloud_seat().cloned();
+        let trial_failed = self.state.read(cx).cloud_trial_failure.is_some();
         let label: SharedString = match seat.as_ref() {
             Some(seat) if seat.config.kind == Some(zeron_proto::CloudSeatKind::GitHub) => {
                 format!("GitHub — {}", seat.config.label).into()
             }
             Some(seat) if seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway) => {
                 match seat.config.expires_at {
+                    None if trial_failed => "Railway trial — unavailable".into(),
                     None => "Railway trial — starting…".into(),
                     Some(_) if seat.config.expired() => "Railway trial — ended".into(),
                     Some(at) => format!(

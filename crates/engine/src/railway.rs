@@ -153,13 +153,34 @@ pub fn redact_trial_banner(output: &str) -> String {
         .join("\n")
 }
 
+/// A manifest line's human `message`/`error`/`reason`, or the raw line.
+fn host_message(line: &str) -> String {
+    let trimmed = line.trim();
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end])
+    {
+        for key in ["message", "error", "reason", "detail"] {
+            if let Some(text) = value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                return text.to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
 /// The honest reason a connect failed, from ssh's own stderr.
 fn ssh_failure(out: &crate::cloud::ExecOutcome) -> String {
     let stderr = out.stderr.trim();
     // Railway's own words first — "temporarily disabled", "sign up", rate
-    // limits all arrive in the welcome/manifest text on stderr.
-    let host_lines: Vec<&str> = stderr
+    // limits all arrive in the welcome/manifest text (stderr or stdout).
+    let host_lines: Vec<String> = stderr
         .lines()
+        .chain(out.stdout.lines())
+        .map(host_message)
         .filter(|l| {
             let l = l.to_lowercase();
             l.contains("temporarily disabled")
@@ -170,7 +191,7 @@ fn ssh_failure(out: &crate::cloud::ExecOutcome) -> String {
         })
         .collect();
     if let Some(line) = host_lines.first() {
-        return line.trim().to_string();
+        return redact_trial_banner(line.trim());
     }
     if stderr.contains("identity") || stderr.contains("Permission denied") {
         return "no SSH key on this machine — run `ssh-keygen -t ed25519`, then retry".into();
@@ -260,6 +281,16 @@ mod tests {
             trial.expires_at,
             Some("2030-01-01T00:00:00Z".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn refused_manifest_surfaces_railway_message() {
+        let out = crate::cloud::ExecOutcome {
+            code: 0,
+            stdout: r#"{"status":"refused","message":"limited. Sign up to keep building."}"#.into(),
+            stderr: String::new(),
+        };
+        assert_eq!(ssh_failure(&out), "limited. Sign up to keep building.");
     }
 
     #[test]
@@ -359,8 +390,13 @@ pub async fn probe_with_existing_deadline(
         return Err(ssh_failure_result(&out, trial));
     }
     if !out.stdout.contains("__cosmos_alive") {
+        let detail = ssh_failure(&out);
         return Err(RailwayFailure {
-            detail: "railway.new answered without the echo marker".into(),
+            detail: if detail.is_empty() {
+                "railway.new answered without the echo marker".into()
+            } else {
+                detail
+            },
             trial,
         });
     }
