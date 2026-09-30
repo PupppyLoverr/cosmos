@@ -336,11 +336,6 @@ impl DevicesPage {
                     widgets::ghost_action(theme)
                         .id("pair-phone-open")
                         .opacity(if signed_in { 0.7 } else { 0.35 })
-                        .hover(|s| {
-                            s.opacity(1.0)
-                                .bg(crate::theme::ink(0.06))
-                                .text_color(theme.text)
-                        })
                         .on_click(cx.listener(|this, _, _, cx| this.open_pair(cx)))
                         .child(SharedString::from("Show code")),
                 ),
@@ -381,11 +376,7 @@ impl DevicesPage {
                         widgets::ghost_action(theme)
                             .id(("phone-revoke", ix))
                             .opacity(0.7)
-                            .hover(|s| {
-                                s.opacity(1.0)
-                                    .bg(theme.danger.opacity(0.12))
-                                    .text_color(theme.danger)
-                            })
+                            .text_color(theme.danger.opacity(0.85))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.revoke_phone(revoke_id.clone(), cx);
                             }))
