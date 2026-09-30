@@ -10,9 +10,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement, MouseButton, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div, prelude::*,
-    px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, prelude::*, px,
 };
 use serde::Deserialize;
 use zeron_engine::cloud::{PrDetail, PrFile, PrRow, RemoteEntry, SeatConfig};
@@ -216,6 +215,74 @@ pub(crate) fn seat_pane_icon(pane: CloudPane) -> &'static str {
     }
 }
 
+pub(crate) fn seat_pane_detail(pane: CloudPane) -> &'static str {
+    match pane {
+        CloudPane::Computer => "Watch and control the seat's desktop",
+        CloudPane::Simulator => "Drive the seat's device emulator",
+        CloudPane::Files => "Browse and preview files on the seat",
+        CloudPane::Changes => "See the agent's file edits",
+        CloudPane::Shell => "Run commands on the seat",
+        CloudPane::Progress => "Follow the run's history and actions",
+        CloudPane::Context => "Files shared in this session",
+        CloudPane::Tasks => "The agent's task list",
+        CloudPane::PullRequests => "View proposed code changes",
+    }
+}
+
+/// One entry in a right-pane launcher list: icon, title, one-line detail.
+/// Shared by the local surface picker and a cloud seat's pane picker so
+/// both modes present the same panel.
+pub(crate) fn surface_pick_row(
+    theme: &Theme,
+    id: impl Into<gpui::ElementId>,
+    icon_path: &'static str,
+    title: &'static str,
+    detail: &'static str,
+) -> gpui::Stateful<gpui::Div> {
+    let hover = theme.element_hover;
+    div()
+        .id(id)
+        .w_full()
+        .px(px(12.0))
+        .py(px(8.0))
+        .rounded(px(8.0))
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(12.0))
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .child(
+            div().pt(px(2.0)).child(
+                icon(icon_path)
+                    .size(px(16.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+            ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(13.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted)
+                        .child(detail),
+                ),
+        )
+}
+
 /// The green/red/sleeping dot used by the bot bar and seat rows.
 pub(crate) fn status_dot(theme: &Theme, probe: Option<&SeatProbe>) -> gpui::Stateful<gpui::Div> {
     let (color, label) = match probe {
@@ -351,6 +418,9 @@ pub struct CloudRail {
     model_label: Option<SharedString>,
     /// The pane "+" menu and the destroy confirmation live on the rail chrome.
     pane_menu: popover::Popup<()>,
+    /// The pane launcher (the empty right-pane list) is showing instead of
+    /// a pane body.
+    picking: bool,
     confirm_destroy: bool,
     control_busy: bool,
     control_error: Option<String>,
@@ -474,6 +544,7 @@ impl CloudRail {
             runs: Vec::new(),
             model_label: None,
             pane_menu: popover::Popup::default(),
+            picking: true,
             confirm_destroy: false,
             control_busy: false,
             control_error: None,
@@ -616,6 +687,10 @@ impl CloudRail {
     /// Switch the rail's active pane — the only pane visible, per the "one
     /// pane at a time" rule.
     pub fn set_pane(&mut self, pane: CloudPane, cx: &mut Context<Self>) {
+        if self.picking {
+            self.picking = false;
+            cx.notify();
+        }
         if self.pane == pane {
             self.close_pane_menu(cx);
             self.ensure_loaded(cx);
@@ -625,6 +700,73 @@ impl CloudRail {
         self.close_pane_menu(cx);
         self.ensure_loaded(cx);
         cx.notify();
+    }
+
+    pub fn show_picker(&mut self, cx: &mut Context<Self>) {
+        self.close_pane_menu(cx);
+        if !self.picking {
+            self.picking = true;
+            cx.notify();
+        }
+    }
+
+    /// The active pane's label, or `None` while the launcher is showing.
+    pub fn active_pane_label(&self) -> Option<&'static str> {
+        (!self.picking).then(|| self.pane.label())
+    }
+
+    /// The pane launcher — the same centered list the local right pane
+    /// shows when empty, listing what this seat can actually back.
+    fn render_picker(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let caps = self.capabilities();
+        let row = |id: SharedString, icon_path, title, detail| {
+            surface_pick_row(theme, id, icon_path, title, detail)
+        };
+        let mut list = div()
+            .w_full()
+            .max_w(px(360.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+        for pane in CloudPane::ALL {
+            let available = match pane {
+                CloudPane::Simulator => caps.simulator,
+                CloudPane::PullRequests => caps.pull_requests,
+                _ => true,
+            };
+            if !available {
+                continue;
+            }
+            list = list.child(
+                row(
+                    SharedString::from(format!("rail-pick-{}", pane.label())),
+                    seat_pane_icon(pane),
+                    pane.label(),
+                    seat_pane_detail(pane),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_pane(pane, cx))),
+            );
+        }
+        list = list.child(
+            row(
+                "rail-pick-sidechat".into(),
+                icons::CHAT_ROUND_LINE,
+                "Side chat",
+                "Ask questions without interrupting the agent",
+            )
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(RailEvent::OpenSideChat))),
+        );
+        div()
+            .id("rail-picker")
+            .size_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .p(px(16.0))
+            .child(list)
+            .into_any_element()
     }
 
     pub(crate) fn close_pane_menu(&mut self, cx: &mut Context<Self>) -> bool {
@@ -3000,84 +3142,6 @@ fn tool_paths(call: &zeron_proto::ToolCall) -> Vec<String> {
 impl CloudRail {
     /// The rail's pane menu: every `CloudPane`, plus the Side chat escape
     /// that opens the existing side-chat surface in the shell's pane host.
-    fn render_pane_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let caps = self.capabilities();
-        let mut menu = popover::popover_card_opaque(&theme.for_popup()).w(px(200.0));
-        menu = menu.on_mouse_down_out(cx.listener(|this, _, _, cx| {
-            this.close_pane_menu(cx);
-        }));
-        for pane in CloudPane::ALL {
-            let disabled = match pane {
-                CloudPane::Simulator => !caps.simulator,
-                CloudPane::PullRequests => !caps.pull_requests,
-                _ => false,
-            };
-            let active = pane == self.pane;
-            let fade = SharedString::from(format!("rail-menu-{}", pane.label()));
-            let mut row = popover::menu_row(theme, active, fade)
-                .id(SharedString::from(format!("rail-pane-{}", pane.label())))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .child(
-                    icon(seat_pane_icon(pane))
-                        .size(px(13.0))
-                        .flex_none()
-                        .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(SharedString::from(pane.label())),
-                );
-            if disabled {
-                row = row.opacity(0.45).child(
-                    div()
-                        .flex_none()
-                        .text_size(crate::typography::ui_rems(9.5))
-                        .text_color(theme.text_faint)
-                        .child(if pane == CloudPane::Simulator {
-                            "no endpoint"
-                        } else {
-                            "no repo"
-                        }),
-                );
-            } else {
-                row = row
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_pane(pane, cx)));
-            }
-            menu = menu.child(row);
-        }
-        // Side chat opens the existing surface — the rail hands it to the
-        // shell via an event, never a second chat column of its own.
-        let fade = SharedString::from("rail-menu-sidechat");
-        menu = menu.child(
-            popover::menu_row(theme, false, fade)
-                .id("rail-pane-sidechat")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .cursor_pointer()
-                .child(
-                    icon(icons::CHAT_ROUND_LINE)
-                        .size(px(13.0))
-                        .flex_none()
-                        .text_color(theme.text_muted),
-                )
-                .child(div().flex_1().min_w_0().truncate().child("Side chat"))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.close_pane_menu(cx);
-                    cx.emit(RailEvent::OpenSideChat);
-                })),
-        );
-        menu.into_any_element()
-    }
-
     /// The bot control area — seat, model, run status, and the honest
     /// controls the engine backs: pause/resume/stop, approve (only while the
     /// run is `NeedsApproval`), preview, destroy.
@@ -3261,65 +3325,6 @@ impl Render for CloudRail {
             CloudPane::Context => self.render_context(&theme, cx),
             CloudPane::Tasks => self.render_tasks(&theme, cx),
         };
-        // The + button top-left opens the pane menu — the screenshot's IA.
-        let mut plus = div()
-            .id("rail-plus")
-            .size(px(20.0))
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .rounded(px(5.0))
-            .text_size(crate::typography::ui_rems(14.0))
-            .text_color(theme.text_muted)
-            .bg(crate::motion::hover_blend(
-                "rail-plus",
-                gpui::transparent_black(),
-                theme.element_hover,
-            ))
-            .on_hover(crate::motion::hover_listener("rail-plus"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.pane_menu.note_trigger_press()),
-            )
-            .cursor_pointer()
-            .child("+")
-            .on_click(cx.listener(|this, _, _, cx| {
-                if this.pane_menu.take_press_was_open() {
-                    this.close_pane_menu(cx);
-                } else {
-                    this.pane_menu.open(());
-                    cx.notify();
-                }
-            }));
-        if self.pane_menu.get().is_some() {
-            plus = plus.relative().child(popover::anchored_menu_below(
-                "cloud-rail-pane-menu",
-                self.render_pane_menu(&theme, cx),
-                self.pane_menu.closing_since(),
-            ));
-        }
-        let header = div()
-            .relative()
-            .flex_none()
-            .h(px(32.0))
-            .px(px(8.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(plus)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(crate::typography::ui_rems(11.5))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(self.pane.label())),
-            );
         let bot_bar = self.render_bot_bar(&theme, cx);
         let seat_row = self.seat.ready().cloned();
         let is_railway = seat_row
@@ -3361,7 +3366,6 @@ impl Render for CloudRail {
             .size_full()
             .flex()
             .flex_col()
-            .child(header)
             .child(bot_bar)
             .when(not_persistent, |el| {
                 el.child(
@@ -3582,6 +3586,14 @@ impl Render for CloudRail {
                 col = col.child(div().flex_1().min_h_0().child(
                     pane_empty(&theme, icons::CLOUD, "Cloud seat", err.as_str()).into_any_element(),
                 ));
+            }
+            _ if self.picking => {
+                col = col.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.render_picker(&theme, cx)),
+                );
             }
             _ => {
                 col = col.child(div().flex_1().min_h_0().child(content));

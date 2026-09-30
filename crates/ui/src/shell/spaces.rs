@@ -3817,14 +3817,14 @@ impl Shell {
             .id("spaces-filter")
             .flex_1()
             .min_w_0()
-            .h(px(29.0))
+            .h(px(28.0))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(Theme::SPACE_SM))
-            .rounded(px(8.0))
+            .rounded(px(6.0))
             .px(px(Theme::SPACE_SM))
-            .text_size(crate::typography::ui_rems(13.0))
+            .text_size(crate::typography::ui_rems(12.5))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(motion::hover_blend(
                 "spaces-filter",
@@ -3857,7 +3857,7 @@ impl Shell {
             }))
             .child(
                 icon(icons::FOLDER)
-                    .size(px(16.0))
+                    .size(px(14.0))
                     .flex_none()
                     .text_color(theme.text_muted),
             )
@@ -3924,7 +3924,7 @@ impl Shell {
             .aria_label("Sidebar view options")
             .aria_expanded(view_open)
             .track_focus(&view_focus)
-            .size(px(29.0))
+            .size(px(28.0))
             .flex_none()
             .flex()
             .items_center()
