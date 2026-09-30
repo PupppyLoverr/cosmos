@@ -10,7 +10,7 @@ use gpui::{
 use zeron_proto::CloudSeatKind;
 use zeron_rpc::methods;
 
-use zeron_engine::cloud::RepoHit;
+use zeron_engine::cloud::{RepoHit, SeatConfig};
 
 use crate::cloud::{CloudView, SeatRow, status_dot};
 use crate::composer::ComposerInput;
@@ -68,8 +68,10 @@ pub struct CloudSeatsPage {
     state: Entity<AppState>,
     scroll: widgets::PageScroll,
     view: Loadable<CloudView>,
+    load_generation: u64,
     /// `Some(kind)` while the add-seat card is open.
     draft_kind: Option<CloudSeatKind>,
+    editing_seat: Option<SeatConfig>,
     form: SeatForm,
     /// The shared GitHub PAT input — the repo picker's token when a seat has
     /// none of its own. Saved to `cloud-keys.json` under the reserved key.
@@ -113,7 +115,9 @@ impl CloudSeatsPage {
             state,
             scroll: widgets::PageScroll::default(),
             view: Loadable::Idle,
+            load_generation: 0,
             draft_kind: None,
+            editing_seat: None,
             form,
             shared_pat: cx
                 .new(|cx| ComposerInput::new("GitHub PAT — shared (repo + workflow scope)", cx)),
@@ -134,11 +138,17 @@ impl CloudSeatsPage {
         page
     }
 
+    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.load(cx);
+    }
+
     fn load(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.view = Loadable::Error("Engine not connected".into());
             return;
         };
+        self.load_generation += 1;
+        let generation = self.load_generation;
         self.view = Loadable::Loading;
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -146,6 +156,10 @@ impl CloudSeatsPage {
                 .call(methods::CLOUD_GET_CONFIG, serde_json::json!({}))
                 .await;
             this.update(cx, |page, cx| {
+                if page.load_generation != generation {
+                    return;
+                }
+                page.load_task = None;
                 page.view = match result {
                     Ok(value) => match serde_json::from_value::<CloudView>(value) {
                         Ok(view) => Loadable::Ready(view),
@@ -153,6 +167,51 @@ impl CloudSeatsPage {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn edit_harness(&mut self, seat: SeatConfig, cx: &mut Context<Self>) {
+        let command = seat.harness_command.clone().unwrap_or_default();
+        self.form
+            .harness_command
+            .update(cx, |input, cx| input.set_text(command, cx));
+        self.editing_seat = Some(seat);
+        self.draft_kind = None;
+        cx.notify();
+    }
+
+    fn save_harness(&mut self, cx: &mut Context<Self>) {
+        let Some(mut seat) = self.editing_seat.clone() else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let command = SeatForm::text(&self.form.harness_command, cx);
+        seat.harness_command = (!command.is_empty()).then_some(command);
+        self.error = None;
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_SAVE_SEAT,
+                    serde_json::json!({ "seat": seat, "secrets": {} }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                match result {
+                    Ok(_) => {
+                        page.editing_seat = None;
+                        page.note = Some("Harness command saved.".into());
+                    }
+                    Err(err) => page.error = Some(err.to_string()),
+                }
+                page.load(cx);
+                page.state
+                    .update(cx, |state, cx| state.refresh_cloud(None, cx));
                 cx.notify();
             })
             .ok();
@@ -189,6 +248,8 @@ impl CloudSeatsPage {
                     Err(err) => page.error = Some(err.to_string()),
                 }
                 page.load(cx);
+                page.state
+                    .update(cx, |state, cx| state.refresh_cloud(None, cx));
                 cx.notify();
             })
             .ok();
@@ -436,6 +497,7 @@ impl CloudSeatsPage {
         let probe = seat.config.last_probe.clone();
         let capabilities = &seat.capabilities;
         let seat_id = seat.config.id.clone();
+        let edit_harness_id = format!("seat-edit-harness-{seat_id}");
         let kind_label = seat
             .config
             .kind
@@ -592,6 +654,14 @@ impl CloudSeatsPage {
                                 cx.listener(move |this, _, _, cx| this.probe(seat_id.clone(), cx)),
                             ),
                     )
+                    .child({
+                        let seat = seat.config.clone();
+                        popover::btn_ghost(theme, "Edit harness", edit_harness_id.clone())
+                            .id(SharedString::from(edit_harness_id))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.edit_harness(seat.clone(), cx)
+                            }))
+                    })
                     .child({
                         let seat_id = seat.config.id.clone();
                         popover::btn_ghost(theme, "Remove", format!("seat-remove-{seat_id}"))
@@ -830,6 +900,48 @@ impl CloudSeatsPage {
         card.into_any_element()
     }
 
+    fn harness_editor(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(seat) = &self.editing_seat else {
+            return div().into_any_element();
+        };
+        widgets::section_card(theme)
+            .child(widgets::card_row(theme, true).child(widgets::row_title(
+                theme,
+                format!("Edit harness — {}", seat.label),
+            )))
+            .child(
+                div()
+                    .px(px(20.0))
+                    .pb(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(popover::dialog_field(
+                        self.form.harness_command.clone().into_any_element(),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .child(
+                                popover::btn_primary(theme, "Save harness")
+                                    .id("seat-harness-save")
+                                    .on_click(cx.listener(|this, _, _, cx| this.save_harness(cx))),
+                            )
+                            .child(
+                                popover::btn_ghost(theme, "Cancel", "seat-harness-cancel")
+                                    .id("seat-harness-cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.editing_seat = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn on_scroll_hovered(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
         if self.scroll.set_list_hovered(*hovered) {
             cx.notify();
@@ -902,7 +1014,10 @@ impl Render for CloudSeatsPage {
         if let Some(error) = load_error {
             column = column.child(widgets::error_strip(&theme, error));
         }
-        if self.draft_kind.is_none() {
+        if self.editing_seat.is_some() {
+            column = column.child(self.harness_editor(&theme, cx));
+        }
+        if self.draft_kind.is_none() && self.editing_seat.is_none() {
             column = column.child(
                 div().flex().flex_row().gap(px(8.0)).pt(px(4.0)).children(
                     [

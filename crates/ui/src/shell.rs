@@ -4770,6 +4770,12 @@ impl Shell {
         cx.notify();
     }
 
+    fn refresh_cloud_seats_page(&mut self, cx: &mut Context<Self>) {
+        if let Some(page) = &self.cloud_seats_page {
+            page.update(cx, |page, cx| page.refresh(cx));
+        }
+    }
+
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         let section = section.canonical();
         self.command_palette = None;
@@ -4777,6 +4783,9 @@ impl Shell {
         // CLIs are installed, so installing one shows up on the next open.
         if section == SettingsSection::Harnesses {
             self.harnesses_page = None;
+        }
+        if section == SettingsSection::CloudComputer {
+            self.refresh_cloud_seats_page(cx);
         }
         if !matches!(self.route, Route::Settings(_)) {
             self.settings_focus_pending = true;
@@ -4994,7 +5003,11 @@ impl Shell {
                 }
             }
             NavEntry::Settings(section) => {
-                self.route = Route::Settings(section.canonical());
+                let section = section.canonical();
+                self.route = Route::Settings(section);
+                if section == SettingsSection::CloudComputer {
+                    self.refresh_cloud_seats_page(cx);
+                }
                 self.remember_settings_section(section, cx);
             }
         }

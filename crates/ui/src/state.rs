@@ -811,6 +811,14 @@ fn is_text_append(frame: &TranscriptFrame) -> bool {
         if upsert.is_empty() && remove.is_empty() && !append.is_empty())
 }
 
+fn repick(
+    pick: Option<crate::cloud::SeatRow>,
+    view: &crate::cloud::CloudView,
+) -> Option<crate::cloud::SeatRow> {
+    let seat_id = pick?.config.id;
+    view.seat(&seat_id).cloned()
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
@@ -2027,6 +2035,9 @@ impl AppState {
                     }
                     Err(err) => crate::popover::Loadable::Error(err.to_string()),
                 };
+                if let Some(view) = state.cloud.ready() {
+                    state.cloud_seat_pick = repick(state.cloud_seat_pick.take(), view);
+                }
                 cx.notify();
             })
             .ok();
@@ -3116,6 +3127,37 @@ mod tests {
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `zeron_proto::view`.
     use zeron_proto::{SessionStatus, UserProfile};
+
+    #[test]
+    fn repick_refreshes_the_selected_seat_and_drops_removed_seats() {
+        let selected = crate::cloud::SeatRow {
+            config: zeron_engine::cloud::SeatConfig {
+                id: "railway-1".into(),
+                harness_command: Some("claude -p".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let updated = crate::cloud::SeatRow {
+            config: zeron_engine::cloud::SeatConfig {
+                id: "railway-1".into(),
+                harness_command: Some("opencode run -m opencode/big-pickle".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let view = crate::cloud::CloudView {
+            seats: vec![updated],
+            ..Default::default()
+        };
+
+        let repicked = repick(Some(selected.clone()), &view).unwrap();
+        assert_eq!(
+            repicked.config.harness_command.as_deref(),
+            Some("opencode run -m opencode/big-pickle")
+        );
+        assert!(repick(Some(selected), &crate::cloud::CloudView::default()).is_none());
+    }
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {
