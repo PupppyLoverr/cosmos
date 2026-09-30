@@ -4825,9 +4825,13 @@ impl Shell {
             let page = cx.new(|cx| crate::cloud::boards::KanbanPage::new(state, cx));
             self.kanban_sub = Some(cx.subscribe(
                 &page,
-                |this: &mut Shell, _, event: &crate::cloud::boards::BoardsEvent, cx| {
-                    let crate::cloud::boards::BoardsEvent::OpenChat(chat_id) = event;
-                    this.apply_nav(NavEntry::Chat(chat_id.clone()), cx);
+                |this: &mut Shell, _, event: &crate::cloud::boards::BoardsEvent, cx| match event {
+                    crate::cloud::boards::BoardsEvent::OpenChat(chat_id) => {
+                        this.apply_nav(NavEntry::Chat(chat_id.clone()), cx);
+                    }
+                    crate::cloud::boards::BoardsEvent::OpenAutomations => {
+                        this.open_automations(cx);
+                    }
                 },
             ));
             self.kanban_page = Some(page);
@@ -4844,9 +4848,13 @@ impl Shell {
             let page = cx.new(|cx| crate::cloud::boards::AutomationsPage::new(state, cx));
             self.automations_sub = Some(cx.subscribe(
                 &page,
-                |this: &mut Shell, _, event: &crate::cloud::boards::BoardsEvent, cx| {
-                    let crate::cloud::boards::BoardsEvent::OpenChat(chat_id) = event;
-                    this.apply_nav(NavEntry::Chat(chat_id.clone()), cx);
+                |this: &mut Shell, _, event: &crate::cloud::boards::BoardsEvent, cx| match event {
+                    crate::cloud::boards::BoardsEvent::OpenChat(chat_id) => {
+                        this.apply_nav(NavEntry::Chat(chat_id.clone()), cx);
+                    }
+                    crate::cloud::boards::BoardsEvent::OpenAutomations => {
+                        this.open_automations(cx);
+                    }
                 },
             ));
             self.automations_page = Some(page);
@@ -8146,15 +8154,35 @@ impl Shell {
             if let Some(picked) = picked {
                 state.cloud_seat_pick = Some(picked);
             } else if (picked_id.is_none() || view_loaded)
-                && let Some(seat) = seats
-                    .iter()
-                    .find(|seat| crate::cloud::CloudView::seat_ready(seat))
-                    .cloned()
+                && let Some(seat) = crate::cloud::CloudView::preferred_seat(&seats).cloned()
             {
                 state.cloud_seat_pick = Some(seat);
             }
             state.refresh_cloud(Some(Duration::from_secs(10)), cx);
         });
+        self.maybe_autostart_cloud_trial(cx);
+    }
+
+    /// First-run on-ramp: a user in Cloud mode with no seat at all gets the
+    /// free Railway trial started for them — once per session, never a retry
+    /// loop (a refused trial surfaces its reason instead). A saved Boat token
+    /// or any other seat means there's nothing to start.
+    fn maybe_autostart_cloud_trial(&mut self, cx: &mut Context<Self>) {
+        let should = {
+            let state = self.state.read(cx);
+            state.cloud_mode
+                && !state.cloud_trial_autostarted
+                && !state.cloud_trial_starting
+                && state.cloud_trial_failure.is_none()
+                && state.cloud_view().is_some_and(|view| view.seats.is_empty())
+        };
+        if !should {
+            return;
+        }
+        self.state
+            .update(cx, |state, _| state.cloud_trial_autostarted = true);
+        self.composer
+            .update(cx, |composer, cx| composer.start_railway_trial(cx));
     }
 
     fn set_cloud_mode(&mut self, cloud_mode: bool, cx: &mut Context<Self>) {

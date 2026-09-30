@@ -45,7 +45,7 @@ wait_ready() {
     st=$(cat "$C/desktop.status" 2>/dev/null)
     case "$st" in failed*) die "desktop unavailable — $st (see $C/desktop.log)";; esac
     if [ "$i" -eq 0 ] && [ -z "$st" ] && [ -x "$C/desktop-setup.sh" ]; then
-      nohup sh "$C/desktop-setup.sh" >"$C/desktop.log" 2>&1 &
+      nohup sh "$C/desktop-setup.sh" </dev/null >"$C/desktop.log" 2>&1 &
     fi
     i=$((i+1)); [ "$i" -gt 180 ] && die "desktop did not come up in 3 minutes (see $C/desktop.log)"
     sleep 1
@@ -117,7 +117,7 @@ case "$cmd" in
     wait_ready
     b=$(browser) || die "no browser on this seat — install chromium or firefox (or: npx playwright install chromium)"
     case "$b" in *chrom*|*chrome*) set -- --no-sandbox --no-first-run --disable-dev-shm-usage --window-size=1280,800 "$@";; esac
-    nohup "$b" "$@" >"$C/browser.log" 2>&1 &
+    nohup "$b" "$@" </dev/null >"$C/browser.log" 2>&1 &
     echo "opened with $b";;
   record)
     wait_ready
@@ -132,7 +132,7 @@ case "$cmd" in
         fi
         [ -f "$C/record.pid" ] && kill -0 "$(cat "$C/record.pid")" 2>/dev/null && die "already recording ($(cat "$C/record.path"))"
         out="${2:-$SHOTS/recording-$(date +%Y%m%d-%H%M%S).mp4}"
-        nohup ffmpeg -loglevel error -y -f x11grab -framerate 12 -video_size "$(geometry)" -i "$DISPLAY" -pix_fmt yuv420p -vcodec libx264 -preset veryfast "$out" >"$C/record.log" 2>&1 &
+        nohup ffmpeg -nostdin -loglevel error -y -f x11grab -framerate 12 -video_size "$(geometry)" -i "$DISPLAY" -pix_fmt yuv420p -vcodec libx264 -preset veryfast "$out" </dev/null >"$C/record.log" 2>&1 &
         echo $! >"$C/record.pid"; echo "$out" >"$C/record.path"; echo "recording → $out";;
       stop)
         [ -f "$C/record.pid" ] || die "not recording"
@@ -190,14 +190,14 @@ if ! have Xvfb || ! have xdotool || { ! have import && ! have scrot; }; then
 fi
 if [ ! -e /tmp/.X11-unix/X99 ]; then
   st starting
-  nohup Xvfb :99 -screen 0 1280x800x24 -nolisten tcp -ac >"$C/xvfb.log" 2>&1 &
+  nohup Xvfb :99 -screen 0 1280x800x24 -nolisten tcp -ac </dev/null >"$C/xvfb.log" 2>&1 &
   i=0; while [ ! -e /tmp/.X11-unix/X99 ] && [ "$i" -lt 40 ]; do sleep 0.25; i=$((i+1)); done
   [ -e /tmp/.X11-unix/X99 ] || { st "failed: Xvfb did not start ($(tail -n1 "$C/xvfb.log" 2>/dev/null))"; exit 1; }
 fi
 export DISPLAY=:99
 if ! pgrep -x openbox >/dev/null 2>&1 && ! pgrep -x fluxbox >/dev/null 2>&1; then
   for wm in openbox fluxbox xfwm4 matchbox-window-manager; do
-    if have "$wm"; then nohup "$wm" >"$C/wm.log" 2>&1 & break; fi
+    if have "$wm"; then nohup "$wm" </dev/null >"$C/wm.log" 2>&1 & break; fi
   done
 fi
 have xsetroot && xsetroot -solid '#1b1d22' 2>/dev/null
@@ -214,8 +214,8 @@ pub fn bootstrap_command() -> String {
         "C=\"$HOME/.cosmos\"; mkdir -p \"$C/bin\" \"$C/shots\" && \
 printf %s {cli} | base64 -d > \"$C/bin/cosmos-computer\" && chmod +x \"$C/bin/cosmos-computer\" && \
 printf %s {setup} | base64 -d > \"$C/desktop-setup.sh\" && chmod +x \"$C/desktop-setup.sh\" && \
-case \"$(cat \"$C/desktop.status\" 2>/dev/null)\" in ready) [ -e /tmp/.X11-unix/X99 ] || nohup sh \"$C/desktop-setup.sh\" >\"$C/desktop.log\" 2>&1 & ;; \
-installing|starting) ;; *) nohup sh \"$C/desktop-setup.sh\" >\"$C/desktop.log\" 2>&1 & ;; esac; echo __cosmos_desktop_ok",
+case \"$(cat \"$C/desktop.status\" 2>/dev/null)\" in ready) [ -e /tmp/.X11-unix/X99 ] || nohup sh \"$C/desktop-setup.sh\" </dev/null >\"$C/desktop.log\" 2>&1 & ;; \
+installing|starting) ;; *) nohup sh \"$C/desktop-setup.sh\" </dev/null >\"$C/desktop.log\" 2>&1 & ;; esac; echo __cosmos_desktop_ok",
         cli = shell_word(&b64(CLI_SCRIPT)),
         setup = shell_word(&b64(SETUP_SCRIPT)),
     )
@@ -235,7 +235,7 @@ echo \"__status=$(cat \"$HOME/.cosmos/desktop.status\" 2>/dev/null)\"",
 /// Shell prefix that puts the display and the CLI on the harness's
 /// environment.
 pub fn env_prefix() -> String {
-    format!("export DISPLAY={DISPLAY} PATH=\"$HOME/.cosmos/bin:$PATH\";")
+    format!("export DISPLAY={DISPLAY} PATH=\"$HOME/.cosmos/bin:$PATH\" &&")
 }
 
 /// The brief prepended to every seat prompt — what the agent can do on this

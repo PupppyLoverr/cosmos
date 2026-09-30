@@ -608,6 +608,11 @@ impl CloudSeatsPage {
             "githubPat": non_empty(text(&self.form.github_pat)),
             "cuaToken": non_empty(text(&self.form.cua_token)),
         });
+        // A persistent computer the user just configured becomes the seat
+        // new cloud chats use (Boat token / VPS alias beat the trial).
+        let prefer = matches!(kind, CloudSeatKind::Box | CloudSeatKind::Ssh)
+            .then(|| seat.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .flatten();
         self.error = None;
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -620,6 +625,10 @@ impl CloudSeatsPage {
             this.update(cx, |page, cx| {
                 match result {
                     Ok(_) => {
+                        if let Some(prefer) = prefer.clone() {
+                            page.state
+                                .update(cx, |state, _| state.cloud_prefer_seat = Some(prefer));
+                        }
                         page.draft_kind = None;
                         page.form = SeatForm::new(cx);
                         page.note = Some(

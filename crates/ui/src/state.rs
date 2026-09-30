@@ -806,6 +806,15 @@ pub struct AppState {
     pub cloud_github_login: Option<String>,
     /// Why the last Railway trial start failed, until one succeeds.
     pub cloud_trial_failure: Option<String>,
+    /// A Railway trial provision is in flight (single-flight guard + the
+    /// "starting…" copy).
+    pub cloud_trial_starting: bool,
+    /// The automatic first-run trial start already fired this session —
+    /// entering Cloud never retry-loops a refused trial.
+    pub cloud_trial_autostarted: bool,
+    /// Seat to pick for new cloud chats on the next refresh (set when the
+    /// user saves a Boat token / VPS seat in Settings).
+    pub cloud_prefer_seat: Option<String>,
 }
 
 /// Text/reasoning growth changes the transcript without changing session
@@ -893,6 +902,9 @@ impl AppState {
             cloud_repos_task: None,
             cloud_github_login: None,
             cloud_trial_failure: None,
+            cloud_trial_starting: false,
+            cloud_trial_autostarted: false,
+            cloud_prefer_seat: None,
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -2089,6 +2101,26 @@ impl AppState {
                 };
                 if let Some(view) = state.cloud.ready() {
                     state.cloud_seat_pick = repick(state.cloud_seat_pick.take(), view);
+                    // A seat the user just set up (a saved Boat token) takes
+                    // over new cloud chats as soon as it's ready.
+                    if let Some(prefer) = state.cloud_prefer_seat.clone()
+                        && let Some(seat) = view.seat(&prefer)
+                    {
+                        if crate::cloud::CloudView::seat_ready(seat) {
+                            state.cloud_seat_pick = Some(seat.clone());
+                        }
+                        state.cloud_prefer_seat = None;
+                    }
+                    // The picked seat died (a trial's hour ended): fall over
+                    // to the best live one instead of blocking every send.
+                    if state
+                        .cloud_seat_pick
+                        .as_ref()
+                        .is_some_and(|seat| !crate::cloud::CloudView::seat_ready(seat))
+                        && let Some(seat) = crate::cloud::CloudView::preferred_seat(&view.seats)
+                    {
+                        state.cloud_seat_pick = Some(seat.clone());
+                    }
                 }
                 cx.notify();
             })

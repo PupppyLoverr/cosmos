@@ -63,6 +63,10 @@ pub struct CloudView {
     pub automations: Vec<CloudAutomation>,
     pub default_seat: Option<String>,
     pub runs: Vec<CloudRun>,
+    /// Per-chat workspace snapshots held on this computer.
+    pub backups: Vec<zeron_proto::WorkspaceBackup>,
+    /// Kanban tasks saved but not started.
+    pub drafts: Vec<zeron_proto::TaskDraft>,
     /// The shared GitHub PAT exists (the repo picker's token flag).
     pub has_github_pat: bool,
     pub load_error: Option<String>,
@@ -71,6 +75,13 @@ pub struct CloudView {
 impl CloudView {
     pub fn seat(&self, seat_id: &str) -> Option<&SeatRow> {
         self.seats.iter().find(|s| s.config.id == seat_id)
+    }
+
+    pub fn backup_for_chat(&self, chat_id: &str) -> Option<&zeron_proto::WorkspaceBackup> {
+        self.backups
+            .iter()
+            .filter(|b| b.chat_id == chat_id)
+            .max_by_key(|b| b.taken_at)
     }
 
     /// Latest ledger run for a chat (the ledger is append-most-recent-last).
@@ -103,6 +114,23 @@ impl CloudView {
             Some(CloudSeatKind::GitHub) => seat.config.repo.is_some() && seat.has_github_pat,
             None => false,
         }
+    }
+
+    /// The seat new cloud chats should land on: the user's own persistent
+    /// computer first (Boat, then a VPS), a live Railway trial as the
+    /// on-ramp, a GitHub workspace last (it can't run a harness).
+    pub fn preferred_seat(seats: &[SeatRow]) -> Option<&SeatRow> {
+        let rank = |seat: &SeatRow| match seat.config.kind {
+            Some(CloudSeatKind::Box) => 0,
+            Some(CloudSeatKind::Ssh) => 1,
+            Some(CloudSeatKind::Railway) => 2,
+            Some(CloudSeatKind::GitHub) => 3,
+            None => 4,
+        };
+        seats
+            .iter()
+            .filter(|seat| Self::seat_ready(seat))
+            .min_by_key(|seat| rank(seat))
     }
 
     pub fn seat_runnable(seat: &SeatRow) -> bool {
@@ -192,6 +220,45 @@ mod tests {
         github.has_github_pat = true;
         assert!(CloudView::seat_ready(&github));
         assert!(!CloudView::seat_runnable(&github));
+    }
+
+    #[test]
+    fn preview_clicks_map_through_the_letterbox() {
+        // 1280×800 in a 640×800 pane: scale 0.5, drawn 640×400, 200px bars.
+        let bounds = (100.0, 50.0, 640.0, 800.0);
+        assert_eq!(
+            seat_point_in(bounds, (1280, 800), (100.0, 250.0)),
+            Some((0, 0))
+        );
+        assert_eq!(
+            seat_point_in(bounds, (1280, 800), (420.0, 450.0)),
+            Some((640, 400))
+        );
+        assert_eq!(seat_point_in(bounds, (1280, 800), (420.0, 100.0)), None);
+        assert_eq!(seat_point_in(bounds, (0, 0), (1.0, 1.0)), None);
+    }
+
+    #[test]
+    fn saved_boat_token_wins_over_the_trial() {
+        let mut railway = seat(CloudSeatKind::Railway);
+        railway.config.id = "trial".into();
+        railway.config.expires_at = Some(Utc::now() + Duration::minutes(30));
+        let mut boat = seat(CloudSeatKind::Box);
+        boat.config.id = "boat".into();
+        let seats = vec![railway.clone(), boat.clone()];
+        // No token yet: the live trial is the pick.
+        assert_eq!(
+            CloudView::preferred_seat(&seats).map(|s| s.config.id.as_str()),
+            Some("trial")
+        );
+        boat.has_box_token = true;
+        let seats = vec![railway.clone(), boat];
+        assert_eq!(
+            CloudView::preferred_seat(&seats).map(|s| s.config.id.as_str()),
+            Some("boat")
+        );
+        railway.config.expires_at = Some(Utc::now() - Duration::minutes(1));
+        assert!(CloudView::preferred_seat(&[railway]).is_none());
     }
 
     #[test]
@@ -504,6 +571,42 @@ fn render_vm_screen(theme: &Theme, info: &serde_json::Value) -> AnyElement {
         .into_any_element()
 }
 
+/// Map a point in window space onto seat pixels for an image of `size`
+/// drawn `object-fit: contain` inside `bounds` (x, y, w, h). `None` when the
+/// point falls in the letterbox.
+fn seat_point_in(
+    bounds: (f32, f32, f32, f32),
+    size: (u32, u32),
+    point: (f32, f32),
+) -> Option<(i32, i32)> {
+    let (bx, by, bw, bh) = bounds;
+    let (iw, ih) = (size.0 as f32, size.1 as f32);
+    if bw <= 0.0 || bh <= 0.0 || iw <= 0.0 || ih <= 0.0 {
+        return None;
+    }
+    let scale = (bw / iw).min(bh / ih);
+    let (dw, dh) = (iw * scale, ih * scale);
+    let (ox, oy) = (bx + (bw - dw) / 2.0, by + (bh - dh) / 2.0);
+    let (x, y) = ((point.0 - ox) / scale, (point.1 - oy) / scale);
+    if x < 0.0 || y < 0.0 || x >= iw || y >= ih {
+        return None;
+    }
+    Some((x.floor() as i32, y.floor() as i32))
+}
+
+/// `size<TAB>name` lines from the evidence listing.
+fn parse_evidence(stdout: &str) -> Vec<(String, u64)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (size, name) = line.split_once('\t')?;
+            let name = name.trim();
+            (!name.is_empty() && !name.contains('/'))
+                .then(|| (name.to_string(), size.trim().parse().unwrap_or(0)))
+        })
+        .collect()
+}
+
 fn pane_empty(theme: &Theme, icon_path: &'static str, title: &str, copy: &str) -> gpui::Div {
     div()
         .size_full()
@@ -619,6 +722,25 @@ pub struct CloudRail {
     /// desktop capture.
     vm_info: Option<serde_json::Value>,
     screen_task: Option<Task<()>>,
+    /// Seat pixels of the last capture — "Take control" maps clicks on the
+    /// scaled preview back onto them.
+    shot_size: Option<(u32, u32)>,
+    /// Where the preview painted last frame (window coords).
+    shot_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// Clicks/keys on the preview drive the seat's desktop.
+    controlling: bool,
+    type_input: Entity<ComposerInput>,
+    act_task: Option<Task<()>>,
+    act_error: Option<String>,
+    /// "Start desktop" in flight (first run installs Xvfb on the seat).
+    desktop_starting: bool,
+    desktop_error: Option<String>,
+    // Context
+    /// Screenshots / recordings the agent saved under `~/.cosmos/shots`.
+    evidence: Loadable<Vec<(String, u64)>>,
+    evidence_preview: Option<(String, Loadable<Arc<gpui::Image>>)>,
+    backup_busy: bool,
+    backup_note: Option<Result<String, String>>,
     /// The chat's latest ledger run — drives the bot bar's status + buttons.
     run: Option<CloudRun>,
     runs: Vec<CloudRun>,
@@ -641,6 +763,7 @@ pub struct CloudRail {
     keep_prompted: Option<bool>,
     task: Option<Task<()>>,
     _input_sub: Subscription,
+    _type_sub: Subscription,
     _state_sub: Subscription,
     /// Railway countdown ticker — 1s re-render while a deadline is live.
     _countdown: Option<Task<()>>,
@@ -709,6 +832,12 @@ impl CloudRail {
                 this.run_shell_command(cx);
             }
         });
+        let type_input = cx.new(|cx| ComposerInput::new("Type on the seat — ⏎ sends", cx));
+        let type_sub = cx.subscribe(&type_input, |this, _, event, cx| {
+            if let ComposerInputEvent::Submitted = event {
+                this.type_on_seat(cx);
+            }
+        });
         // A session flip (run started/finished) refreshes the ledger row the
         // bot bar renders — the same watch Kanban cards ride. Gated on this
         // chat's row actually changing: AppState notifies on every keystroke,
@@ -750,6 +879,18 @@ impl CloudRail {
             shot: Loadable::Idle,
             vm_info: None,
             screen_task: None,
+            shot_size: None,
+            shot_bounds: Default::default(),
+            controlling: false,
+            type_input,
+            act_task: None,
+            act_error: None,
+            desktop_starting: false,
+            desktop_error: None,
+            evidence: Loadable::Idle,
+            evidence_preview: None,
+            backup_busy: false,
+            backup_note: None,
             run: None,
             runs: Vec::new(),
             model_label: None,
@@ -762,6 +903,7 @@ impl CloudRail {
             keep_prompted: None,
             task: None,
             _input_sub: input_sub,
+            _type_sub: type_sub,
             _state_sub: state_sub,
             _countdown: None,
             _refresh: None,
@@ -839,6 +981,7 @@ impl CloudRail {
             CloudPane::Changes if matches!(self.status, Loadable::Idle) => self.load_changes(cx),
             CloudPane::PullRequests if matches!(self.prs, Loadable::Idle) => self.load_prs(cx),
             CloudPane::Computer if matches!(self.shot, Loadable::Idle) => self.capture_shot(cx),
+            CloudPane::Context if matches!(self.evidence, Loadable::Idle) => self.load_evidence(cx),
             CloudPane::Simulator => {}
             _ => {}
         }
@@ -1035,6 +1178,65 @@ impl CloudRail {
             })
             .ok();
         }));
+    }
+
+    /// Move this chat to another seat (its trial ended): the engine rebinds
+    /// the chat row; the chat's workspace backup restores there on the next
+    /// run. The rail follows the new binding at once.
+    fn move_chat(&mut self, seat_id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.control_busy = true;
+        self.control_error = None;
+        let chat_id = self.chat_id.clone();
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_MOVE_CHAT,
+                    serde_json::json!({ "chatId": chat_id, "seatId": seat_id }),
+                )
+                .await;
+            this.update(cx, |rail, cx| {
+                rail.control_busy = false;
+                match result.map(|v| v.get("binding").cloned()) {
+                    Ok(Some(value)) => match serde_json::from_value::<CloudSeatBinding>(value) {
+                        Ok(binding) => rail.rebind(binding, cx),
+                        Err(err) => rail.control_error = Some(err.to_string()),
+                    },
+                    Ok(None) => rail.control_error = Some("the engine didn't return a seat".into()),
+                    Err(err) => rail.control_error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn rebind(&mut self, binding: CloudSeatBinding, cx: &mut Context<Self>) {
+        self.cwd = binding.workspace_path.clone().unwrap_or_else(|| ".".into());
+        self.binding = binding;
+        self.parents.clear();
+        self.seat = Loadable::Loading;
+        self.listing = Loadable::Idle;
+        self.file_path = None;
+        self.file_text = Loadable::Idle;
+        self.status = Loadable::Idle;
+        self.diff = Loadable::Idle;
+        self.prs = Loadable::Idle;
+        self.shot = Loadable::Idle;
+        self.vm_info = None;
+        self.shot_size = None;
+        self.controlling = false;
+        self.evidence = Loadable::Idle;
+        self.run = None;
+        self.keep_prompted = None;
+        self.state
+            .update(cx, |state, cx| state.refresh_cloud(None, cx));
+        self.load_seat(cx);
+        self.ensure_loaded(cx);
     }
 
     /// Both keep-card answers land here — the engine stamps
@@ -1505,6 +1707,16 @@ impl CloudRail {
                                             bytes,
                                         ))
                                     });
+                                rail.shot_size = match (
+                                    value.get("width").and_then(|w| w.as_u64()),
+                                    value.get("height").and_then(|h| h.as_u64()),
+                                ) {
+                                    (Some(w), Some(h)) => Some((w as u32, h as u32)),
+                                    _ => None,
+                                };
+                                if image.is_none() {
+                                    rail.controlling = false;
+                                }
                                 rail.vm_info = value.get("system").cloned();
                                 rail.shot = Loadable::Ready(image);
                             }
@@ -1535,6 +1747,311 @@ impl CloudRail {
                 }
             }
         }));
+    }
+
+    /// A bounded command on the seat through `CloudExec` (the chat's scope).
+    fn seat_exec_call(
+        &self,
+        command: String,
+        cx: &App,
+    ) -> Option<impl std::future::Future<Output = anyhow::Result<serde_json::Value>> + use<>> {
+        let engine = self.engine(cx)?;
+        let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
+        Some(async move {
+            engine
+                .client()
+                .call(
+                    methods::CLOUD_EXEC,
+                    serde_json::json!({
+                        "seatId": seat_id,
+                        "workspace": scope.0,
+                        "repo": scope.1,
+                        "command": command,
+                        "timeoutSecs": 30,
+                    }),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))
+        })
+    }
+
+    /// The agent's evidence folder: newest first, with sizes.
+    fn load_evidence(&mut self, cx: &mut Context<Self>) {
+        let Some(call) = self.seat_exec_call(
+            "cd \"$HOME/.cosmos/shots\" 2>/dev/null || exit 0; ls -1t | head -40 | \
+             while IFS= read -r f; do [ -f \"$f\" ] && printf '%s\\t%s\\n' \"$(wc -c < \"$f\")\" \"$f\"; done"
+                .to_string(),
+            cx,
+        ) else {
+            return;
+        };
+        if !matches!(self.evidence, Loadable::Ready(_)) {
+            self.evidence = Loadable::Loading;
+        }
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = call.await;
+            this.update(cx, |rail, cx| {
+                rail.evidence = match result {
+                    Ok(value) => {
+                        let stdout = value
+                            .get("stdout")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        Loadable::Ready(parse_evidence(stdout))
+                    }
+                    Err(err) => Loadable::Error(err.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn preview_evidence(&mut self, name: String, cx: &mut Context<Self>) {
+        if self
+            .evidence_preview
+            .as_ref()
+            .is_some_and(|(open, _)| *open == name)
+        {
+            self.evidence_preview = None;
+            cx.notify();
+            return;
+        }
+        let Some(call) = self.seat_exec_call(
+            format!(
+                "base64 < \"$HOME/.cosmos/shots\"/{} | tr -d '\\n'",
+                zeron_engine::cloud::shell_word(&name)
+            ),
+            cx,
+        ) else {
+            return;
+        };
+        self.evidence_preview = Some((name.clone(), Loadable::Loading));
+        self.act_task = Some(cx.spawn(async move |this, cx| {
+            let result = call.await;
+            this.update(cx, |rail, cx| {
+                let image = result.map_err(|e| e.to_string()).and_then(|value| {
+                    use base64::Engine as _;
+                    let b64 = value
+                        .get("stdout")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .map_err(|e| format!("couldn't read the image: {e}"))
+                        .map(|bytes| {
+                            Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes))
+                        })
+                });
+                if let Some((open, slot)) = rail.evidence_preview.as_mut()
+                    && *open == name
+                {
+                    *slot = match image {
+                        Ok(image) => Loadable::Ready(image),
+                        Err(err) => Loadable::Error(err),
+                    };
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn backup_now(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        if self.backup_busy {
+            return;
+        }
+        self.backup_busy = true;
+        self.backup_note = None;
+        let chat_id = self.chat_id.clone();
+        self.act_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_BACKUP_CHAT,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
+                .await;
+            this.update(cx, |rail, cx| {
+                rail.backup_busy = false;
+                rail.backup_note = Some(match result {
+                    Ok(value) => Ok(format!(
+                        "Backed up {} to this computer",
+                        zeron_engine::cloud::human_bytes(
+                            value
+                                .get("backup")
+                                .and_then(|b| b.get("bytes"))
+                                .and_then(|b| b.as_u64())
+                                .unwrap_or(0)
+                        )
+                    )),
+                    Err(err) => Err(err.to_string()),
+                });
+                rail.state
+                    .update(cx, |state, cx| state.refresh_cloud(None, cx));
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Bring the seat's virtual desktop up (the first time installs Xvfb +
+    /// xdotool on the seat — about a minute), then start watching it.
+    fn start_desktop(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        if self.desktop_starting {
+            return;
+        }
+        self.desktop_starting = true;
+        self.desktop_error = None;
+        let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
+        self.act_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_DESKTOP_START,
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1 }),
+                )
+                .await;
+            this.update(cx, |rail, cx| {
+                rail.desktop_starting = false;
+                match result {
+                    Ok(_) => rail.capture_shot(cx),
+                    Err(err) => rail.desktop_error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// One "Take control" action on the seat desktop, then an immediate
+    /// re-capture so the preview shows the result.
+    fn act(&mut self, action: serde_json::Value, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
+        self.act_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_COMPUTER_ACT,
+                    serde_json::json!({
+                        "seatId": seat_id,
+                        "workspace": &scope.0,
+                        "repo": &scope.1,
+                        "action": action,
+                    }),
+                )
+                .await;
+            this.update(cx, |rail, cx| {
+                rail.act_error = result.err().map(|err| err.to_string());
+                rail.capture_shot(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Window position → seat pixel, through the preview's `object-fit:
+    /// contain` letterboxing. `None` outside the drawn image.
+    fn seat_point(&self, position: gpui::Point<gpui::Pixels>) -> Option<(i32, i32)> {
+        let bounds = self.shot_bounds.get()?;
+        let (w, h) = self.shot_size?;
+        seat_point_in(
+            (
+                f32::from(bounds.origin.x),
+                f32::from(bounds.origin.y),
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height),
+            ),
+            (w, h),
+            (f32::from(position.x), f32::from(position.y)),
+        )
+    }
+
+    fn click_preview(&mut self, event: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
+        if !self.controlling {
+            return;
+        }
+        let Some((x, y)) = self.seat_point(event.position) else {
+            return;
+        };
+        let action = match (event.button, event.click_count) {
+            (gpui::MouseButton::Right, _) => {
+                serde_json::json!({ "kind": "click", "x": x, "y": y, "button": "right" })
+            }
+            (gpui::MouseButton::Middle, _) => {
+                serde_json::json!({ "kind": "click", "x": x, "y": y, "button": "middle" })
+            }
+            (_, n) if n >= 2 => serde_json::json!({ "kind": "doubleClick", "x": x, "y": y }),
+            _ => serde_json::json!({ "kind": "click", "x": x, "y": y }),
+        };
+        self.act(action, cx);
+    }
+
+    fn scroll_preview(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
+        if !self.controlling {
+            return;
+        }
+        let Some((x, y)) = self.seat_point(event.position) else {
+            return;
+        };
+        let dy = match event.delta {
+            gpui::ScrollDelta::Lines(delta) => delta.y,
+            gpui::ScrollDelta::Pixels(delta) => f32::from(delta.y) / 40.0,
+        };
+        if dy.abs() < 0.5 {
+            return;
+        }
+        let amount = dy.abs().round().clamp(1.0, 10.0) as u32;
+        let direction = if dy > 0.0 { "up" } else { "down" };
+        self.act(
+            serde_json::json!({ "kind": "scroll", "direction": direction, "amount": amount, "x": x, "y": y }),
+            cx,
+        );
+    }
+
+    fn type_on_seat(&mut self, cx: &mut Context<Self>) {
+        let text = self.type_input.read(cx).text().to_string();
+        if text.is_empty() {
+            self.act(serde_json::json!({ "kind": "key", "combo": "Return" }), cx);
+            return;
+        }
+        self.type_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.act(serde_json::json!({ "kind": "type", "text": text }), cx);
+    }
+
+    /// "Open": the bar's URL launches in a browser on the seat's desktop.
+    fn open_on_seat(&mut self, cx: &mut Context<Self>) {
+        let text = self.type_input.read(cx).text().trim().to_string();
+        let url = if text.starts_with("http://") || text.starts_with("https://") {
+            text
+        } else if !text.is_empty() && !text.contains(' ') && text.contains('.') {
+            format!("https://{text}")
+        } else {
+            self.act_error = Some("Type a URL in the bar, then Open".into());
+            cx.notify();
+            return;
+        };
+        self.type_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.act(serde_json::json!({ "kind": "openUrl", "url": url }), cx);
     }
 
     // -- rendering --
@@ -2959,17 +3476,81 @@ impl CloudRail {
     }
 
     fn render_computer(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let seat = self.seat.ready().cloned();
-        let probe = seat.as_ref().and_then(|s| s.config.last_probe.clone());
-        let _ = probe;
+        let caps = self.capabilities();
+        let can_watch = caps.computer || caps.shell;
+        let has_image = matches!(self.shot, Loadable::Ready(Some(_)));
+        let desktop_status = self
+            .vm_info
+            .as_ref()
+            .and_then(|v| v.get("desktop"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         let mode: SharedString = match &self.shot {
-            Loadable::Ready(Some(_)) => "Live desktop · refreshes every 4s".into(),
+            Loadable::Ready(Some(_)) if self.controlling => {
+                "You're in control — clicks, scrolls and keys go to the seat".into()
+            }
+            Loadable::Ready(Some(_)) => match self.shot_size {
+                Some((w, h)) => format!("Live desktop · {w}×{h} · every 4s").into(),
+                None => "Live desktop · every 4s".into(),
+            },
+            _ if self.desktop_starting => "Starting the seat's desktop…".into(),
             Loadable::Ready(None) if self.vm_info.is_some() => "Linux console · no display".into(),
             Loadable::Error(_) => "Not reachable".into(),
             Loadable::Ready(None) => "No display".into(),
             _ => "Connecting…".into(),
         };
-        let live = matches!(self.shot, Loadable::Ready(Some(_))) || self.vm_info.is_some();
+        let live = has_image || self.vm_info.is_some();
+        let control_id = "rail-take-control";
+        let take_control = div()
+            .id(control_id)
+            .flex_none()
+            .px(px(8.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .rounded(px(6.0))
+            .text_size(crate::typography::ui_rems(11.0))
+            .when(has_image, |el| el.cursor_pointer())
+            .opacity(if has_image { 1.0 } else { 0.4 })
+            .text_color(if self.controlling {
+                theme.accent
+            } else {
+                theme.text_muted
+            })
+            .bg(if self.controlling {
+                theme.accent.opacity(0.12)
+            } else {
+                theme.element_hover.opacity(0.0)
+            })
+            .hover(|s| s.bg(theme.element_hover))
+            .tooltip(widgets::text_tooltip(if has_image {
+                "Drive the seat's desktop yourself — the agent keeps its own control"
+            } else {
+                "Start the desktop to take control"
+            }))
+            .child(
+                icon(icons::MONITOR)
+                    .size(px(12.0))
+                    .text_color(if self.controlling {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    }),
+            )
+            .child(if self.controlling {
+                "Release"
+            } else {
+                "Take control"
+            })
+            .when(has_image, |el| {
+                el.on_click(cx.listener(|this, _, _, cx| {
+                    this.controlling = !this.controlling;
+                    this.act_error = None;
+                    cx.notify();
+                }))
+            });
         let mut col = div().size_full().flex().flex_col();
         col = col.child(
             div()
@@ -2996,21 +3577,15 @@ impl CloudRail {
                         .text_color(theme.text_muted)
                         .child(mode),
                 )
+                .child(take_control)
                 .child(
                     div()
                         .id("rail-shot-refresh")
                         .cursor_pointer()
-                        .when(
-                            self.capabilities().computer || self.capabilities().shell,
-                            |el| el.on_click(cx.listener(|this, _, _, cx| this.capture_shot(cx))),
-                        )
-                        .opacity(
-                            if self.capabilities().computer || self.capabilities().shell {
-                                1.0
-                            } else {
-                                0.35
-                            },
-                        )
+                        .when(can_watch, |el| {
+                            el.on_click(cx.listener(|this, _, _, cx| this.capture_shot(cx)))
+                        })
+                        .opacity(if can_watch { 1.0 } else { 0.35 })
                         .child(
                             icon(icons::REFRESH)
                                 .size(px(13.0))
@@ -3018,42 +3593,113 @@ impl CloudRail {
                         ),
                 ),
         );
+        let start_button = |label: &'static str, this: &Self, cx: &mut Context<Self>| {
+            popover::btn_primary(theme, label)
+                .id("rail-start-desktop")
+                .when(this.desktop_starting, |el| el.opacity(0.5))
+                .on_click(cx.listener(|this, _, _, cx| this.start_desktop(cx)))
+        };
         let body = match &self.shot {
-            Loadable::Ready(Some(image)) => div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    gpui::img(image.clone())
-                        .max_w_full()
-                        .max_h_full()
-                        .object_fit(gpui::ObjectFit::Contain),
-                )
-                .into_any_element(),
-            Loadable::Ready(None) if self.vm_info.is_some() => render_vm_screen(
-                theme,
-                self.vm_info.as_ref().unwrap_or(&serde_json::Value::Null),
-            ),
-            Loadable::Ready(None) => {
-                let keeps = self.capabilities().keeps_running;
-                pane_empty(
-                    theme,
-                    icons::MONITOR,
-                    "seat not controllable yet",
-                    if keeps {
-                        "No remote CUA endpoint is stamped for this seat. \
-                         Files, Changes, Shell and Pull requests still work \
-                         through git/ssh/docker."
+            Loadable::Ready(Some(image)) => {
+                let bounds = self.shot_bounds.clone();
+                div()
+                    .id("rail-shot-surface")
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .m(px(8.0))
+                    .rounded(px(8.0))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(if self.controlling {
+                        theme.accent.opacity(0.6)
                     } else {
-                        "No remote CUA endpoint is stamped for this seat, and \
-                         it runs only while the desktop app is open — no \
-                         remote harness is detached yet."
-                    },
-                )
-                .into_any_element()
+                        theme.border
+                    })
+                    .bg(gpui::hsla(0.0, 0.0, 0.05, 1.0))
+                    .when(self.controlling, |el| el.cursor_crosshair())
+                    .child(
+                        gpui::img(image.clone())
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Contain),
+                    )
+                    .child(
+                        gpui::canvas(move |b, _, _| bounds.set(Some(b)), |_, _, _, _| {})
+                            .absolute()
+                            .inset_0(),
+                    )
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, event, _, cx| this.click_preview(event, cx)),
+                    )
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(|this, event, _, cx| this.click_preview(event, cx)),
+                    )
+                    .on_scroll_wheel(
+                        cx.listener(|this, event, _, cx| this.scroll_preview(event, cx)),
+                    )
+                    .into_any_element()
             }
+            Loadable::Ready(None) if self.vm_info.is_some() => {
+                let installing = matches!(desktop_status.as_str(), "installing" | "starting");
+                let copy: SharedString = if self.desktop_starting || installing {
+                    "Bringing up a virtual display (Xvfb) on the seat. The first start installs \
+                     it — about a minute."
+                        .into()
+                } else if let Some(err) = self.desktop_error.clone() {
+                    err.into()
+                } else if let Some(failed) = desktop_status.strip_prefix("failed") {
+                    format!("The desktop couldn't start{failed}").into()
+                } else {
+                    "The agent gets a desktop on every run — or start it now to watch and \
+                     drive it: screenshots, clicks, typing, a browser, recordings."
+                        .into()
+                };
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex_none()
+                            .p(px(12.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .text_color(theme.text_muted)
+                                    .child(copy),
+                            )
+                            .when(caps.computer, |el| {
+                                el.child(div().flex().child(start_button(
+                                    if self.desktop_starting || installing {
+                                        "Starting…"
+                                    } else {
+                                        "Start desktop"
+                                    },
+                                    self,
+                                    cx,
+                                )))
+                            }),
+                    )
+                    .child(render_vm_screen(
+                        theme,
+                        self.vm_info.as_ref().unwrap_or(&serde_json::Value::Null),
+                    ))
+                    .into_any_element()
+            }
+            Loadable::Ready(None) => pane_empty(
+                theme,
+                icons::MONITOR,
+                "No desktop yet",
+                "This seat can't show a screen until it can run commands — Files, \
+                 Changes and Pull requests still work.",
+            )
+            .into_any_element(),
             Loadable::Error(err) => {
                 pane_empty(theme, icons::DANGER_TRIANGLE, "Seat preview", err).into_any_element()
             }
@@ -3068,6 +3714,83 @@ impl CloudRail {
                 .into_any_element(),
         };
         col = col.child(body);
+        if has_image && self.controlling {
+            let key = |id: &'static str, label: &'static str, combo: &'static str| {
+                div()
+                    .id(id)
+                    .flex_none()
+                    .px(px(7.0))
+                    .h(px(22.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_size(crate::typography::ui_rems(10.5))
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.element_hover))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.act(serde_json::json!({ "kind": "key", "combo": combo }), cx)
+                    }))
+            };
+            col = col.child(
+                div()
+                    .flex_none()
+                    .px(px(8.0))
+                    .pb(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(div().flex_1().min_w_0().child(popover::dialog_field(
+                                self.type_input.clone().into_any_element(),
+                            )))
+                            .child(
+                                popover::btn_ghost(theme, "Open", "rail-open-url")
+                                    .id("rail-open-url")
+                                    .tooltip(widgets::text_tooltip(
+                                        "Open the URL in the bar in a browser on the seat",
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| this.open_on_seat(cx))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(px(4.0))
+                            .child(key("seat-key-enter", "Enter", "Return"))
+                            .child(key("seat-key-tab", "Tab", "Tab"))
+                            .child(key("seat-key-esc", "Esc", "Escape"))
+                            .child(key("seat-key-bksp", "⌫", "BackSpace"))
+                            .child(key("seat-key-up", "↑", "Up"))
+                            .child(key("seat-key-down", "↓", "Down"))
+                            .child(key("seat-key-selall", "Ctrl+A", "ctrl+a"))
+                            .child(key("seat-key-copy", "Ctrl+C", "ctrl+c"))
+                            .child(key("seat-key-paste", "Ctrl+V", "ctrl+v"))
+                            .child(key("seat-key-url", "Ctrl+L", "ctrl+l")),
+                    ),
+            );
+        }
+        if let Some(err) = self.act_error.clone() {
+            col = col.child(
+                div()
+                    .flex_none()
+                    .px(px(12.0))
+                    .pb(px(8.0))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.danger)
+                    .child(SharedString::from(err)),
+            );
+        }
         col.into_any_element()
     }
 
@@ -3219,42 +3942,298 @@ impl CloudRail {
                 }
             }
         }
-        if paths.is_empty() {
-            return pane_empty(
-                theme,
-                icons::FOLDER_WITH_FILES,
-                "Context",
-                "Files the run reads or edits attach here as it works.",
+        let caps = self.capabilities();
+        let backup = self
+            .state
+            .read(cx)
+            .cloud_view()
+            .and_then(|view| view.backup_for_chat(&self.chat_id))
+            .cloned();
+        let workspace = self
+            .binding
+            .workspace_path
+            .clone()
+            .unwrap_or_else(|| "seat workspace".into());
+        let section = |title: &'static str| {
+            div()
+                .pt(px(12.0))
+                .pb(px(4.0))
+                .px(px(4.0))
+                .text_size(crate::typography::ui_rems(10.5))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text_faint)
+                .child(title)
+        };
+        let mut list = div().flex().flex_col().px(px(8.0)).pb(px(12.0));
+
+        // Workspace: where the work lives and how it's kept.
+        let storage: SharedString = match (&self.binding.repo, &backup) {
+            (Some(repo), _) => {
+                format!("Checkout of {repo} — commits and PRs are the record").into()
+            }
+            (None, Some(b)) => format!(
+                "Local git checkpoint every turn · backed up to this computer {} ({})",
+                crate::cloud::boards::relative(b.taken_at, chrono::Utc::now()),
+                zeron_engine::cloud::human_bytes(b.bytes)
             )
-            .into_any_element();
-        }
-        let mut list = div().flex().flex_col().p(px(8.0));
-        for path in paths {
-            list = list.child(
-                div()
-                    .h(px(24.0))
-                    .px(px(4.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        icon(icons::DOCUMENT)
+            .into(),
+            (None, None) => {
+                "Local git checkpoint every turn · backs up to this computer after each turn".into()
+            }
+        };
+        list = list.child(section("WORKSPACE")).child(
+            div()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.surface_card)
+                .p(px(10.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            icon(if self.binding.repo.is_some() {
+                                icons::GIT_BRANCH
+                            } else {
+                                icons::FOLDER
+                            })
                             .size(px(12.0))
-                            .flex_none()
                             .text_color(theme.text_muted),
-                    )
-                    .child(
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.text)
+                                .child(SharedString::from(workspace)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_muted)
+                        .child(storage),
+                )
+                .when(caps.exec, |el| {
+                    el.child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(11.5))
-                            .font_family(theme.font_mono.clone())
-                            .text_color(theme.text)
-                            .child(SharedString::from(path)),
-                    ),
-            );
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                popover::btn_ghost(
+                                    theme,
+                                    if self.backup_busy {
+                                        "Backing up…"
+                                    } else {
+                                        "Back up now"
+                                    },
+                                    "rail-backup-now",
+                                )
+                                .id("rail-backup-now")
+                                .on_click(cx.listener(|this, _, _, cx| this.backup_now(cx))),
+                            )
+                            .when_some(self.backup_note.clone(), |el, note| {
+                                let (text, color) = match note {
+                                    Ok(text) => (text, theme.success),
+                                    Err(text) => (text, theme.danger),
+                                };
+                                el.child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(crate::typography::ui_rems(10.5))
+                                        .text_color(color)
+                                        .child(SharedString::from(text)),
+                                )
+                            }),
+                    )
+                }),
+        );
+
+        // Evidence: what the agent captured to show its work.
+        list = list.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(section("SCREENSHOTS & RECORDINGS"))
+                .child(div().flex_1())
+                .when(caps.exec, |el| {
+                    el.child(
+                        div()
+                            .id("rail-evidence-refresh")
+                            .pt(px(8.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.load_evidence(cx)))
+                            .child(
+                                icon(icons::REFRESH)
+                                    .size(px(12.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    )
+                }),
+        );
+        match &self.evidence {
+            Loadable::Ready(items) if !items.is_empty() => {
+                for (ix, (name, size)) in items.iter().enumerate() {
+                    let is_image = name.ends_with(".png");
+                    let open = self
+                        .evidence_preview
+                        .as_ref()
+                        .filter(|(open, _)| open == name)
+                        .map(|(_, slot)| slot.clone());
+                    let row_name = name.clone();
+                    list = list.child(
+                        div()
+                            .id(("rail-evidence", ix))
+                            .h(px(26.0))
+                            .px(px(4.0))
+                            .rounded(px(6.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .when(is_image, |el| {
+                                el.cursor_pointer()
+                                    .hover(|s| s.bg(theme.element_hover))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.preview_evidence(row_name.clone(), cx)
+                                    }))
+                            })
+                            .child(
+                                icon(if is_image {
+                                    icons::MONITOR
+                                } else {
+                                    icons::DOCUMENT
+                                })
+                                .size(px(12.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::typography::ui_rems(11.5))
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(name.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(crate::typography::ui_rems(10.0))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from(zeron_engine::cloud::human_bytes(
+                                        *size,
+                                    ))),
+                            ),
+                    );
+                    if let Some(slot) = open {
+                        list = list.child(match slot {
+                            Loadable::Ready(image) => div()
+                                .mx(px(4.0))
+                                .mb(px(6.0))
+                                .rounded(px(8.0))
+                                .overflow_hidden()
+                                .border_1()
+                                .border_color(theme.border)
+                                .child(
+                                    gpui::img(image)
+                                        .w_full()
+                                        .object_fit(gpui::ObjectFit::Contain),
+                                )
+                                .into_any_element(),
+                            Loadable::Error(err) => div()
+                                .px(px(4.0))
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.danger)
+                                .child(SharedString::from(err))
+                                .into_any_element(),
+                            _ => div()
+                                .px(px(4.0))
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.text_muted)
+                                .child("Loading…")
+                                .into_any_element(),
+                        });
+                    }
+                }
+            }
+            Loadable::Error(err) => {
+                list = list.child(
+                    div()
+                        .px(px(4.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.danger)
+                        .child(SharedString::from(err.clone())),
+                );
+            }
+            Loadable::Loading => {
+                list = list.child(
+                    div()
+                        .px(px(4.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_muted)
+                        .child("Loading…"),
+                );
+            }
+            _ => {
+                list = list.child(
+                    div()
+                        .px(px(4.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_muted)
+                        .child(
+                            "Nothing yet — the agent saves screenshots and recordings here \
+                             (cosmos-computer screenshot / record).",
+                        ),
+                );
+            }
+        }
+
+        // Files the run touched (structured tool calls).
+        if !paths.is_empty() {
+            list = list.child(section("FILES TOUCHED"));
+            for path in paths {
+                list = list.child(
+                    div()
+                        .h(px(24.0))
+                        .px(px(4.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            icon(icons::DOCUMENT)
+                                .size(px(12.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .font_family(theme.font_mono.clone())
+                                .text_color(theme.text)
+                                .child(SharedString::from(path)),
+                        ),
+                );
+            }
         }
         div()
             .id("rail-context-list")
@@ -3631,6 +4610,27 @@ impl Render for CloudRail {
             .as_ref()
             .is_some_and(|s| s.config.backup_at.is_some());
         let not_persistent = !self.capabilities().keeps_running && !sleeping && !railway_expired;
+        // Where a dead trial's thread can continue: the best live seat.
+        let move_target: Option<(String, String)> = railway_expired
+            .then(|| {
+                let state = self.state.read(cx);
+                let seats: Vec<SeatRow> = state
+                    .cloud_seats()
+                    .iter()
+                    .filter(|s| s.config.id != self.binding.seat_id && CloudView::seat_runnable(s))
+                    .cloned()
+                    .collect();
+                CloudView::preferred_seat(&seats).map(|s| {
+                    (
+                        s.config.id.clone(),
+                        match s.config.kind {
+                            Some(CloudSeatKind::Railway) => "a new trial".to_string(),
+                            _ => s.config.label.clone(),
+                        },
+                    )
+                })
+            })
+            .flatten();
         // The "Keep this computer" card shows once: a Railway (or
         // desk-bound) seat that finished a run and has never been asked.
         let show_keep_prompt = is_railway
@@ -3713,16 +4713,36 @@ impl Render for CloudRail {
                 el.child(
                     div()
                         .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
                         .px(px(10.0))
                         .py(px(6.0))
                         .border_b_1()
                         .border_color(theme.border)
-                        .text_size(crate::typography::ui_rems(10.5))
-                        .text_color(theme.danger)
-                        .child(if backed_up {
-                            "Trial ended — workspace backed up locally; a Boat seat restores it on its first run"
-                        } else {
-                            "Trial ended — claim the VM from the link or start a new seat"
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(theme.danger)
+                                .child(match (&move_target, backed_up) {
+                                    (Some(_), true) => "Trial ended — your work is backed up on this computer. Continue on another seat and it comes back.",
+                                    (Some(_), false) => "Trial ended — continue this chat on another seat.",
+                                    (None, true) => "Trial ended — work is backed up here; add a Boat token to continue on a persistent PC.",
+                                    (None, false) => "Trial ended — claim the VM from the link, or add a Boat token.",
+                                }),
+                        )
+                        .when_some(move_target.clone(), |el, (seat_id, label)| {
+                            el.child(
+                                popover::btn_primary(&theme, &format!("Continue on {label}"))
+                                    .id("rail-move-chat")
+                                    .when(self.control_busy, |el| el.opacity(0.5))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.move_chat(seat_id.clone(), cx)
+                                    })),
+                            )
                         }),
                 )
             })

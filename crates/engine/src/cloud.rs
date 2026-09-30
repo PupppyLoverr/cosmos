@@ -22,7 +22,7 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use zeron_proto::{
     ByokProvider, CloudAutomation, CloudRun, CloudSeatBinding, CloudSeatKind, SeatCapabilities,
-    SeatProbe, WorkspaceBackup,
+    SeatProbe, TaskDraft, WorkspaceBackup,
 };
 
 use crate::EngineError;
@@ -270,6 +270,8 @@ struct CloudConfigFile {
     default_seat: Option<String>,
     /// Per-chat workspace snapshots on this computer (`seat-backups/`).
     backups: Vec<WorkspaceBackup>,
+    /// Kanban drafts — tasks created but not started.
+    drafts: Vec<TaskDraft>,
 }
 
 /// Secrets — `cloud-keys.json`, 0600 on Unix. Everything optional; a missing
@@ -743,14 +745,14 @@ impl CloudStore {
             None => state.config.automations.push(automation),
         }
         drop(state);
-        self.persist_config();
+        let _ = self.persist_config();
     }
 
     pub fn remove_automation(&self, id: &str) {
         let mut state = self.inner.state.write().unwrap();
         state.config.automations.retain(|a| a.id != id);
         drop(state);
-        self.persist_config();
+        let _ = self.persist_config();
     }
 
     /// Due automations are claimed in one mutation: each gets `next_run_at`
@@ -810,7 +812,7 @@ impl CloudStore {
         }
         if !due.is_empty() {
             drop(state);
-            self.persist_config();
+            let _ = self.persist_config();
         }
         due
     }
@@ -824,7 +826,7 @@ impl CloudStore {
             }
         }
         drop(state);
-        self.persist_config();
+        let _ = self.persist_config();
     }
 
     // ── run ledger ───────────────────────────────────────────────────────
@@ -847,7 +849,7 @@ impl CloudStore {
             None => state.runs.runs.push(run),
         }
         drop(state);
-        self.persist_runs();
+        let _ = self.persist_runs();
     }
 
     pub fn update_run(&self, run_id: &str, f: impl FnOnce(&mut CloudRun)) {
@@ -857,7 +859,7 @@ impl CloudStore {
             run.updated_at = Utc::now();
         }
         drop(state);
-        self.persist_runs();
+        let _ = self.persist_runs();
     }
 
     /// A redacted config view for RPC: secrets collapse to `has_*` booleans.
@@ -909,6 +911,7 @@ impl CloudStore {
             "defaultSeat": self.default_seat().map(|s| s.id),
             "runs": self.runs(),
             "backups": self.backups(),
+            "drafts": self.drafts(),
             // Whether the shared GitHub PAT exists — the repo picker's
             // "token present" flag (never the token itself).
             "hasGithubPat": has_shared_github,
@@ -957,6 +960,34 @@ impl CloudStore {
             .max_by_key(|s| s.backup_at)
             .and_then(|s| s.backup_path.map(PathBuf::from))
             .filter(|p| p.exists())
+    }
+
+    // ── Kanban drafts ────────────────────────────────────────────────────
+
+    pub fn drafts(&self) -> Vec<TaskDraft> {
+        self.inner.state.read().unwrap().config.drafts.clone()
+    }
+
+    pub fn save_draft(&self, draft: TaskDraft) {
+        let mut state = self.inner.state.write().unwrap();
+        state.config.drafts.retain(|d| d.chat_id != draft.chat_id);
+        state.config.drafts.push(draft);
+        drop(state);
+        let _ = self.persist_config();
+    }
+
+    /// Remove and return a draft (starting or discarding it).
+    pub fn take_draft(&self, chat_id: &str) -> Option<TaskDraft> {
+        let mut state = self.inner.state.write().unwrap();
+        let ix = state
+            .config
+            .drafts
+            .iter()
+            .position(|d| d.chat_id == chat_id)?;
+        let draft = state.config.drafts.remove(ix);
+        drop(state);
+        let _ = self.persist_config();
+        Some(draft)
     }
 
     // ── per-chat workspace backups ───────────────────────────────────────
@@ -1686,18 +1717,36 @@ pub async fn ensure_chat_workspace(
     workspace: &str,
     repo_less: bool,
 ) -> Option<String> {
-    let prepare = if repo_less {
+    let prepare = chat_workspace_prepare(workspace, repo_less);
+    let empty = match seat_exec(http, store, seat, &prepare, Duration::from_secs(40)).await {
+        Ok(out) => out.stdout.contains("__cosmos_ws_empty"),
+        Err(e) => return Some(format!("Couldn't prepare the workspace on the seat: {e}")),
+    };
+    restore_chat_workspace_if_empty(http, store, seat, chat_id, workspace, empty).await
+}
+
+/// The shell line that creates a chat's workspace (git-initialising a
+/// repo-less one) and prints `__cosmos_ws_empty` / `__cosmos_ws_has`.
+pub fn chat_workspace_prepare(workspace: &str, repo_less: bool) -> String {
+    if repo_less {
         workspace_prepare_command(workspace)
     } else {
         let ws = shell_word(workspace);
         format!(
             "mkdir -p {ws} && cd {ws} && {{ [ -n \"$(ls -A 2>/dev/null)\" ] && echo __cosmos_ws_has || echo __cosmos_ws_empty; }}"
         )
-    };
-    let empty = match seat_exec(http, store, seat, &prepare, Duration::from_secs(40)).await {
-        Ok(out) => out.stdout.contains("__cosmos_ws_empty"),
-        Err(e) => return Some(format!("Couldn't prepare the workspace on the seat: {e}")),
-    };
+    }
+}
+
+/// Restore the chat's snapshot when its workspace came up `empty`.
+pub async fn restore_chat_workspace_if_empty(
+    http: &reqwest::Client,
+    store: &CloudStore,
+    seat: &SeatConfig,
+    chat_id: &str,
+    workspace: &str,
+    empty: bool,
+) -> Option<String> {
     if !empty {
         return None;
     }
@@ -2000,7 +2049,7 @@ pub async fn probe_seat(
                         {
                             let mut seat = seat.clone();
                             seat.ssh_endpoint = sandbox.ssh_endpoint;
-                            store.save_seat(seat);
+                            let _ = store.save_seat(seat);
                         }
                     }
                     Err(e) => probe.detail = Some(e),
@@ -2026,7 +2075,7 @@ pub async fn probe_seat(
                             let mut seat = seat.clone();
                             seat.box_id = Some(live.id.clone());
                             seat.ssh_endpoint = live.ssh_endpoint.clone();
-                            store.save_seat(seat);
+                            let _ = store.save_seat(seat);
                             probe.online = live.usable();
                             probe.sleeping = live.sleeping();
                         } else {
@@ -3352,6 +3401,128 @@ pub fn runs_file_name() -> &'static str {
 // Kanban) instead of erroring a chat nobody asked for.
 // ---------------------------------------------------------------------------
 
+/// What a new task (Kanban "+ New task", an automation fire) runs.
+pub struct TaskSpec {
+    pub title: String,
+    pub prompt: String,
+    /// Cloud seat; `None` = this computer.
+    pub seat_id: Option<String>,
+    /// Local project (and the project context for seat runs).
+    pub space_id: Option<String>,
+    pub harness: Option<zeron_proto::HarnessId>,
+    /// Seat workspace to use instead of the per-chat default (automations
+    /// keep one workspace across fires).
+    pub seat_workspace: Option<String>,
+}
+
+/// Create the chat a task runs in — bound to its seat (repo-less seats get
+/// the per-chat workspace) — and return `(chat_id, cwd)`.
+pub fn create_task_chat(
+    store: &CloudStore,
+    workspace: &crate::workspace_host::WorkspaceHost,
+    device_id: &str,
+    spec: &TaskSpec,
+) -> Result<(String, String), EngineError> {
+    let chat_id = crate::new_id();
+    let seat = match spec.seat_id.as_deref() {
+        Some(id) => Some(
+            store
+                .seat(id)
+                .ok_or_else(|| EngineError::Other(format!("no such seat: {id}")))?,
+        ),
+        None => None,
+    };
+    if let Some(seat) = &seat
+        && seat.expired()
+    {
+        return Err(EngineError::Other(
+            "that Railway trial has ended — pick a live seat".into(),
+        ));
+    }
+    let binding = seat.as_ref().map(|seat| CloudSeatBinding {
+        seat_id: seat.id.clone(),
+        kind: seat.kind.unwrap_or(CloudSeatKind::Ssh),
+        label: seat.label.clone(),
+        repo: seat.repo.clone(),
+        workspace_path: Some(match (&spec.seat_workspace, &seat.repo) {
+            (Some(ws), _) => ws.clone(),
+            (None, Some(_)) => seat.workspace(),
+            (None, None) => chat_workspace(&seat.workspace(), &chat_id),
+        }),
+        model_label: None,
+        expires_at: seat.expires_at,
+    });
+    let seat_cwd = binding.as_ref().and_then(|b| b.workspace_path.clone());
+    workspace.create_chat_with_parent(
+        &chat_id,
+        spec.space_id.as_deref(),
+        Some(device_id),
+        None,
+        seat_cwd.clone(),
+        None,
+        binding,
+    )?;
+    workspace
+        .rename_chat(&chat_id, &spec.title)
+        .map_err(|e| EngineError::Other(e.to_string()))?;
+    let cwd = seat_cwd
+        .or_else(|| {
+            spec.space_id
+                .as_deref()
+                .and_then(|id| workspace.space(id).ok().flatten())
+                .map(|space| space.path)
+        })
+        .unwrap_or_else(|| "~".to_string());
+    Ok((chat_id, cwd))
+}
+
+/// Queue a task's first run (the host's normal drain dispatches it —
+/// remotely for seat-bound chats).
+pub fn queue_task_run(
+    doc_host: &crate::doc_host::DocHost,
+    chat_id: &str,
+    prompt: &str,
+    cwd: &str,
+    harness: Option<zeron_proto::HarnessId>,
+) -> Result<(), EngineError> {
+    doc_host.queue_command(
+        chat_id,
+        zeron_doc::SessionCommandPayload::Run {
+            request: zeron_proto::RunRequest {
+                prompt: prompt.to_string(),
+                harness,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                cwd: cwd.to_string(),
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                auto_approve: true,
+                resume: None,
+                attachments: Vec::new(),
+                worktree: None,
+            },
+            message_id: crate::new_id(),
+        },
+    )?;
+    Ok(())
+}
+
+/// A task title from its prompt's first line.
+pub fn task_title(prompt: &str) -> String {
+    let line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("New task");
+    let mut chars = line.chars();
+    let head: String = chars.by_ref().take(60).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 pub struct Scheduler {
     store: CloudStore,
     doc_host: crate::doc_host::DocHost,
@@ -3490,53 +3661,30 @@ impl Scheduler {
         };
 
         // The run's chat — one per fire, titled `name · timestamp`.
-        let chat_id = crate::new_id();
         let title = format!(
             "{} · {}",
             automation.name,
             Utc::now().format("%b %-d %H:%M")
         );
-        let seat_cwd = binding.as_ref().and_then(|b| b.workspace_path.clone());
-        self.workspace.create_chat_with_parent(
-            &chat_id,
-            automation.space_id.as_deref(),
-            Some(&self.device_id),
-            None,
-            seat_cwd.clone(),
-            None,
-            binding,
-        )?;
-        self.workspace
-            .rename_chat(&chat_id, &title)
-            .map_err(|e| EngineError::Other(e.to_string()))?;
-
-        let cwd = seat_cwd
-            .or_else(|| {
-                automation
-                    .space_id
-                    .as_deref()
-                    .and_then(|id| self.workspace.space(id).ok().flatten())
-                    .map(|space| space.path)
-            })
-            .unwrap_or_else(|| "~".to_string());
-        self.doc_host.queue_command(
-            &chat_id,
-            zeron_doc::SessionCommandPayload::Run {
-                request: zeron_proto::RunRequest {
-                    prompt: automation.prompt.clone(),
-                    harness: automation.harness,
-                    model: None,
-                    reasoning: None,
-                    model_options: Default::default(),
-                    cwd,
-                    sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
-                    auto_approve: true,
-                    resume: None,
-                    attachments: Vec::new(),
-                    worktree: None,
-                },
-                message_id: crate::new_id(),
+        let (chat_id, cwd) = create_task_chat(
+            &self.store,
+            &self.workspace,
+            &self.device_id,
+            &TaskSpec {
+                title,
+                prompt: automation.prompt.clone(),
+                seat_id: automation.seat_id.clone(),
+                space_id: automation.space_id.clone(),
+                harness: automation.harness,
+                seat_workspace: binding.and_then(|b| b.workspace_path),
             },
+        )?;
+        queue_task_run(
+            &self.doc_host,
+            &chat_id,
+            &automation.prompt,
+            &cwd,
+            automation.harness,
         )?;
         self.store
             .mark_automation(&automation.id, "ok", Some(&chat_id));
@@ -3795,6 +3943,28 @@ mod tests {
         assert!(back.stdout.contains("print(1)"), "{}", back.stdout);
         assert!(back.stdout.contains("Cosmos checkpoint: build the app"));
         assert!(!back.stdout.contains("\nx\n"), "node_modules excluded");
+
+        // The desktop over the same link: the turn-start prep returns fast
+        // (bring-up is detached — the ssh session must not hang on it), then
+        // the pane's capture and an act round-trip.
+        let started = std::time::Instant::now();
+        let prep = format!(
+            "{{ {} ; }} ; {}",
+            crate::seat_desktop::bootstrap_command(),
+            chat_workspace_prepare(&ws, true)
+        );
+        let out = run(prep).await;
+        assert!(out.stdout.contains("__cosmos_desktop_ok"), "{}", out.stderr);
+        assert!(out.stdout.contains("__cosmos_ws_has"));
+        assert!(started.elapsed() < Duration::from_secs(20), "prep hung");
+        let ready = run(crate::seat_desktop::start_command()).await;
+        assert!(ready.stdout.contains("__status=ready"), "{}", ready.stderr);
+        let screen = linux_screen(&http, &store, &seat).await.unwrap();
+        assert_eq!(screen["width"], 1280, "{screen}");
+        let act = crate::seat_desktop::SeatAction::Type { text: "hi".into() }
+            .command()
+            .unwrap();
+        assert_eq!(run(act).await.code, 0);
         run(format!("rm -rf {}", shell_word(&base))).await;
     }
 

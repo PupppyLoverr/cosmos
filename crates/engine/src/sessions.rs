@@ -1859,11 +1859,14 @@ async fn persist_remote_turn(
     if produced && let Some(tag) = turn.session_tag.clone() {
         store.update_run(run_id, |run| run.harness_session = Some(tag));
     }
-    if seat.expired() {
+    // Repo chats keep their record in git (commits, pushed branches, PRs —
+    // plus the trial-expiry sweep and "Back up now"); per-turn snapshots are
+    // for repo-less workspaces, whose only other copy is the seat itself.
+    if seat.expired() || seat.repo.is_some() {
         return;
     }
     let workspace = seat.workspace();
-    if seat.repo.is_none() {
+    {
         match crate::cloud::seat_exec(
             http,
             store,
@@ -1883,13 +1886,12 @@ async fn persist_remote_turn(
     match crate::cloud::backup_chat_workspace(http, store, seat, chat_id, &workspace).await {
         Ok(backup) => {
             tracing::info!(chat = %chat_id, bytes = backup.bytes, "chat workspace backed up");
-            let _ = inner;
         }
         Err(e) => {
             tracing::warn!(chat = %chat_id, error = %e, "chat workspace backup failed");
-            // Only say so in the transcript when a repo-less workspace — the
-            // one place the work has no other home — couldn't be saved.
-            if seat.repo.is_none() && produced {
+            // Say so in the transcript: a repo-less workspace has no other
+            // home, so a failed save is worth one honest line.
+            if produced {
                 write_transcript_note(
                     doc,
                     &inner.device_id,
@@ -1913,27 +1915,36 @@ async fn prepare_remote_turn(
     doc: &crate::doc_host::DocWriter,
 ) -> String {
     let workspace = seat.workspace();
-    if let Some(note) = crate::cloud::ensure_chat_workspace(
-        http,
-        store,
-        seat,
-        chat_id,
-        &workspace,
-        seat.repo.is_none(),
-    )
-    .await
+    // One round-trip: stage the desktop tooling (detached bring-up), then
+    // create/inspect the chat's workspace.
+    let prep = format!(
+        "{{ {} ; }} ; {}",
+        crate::seat_desktop::bootstrap_command(),
+        crate::cloud::chat_workspace_prepare(&workspace, seat.repo.is_none())
+    );
+    let (desktop_ok, empty) =
+        match crate::cloud::seat_exec(http, store, seat, &prep, std::time::Duration::from_secs(45))
+            .await
+        {
+            Ok(out) => (
+                out.stdout.contains("__cosmos_desktop_ok"),
+                out.stdout.contains("__cosmos_ws_empty"),
+            ),
+            Err(e) => {
+                write_transcript_note(
+                    doc,
+                    &inner.device_id,
+                    &format!("Couldn't prepare the workspace on the seat: {e}"),
+                );
+                (false, false)
+            }
+        };
+    if let Some(note) =
+        crate::cloud::restore_chat_workspace_if_empty(http, store, seat, chat_id, &workspace, empty)
+            .await
     {
         write_transcript_note(doc, &inner.device_id, &note);
     }
-    let desktop = crate::cloud::seat_exec(
-        http,
-        store,
-        seat,
-        &crate::seat_desktop::bootstrap_command(),
-        std::time::Duration::from_secs(30),
-    )
-    .await;
-    let desktop_ok = matches!(&desktop, Ok(out) if out.stdout.contains("__cosmos_desktop_ok"));
     if !desktop_ok {
         tracing::warn!(seat = %seat.id, "seat desktop bootstrap failed");
     }

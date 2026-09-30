@@ -4261,6 +4261,99 @@ impl RpcService for EngineRpc {
                 .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "ok": true, "backup": backup }))
             }
+            methods::CLOUD_TASK_CREATE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    prompt: String,
+                    #[serde(default)]
+                    seat_id: Option<String>,
+                    #[serde(default)]
+                    space_id: Option<String>,
+                    #[serde(default)]
+                    harness: Option<zeron_proto::HarnessId>,
+                    #[serde(default)]
+                    start: bool,
+                }
+                let p: P = parse_params(params)?;
+                let prompt = p.prompt.trim().to_string();
+                if prompt.is_empty() {
+                    return Err(RpcError::BadParams("a task needs a prompt".into()));
+                }
+                let cloud = self.cloud()?.clone();
+                let (chat_id, cwd) = crate::cloud::create_task_chat(
+                    &cloud,
+                    &self.workspace,
+                    self.doc_host.device_id(),
+                    &crate::cloud::TaskSpec {
+                        title: crate::cloud::task_title(&prompt),
+                        prompt: prompt.clone(),
+                        seat_id: p.seat_id.clone(),
+                        space_id: p.space_id.clone(),
+                        harness: p.harness,
+                        seat_workspace: None,
+                    },
+                )
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if p.start {
+                    crate::cloud::queue_task_run(
+                        &self.doc_host,
+                        &chat_id,
+                        &prompt,
+                        &cwd,
+                        p.harness,
+                    )
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                } else {
+                    cloud.save_draft(zeron_proto::TaskDraft {
+                        chat_id: chat_id.clone(),
+                        prompt,
+                        seat_id: p.seat_id,
+                        space_id: p.space_id,
+                        harness: p.harness,
+                        cwd,
+                        created_at: Utc::now(),
+                    });
+                }
+                RpcReply::value(&serde_json::json!({ "chatId": chat_id }))
+            }
+            methods::CLOUD_TASK_START => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    chat_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let draft = cloud
+                    .take_draft(&p.chat_id)
+                    .ok_or_else(|| RpcError::Failed("that task already started".into()))?;
+                if let Err(e) = crate::cloud::queue_task_run(
+                    &self.doc_host,
+                    &draft.chat_id,
+                    &draft.prompt,
+                    &draft.cwd,
+                    draft.harness,
+                ) {
+                    // Keep the draft so the card doesn't vanish on a failure.
+                    cloud.save_draft(draft);
+                    return Err(RpcError::Failed(e.to_string()));
+                }
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLOUD_TASK_DISCARD => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    chat_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                if cloud.take_draft(&p.chat_id).is_some() {
+                    let _ = self.workspace.delete_chat(&p.chat_id);
+                }
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             methods::CLOUD_AUTOMATION_RUN_NOW => {
                 #[derive(Deserialize)]
                 struct P {

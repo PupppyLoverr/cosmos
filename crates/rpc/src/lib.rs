@@ -382,6 +382,14 @@ pub mod methods {
     /// `{chatId}` → `{ok, backup}` — snapshot a chat's seat workspace to this
     /// computer now (the Context pane's "Back up now").
     pub const CLOUD_BACKUP_CHAT: &str = "CloudBackupChat";
+    /// `{prompt, seatId?, spaceId?, harness?, start}` → `{chatId}` — Kanban
+    /// "+ New task": creates the task's chat; `start` queues the run now,
+    /// otherwise it lands in Draft.
+    pub const CLOUD_TASK_CREATE: &str = "CloudTaskCreate";
+    /// `{chatId}` → `{ok}` — start a Draft task (its first run queues).
+    pub const CLOUD_TASK_START: &str = "CloudTaskStart";
+    /// `{chatId}` → `{ok}` — drop a Draft task and its empty chat.
+    pub const CLOUD_TASK_DISCARD: &str = "CloudTaskDiscard";
 }
 
 #[derive(Debug, thiserror::Error)]

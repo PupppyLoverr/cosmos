@@ -340,6 +340,25 @@ fn default_enabled() -> bool {
     true
 }
 
+/// A Kanban task saved as a draft: its chat exists (so the card opens a
+/// real session), the prompt waits here until the user starts it — "Start"
+/// or a drag into In progress queues the run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDraft {
+    pub chat_id: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<crate::HarnessId>,
+    /// Where the run executes (seat workspace or local project path).
+    pub cwd: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// A workspace snapshot pulled from a seat down to this computer — how a
 /// cloud workspace's progress survives the seat (a Railway trial dying, a
 /// Boat box destroyed). Restored onto whichever seat next runs the chat.
