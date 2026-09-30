@@ -3432,7 +3432,7 @@ mod tests {
 pub const COSMOS_GITHUB_CLIENT_ID: &str = "Iv23lijEVv5jdl2f7RTm";
 
 /// Where a user installs the Cosmos GitHub App on their repos.
-pub const COSMOS_GITHUB_INSTALL_URL: &str = "https://github.com/apps/cosmos/installations/new";
+pub const COSMOS_GITHUB_INSTALL_URL: &str = "https://github.com/apps/cosmos-ade/installations/new";
 
 #[derive(Debug)]
 pub enum DevicePoll {
