@@ -925,6 +925,9 @@ impl WorkspaceHost {
         cloud_seat: Option<zeron_proto::CloudSeatBinding>,
     ) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
+            if let Some(cloud_seat) = cloud_seat.as_ref() {
+                self.mutate(|doc| doc.set_chat_cloud_seat_if_unset(chat_id, cloud_seat))?;
+            }
             return Ok(()); // idempotent: optimistic client retries never duplicate
         }
         let space = match space_id {

@@ -61,16 +61,22 @@ fn parse_manifest(stderr: &str, assign_fallback_deadline: bool) -> RailwayTrial 
                     .map(str::to_string)
             })
         };
-        trial.claim_url =
-            trial
-                .claim_url
-                .or(pick(&["claimUrl", "claim_url", "claim", "signupUrl"]));
+        trial.claim_url = trial.claim_url.or(pick(&[
+            "human_claim_url",
+            "humanClaimUrl",
+            "claimUrl",
+            "claim_url",
+            "claim",
+            "signupUrl",
+        ]));
         trial.preview_url =
             trial
                 .preview_url
                 .or(pick(&["previewUrl", "preview_url", "preview", "url"]));
         if trial.expires_at.is_none() {
             for key in [
+                "build_expires_at",
+                "buildExpiresAt",
                 "buildDeadline",
                 "build_deadline",
                 "deadline",
@@ -210,6 +216,26 @@ mod tests {
         let explicit = parse_manifest(r#"{"expiresAt":"2030-01-01T00:00:00Z"}"#, true);
         assert_eq!(
             explicit.expires_at,
+            Some("2030-01-01T00:00:00Z".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn parses_current_trial_manifest_fields() {
+        let trial = parse_manifest(
+            r#"{"status":"trial_starting","human_claim_url":"https://example.test/claim","preview_url":"https://preview.example.test","build_expires_at":"2030-01-01T00:00:00Z"}"#,
+            true,
+        );
+        assert_eq!(
+            trial.claim_url.as_deref(),
+            Some("https://example.test/claim")
+        );
+        assert_eq!(
+            trial.preview_url.as_deref(),
+            Some("https://preview.example.test")
+        );
+        assert_eq!(
+            trial.expires_at,
             Some("2030-01-01T00:00:00Z".parse().unwrap())
         );
     }

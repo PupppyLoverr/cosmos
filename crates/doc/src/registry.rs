@@ -961,6 +961,7 @@ impl RegistryDoc {
                 chat.room_gen.map(|g| json!(g)).unwrap_or(Value::Null),
             ),
             ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
+            ("cloudSeat", json!(chat.cloud_seat.as_ref())),
         ]);
         self.write(KIND_CHATS, &chat.id.clone(), OpKind::Upsert, set);
         Ok(())
@@ -1050,6 +1051,30 @@ impl RegistryDoc {
             chat_id,
             OpKind::Update,
             fields([("archived", json!(archived))]),
+        );
+        Ok(true)
+    }
+
+    pub fn set_chat_cloud_seat_if_unset(
+        &mut self,
+        chat_id: &str,
+        cloud_seat: &zeron_proto::CloudSeatBinding,
+    ) -> Result<bool, DocError> {
+        let Some(row) = self.overlay_row(KIND_CHATS, chat_id) else {
+            return Ok(false);
+        };
+        if row
+            .fields
+            .get("cloudSeat")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("cloudSeat", serde_json::to_value(cloud_seat)?)]),
         );
         Ok(true)
     }
