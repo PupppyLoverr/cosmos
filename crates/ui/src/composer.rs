@@ -9499,38 +9499,79 @@ impl Composer {
         })
     }
 
-    /// One-click trial on-ramp: create a Railway seat row, provision the VM
-    /// via `ssh railway.new` (the probe stamps deadline/claim/preview), then
-    /// pick it — the send path just sees a bound seat.
+    /// One-click trial on-ramp: reuse the Railway seat if one is already
+    /// configured, otherwise create it, then probe and pick that seat.
     pub(crate) fn start_railway_trial(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let seat_id = format!("seat-{}", uuid::Uuid::new_v4().simple());
         cx.spawn(async move |this, cx| {
-            let saved = engine
+            let current_view = engine
                 .client()
-                .call(
-                    zeron_rpc::methods::CLOUD_SAVE_SEAT,
-                    serde_json::json!({
-                        "seat": {
-                            "id": seat_id,
-                            "kind": zeron_proto::CloudSeatKind::Railway,
-                            "label": "Railway trial",
-                            "sshAlias": "railway.new",
-                            "workspacePath": "/app",
-                            // A trial VM dies at the hour regardless — the
-                            // detached flag stays honest about what survives
-                            // the desktop closing.
-                            "detached": true,
-                        },
-                        "secrets": {},
-                    }),
-                )
+                .call(zeron_rpc::methods::CLOUD_GET_CONFIG, serde_json::json!({}))
                 .await;
-            if let Err(err) = saved {
-                tracing::warn!(error = %err, "railway trial seat save failed");
-                return;
+            let current_view = match current_view {
+                Ok(value) => match serde_json::from_value::<crate::cloud::CloudView>(value) {
+                    Ok(view) => view,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "railway trial seat lookup failed");
+                        this.update(cx, |_, _| {
+                            crate::notify::post(
+                                "Railway trial couldn't start",
+                                &err.to_string(),
+                                None,
+                            )
+                        })
+                        .ok();
+                        return;
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(error = %err, "railway trial seat lookup failed");
+                    this.update(cx, |_, _| {
+                        crate::notify::post("Railway trial couldn't start", &err.to_string(), None)
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let existing_seat_id = current_view
+                .seats
+                .iter()
+                .find(|seat| seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway))
+                .map(|seat| seat.config.id.clone());
+            let seat_id = existing_seat_id
+                .clone()
+                .unwrap_or_else(|| format!("seat-{}", uuid::Uuid::new_v4().simple()));
+            if existing_seat_id.is_none() {
+                let saved = engine
+                    .client()
+                    .call(
+                        zeron_rpc::methods::CLOUD_SAVE_SEAT,
+                        serde_json::json!({
+                            "seat": {
+                                "id": seat_id,
+                                "kind": zeron_proto::CloudSeatKind::Railway,
+                                "label": "Railway trial",
+                                "sshAlias": "railway.new",
+                                "workspacePath": "/app",
+                                // A trial VM dies at the hour regardless — the
+                                // detached flag stays honest about what survives
+                                // the desktop closing.
+                                "detached": true,
+                            },
+                            "secrets": {},
+                        }),
+                    )
+                    .await;
+                if let Err(err) = saved {
+                    tracing::warn!(error = %err, "railway trial seat save failed");
+                    this.update(cx, |_, _| {
+                        crate::notify::post("Railway trial couldn't start", &err.to_string(), None)
+                    })
+                    .ok();
+                    return;
+                }
             }
             // The probe IS the provisioning handshake — it can take tens of
             // seconds while Railway brings the VM up.
@@ -9538,7 +9579,7 @@ impl Composer {
                 .client()
                 .call(
                     zeron_rpc::methods::CLOUD_PROBE_SEAT,
-                    serde_json::json!({ "seatId": seat_id }),
+                    serde_json::json!({ "seatId": seat_id.clone() }),
                 )
                 .await;
             // Re-read the view so the picked row carries the stamped
@@ -9549,32 +9590,39 @@ impl Composer {
                 .await
                 .ok()
                 .and_then(|v| serde_json::from_value::<crate::cloud::CloudView>(v).ok());
+            let picked_row = view
+                .as_ref()
+                .and_then(|view| view.seats.iter().find(|s| s.config.id == seat_id))
+                .or_else(|| {
+                    existing_seat_id
+                        .as_deref()
+                        .and_then(|id| current_view.seat(id))
+                })
+                .cloned();
             this.update(cx, |composer, cx| {
                 composer.state.update(cx, |state, cx| {
                     state.refresh_cloud(None, cx);
                 });
-                match (probe, view) {
-                    (Ok(_), Some(view)) => {
-                        if let Some(row) = view.seats.iter().find(|s| s.config.id == seat_id) {
-                            composer.clear_failure(cx);
-                            composer.state.update(cx, |state, cx| {
-                                state.cloud_seat_pick = Some(row.clone());
-                                state.cloud_mode = true;
-                                crate::settings::update(
-                                    crate::settings::SavePolicy::Debounced,
-                                    cx,
-                                    |settings| settings.cloud_mode = true,
-                                );
-                            });
-                        }
-                    }
-                    (Err(err), _) => {
-                        // Rate-limit/region-full errors surface verbatim —
-                        // the spec's "visible errors, no retry-loop" rule.
+                let probe_error = probe.as_ref().err().map(ToString::to_string);
+                if let Some(row) = picked_row {
+                    if let Some(err) = probe_error {
                         tracing::warn!(error = %err, "railway trial provision failed");
-                        crate::notify::post("Railway trial couldn't start", &err.to_string(), None);
+                        crate::notify::post("Railway trial couldn't start", &err, None);
+                    } else {
+                        composer.clear_failure(cx);
                     }
-                    _ => {}
+                    composer.state.update(cx, |state, cx| {
+                        state.cloud_seat_pick = Some(row);
+                        state.cloud_mode = true;
+                        crate::settings::update(
+                            crate::settings::SavePolicy::Debounced,
+                            cx,
+                            |settings| settings.cloud_mode = true,
+                        );
+                    });
+                } else if let Some(err) = probe_error {
+                    tracing::warn!(error = %err, "railway trial provision failed");
+                    crate::notify::post("Railway trial couldn't start", &err, None);
                 }
                 cx.notify();
             })

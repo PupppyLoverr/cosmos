@@ -8233,6 +8233,28 @@ impl Shell {
             let seat_data = seat.clone();
             let selected = picked.as_deref() == Some(seat.config.id.as_str());
             let ready = crate::cloud::CloudView::seat_ready(seat);
+            let status = match seat.config.kind {
+                Some(zeron_proto::CloudSeatKind::Railway) if seat.config.expired() => {
+                    Some("trial ended")
+                }
+                Some(zeron_proto::CloudSeatKind::Ssh)
+                    if seat
+                        .config
+                        .last_probe
+                        .as_ref()
+                        .is_some_and(|probe| !probe.online) =>
+                {
+                    Some("offline")
+                }
+                Some(zeron_proto::CloudSeatKind::GitHub)
+                    if seat.config.repo.is_none() || !seat.has_github_pat =>
+                {
+                    Some("needs token")
+                }
+                Some(zeron_proto::CloudSeatKind::Box) if !seat.has_box_token => Some("needs token"),
+                _ if !ready => Some("needs credentials"),
+                _ => None,
+            };
             let mut row = popover::menu_row(
                 theme,
                 selected,
@@ -8260,13 +8282,31 @@ impl Shell {
                     .truncate()
                     .child(SharedString::from(seat.config.label.clone())),
             );
-            if !ready {
+            if let Some(status) = status {
                 row = row.child(
                     div()
                         .flex_none()
                         .text_size(crate::typography::ui_rems(9.5))
                         .text_color(theme.warning)
-                        .child("needs credentials"),
+                        .child(status),
+                );
+            }
+            if seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway)
+                && seat.config.expired()
+                && let Some(url) = seat.config.claim_url.clone()
+            {
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("sidebar-seat-claim-{ix}")))
+                        .flex_none()
+                        .text_size(crate::typography::ui_rems(9.5))
+                        .text_color(theme.accent)
+                        .cursor_pointer()
+                        .child("Claim")
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            cx.open_url(&url);
+                        }),
                 );
             }
             row.cursor_pointer()
@@ -8281,14 +8321,14 @@ impl Shell {
                     cx.notify();
                 }))
         };
-        let live_trial = seats.iter().any(|seat| {
-            seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway) && !seat.config.expired()
-        });
-        if cloud_seats.peek().is_some() || !live_trial {
+        let has_railway_seat = seats
+            .iter()
+            .any(|seat| seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway));
+        if cloud_seats.peek().is_some() || !has_railway_seat {
             menu = menu
                 .child(popover::menu_separator())
                 .child(popover::menu_heading(&theme, "Cloud seat"));
-            if !live_trial {
+            if !has_railway_seat {
                 menu = menu.child(
                     popover::menu_row(&theme, false, "sidebar-seat-railway")
                         .id("sidebar-seat-railway")
@@ -8338,37 +8378,35 @@ impl Shell {
             }
         }
         if seats.is_empty() {
-            menu = menu
-                .child(popover::menu_separator())
-                .child(
-                    div()
-                        .px(px(8.0))
-                        .py(px(6.0))
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.text_muted)
-                        .child("No cloud seats yet — add one in Settings → Cloud computer."),
-                )
-                .child(
-                    popover::menu_row(&theme, false, "sidebar-seat-settings")
-                        .id("sidebar-seat-settings")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .cursor_pointer()
-                        .child(
-                            icon(icons::SETTINGS_MINIMALISTIC)
-                                .size(px(13.0))
-                                .flex_none()
-                                .text_color(theme.text_muted),
-                        )
-                        .child(div().flex_1().min_w_0().truncate().child("Configure seats"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.close_cloud_seat_menu(cx);
-                            this.open_settings(SettingsSection::CloudComputer, cx);
-                        })),
-                );
+            menu = menu.child(
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted)
+                    .child("No cloud seats yet — add one in Settings → Cloud computer."),
+            );
         }
+        menu = menu.child(popover::menu_separator()).child(
+            popover::menu_row(&theme, false, "sidebar-seat-settings")
+                .id("sidebar-seat-settings")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .cursor_pointer()
+                .child(
+                    icon(icons::SETTINGS_MINIMALISTIC)
+                        .size(px(13.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(div().flex_1().min_w_0().truncate().child("Configure seats"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.close_cloud_seat_menu(cx);
+                    this.open_settings(SettingsSection::CloudComputer, cx);
+                })),
+        );
         menu.into_any_element()
     }
 
@@ -8379,12 +8417,15 @@ impl Shell {
                 format!("GitHub — {}", seat.config.label).into()
             }
             Some(seat) if seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway) => {
-                let minutes = seat
-                    .config
-                    .expires_at
-                    .map(|at| at.signed_duration_since(Utc::now()).num_minutes().max(0))
-                    .unwrap_or(0);
-                format!("Railway trial — {minutes}m").into()
+                match seat.config.expires_at {
+                    None => "Railway trial — starting…".into(),
+                    Some(_) if seat.config.expired() => "Railway trial — ended".into(),
+                    Some(at) => format!(
+                        "Railway trial — {}m",
+                        at.signed_duration_since(Utc::now()).num_minutes().max(0)
+                    )
+                    .into(),
+                }
             }
             Some(seat) => format!("Cloud — {}", seat.config.label).into(),
             None => "Choose a seat…".into(),
@@ -8400,7 +8441,8 @@ impl Shell {
             .items_center()
             .gap(px(Theme::SPACE_SM))
             .rounded(px(6.0))
-            .text_size(crate::typography::ui_rems(12.0))
+            .text_size(crate::typography::ui_rems(12.5))
+            .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(if open { theme.text } else { theme.text_muted })
             .bg(if open {
                 theme.glass_hover()
@@ -8429,7 +8471,12 @@ impl Shell {
                     cx.notify();
                 }
             }))
-            .child(icon(icons::CLOUD).size(px(13.0)).flex_none())
+            .child(
+                icon(icons::CLOUD)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(if open { theme.text } else { theme.text_muted }),
+            )
             .child(div().flex_1().min_w_0().truncate().child(label))
             .child(
                 icon(icons::ALT_ARROW_DOWN)
