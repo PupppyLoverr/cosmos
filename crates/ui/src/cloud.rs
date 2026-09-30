@@ -346,6 +346,7 @@ pub struct CloudRail {
     shot: Loadable<Option<Arc<gpui::Image>>>,
     /// The chat's latest ledger run — drives the bot bar's status + buttons.
     run: Option<CloudRun>,
+    runs: Vec<CloudRun>,
     /// BYOK label for the model chip (the engine view's cloud default).
     model_label: Option<SharedString>,
     /// The pane "+" menu and the destroy confirmation live on the rail chrome.
@@ -382,6 +383,38 @@ fn cloud_run_finished(previous: Option<&CloudRun>, next: &CloudRun) -> bool {
                     | CloudRunStatus::NeedsApproval
             )
     })
+}
+
+fn cloud_run_prompt(run: &CloudRun, entries: &[zeron_doc::SessionMessageEntry]) -> String {
+    let text = entries
+        .iter()
+        .filter(|entry| {
+            entry.role == zeron_doc::MessageRole::User
+                && entry.created_at <= run.started_at.timestamp_millis()
+        })
+        .max_by_key(|entry| entry.created_at)
+        .map(|entry| {
+            entry
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    zeron_doc::MessagePart::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    let first_line = text.lines().next().unwrap_or_default().trim();
+    if first_line.is_empty() {
+        return "Cloud run".into();
+    }
+    let mut chars = first_line.chars();
+    let truncated = chars.by_ref().take(80).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
 }
 
 impl CloudRail {
@@ -438,6 +471,7 @@ impl CloudRail {
             analysis: Loadable::Idle,
             shot: Loadable::Idle,
             run: None,
+            runs: Vec::new(),
             model_label: None,
             pane_menu: popover::Popup::default(),
             confirm_destroy: false,
@@ -545,6 +579,12 @@ impl CloudRail {
                 rail.seat = match result {
                     Ok(value) => match serde_json::from_value::<CloudView>(value) {
                         Ok(view) => {
+                            rail.runs = view
+                                .runs
+                                .iter()
+                                .filter(|run| run.chat_id == rail.chat_id)
+                                .cloned()
+                                .collect();
                             let run = view.run_for_chat(&rail.chat_id).cloned();
                             run_finished = run
                                 .as_ref()
@@ -2627,13 +2667,69 @@ impl CloudRail {
             })
             .collect();
         if steps.is_empty() {
-            return pane_empty(
-                theme,
-                icons::SORT_VERTICAL,
-                "Progress",
-                "The run's tool calls land here as steps while the agent works.",
-            )
-            .into_any_element();
+            if self.runs.is_empty() {
+                return pane_empty(
+                    theme,
+                    icons::SORT_VERTICAL,
+                    "Progress",
+                    "Runs on this seat show up here.",
+                )
+                .into_any_element();
+            }
+            let state = self.state.read(cx);
+            let mut list = div().flex().flex_col().p(px(8.0));
+            for run in &self.runs {
+                let prompt = cloud_run_prompt(run, &state.transcript);
+                let (status_icon, status_color) = match run.status {
+                    CloudRunStatus::Done => (icons::QUEUE_CHECK, theme.success),
+                    CloudRunStatus::Error | CloudRunStatus::Stopped => {
+                        (icons::DANGER_TRIANGLE, theme.danger)
+                    }
+                    _ => (icons::CLOCK_CIRCLE, theme.accent),
+                };
+                let end = run.finished_at.unwrap_or_else(chrono::Utc::now);
+                let elapsed =
+                    crate::transcript::format_elapsed((end - run.started_at).num_seconds().max(0));
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .h(px(24.0))
+                        .child(
+                            icon(status_icon)
+                                .size(px(11.0))
+                                .flex_none()
+                                .text_color(status_color),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .text_color(theme.text)
+                                .child(SharedString::from(prompt)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(crate::typography::ui_rems(10.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!(
+                                    "{} · {elapsed}",
+                                    run.status.label()
+                                ))),
+                        ),
+                );
+            }
+            return div()
+                .id("rail-progress-cloud-runs")
+                .size_full()
+                .overflow_y_scroll()
+                .child(list)
+                .into_any_element();
         }
         let mut list = div().flex().flex_col().p(px(8.0));
         for (ix, (name, done)) in steps.iter().enumerate() {
@@ -2993,9 +3089,12 @@ impl CloudRail {
             .map(|s| s.config.label.clone())
             .unwrap_or_else(|| self.binding.label.clone());
         let model = self
-            .binding
-            .model_label
-            .clone()
+            .seat
+            .ready()
+            .and_then(|seat| seat.config.harness_command.as_deref())
+            .filter(|command| !command.trim().is_empty())
+            .map(cloud_harness_label)
+            .or_else(|| self.binding.model_label.clone())
             .or_else(|| self.model_label.as_ref().map(|m| m.to_string()))
             .unwrap_or_else(|| "seat CLI login".into());
         let run_status = self.run.as_ref().map(|r| r.status);
