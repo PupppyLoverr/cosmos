@@ -137,6 +137,22 @@ fn parse_manifest(stdout: &str, stderr: &str, assign_fallback_deadline: bool) ->
     trial
 }
 
+/// Drop the lines of Railway's trial banner that carry the claim link or
+/// code, so command output shown on screen never leaks them.
+pub fn redact_trial_banner(output: &str) -> String {
+    output
+        .lines()
+        .filter(|line| {
+            !(line.contains("ssh-signup")
+                || line.contains("claim_url")
+                || line.contains("claimUrl")
+                || line.contains("\"claim_code\"")
+                || line.contains("\"claimCode\""))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The honest reason a connect failed, from ssh's own stderr.
 fn ssh_failure(out: &crate::cloud::ExecOutcome) -> String {
     let stderr = out.stderr.trim();
@@ -244,6 +260,12 @@ mod tests {
             trial.expires_at,
             Some("2030-01-01T00:00:00Z".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn redacts_claim_banner_lines() {
+        let out = "hello\n{\"state\":\"expiring\",\"human_claim_url\":\"https://railway.com/ssh-signup?code=abc\"}\nworld";
+        assert_eq!(redact_trial_banner(out), "hello\nworld");
     }
 
     #[test]

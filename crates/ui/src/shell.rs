@@ -8206,7 +8206,12 @@ impl Shell {
                 })
                 .on_hover(motion::hover_listener(id))
                 .cursor_pointer()
-                .child(icon(icon_path).size(px(14.0)).flex_none())
+                .child(
+                    icon(icon_path)
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(if active { theme.text } else { theme.text_muted }),
+                )
         };
         let agent = segment(
             "sidebar-agent-mode",
@@ -11408,9 +11413,9 @@ impl Shell {
             crate::cloud::surface_pick_row(&theme, id, icon_path, title, detail)
         };
         let has_plan = self.state.read(cx).transcript.iter().rev().any(|entry| {
-            entry.parts.iter().any(|part| {
-                matches!(part, zeron_doc::MessagePart::Tool { call, .. } if call.is_plan())
-            })
+            entry.parts.iter().any(
+                |part| matches!(part, zeron_doc::MessagePart::Tool { call, .. } if call.is_plan()),
+            )
         });
         let git = self.space_git_detected(cx);
         div()
@@ -11481,9 +11486,11 @@ impl Shell {
                                 "Diffs",
                                 "See uncommitted changes",
                             )
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.add_diff_surface(window, cx);
-                            })),
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.add_diff_surface(window, cx);
+                                },
+                            )),
                         )
                         .child(
                             row(
@@ -11492,9 +11499,11 @@ impl Shell {
                                 "History",
                                 "Browse commits on this branch",
                             )
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.add_history_surface(window, cx);
-                            })),
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.add_history_surface(window, cx);
+                                },
+                            )),
                         )
                     }),
             )

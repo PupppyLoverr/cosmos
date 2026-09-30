@@ -1028,13 +1028,14 @@ impl CloudRail {
                             .get("stderr")
                             .and_then(|s| s.as_str())
                             .unwrap_or_default();
-                        line.output = if stderr.is_empty() {
+                        let output = if stderr.is_empty() {
                             stdout.to_string()
                         } else if stdout.is_empty() {
                             stderr.to_string()
                         } else {
                             format!("{stdout}\n{stderr}")
                         };
+                        line.output = zeron_engine::railway::redact_trial_banner(&output);
                     }
                     (Err(err), Some(line)) => {
                         line.code = Some(-1);
