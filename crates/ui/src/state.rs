@@ -802,6 +802,8 @@ pub struct AppState {
     /// The connected GitHub account's repos for that picker.
     pub cloud_repos: crate::popover::Loadable<Vec<zeron_engine::cloud::RepoHit>>,
     cloud_repos_task: Option<Task<()>>,
+    /// GitHub login behind `cloud_repos`, from the last repo fetch.
+    pub cloud_github_login: Option<String>,
     /// Why the last Railway trial start failed, until one succeeds.
     pub cloud_trial_failure: Option<String>,
 }
@@ -889,6 +891,7 @@ impl AppState {
             cloud_repo_pick: None,
             cloud_repos: crate::popover::Loadable::Idle,
             cloud_repos_task: None,
+            cloud_github_login: None,
             cloud_trial_failure: None,
             auto_selected: false,
             chats_synced: false,
@@ -2025,6 +2028,10 @@ impl AppState {
                 .await;
             this.update(cx, |state, cx| {
                 state.cloud_repos_task = None;
+                state.cloud_github_login = reply
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.get("login")?.as_str().map(str::to_string));
                 state.cloud_repos = match reply {
                     Ok(value) => crate::popover::Loadable::Ready(
                         serde_json::from_value(value.get("repos").cloned().unwrap_or_default())

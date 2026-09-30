@@ -4378,7 +4378,8 @@ impl RpcService for EngineRpc {
                         )
                     })?;
                 let gh = crate::cloud::github(&self.http, &pat);
-                let (repos, orgs) = tokio::join!(gh.repos(p.query.as_deref()), gh.orgs());
+                let (repos, orgs, login) =
+                    tokio::join!(gh.repos(p.query.as_deref()), gh.orgs(), gh.login());
                 let repos = repos.map_err(RpcError::Failed)?;
                 let (orgs, orgs_error) = match orgs {
                     Ok(orgs) => (orgs.items, None),
@@ -4389,6 +4390,7 @@ impl RpcService for EngineRpc {
                     "truncated": repos.truncated,
                     "orgs": orgs,
                     "orgsError": orgs_error,
+                    "login": login.ok().filter(|l| !l.is_empty()),
                 }))
             }
             methods::CLOUD_GITHUB_SAVE => {

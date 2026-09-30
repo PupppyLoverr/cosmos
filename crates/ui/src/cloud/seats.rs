@@ -543,6 +543,10 @@ impl CloudSeatsPage {
                     Ok(_) => {
                         page.gh_login = None;
                         page.note = Some("GitHub disconnected.".into());
+                        page.state.update(cx, |state, _| {
+                            state.cloud_github_login = None;
+                            state.cloud_repos = crate::popover::Loadable::Idle;
+                        });
                     }
                     Err(err) => page.error = Some(err.to_string()),
                 }
@@ -1221,7 +1225,20 @@ impl Render for CloudSeatsPage {
             )
             .into()
         } else if has_pat {
-            match self.gh_login.as_deref().filter(|l| !l.is_empty()) {
+            if self.gh_login.is_none() {
+                let state = self.state.read(cx);
+                if state.cloud_github_login.is_none()
+                    && matches!(state.cloud_repos, crate::popover::Loadable::Idle)
+                {
+                    self.state
+                        .update(cx, |state, cx| state.refresh_cloud_repos(cx));
+                }
+            }
+            let login = self
+                .gh_login
+                .clone()
+                .or_else(|| self.state.read(cx).cloud_github_login.clone());
+            match login.as_deref().filter(|l| !l.is_empty()) {
                 Some(login) => {
                     format!("Connected as {login} — repos, pull requests and GitHub seats use it.")
                         .into()
