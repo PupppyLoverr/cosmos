@@ -13754,6 +13754,7 @@ mod tests {
     fn tool_diff_counts_extracts_add_del() {
         let base = ToolItem {
             part_id: "p1".into(),
+            kind: ToolItemKind::Call,
             call: ToolCall::EditFile {
                 path: "a.rs".into(),
                 old_string: None,
@@ -13769,7 +13770,6 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
-            is_thought: false,
         };
         // Stats detail → counts.
         let mut item = base.clone();

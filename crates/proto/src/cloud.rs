@@ -326,7 +326,7 @@ fn default_enabled() -> bool {
 
 /// Seat health as the last probe reported it — drives the bot bar's dot and
 /// the settings "Health" block.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SeatProbe {
     pub seat_id: String,

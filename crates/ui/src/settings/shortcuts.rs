@@ -954,6 +954,9 @@ mod tests {
                 false,
                 false,
                 AppshotDestination::Automatic,
+                false,
+                false,
+                false,
                 cx,
             );
             page.show_section(false, true);
