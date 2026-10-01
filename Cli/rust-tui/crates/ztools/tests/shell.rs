@@ -15,6 +15,23 @@ fn ctx() -> (tempfile::TempDir, ToolContext) {
     let mut c = ToolContext::new(&ws);
     c.home = d.path().join("home");
     c.session_id = "s1".into();
+    // The first sandboxed call would probe every tier with a live canary
+    // (up to two PowerShell runs at up to 90 s each, on a fresh home).
+    // Record a job-limits decision up front — the key mirrors
+    // shell::shell_tier's ("v<CANARY_VERSION>|<pkg version>|<shell argv0>")
+    // so the probe is skipped and the wait=now test times the call, not
+    // the canary. Jobs still spawn through zsandbox.
+    std::fs::create_dir_all(&c.home).unwrap();
+    std::fs::write(
+        c.home.join("sandbox_tier.json"),
+        serde_json::json!({
+            "key": format!("v1|{}|{}", env!("CARGO_PKG_VERSION"), ztools::shell::shell_argv("")[0]),
+            "tier": "job",
+            "degraded": "test-pinned job tier",
+        })
+        .to_string(),
+    )
+    .unwrap();
     (d, c)
 }
 

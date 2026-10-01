@@ -360,3 +360,90 @@ Toolchains installed: Bun 1.4.2 via `npm install -g bun`; Go 1.27.1 via
 - `zcli`, `zdev`, and `zagy` now share output/permission aliases, cwd-aware
   continuation, additional roots, system-prompt overrides, project MCP
   discovery, `/cost`, `/init`, and shell completion entry points.
+
+## 2026-10-01 — `cosmostui`: rename, size, sticky compaction, ACP subscriptions
+
+Branch `cosmos-harness`. Same machine. `zcli` was renamed `cosmostui`
+(`cosmos.exe` is the desktop app's launcher); a `zcli.exe` copy still works and
+prints a one-line notice. zdev/zagy rows unchanged.
+
+### Gates
+
+```
+powershell -File eval\size-gate.ps1
+PASS  …\target\release\cosmostui.exe is 5.81 MiB (6091776 bytes) <= 8 MiB   (was 17.6-18.7 MB)
+
+powershell -File eval\startup.ps1
+baseline (zsandbox --help) median 12.2 ms
+PASS  --version median 17.2 ms (+5 ms over baseline, limit +10)
+PASS  fixture ping median 48.1 ms (+35.9 ms over baseline, limit +120)
+
+powershell -File eval\conformance.ps1    →  19/19 PASS
+powershell -File eval\run.ps1            →  9/9 PASS (t01, t02-compact-resume, t03-repair × 3)
+cargo test --workspace                   →  166 passed, 0 failed, 4 ignored (live lists / mic)
+cosmostui -p ping --model fixture --output json-stream
+  → session_start, user, assistant, usage, session_end  (5 kinds)
+tools dump byte-identical to contracts/tools.json (conformance row 2)
+```
+
+### Compaction — `zcore/tests/compact40.rs` (40 turns of fat `read`s)
+
+```
+A fat reads:   final 22024 / naive 301744 = 7.3% · cumulative 7.3%
+               checkpoints 0 · busts 0 · prefix stable true · resume == live true
+B 30k window:  final 5740 / naive 67344 = 8.5% · cumulative 26.0%
+               checkpoints 7 · busts 7 (≤ checkpoints) · max request 13990
+               prefix stable true · resume == live true
+```
+
+All model-view edits are sticky: computed once at a checkpoint, replayed
+identically on every later request and on `--resume`. The wire prompt is a
+fixed prefix — ≤120-token snippet, 8 default tools (~600 tokens; the rest are
+reached through `tool_search`/`mcp_call`), boot ≤ 800 tokens.
+
+### What changed per phase
+
+- **0 correctness**: boot `text` field read (was dropped), L4 only collapses
+  same-path superseded reads, resume replays the compaction boundary,
+  `submit_plan`/`tool_search`/`mcp_call` exposure gated, Anthropic usage merges
+  (not sums) `message_start`+`message_delta`, Gemini takes last cumulative
+  `usageMetadata`, provider errors exit 4.
+- **1 rename+size**: package/bin `cosmostui`; tree-sitter behind `highlight`
+  feature (built-in highlighter default), cpal behind `voice`, ratatui-core,
+  chrono/ulid dropped for small RFC3339/ULID fns. `eval/size-gate.ps1` and
+  `eval/startup.ps1` added.
+- **2 prompt+memory**: `ztools::memory` (BM25 bullets, Meridian format, secret
+  scan, `COSMOS_MEMORY_DIR`/`MERIDIAN_VAULT`/`COSMOS_CLI_HOME/memory`), no
+  meridian subprocess or tokenizer file; Supermemory only when
+  `SUPERMEMORY_API_KEY` is set; sticky L1-L5 compaction as above.
+- **3 subscriptions**: provider kind `acp` spawns the vendor's own CLI —
+  `devin acp`, `agent acp` (Cursor), `codex-acp`; `cosmostui auth login
+  devin|cursor|codex` runs the vendor login; `session/request_permission`
+  surfaces as the TUI permission prompt; `devin.rs` behind non-default
+  `devin-direct` feature; one ureq agent + host allowlist for all HTTP.
+- **4 shell**: `wait=now|next_write` spawn through zsandbox, logs keyed by
+  command so `from_offset` works, 24/24 middle-out with exact `omitted_chars`,
+  137/143 named, real `sandbox:"degraded", reason` in `session_start` and every
+  result. Windows fix: PowerShell commands returned empty through the old
+  restricted-token path.
+- **5 self-improve**: after a clean interactive session, detached
+  `cosmostui review --session <id>` writes ≤5 memory bullets + 1 bounded skill;
+  `/compact`, `/undo`, `/skillify` run locally (were forwarded to the model);
+  write/edit refuse cosmostui's binary, CONTRACT.md and sandbox policy paths
+  without `--allow-self-mutate`.
+- **6**: §8 ledger in the status line (`turn · in · cache_r · cache_w · out ·
+  $ · Σ · ctx%`), `session tree` + `/tree` (branch-aware, short ids usable as
+  `--resume <session>@<id>`), README + this entry.
+
+### Decisions / notes
+
+- ChatGPT tokens stay in the shared `credentials.json` (now 0600 on Unix) —
+  a second copy would sign the other harness out after one refresh.
+- This machine runs `bash` at JobOnly: PowerShell 5.1 can't start its file
+  provider inside AppContainer, and the profile's ACLs keep the restricted
+  token out. `session_start` and every bash result say so;
+  `COSMOS_SANDBOX_TIER=appcontainer|restricted|job` pins a tier.
+- ACP plugin turns run the vendor's own agent loop and tools; cosmostui's
+  compaction/tools don't apply to those turns.
+- `startup.ps1` measures against a baseline exe because Windows process
+  creation alone costs ~12-34 ms here.

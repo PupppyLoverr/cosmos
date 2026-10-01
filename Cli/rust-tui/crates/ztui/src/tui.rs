@@ -1137,6 +1137,10 @@ impl App {
                 }
             }
             "session" => self.note(format!("Session {} · resume with  cosmostui --resume {}", self.session, self.session)),
+            "tree" => {
+                let lines = view::tree(self);
+                self.block(lines);
+            }
             "clear" => self.clear_screen = true,
             "onboarding" => self.replay_onboard = true,
             "help" => self.popup = Some(Popup::Help),

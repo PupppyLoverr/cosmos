@@ -19,6 +19,7 @@ usage:
   cosmostui session list        sessions in COSMOS_CLI_HOME
   cosmostui session export <id> [--format md|jsonl]
   cosmostui session branch <id> --at <event_id>
+  cosmostui session tree <id>     the session's event tree (branch points indent)
   cosmostui memory search <q>   search local memory
   cosmostui memory add <text>   remember a fact (scope: global)
   cosmostui auth [login|logout] … API keys (30 providers) and ChatGPT sign-in
@@ -279,34 +280,8 @@ fn session_cmd(args: &[String]) -> i32 {
             let file = home.join("sessions").join(format!("{id}.jsonl"));
             match zcore::session::read_events(&file) {
                 Ok(events) => {
-                    use std::collections::HashMap;
-                    let by_parent: HashMap<Option<String>, Vec<&zproto::Event>> = {
-                        let mut m: HashMap<Option<String>, Vec<&zproto::Event>> = HashMap::new();
-                        for e in &events {
-                            m.entry(e.parent.clone()).or_default().push(e);
-                        }
-                        m
-                    };
-                    fn walk(
-                        parent: &Option<String>,
-                        depth: usize,
-                        by: &HashMap<Option<String>, Vec<&zproto::Event>>,
-                    ) {
-                        if let Some(kids) = by.get(parent) {
-                            for e in kids {
-                                println!("{}{} [{}] {}", "  ".repeat(depth), e.id, e.kind, e.ts);
-                                walk(&Some(e.id.clone()), depth + 1, by);
-                            }
-                        }
-                    }
-                    walk(&None, 0, &by_parent);
-                    // orphans (parent points at a checkout target mid-file)
-                    for e in &events {
-                        if e.parent.is_some()
-                            && !events.iter().any(|x| Some(&x.id) == e.parent.as_ref())
-                        {
-                            println!("  {} [{}] {} (orphan)", e.id, e.kind, e.ts);
-                        }
+                    for line in zcore::session::tree(&events) {
+                        println!("{line}");
                     }
                     exit::DONE
                 }

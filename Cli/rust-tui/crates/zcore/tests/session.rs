@@ -2,7 +2,7 @@
 //! branch/checkout rewind, cross-harness visibility.
 
 use serde_json::json;
-use zcore::session::{chain, events_to_messages, read_events, Session};
+use zcore::session::{chain, events_to_messages, read_events, tree, Session};
 use zproto::{Block, Role};
 
 #[test]
@@ -73,6 +73,36 @@ fn checkout_rewinds_chain() {
     s2.append("assistant", json!({"text": "branched"}));
     let msgs2 = Session::replay(home.path(), &id).unwrap();
     assert_eq!(msgs2.len(), 2);
+}
+
+#[test]
+fn tree_indents_only_at_branch_points() {
+    let home = tempfile::tempdir().unwrap();
+    let mut s = Session::create(home.path(), "cosmostui").unwrap();
+    s.append("session_start", json!({}));
+    let u1 = s.append("user", json!({"text": "first"}));
+    s.append("assistant", json!({"text": "a1"}));
+    s.append("user", json!({"text": "second"}));
+    let a2 = s.append("assistant", json!({"text": "a2"}));
+    // straight run, no branch: every line at depth 0
+    let flat = tree(&read_events(&s.file).unwrap());
+    assert_eq!(flat.len(), 5);
+    assert!(flat.iter().all(|l| !l.starts_with(' ')), "{flat:?}");
+    assert!(flat[4].starts_with(&a2.id[a2.id.len() - 8..]), "{flat:?}");
+
+    // a checkout rewinds to u1 → u1 now has two children, so everything below
+    // it indents one level on both timelines
+    let mut s2 = Session::open(home.path(), &s.id).unwrap();
+    s2.branch(&u1.id);
+    s2.append("assistant", json!({"text": "branched"}));
+    let lines = tree(&read_events(&s2.file).unwrap());
+    assert_eq!(lines.len(), 7);
+    assert!(!lines[0].starts_with(' ') && !lines[1].starts_with(' '), "{lines:?}");
+    assert!(lines[2..].iter().all(|l| l.starts_with("  ") && !l.starts_with("   ")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("checkout") && l.contains(&u1.id[u1.id.len() - 8..])), "{lines:?}");
+    // tree ids are the unique suffixes --resume <session>@<id> accepts
+    let reopened = Session::open_at(home.path(), &s.id, Some(&a2.id[a2.id.len() - 8..])).unwrap();
+    assert_eq!(reopened.leaf.as_deref(), Some(a2.id.as_str()));
 }
 
 #[test]

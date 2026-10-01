@@ -47,6 +47,7 @@ const BUILTIN: &[(&str, &str, &str)] = &[
     ("skillify", "[name]", "Distill this session into a skill"),
     ("yolo", "", "Switch to yolo mode"),
     ("session", "", "Show the session id and how to resume it"),
+    ("tree", "", "Show the session's event tree and branch points"),
     ("clear", "", "Clear the screen"),
     ("onboarding", "", "Replay the first-run setup (until it retires itself)"),
     ("help", "", "Keyboard shortcuts"),

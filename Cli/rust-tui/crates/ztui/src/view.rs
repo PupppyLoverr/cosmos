@@ -390,6 +390,32 @@ pub fn context(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
+/// `/tree` — the session's event tree; a straight run stays at one depth and
+/// branch points (checkout rewinds) indent. Ids are the short suffixes
+/// `--resume <session>@<id>` accepts.
+pub fn tree(app: &App) -> Vec<Line<'static>> {
+    let file = zcore::cli_home().join("sessions").join(format!("{}.jsonl", app.session));
+    let events = zcore::session::read_events(&file).unwrap_or_default();
+    if events.is_empty() {
+        return vec![Line::from(dim("   no events yet"))];
+    }
+    let rows = zcore::session::tree(&events);
+    let mut out = vec![Line::from(vec![
+        sp(" "),
+        Span::styled("Session tree", theme::bold(Style::new())),
+        dim(format!("  {} events", events.len())),
+    ])];
+    let keep = 200usize;
+    for r in rows.iter().take(keep) {
+        out.push(Line::from(vec![sp("   "), dim(r.clone())]));
+    }
+    if rows.len() > keep {
+        out.push(Line::from(dim(format!("   … +{} rows", rows.len() - keep))));
+    }
+    out.push(Line::from(dim("   resume a point with  cosmostui --resume <session>@<id>")));
+    out
+}
+
 pub fn farewell(app: &App) -> Vec<Line<'static>> {
     if app.session.is_empty() {
         return Vec::new();
