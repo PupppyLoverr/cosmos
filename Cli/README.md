@@ -89,8 +89,13 @@ how-to). Replay it with `zdev onboarding` or `/onboarding`.
 
 `cosmostui` also drives subscription plans you already pay for through their
 own CLIs over ACP: `cosmostui auth login devin` (Devin), `cursor` (Cursor
-`agent`), `codex` (`codex-acp`). The vendor's agent loop does that turn's work;
-cosmostui renders it, holds the permissions prompt, and keeps the session log.
+`cursor-agent`), `codex` (`codex-acp`). The vendor's agent loop does that
+turn's work; cosmostui renders it, holds the permissions prompt, and keeps the
+session log. The plan's real model list is pulled from the agent's own
+`session/new` reply (its `models` block, or a `model` config select — Devin's
+dialect) at sign-in, `/connect`, onboarding, and `cosmostui models <agent>`;
+it's cached in `live_models.json` so `/model` shows it too, and `<id>/default`
+always means "the plan decides".
 
 `zdev` and `zagy` accept the same commands and flags
 (`--output text|json|json-stream`, `--mode plan|agent`, `--allow`, `--yolo`,

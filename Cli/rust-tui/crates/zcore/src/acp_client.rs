@@ -25,6 +25,14 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+/// One entry from the agent's `session/new` `models.availableModels` — the
+/// plan's real, current model list as the vendor reports it.
+#[derive(Debug, Clone)]
+pub struct AcpModel {
+    pub id: String,
+    pub name: String,
+}
+
 /// One installable subscription agent.
 pub struct Plugin {
     pub id: &'static str,
@@ -42,10 +50,12 @@ pub const PLUGINS: &[Plugin] = &[
     Plugin {
         id: "cursor",
         name: "Cursor",
-        bins: &["agent", "cursor-agent"],
+        // `cursor-agent` first: a bare `agent` on PATH can be another vendor's
+        // CLI entirely (e.g. grok's) and would spawn the wrong program
+        bins: &["cursor-agent", "agent"],
         args: &["acp"],
-        login: &["agent", "login"],
-        install: "install the Cursor CLI (https://cursor.com/docs/cli/installation), then run `agent login`",
+        login: &["cursor-agent", "login"],
+        install: "install the Cursor CLI (https://cursor.com/docs/cli/installation), then run `cursor-agent login`",
     },
     Plugin {
         id: "devin",
@@ -122,6 +132,19 @@ pub fn status(id: &str) -> String {
     }
 }
 
+/// The plan's real model list, asked of the installed agent itself: spawn it,
+/// run `initialize` + `session/new`, read `models.availableModels`, kill it.
+/// Costs one agent spawn (~a second or two), so callers should be deliberate —
+/// `live::fetch` caches the result for the pickers.
+pub fn list_models(plugin_id: &str, cwd: &Path) -> Result<Vec<AcpModel>> {
+    let p = plugin(plugin_id).with_context(|| format!("unknown ACP plugin {plugin_id}"))?;
+    let exe = executable(p).with_context(|| format!("{} is not installed — {}", p.name, p.install))?;
+    let mut cmd = command(&exe);
+    cmd.args(p.args);
+    let mut s = AcpSession::spawn_within(cmd, p.id, cwd, "default", LIST_TIMEOUT)?;
+    Ok(std::mem::take(&mut s.models))
+}
+
 /// Run the vendor's own sign-in with this terminal attached.
 pub fn login(id: &str) -> Result<()> {
     let p = plugin(id).with_context(|| format!("unknown plugin {id}"))?;
@@ -164,9 +187,17 @@ pub struct AcpSession {
     pub session_id: String,
     pub plugin_id: String,
     pub agent_name: String,
+    /// the plan's model list from `session/new` — empty when the agent
+    /// doesn't advertise `models.availableModels`
+    pub models: Vec<AcpModel>,
     /// set when a model was asked for and the agent didn't accept it
     pub model_note: Option<String>,
+    /// the `configOptions` select that picks the model, when the agent
+    /// advertises one — Devin exposes models only this way (its
+    /// `session/set_model` is a fallback, not guaranteed)
+    model_config_id: Option<String>,
     next_id: u64,
+    setup_timeout: Duration,
 }
 
 impl Drop for AcpSession {
@@ -177,6 +208,10 @@ impl Drop for AcpSession {
 }
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
+/// `list_models` is a query, not a task — but a cold `cursor-agent acp`
+/// spends ~30 s connecting its MCP servers before answering `session/new`,
+/// so the ceiling is generous; the result is cached afterwards.
+const LIST_TIMEOUT: Duration = Duration::from_secs(45);
 
 impl AcpSession {
     /// Spawn the plugin, `initialize`, `session/new`. `model` other than
@@ -190,7 +225,12 @@ impl AcpSession {
     }
 
     /// Spawn an arbitrary ACP agent command (tests drive a fake one).
-    pub fn spawn(mut cmd: Command, plugin_id: &str, cwd: &Path, model: &str) -> Result<AcpSession> {
+    pub fn spawn(cmd: Command, plugin_id: &str, cwd: &Path, model: &str) -> Result<AcpSession> {
+        Self::spawn_within(cmd, plugin_id, cwd, model, SETUP_TIMEOUT)
+    }
+
+    /// `spawn` with a caller-chosen ceiling on the setup handshake.
+    fn spawn_within(mut cmd: Command, plugin_id: &str, cwd: &Path, model: &str, setup_timeout: Duration) -> Result<AcpSession> {
         let mut child = cmd
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -230,8 +270,11 @@ impl AcpSession {
             session_id: String::new(),
             plugin_id: plugin_id.into(),
             agent_name: plugin_id.into(),
+            models: Vec::new(),
             model_note: None,
+            model_config_id: None,
             next_id: 0,
+            setup_timeout,
         };
         let init = s.call_simple(
             "initialize",
@@ -260,8 +303,20 @@ impl AcpSession {
             }
         };
         s.session_id = created["sessionId"].as_str().context("session/new returned no sessionId")?.to_string();
+        s.models = listed_models(&created);
+        s.model_config_id = model_config(&created).map(|(id, _)| id);
         if !model.is_empty() && model != "default" {
-            if let Err(e) = s.call_simple("session/set_model", json!({"sessionId": s.session_id, "modelId": model})) {
+            let config_id = s.model_config_id.clone();
+            // `session/set_model` is the standard verb; an agent that only
+            // advertised a model `configOptions` select (Devin) takes
+            // `session/set_config_option` instead
+            let r = s
+                .call_simple("session/set_model", json!({"sessionId": s.session_id, "modelId": model}))
+                .or_else(|e1| match &config_id {
+                    Some(id) => s.call_simple("session/set_config_option", json!({"sessionId": s.session_id, "configId": id, "value": model})).map_err(|e2| e2.context(format!("set_model also failed: {e1:#}"))),
+                    None => Err(e1),
+                });
+            if let Err(e) = r {
                 s.model_note = Some(format!("{} kept its own model ({e:#})", s.agent_name));
             }
         }
@@ -279,7 +334,7 @@ impl AcpSession {
 
     /// A request with no streaming expected (setup calls).
     fn call_simple(&mut self, method: &str, params: Value) -> Result<Value> {
-        let deadline = Instant::now() + SETUP_TIMEOUT;
+        let deadline = Instant::now() + self.setup_timeout;
         self.call(method, params, &mut |_| {}, &mut |_, _| false, None, Some(deadline))
     }
 
@@ -405,6 +460,56 @@ fn content_text(c: &Value) -> String {
     out.join("\n")
 }
 
+/// The `session/new` `configOptions` select with `category`/`id` "model" —
+/// Cognition's extension: Devin's agent has no standard `models` block and
+/// lists its plan's models here. Returns (config id, options).
+fn model_config(created: &Value) -> Option<(String, Vec<AcpModel>)> {
+    let opt = created["configOptions"]
+        .as_array()?
+        .iter()
+        .find(|o| o["category"].as_str() == Some("model") || o["id"].as_str() == Some("model"))?;
+    let id = opt["id"].as_str().unwrap_or("model").to_string();
+    let models = opt["options"]
+        .as_array()
+        .map(|all| {
+            all.iter()
+                .filter_map(|m| {
+                    let v = m["value"].as_str()?;
+                    (!v.is_empty()).then(|| AcpModel {
+                        id: v.to_string(),
+                        name: m["name"].as_str().unwrap_or(v).to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((id, models))
+}
+
+/// `session/new`'s `models.availableModels` → what `/model` lists — or, when
+/// the agent speaks only config options (Devin), the `model` select's options.
+/// Agents that report neither just yield `[]`.
+fn listed_models(created: &Value) -> Vec<AcpModel> {
+    let standard: Vec<AcpModel> = created["models"]["availableModels"]
+        .as_array()
+        .map(|all| {
+            all.iter()
+                .filter_map(|m| {
+                    let id = m["modelId"].as_str().or(m["model_id"].as_str()).or(m["id"].as_str())?;
+                    (!id.is_empty()).then(|| AcpModel {
+                        id: id.to_string(),
+                        name: m["name"].as_str().or(m["title"].as_str()).unwrap_or(id).to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !standard.is_empty() {
+        return standard;
+    }
+    model_config(created).map(|(_, ms)| ms).unwrap_or_default()
+}
+
 /// `session/update` → what the UI and the log need.
 pub fn parse_update(u: &Value) -> Option<Update> {
     match u["sessionUpdate"].as_str()? {
@@ -438,6 +543,38 @@ mod tests {
         assert_eq!(choose(&p, true), json!({"outcome": "selected", "optionId": "a"}));
         assert_eq!(choose(&p, false), json!({"outcome": "selected", "optionId": "r"}));
         assert_eq!(choose(&json!({"options": []}), true), json!({"outcome": "cancelled"}));
+    }
+
+    #[test]
+    fn session_new_models_parse() {
+        let v = json!({"sessionId": "s1", "models": {"currentModelId": "a", "availableModels": [
+            {"modelId": "a", "name": "A"},
+            {"model_id": "b"},
+            {"id": "c", "title": "C Title"},
+            {"modelId": ""},
+            {"name": "no id"}
+        ]}});
+        let ms = listed_models(&v);
+        assert_eq!(ms.iter().map(|m| (m.id.as_str(), m.name.as_str())).collect::<Vec<_>>(), [("a", "A"), ("b", "b"), ("c", "C Title")]);
+        assert!(listed_models(&json!({"sessionId": "s1"})).is_empty());
+        assert!(listed_models(&json!({"models": {}})).is_empty());
+    }
+
+    #[test]
+    fn devin_config_options_models_parse() {
+        // Devin's agent has no `models` block — its plan list is a
+        // `configOptions` select; `session/set_config_option` drives it
+        let d = json!({"sessionId": "s2", "configOptions": [
+            {"id": "mode", "category": "mode", "type": "select", "options": [{"value": "code", "name": "Code"}]},
+            {"id": "model", "category": "model", "type": "select", "currentValue": "swe-2-max", "options": [
+                {"value": "swe-2-max", "name": "SWE-2 Max"},
+                {"value": "adaptive", "name": "Adaptive", "description": "balances quality and cost"},
+                {"value": ""}
+            ]}
+        ]});
+        let ms = listed_models(&d);
+        assert_eq!(ms.iter().map(|m| (m.id.as_str(), m.name.as_str())).collect::<Vec<_>>(), [("swe-2-max", "SWE-2 Max"), ("adaptive", "Adaptive")]);
+        assert_eq!(model_config(&d).unwrap().0, "model");
     }
 
     #[test]

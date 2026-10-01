@@ -117,7 +117,16 @@ fn login(args: &[String]) -> i32 {
         }
         return match zcore::acp_client::login(p.id) {
             Ok(()) => {
-                println!("✓ {} is signed in through its CLI · try: cosmostui --model {}/default", p.name, p.id);
+                // pull the plan's real model list now that sign-in works
+                let note = match catalog::provider(id).map(zcore::live::fetch) {
+                    Some(Ok(models)) => {
+                        let n = models.len();
+                        let _ = zcore::live::store(id, &models);
+                        format!("{n} models — `cosmostui models {id}` lists them")
+                    }
+                    _ => format!("try: cosmostui --model {id}/default"),
+                };
+                println!("✓ {} is signed in through its CLI · {note}", p.name);
                 exit::DONE
             }
             Err(e) => {
@@ -206,6 +215,28 @@ pub fn models_cmd(args: &[String]) -> i32 {
         if catalog::provider(id).is_none() && !cfg.providers.contains_key(id) {
             eprintln!("unknown provider {id:?}");
             return exit::USAGE;
+        }
+    }
+    // subscription agents report the plan's real list on session/new —
+    // `models <agent>` always re-asks; the bare listing fills any cache the
+    // sign-in flow hasn't populated yet. Fetches run in parallel: a cold
+    // agent can take tens of seconds.
+    let defs: Vec<_> = catalog::providers()
+        .iter()
+        .filter(|p| {
+            p.kind == "acp"
+                && (want == Some(p.id.as_str())
+                    || (zcore::acp_client::installed(&p.id) && zcore::live::cached(&p.id).is_none()))
+        })
+        .collect();
+    let handles: Vec<_> = defs.iter().map(|&p| std::thread::spawn(move || (p, zcore::live::fetch(p)))).collect();
+    for h in handles {
+        match h.join() {
+            Ok((p, Ok(models))) => {
+                let _ = zcore::live::store(&p.id, &models);
+            }
+            Ok((p, Err(e))) if want == Some(p.id.as_str()) => eprintln!("{} couldn't report its live list: {e:#}", p.name),
+            _ => {}
         }
     }
     let list: Vec<_> = cfg

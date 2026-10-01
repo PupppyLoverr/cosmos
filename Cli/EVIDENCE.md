@@ -447,3 +447,56 @@ reached through `tool_search`/`mcp_call`), boot ≤ 800 tokens.
   compaction/tools don't apply to those turns.
 - `startup.ps1` measures against a baseline exe because Windows process
   creation alone costs ~12-34 ms here.
+
+## 2026-10-01 (later) — ACP live model lists (Devin `configOptions`, Cursor `models`)
+
+`/model` and `cosmostui models` now show the plan's real, current model list
+for subscription agents. `live::fetch` no longer refuses `kind=acp`: it spawns
+the installed vendor CLI, runs `initialize` + `session/new`, and reads the
+model list the agent itself reports — standard `models.availableModels`
+(Cursor) or the `configOptions` `category:"model"` select (Devin's dialect).
+`session/set_model` is tried first; agents that only advertise a model config
+select get `session/set_config_option` instead. Results cache to
+`live_models.json` so the TUI picker is instant; `<id>/default` stays on top
+and means "the plan decides". `cosmostui auth login <agent>`, `/connect`,
+onboarding and `cosmostui models <agent>` all refresh it; bare
+`cosmostui models` fills missing caches, in parallel.
+
+Cursor's bins now prefer `cursor-agent` over `agent` — a bare `agent` on PATH
+can be another vendor's CLI (this machine resolves `agent` to grok's), which
+would have spawned the wrong program and shadowed `installed()`.
+
+### Live evidence (this machine, both CLIs signed in)
+
+```
+$ cosmostui models devin     # devin acp → configOptions category "model"
+  devin/default                    200k ctx  free / included
+  devin/adaptive                   128k ctx  free / included
+  devin/swe-2-max                  128k ctx  free / included
+  devin/claude-opus-5-5-max        128k ctx  free / included
+  … 149 models, vendor order
+
+$ cosmostui models cursor    # cursor-agent acp → models.availableModels
+  cursor/default                   200k ctx  free / included
+  cursor/default[]                 128k ctx  free / included   (Auto)
+  cursor/composer-2.5[fast=true]   128k ctx  free / included
+  cursor/claude-opus-5-5[context=300k,effort=medium,fast=false] …
+  … 43 models, vendor order
+```
+
+`session/set_config_option` verified on real `devin acp`: dispatches (rejects
+a bogus session id with "Resource not found", not -32601). Cursor's cold
+`session/new` takes ~30 s while its MCP servers connect — the list query
+allows 45 s and caches after.
+
+### Gates
+
+```
+cargo test --workspace          169 passed, 0 failed (acp_plugin end-to-end now
+                                covers list_models→fetch→store→available_models)
+size-gate                       PASS  5.83 MiB <= 8 MiB
+startup.ps1                     PASS  --version 16.5 ms (+0.2 over baseline),
+                                fixture ping 48.6 ms
+conformance.ps1                 19/19 PASS
+run.ps1 (eval)                  9/9 PASS
+```

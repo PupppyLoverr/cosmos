@@ -1188,6 +1188,15 @@ impl App {
             self.error(format!("{} isn't installed — {}", p.name, p.install));
             return;
         }
+        // the agent reports the plan's real model list on session/new —
+        // grab it now so the picker shows more than "<id>/default"
+        match zcore::catalog::provider(id).map(zcore::live::fetch) {
+            Some(Ok(models)) => {
+                let _ = zcore::live::store(id, &models);
+            }
+            Some(Err(e)) => self.note(format!("Couldn't get {}'s model list ({e:#}) — showing its default", p.name)),
+            None => {}
+        }
         self.reload_models();
         self.note(format!(
             "{} found — it runs on your {} plan. Not signed in yet? Run `{}` in a terminal (or `cosmostui auth login {id}`).",

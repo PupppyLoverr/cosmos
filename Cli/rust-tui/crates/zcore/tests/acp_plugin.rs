@@ -34,7 +34,10 @@ fn fake_agent() {
         let up = |u: Value| send(json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": u}}));
         match m["method"].as_str().unwrap_or("") {
             "initialize" => send(json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1, "agentInfo": {"name": "fake", "title": "Fake Agent"}, "authMethods": []}})),
-            "session/new" => send(json!({"jsonrpc": "2.0", "id": id, "result": {"sessionId": "s1"}})),
+            "session/new" => send(json!({"jsonrpc": "2.0", "id": id, "result": {"sessionId": "s1", "models": {"currentModelId": "fake-fast", "availableModels": [
+                {"modelId": "fake-fast", "name": "Fake Fast"},
+                {"modelId": "fake-smart", "name": "Fake Smart", "description": "slow but thorough"}
+            ]}}})),
             "session/set_model" => send(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "no model switching"}})),
             "session/prompt" => {
                 let text = m["params"]["prompt"][0]["text"].as_str().unwrap_or("").to_string();
@@ -122,6 +125,7 @@ fn acp_plugins_end_to_end() {
     // 1. the session protocol: stream, permission, unsupported set_model
     let mut s = AcpSession::spawn(fake_cmd(), "devin", &ws, "some-model").unwrap();
     assert_eq!(s.agent_name, "Fake Agent");
+    assert_eq!(s.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["fake-fast", "fake-smart"]);
     assert!(s.model_note.as_deref().is_some_and(|n| n.contains("kept its own model")), "{:?}", s.model_note);
     let mut got = Vec::new();
     let stop = s.prompt("ping", &mut |u| got.push(u), &mut |title, _| title == "Edit a.rs", None).unwrap();
@@ -147,6 +151,17 @@ fn acp_plugins_end_to_end() {
     std::env::set_var("COSMOS_CLI_HOME", dir.path().join("home"));
     std::env::set_var("FAKE_ACP_AGENT", "1"); // inherited by the shim's child
     assert!(zcore::acp_client::installed("devin"));
+
+    // the plan's real model list comes back over session/new — `live::fetch`
+    // keeps `default` on top and preserves the vendor's own ordering
+    let listed = zcore::acp_client::list_models("devin", &ws).unwrap();
+    assert_eq!(listed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["fake-fast", "fake-smart"]);
+    let live = zcore::live::fetch(zcore::catalog::provider("devin").unwrap()).unwrap();
+    assert_eq!(live.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["default", "fake-fast", "fake-smart"]);
+    zcore::live::store("devin", &live).unwrap();
+    let cfg = zcore::config::Config::load(&zcore::cli_home());
+    let aliases: Vec<_> = cfg.available_models().iter().filter(|m| m.provider == "devin").map(|m| m.alias.clone()).collect();
+    assert_eq!(aliases, ["devin/default", "devin/fake-fast", "devin/fake-smart"]);
 
     let (code, ev) = headless(&ws, "devin/default", &["devin"]);
     assert_eq!(code, zproto::exit::DONE, "{ev:?}");
