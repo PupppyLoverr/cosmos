@@ -4467,16 +4467,23 @@ impl RpcService for EngineRpc {
                         let seat = cloud.seat(&run.seat_id).ok_or_else(|| {
                             RpcError::Failed("run's seat is not configured".into())
                         })?;
-                        let command = seat
-                            .harness_command
+                        // The run's own command names the agent actually
+                        // running (the composer's pick), not the seat default.
+                        let command = run
+                            .command
                             .clone()
+                            .filter(|c| !c.trim().is_empty())
+                            .or_else(|| seat.harness_command.clone())
                             .unwrap_or_else(|| "agent".into());
-                        let prog = command.split_whitespace().next().unwrap_or("agent");
+                        let prog = crate::cloud::command_bin(&command);
                         let out = crate::cloud::seat_exec(
                             &self.http,
                             &cloud,
                             &seat,
-                            &format!("pkill {signal} -x {prog} 2>/dev/null || true"),
+                            &format!(
+                                "pkill {signal} -x {} 2>/dev/null || true",
+                                crate::cloud::shell_word(&prog)
+                            ),
                             std::time::Duration::from_secs(10),
                         )
                         .await

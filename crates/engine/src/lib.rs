@@ -368,6 +368,9 @@ impl EngineCore {
             device_id.clone(),
         );
         scheduler.start();
+        // Runs that kept going on a seat while the app was closed pick up
+        // where their transcript stopped.
+        sessions.resume_cloud_runs();
         let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
         // Turn starts snapshot the checkout tree — the "Latest turn" diff base.
         let turn_diff = diff_sync.clone();

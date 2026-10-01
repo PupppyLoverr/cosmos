@@ -82,9 +82,13 @@ geometry() {
   else echo 1280x800; fi
 }
 
+# Ubuntu ships `chromium-browser`/`firefox` as stubs that only install the
+# snap (no snapd in a container) — never pick one of those.
+snap_stub() { p=$(command -v "$1") || return 1; head -c 2 "$p" 2>/dev/null | grep -q '#!' && grep -qi snap "$p" 2>/dev/null; }
+
 browser() {
   for b in chromium chromium-browser google-chrome google-chrome-stable firefox firefox-esr; do
-    command -v "$b" >/dev/null 2>&1 && { echo "$b"; return 0; }
+    command -v "$b" >/dev/null 2>&1 && ! snap_stub "$b" && { echo "$b"; return 0; }
   done
   for b in "${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"/chromium-*/chrome-linux*/chrome \
            "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome; do
@@ -94,6 +98,34 @@ browser() {
 }
 
 sudo_cmd() { if [ "$(id -u)" = 0 ]; then echo ""; elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then echo "sudo -n"; else return 1; fi; }
+
+# First `open` on a bare seat: a distro browser when the package manager has
+# a real one, else Playwright's own Chromium (no snap, no root for the
+# browser itself). Progress goes to stderr; the open waits for it.
+install_browser() {
+  echo "cosmos-computer: no browser yet — installing one (first time only, about a minute)…" >&2
+  if s=$(sudo_cmd); then
+    apt_try() { DEBIAN_FRONTEND=noninteractive $s apt-get install -y -qq --no-install-recommends "$1" >/dev/null 2>&1; }
+    if command -v apt-get >/dev/null 2>&1; then
+      apt_try chromium || apt_try firefox-esr || {
+        $s apt-get update -qq >/dev/null 2>&1
+        apt_try chromium || apt_try firefox-esr
+      }
+    elif command -v apk >/dev/null 2>&1; then $s apk add -q chromium >/dev/null 2>&1
+    elif command -v dnf >/dev/null 2>&1; then $s dnf install -y -q chromium >/dev/null 2>&1
+    fi
+    browser >/dev/null && return 0
+  fi
+  deps=""; sudo_cmd >/dev/null && deps="--with-deps"
+  if command -v npx >/dev/null 2>&1; then
+    npx -y playwright install $deps chromium >/dev/null 2>&1
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -m pip install -q --user playwright >/dev/null 2>&1 \
+      || python3 -m pip install -q --user --break-system-packages playwright >/dev/null 2>&1
+    python3 -m playwright install $deps chromium >/dev/null 2>&1
+  fi
+  browser >/dev/null
+}
 
 cmd="$1"; [ $# -gt 0 ] && shift
 case "$cmd" in
@@ -128,7 +160,8 @@ case "$cmd" in
     else need xdotool; for w in $(xdotool search --onlyvisible --name . 2>/dev/null); do echo "$w $(xdotool getwindowname "$w")"; done; fi;;
   open)
     wait_ready
-    b=$(browser) || die "no browser on this seat — install chromium or firefox (or: npx playwright install chromium)"
+    b=$(browser) || { install_browser; b=$(browser); } \
+      || die "no browser on this seat and the automatic install failed — install chromium or firefox (or: npx playwright install --with-deps chromium)"
     # Container-safe Chromium: no sandbox/GPU (root + no /dev/dri), its own
     # profile, and --test-type to drop the --no-sandbox warning bar.
     case "$b" in *chrom*|*chrome*) set -- --no-sandbox --disable-gpu --disable-dev-shm-usage --test-type \

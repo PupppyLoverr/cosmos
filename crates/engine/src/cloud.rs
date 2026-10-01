@@ -2034,7 +2034,7 @@ pub fn seat_harness(
         // unless the CLI is told it's in a sandbox — which a seat is.
         H::ClaudeCode => SeatHarness {
             command: format!(
-                "IS_SANDBOX=1 claude -p --dangerously-skip-permissions --output-format text{}",
+                "IS_SANDBOX=1 claude -p --dangerously-skip-permissions --output-format stream-json --verbose{}",
                 model_arg("--model", model)
             ),
             install: install(
@@ -4149,7 +4149,7 @@ mod tests {
         let claude = seat_harness(HarnessId::ClaudeCode, Some("claude-opus-4-5"), None).unwrap();
         assert_eq!(
             claude.command,
-            "IS_SANDBOX=1 claude -p --dangerously-skip-permissions --output-format text --model 'claude-opus-4-5'"
+            "IS_SANDBOX=1 claude -p --dangerously-skip-permissions --output-format stream-json --verbose --model 'claude-opus-4-5'"
         );
         assert_eq!(command_bin(&claude.command), "claude");
         assert!(claude.install.starts_with("command -v claude"));
@@ -4249,6 +4249,8 @@ mod tests {
             log_path: None,
             remote_ref: None,
             mirrored_bytes: 3,
+            remote_cursor: None,
+            entry_id: None,
             error: None,
             workspace: None,
             harness_session: Some("sid".into()),

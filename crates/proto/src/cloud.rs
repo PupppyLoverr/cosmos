@@ -283,6 +283,14 @@ pub struct CloudRun {
     /// Bytes of the remote log already mirrored into the transcript.
     #[serde(default)]
     pub mirrored_bytes: u64,
+    /// Boat runs: the last `/events` cursor mirrored, so a reopened app
+    /// resumes the stream where it left off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_cursor: Option<String>,
+    /// The transcript entry this run streams into — a reattach reopens it
+    /// instead of starting a second message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Seat working directory this run executed in (the chat's workspace).
