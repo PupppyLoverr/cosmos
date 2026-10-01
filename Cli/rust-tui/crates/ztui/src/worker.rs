@@ -13,6 +13,7 @@ use zcore::agent::{Agent, Mode};
 use zproto::{Block, Event, RunOpts};
 
 /// UI → worker.
+#[derive(Debug)]
 pub enum Cmd {
     Prompt(String),
     SetMode(Mode),
@@ -22,7 +23,19 @@ pub enum Cmd {
     Approve,
     /// continue a stored session (replaces the current agent)
     Resume(String),
+    /// harness-side commands that never reach the model
+    Local(LocalCmd),
     Quit,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocalCmd {
+    /// /compact [focus]
+    Compact(Option<String>),
+    /// /undo
+    Undo,
+    /// /skillify <name>
+    Skillify(String),
 }
 
 /// One row of a rendered file diff.
@@ -321,7 +334,7 @@ fn worker(
     rx: Receiver<Cmd>,
     tx: Sender<Msg>,
 ) {
-    let mut agent = match Agent::new(&opts, "zcli", &cwd) {
+    let mut agent = match Agent::new(&opts, zcore::NAME, &cwd) {
         Ok(a) => a,
         Err(e) => {
             send(&tx, Msg::Err(format!("agent init failed: {e:#}")));
@@ -332,6 +345,7 @@ fn worker(
     let always = Arc::new(Mutex::new(Vec::new()));
     install_asker(&mut agent, &tx, &always);
     install_delta(&mut agent, &tx);
+    agent.interrupt = Some(interrupt.clone());
     let mut effort: Option<String> = None;
 
     let tx2 = tx.clone();
@@ -341,12 +355,7 @@ fn worker(
     send(&tx, ready(&agent));
     let start = agent.session.append(
         "session_start",
-        json!({
-            "model": agent.model_alias, "mode": agent.mode.name(),
-            "sandbox": if agent.ctx.no_sandbox {"off"} else {"appcontainer"},
-            "boot_tokens": agent.boot_tokens,
-            "resume": opts.resume,
-        }),
+        agent.start_data(json!({"resume": opts.resume, "cwd": agent.ctx.workspace})),
     );
     emit(&start);
 
@@ -364,6 +373,21 @@ fn worker(
             Cmd::Prompt(text) => {
                 interrupt.store(false, Ordering::Relaxed);
                 run_task(&mut agent, &text, &mut emit, &interrupt, &always, &tx);
+                send(&tx, Msg::TurnDone);
+            }
+            Cmd::Local(lc) => {
+                let note = match lc {
+                    LocalCmd::Compact(focus) => {
+                        let before = agent.context_report();
+                        agent.compact_now(focus.as_deref(), &mut emit);
+                        let after = agent.context_report();
+                        let pct = |r: &str| serde_json::from_str::<serde_json::Value>(r).ok().and_then(|v| v["percent"].as_u64()).unwrap_or(0);
+                        format!("compacted · context {}% → {}%", pct(&before), pct(&after))
+                    }
+                    LocalCmd::Undo => agent.undo_last(&mut emit),
+                    LocalCmd::Skillify(name) => agent.skillify(&name, &mut emit),
+                };
+                send(&tx, Msg::Note(note));
                 send(&tx, Msg::TurnDone);
             }
             Cmd::Approve => {
@@ -388,18 +412,25 @@ fn worker(
                 o.prompt = None;
                 o.mode = Some(agent.mode.name().to_string());
                 o.yolo = agent.mode == Mode::Yolo;
-                match Agent::new(&o, "zcli", &cwd) {
+                match Agent::new(&o, zcore::NAME, &cwd) {
                     Ok(mut a) => {
                         install_asker(&mut a, &tx, &always);
                         install_delta(&mut a, &tx);
+                        a.interrupt = Some(interrupt.clone());
                         a.provider.effort = effort.clone();
                         let ev = a.session.append(
                             "session_start",
                             json!({"model": a.model_alias, "mode": a.mode.name(),
                                    "resume": o.resume, "switch": true}),
                         );
+                        let from = agent.model_alias.clone();
                         agent = a;
                         emit(&ev);
+                        let ev = agent
+                            .session
+                            .append("model_switch", json!({"from": from, "to": agent.model_alias}));
+                        emit(&ev);
+                        agent.log_cache_break("model_switch", &mut emit);
                         send(&tx, ready(&agent));
                         send(&tx, Msg::Note(format!("model → {alias}")));
                     }
@@ -410,15 +441,17 @@ fn worker(
                 let mut o = agent.opts.clone();
                 o.resume = Some(id.clone());
                 o.prompt = None;
-                match Agent::new(&o, "zcli", &cwd) {
+                match Agent::new(&o, zcore::NAME, &cwd) {
                     Ok(mut a) => {
                         install_asker(&mut a, &tx, &always);
                         install_delta(&mut a, &tx);
+                        a.interrupt = Some(interrupt.clone());
                         a.provider.effort = effort.clone();
                         let ev = a.session.append(
                             "session_start",
                             json!({"model": a.model_alias, "mode": a.mode.name(), "resume": id}),
                         );
+                        a.log_cache_break("resume", &mut emit);
                         let history: Vec<(bool, String)> = a
                             .messages
                             .iter()

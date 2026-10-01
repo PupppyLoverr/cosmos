@@ -1,3 +1,6 @@
+//! `cosmostui completion <shell>` — completion scripts generated from one table
+//! of commands and flags, so every shell offers the same words.
+
 pub struct CommandSpec {
     pub name: &'static str,
     pub description: &'static str,
@@ -10,16 +13,20 @@ pub struct FlagSpec {
     pub takes_value: bool,
 }
 
+pub const SHELLS: &[&str] = &["bash", "zsh", "fish", "powershell"];
+
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "tools", description: "tool commands", subcommands: &["dump"] },
     CommandSpec { name: "session", description: "session management", subcommands: &["list", "export", "branch", "tree"] },
-    CommandSpec { name: "memory", description: "Meridian memory", subcommands: &["search", "add"] },
-    CommandSpec { name: "completion", description: "generate shell completion", subcommands: &["bash", "zsh", "fish"] },
+    CommandSpec { name: "memory", description: "local memory", subcommands: &["search", "add"] },
+    CommandSpec { name: "completion", description: "generate shell completion", subcommands: SHELLS },
     CommandSpec { name: "compact", description: "compact a session", subcommands: &[] },
     CommandSpec { name: "undo", description: "undo the last checkpoint", subcommands: &[] },
+    CommandSpec { name: "review", description: "self-improve pass over a session", subcommands: &[] },
     CommandSpec { name: "checkpoint", description: "checkpoint operations", subcommands: &["restore"] },
-    CommandSpec { name: "auth", description: "authentication", subcommands: &["login", "logout"] },
+    CommandSpec { name: "auth", description: "keys and sign-ins", subcommands: &["login", "logout"] },
     CommandSpec { name: "models", description: "list models", subcommands: &[] },
+    CommandSpec { name: "acp", description: "serve the Agent Client Protocol on stdio", subcommands: &[] },
     CommandSpec { name: "onboarding", description: "run onboarding", subcommands: &[] },
 ];
 
@@ -59,78 +66,101 @@ fn words(items: impl Iterator<Item = &'static str>) -> String {
     items.collect::<Vec<_>>().join(" ")
 }
 
+fn top() -> String {
+    words(COMMANDS.iter().map(|c| c.name).chain(["--help", "--version"]))
+}
+
+fn flags() -> String {
+    words(FLAGS.iter().map(|f| f.name))
+}
+
+fn with_subs() -> impl Iterator<Item = &'static CommandSpec> {
+    COMMANDS.iter().filter(|c| !c.subcommands.is_empty())
+}
+
 pub fn script(shell: &str, bin: &str) -> Option<String> {
-    let top = words(COMMANDS.iter().map(|c| c.name).chain(["--help", "--version"]));
-    let flags = words(FLAGS.iter().map(|f| f.name));
-    let session = "list export branch tree";
-    let memory = "search add";
-    let tools = "dump";
-    let completion = "bash zsh fish";
+    let fname = bin.replace('-', "_");
     match shell {
-        "bash" => Some(format!(
-            r#"_{{bin}}_complete() {{
-  local cur="${{COMP_WORDS[COMP_CWORD]}}" cmd="${{COMP_WORDS[1]}}"
-  if [[ "$COMP_CWORD" -eq 1 ]]; then
-    COMPREPLY=($(compgen -W "{top}" -- "$cur")); return
-  fi
-  case "$cmd" in
-    session) COMPREPLY=($(compgen -W "{session} {flags}" -- "$cur"));;
-    memory) COMPREPLY=($(compgen -W "{memory} {flags}" -- "$cur"));;
-    tools) COMPREPLY=($(compgen -W "{tools} {flags}" -- "$cur"));;
-    completion) COMPREPLY=($(compgen -W "{completion}" -- "$cur"));;
-    *) COMPREPLY=($(compgen -W "{flags}" -- "$cur"));;
-  esac
-}}
-complete -F _{{bin}}_complete {bin}
-"#,
-            bin = bin,
-            top = top,
-            flags = flags,
-            session = session,
-            memory = memory,
-            tools = tools,
-            completion = completion
-        )),
-        "zsh" => {
-            let args = FLAGS.iter().map(|f| {
-                if f.takes_value {
-                    format!("'{}[{}]:value:'", f.name, f.description)
-                } else {
-                    format!("'{}[{}]'", f.name, f.description)
-                }
-            }).collect::<Vec<_>>().join(" \\\n  ");
+        "bash" => {
+            let cases: String = with_subs()
+                .map(|c| format!("    {}) COMPREPLY=($(compgen -W \"{} {}\" -- \"$cur\"));;\n", c.name, c.subcommands.join(" "), flags()))
+                .collect();
             Some(format!(
-                "#compdef {bin}\n_{bin}() {{\n  local -a commands\n  commands=({top})\n  _arguments -C \\\n    '1:command:(({top}))' \\\n    '*:arguments:->args'\n  case $state in\n    args)\n      case $words[2] in\n        session) _arguments '1:subcommand:(({session}))' {args};;\n        memory) _arguments '1:subcommand:(({memory}))' {args};;\n        tools) _arguments '1:subcommand:(({tools}))' {args};;\n        completion) _values 'shell' {completion};;\n        *) _arguments {args};;\n      esac\n      ;;\n  esac\n}}\ncompdef _{bin} {bin}\n",
-                bin = bin,
-                top = top,
-                args = args,
-                session = session,
-                memory = memory,
-                tools = tools,
-                completion = completion
+                "_{fname}_complete() {{\n  local cur=\"${{COMP_WORDS[COMP_CWORD]}}\" cmd=\"${{COMP_WORDS[1]}}\"\n  if [[ \"$COMP_CWORD\" -eq 1 ]]; then\n    COMPREPLY=($(compgen -W \"{top}\" -- \"$cur\")); return\n  fi\n  case \"$cmd\" in\n{cases}    *) COMPREPLY=($(compgen -W \"{flags}\" -- \"$cur\"));;\n  esac\n}}\ncomplete -F _{fname}_complete {bin}\n",
+                top = top(),
+                flags = flags(),
+            ))
+        }
+        "zsh" => {
+            let args = FLAGS
+                .iter()
+                .map(|f| {
+                    if f.takes_value {
+                        format!("'{}[{}]:value:'", f.name, f.description)
+                    } else {
+                        format!("'{}[{}]'", f.name, f.description)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" \\\n  ");
+            let cmds = COMMANDS.iter().map(|c| format!("'{}:{}'", c.name, c.description)).collect::<Vec<_>>().join(" ");
+            let cases: String = with_subs()
+                .map(|c| format!("        {}) _arguments '1:subcommand:(({}))' {args};;\n", c.name, c.subcommands.join(" ")))
+                .collect();
+            Some(format!(
+                "#compdef {bin}\n_{fname}() {{\n  local -a commands\n  commands=({cmds})\n  _arguments -C \\\n    '1:command:->cmds' \\\n    '*:arguments:->args'\n  case $state in\n    cmds) _describe 'command' commands;;\n    args)\n      case $words[2] in\n{cases}        *) _arguments {args};;\n      esac\n      ;;\n  esac\n}}\ncompdef _{fname} {bin}\n"
             ))
         }
         "fish" => {
-            let mut out = format!(
-                "complete -c {bin} -f -a '{top}' -d 'Cosmos CLI command'\n",
-                bin = bin,
-                top = top
-            );
+            let mut out = String::new();
+            for c in COMMANDS {
+                out.push_str(&format!("complete -c {bin} -f -n '__fish_use_subcommand' -a '{}' -d '{}'\n", c.name, c.description));
+            }
             for f in FLAGS {
                 out.push_str(&format!(
-                    "complete -c {bin} -l {name} -d '{desc}'{value}\n",
-                    bin = bin,
-                    name = f.name.trim_start_matches('-'),
-                    desc = f.description,
-                    value = if f.takes_value { " -r" } else { "" }
+                    "complete -c {bin} -l {} -d '{}'{}\n",
+                    f.name.trim_start_matches('-'),
+                    f.description,
+                    if f.takes_value { " -r" } else { "" }
                 ));
             }
-            out.push_str(&format!("complete -c {bin} -n '__fish_seen_subcommand_from session' -a '{session}' -d 'session operation'\n", bin = bin, session = session));
-            out.push_str(&format!("complete -c {bin} -n '__fish_seen_subcommand_from memory' -a '{memory}' -d 'memory operation'\n", bin = bin, memory = memory));
-            out.push_str(&format!("complete -c {bin} -n '__fish_seen_subcommand_from tools' -a '{tools}' -d 'tool operation'\n", bin = bin, tools = tools));
-            out.push_str(&format!("complete -c {bin} -n '__fish_seen_subcommand_from completion' -a '{completion}' -d 'shell'\n", bin = bin, completion = completion));
+            for c in with_subs() {
+                out.push_str(&format!(
+                    "complete -c {bin} -f -n '__fish_seen_subcommand_from {}' -a '{}'\n",
+                    c.name,
+                    c.subcommands.join(" ")
+                ));
+            }
             Some(out)
         }
+        "powershell" | "pwsh" => {
+            let cmds = COMMANDS.iter().map(|c| format!("'{}'", c.name)).collect::<Vec<_>>().join(",");
+            let subs = with_subs()
+                .map(|c| format!("'{}'=@({})", c.name, c.subcommands.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",")))
+                .collect::<Vec<_>>()
+                .join(";");
+            let fl = FLAGS.iter().map(|f| format!("'{}'", f.name)).collect::<Vec<_>>().join(",");
+            Some(format!(
+                "Register-ArgumentCompleter -Native -CommandName {bin} -ScriptBlock {{\n  param($word, $ast, $cursor)\n  $cmds = @({cmds})\n  $subs = @{{{subs}}}\n  $flags = @({fl})\n  $parts = $ast.CommandElements | ForEach-Object {{ $_.ToString() }}\n  $pool = if ($parts.Count -le 1 -or ($parts.Count -eq 2 -and $word)) {{ $cmds + $flags }} elseif ($subs.ContainsKey($parts[1])) {{ $subs[$parts[1]] + $flags }} else {{ $flags }}\n  $pool | Where-Object {{ $_ -like \"$word*\" }} | ForEach-Object {{\n    [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)\n  }}\n}}\n"
+            ))
+        }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_shell_names_the_binary() {
+        for sh in SHELLS {
+            let s = script(sh, "cosmostui").unwrap();
+            assert!(s.contains("cosmostui"), "{sh}");
+            assert!(!s.contains("{bin}") && !s.contains("{fname}"), "{sh}: unrendered placeholder\n{s}");
+            assert!(s.contains("session") && s.contains("model"), "{sh}");
+        }
+        assert!(script("bash", "cosmostui").unwrap().contains("_cosmostui_complete() {"));
+        assert!(script("tcsh", "cosmostui").is_none());
     }
 }

@@ -1,5 +1,5 @@
 //! Checkpoints — copy previous bytes before `edit`/`write` overwrite.
-//! `/undo` or `zcli checkpoint restore --last` walks back one file.
+//! `/undo` or `cosmostui checkpoint restore --last` walks back one file.
 //! Not git. Do not touch the user's index.
 
 use std::fs;

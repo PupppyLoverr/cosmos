@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::style::Color;
-use ratatui::text::Line;
+use ratatui_core::style::Color;
+use ratatui_core::text::Line;
 use serde_json::Value;
 use zcore::agent::Mode;
 use zproto::RunOpts;
@@ -34,9 +34,9 @@ use crate::term::{Frame, Screen};
 use crate::theme;
 use crate::view;
 use crate::voice::{self, Recorder};
-use crate::worker::{self, Cmd, Diff, Msg};
+use crate::worker::{self, Cmd, Diff, LocalCmd, Msg};
 
-pub(crate) const PLACEHOLDER: &str = "Ask zcli to build features, fix bugs, or work on your code";
+pub(crate) const PLACEHOLDER: &str = "Ask Cosmos to build features, fix bugs, or work on your code";
 
 /// Reasoning-effort choices in the model picker (index 0 = provider default).
 pub const EFFORTS: &[(&str, Option<&str>)] =
@@ -53,6 +53,12 @@ pub struct UsageInfo {
     pub turns: u64,
     pub cum_usd: Option<f64>,
     pub model_usd: HashMap<String, f64>,
+    /// the last turn alone: input, cache read, cache write, output
+    pub last: [u64; 4],
+    /// the last turn's price; None = unknown (or a subscription plan)
+    pub last_usd: Option<f64>,
+    /// the last turn ran on a subscription (no per-token price)
+    pub plan: bool,
 }
 
 /// A `/model` picker row: a config.toml alias or a catalog `provider/model`.
@@ -191,7 +197,7 @@ pub struct App {
     last_reply: String,
     /// operator name from onboarding — shown in the info line
     pub user: Option<String>,
-    /// `/onboarding` asked the loop to hand the terminal to zcli-welcome
+    /// `/onboarding` asked the loop to hand the terminal to cosmostui-welcome
     pub replay_onboard: bool,
     /// the dictation key is physically down (Windows reports releases), so
     /// its auto-repeat can't stop a recording it just started
@@ -478,10 +484,14 @@ impl App {
                 }
                 if let Some(calls) = ev.data["tool_calls"].as_array() {
                     for c in calls {
+                        let name = c["name"].as_str().unwrap_or("tool");
+                        // a deferred tool through the built-in server shows as itself
+                        let (name, input) = ztools::unwrap_self_call(name, &c["input"])
+                            .unwrap_or_else(|| (name.to_string(), c["input"].clone()));
                         self.tools.push(PendingTool {
                             id: c["id"].as_str().unwrap_or("").to_string(),
-                            name: c["name"].as_str().unwrap_or("tool").to_string(),
-                            input: c["input"].clone(),
+                            name,
+                            input,
                         });
                     }
                 }
@@ -503,6 +513,14 @@ impl App {
                     self.block(lines);
                 }
             }
+            // a subscription agent's own tool (ACP) — shown, never replayed
+            "tool_call" if ev.data["source"] == "acp" => {
+                let name = ev.data["name"].as_str().unwrap_or("tool");
+                let status = ev.data["status"].as_str().unwrap_or("");
+                let input = serde_json::json!({"title": ev.data["title"]});
+                let out = ev.data["output"].as_str().unwrap_or("");
+                self.block(view::tool_block(name, &input, Some(out), status == "failed", None, w, false));
+            }
             "plan" => {
                 self.plan_pending = true;
                 self.block(view::plan(ev.data["plan"].as_str().unwrap_or(""), w));
@@ -515,6 +533,9 @@ impl App {
                 u.cache_write += g("cache_write");
                 u.output += g("output");
                 u.last_prompt = g("input") + g("cache_read") + g("cache_write");
+                u.last = [g("input"), g("cache_read"), g("cache_write"), g("output")];
+                u.last_usd = ev.data["usd"].as_f64();
+                u.plan = ev.data["billing"] == "subscription";
                 u.turns += 1;
                 if ev.data["usd"].is_number() {
                     u.cum_usd = ev.data["cum_usd"].as_f64();
@@ -539,7 +560,7 @@ impl App {
                 let to = ev.data["to"].as_str().unwrap_or("");
                 self.mode = Mode::parse(to);
                 let label = match self.mode {
-                    Mode::Plan => "Plan mode — zcli proposes before it changes anything",
+                    Mode::Plan => "Plan mode — Cosmos proposes before it changes anything",
                     Mode::Yolo => "Yolo mode — tools run without asking (sandbox stays on)",
                     Mode::AcceptEdits => "Accept-edits — writes auto-allow inside the workspace",
                     Mode::Agent => "Agent mode",
@@ -952,7 +973,7 @@ impl App {
             let note = note.trim();
             if !note.is_empty() {
                 let mut ctx = ztools::ToolContext::new(&self.cwd);
-                let r = ztools::run(&mut ctx, "memory_write", &serde_json::json!({"type": "preference", "text": note, "scope": "zcli"}));
+                let r = ztools::run(&mut ctx, "memory_write", &serde_json::json!({"type": "preference", "text": note, "scope": "global"}));
                 if r.to_lowercase().contains("error") {
                     self.error(format!("Memory: {r}"));
                 } else {
@@ -1035,25 +1056,17 @@ impl App {
                     self.note("No plan is waiting for approval");
                 }
             }
+            // these run in the harness, never as a model turn (contract §7)
             "compact" => {
                 let focus = args.strip_prefix("focus:").or_else(|| args.strip_prefix("focus")).unwrap_or(args).trim();
-                let prompt = if focus.is_empty() {
-                    "/compact".to_string()
-                } else {
-                    format!("/compact focus: {focus}")
-                };
-                self.send_prompt(&prompt, prompt.clone(), cmd);
+                let _ = cmd.send(Cmd::Local(LocalCmd::Compact((!focus.is_empty()).then(|| focus.to_string()))));
             }
             "undo" => {
-                self.send_prompt("/undo", "/undo".into(), cmd);
+                let _ = cmd.send(Cmd::Local(LocalCmd::Undo));
             }
             "skillify" => {
                 let name = if args.is_empty() { "session" } else { args };
-                self.note(format!("skillify {name} — run after the turn, or use zcli skillify"));
-                self.send_prompt(&format!("/skillify {name}"), format!("/skillify {name}"), cmd);
-            }
-            "refine" => {
-                self.note("refine: use meridian refine.apply / refine.rollback");
+                let _ = cmd.send(Cmd::Local(LocalCmd::Skillify(name.to_string())));
             }
             "usage" | "cost" => {
                 let lines = view::usage(self);
@@ -1123,7 +1136,11 @@ impl App {
                     self.flash(format!("Copied the last reply ({} chars)", self.last_reply.chars().count()), theme::GREEN);
                 }
             }
-            "session" => self.note(format!("Session {} · resume with  zcli --resume {}", self.session, self.session)),
+            "session" => self.note(format!("Session {} · resume with  cosmostui --resume {}", self.session, self.session)),
+            "tree" => {
+                let lines = view::tree(self);
+                self.block(lines);
+            }
             "clear" => self.clear_screen = true,
             "onboarding" => self.replay_onboard = true,
             "help" => self.popup = Some(Popup::Help),
@@ -1140,15 +1157,16 @@ impl App {
         }
     }
 
-    /// Begin /connect for a provider: ChatGPT and Devin sign in, others ask for a key.
+    /// Begin /connect for a provider: ChatGPT signs in, subscription agents
+    /// (Cursor, Devin, Codex) use their own CLI, others ask for a key.
     fn connect(&mut self, id: &str) {
         self.popup = None;
         if id == "chatgpt" {
             self.start_login();
             return;
         }
-        if id == "devin" {
-            self.connect_devin();
+        if zcore::acp_client::plugin(id).is_some() {
+            self.connect_acp(id);
             return;
         }
         match zcore::catalog::provider(id) {
@@ -1162,25 +1180,31 @@ impl App {
         }
     }
 
-    fn connect_devin(&mut self) {
-        zcore::devin::invalidate();
-        if !zcore::devin::ready() {
-            self.error(zcore::devin::hint());
+    /// A subscription agent needs only its CLI on PATH and its own sign-in;
+    /// it runs on the operator's plan, never on a key Cosmos holds.
+    fn connect_acp(&mut self, id: &str) {
+        let Some(p) = zcore::acp_client::plugin(id) else { return };
+        if !zcore::acp_client::installed(id) {
+            self.error(format!("{} isn't installed — {}", p.name, p.install));
             return;
         }
-        let Some(def) = zcore::catalog::provider("devin") else {
-            self.error("Devin is missing from the catalog");
-            return;
-        };
-        match zcore::live::fetch(def) {
-            Ok(models) => {
-                let _ = zcore::live::store("devin", &models);
-                self.reload_models();
-                self.note(format!("Devin · {} · {} models", zcore::devin::detail(), models.len()));
-                self.open_model_picker_for("devin");
+        // the agent reports the plan's real model list on session/new —
+        // grab it now so the picker shows more than "<id>/default"
+        match zcore::catalog::provider(id).map(zcore::live::fetch) {
+            Some(Ok(models)) => {
+                let _ = zcore::live::store(id, &models);
             }
-            Err(e) => self.error(format!("{e:#}")),
+            Some(Err(e)) => self.note(format!("Couldn't get {}'s model list ({e:#}) — showing its default", p.name)),
+            None => {}
         }
+        self.reload_models();
+        self.note(format!(
+            "{} found — it runs on your {} plan. Not signed in yet? Run `{}` in a terminal (or `cosmostui auth login {id}`).",
+            p.name,
+            p.name,
+            p.login.join(" ")
+        ));
+        self.open_model_picker_for(id);
     }
 
     fn open_model_picker(&mut self) {
@@ -1566,7 +1590,7 @@ fn copy_osc52(text: &str) {
 // ---- persistence --------------------------------------------------------------
 
 fn history_path() -> PathBuf {
-    zcore::cli_home().join("zcli_history.jsonl")
+    zcore::home_file("history.jsonl", "zcli_history.jsonl")
 }
 
 fn load_history() -> Vec<String> {
@@ -1591,10 +1615,10 @@ fn push_history(h: &mut Vec<String>, entry: &str) {
 }
 
 fn state_path() -> PathBuf {
-    zcore::cli_home().join("zcli_state.json")
+    zcore::home_file("state.json", "zcli_state.json")
 }
 
-/// The model picked last time — used when zcli starts without `--model`.
+/// The model picked last time — used when cosmostui starts without `--model`.
 fn saved_model() -> Option<String> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(state_path()).ok()?).ok()?;
     v["model"].as_str().map(str::to_string)
@@ -1612,7 +1636,7 @@ pub fn try_run(opts: &RunOpts, cwd: &Path) -> Result<Option<i32>> {
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         return Ok(None);
     }
-    // first launch: the one-shot `zcli-welcome` binary (galaxy intro → name
+    // first launch: the one-shot `cosmostui-welcome` binary (galaxy intro → name
     // → keys → how-to) runs before anything else so the keys and default
     // model it writes land in this session. It's deleted once it completes.
     if zcore::welcome::needed() {
@@ -1644,11 +1668,16 @@ pub fn try_run(opts: &RunOpts, cwd: &Path) -> Result<Option<i32>> {
         app.cwd = PathBuf::from(d);
     }
     app.user = zcore::welcome::user_name();
-    app.cont(crate::logo::banner("zcli", concat!("v", env!("CARGO_PKG_VERSION"))));
+    app.cont(crate::logo::banner("cosmos", concat!("v", env!("CARGO_PKG_VERSION"))));
 
     let r = run_loop(&mut screen, &mut app, &rx, &cmd, &interrupt);
     let bye = view::farewell(&app);
     screen.leave(&bye);
+    // contract §13: after a clean interactive session, learn from it in the
+    // background (skills + memory only; the operator can turn it off)
+    if matches!(r, Ok(0)) && !app.session.is_empty() && zcore::config::Config::load(&zcore::cli_home()).self_improve.enabled {
+        zcore::improve::spawn_review(&app.session);
+    }
     r.map(Some)
 }
 
@@ -1714,7 +1743,7 @@ fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender
             if zcore::welcome::exe().is_none() {
                 app.note("onboarding has retired — /connect adds keys, /login signs in, /model picks a default");
             } else {
-                // hand the terminal to zcli-welcome, then take it back
+                // hand the terminal to cosmostui-welcome, then take it back
                 let out = std::mem::take(&mut app.out);
                 screen.draw(&out, Frame { lines: &[], cursor: None })?;
                 screen.leave(&[]);
@@ -1826,9 +1855,9 @@ mod tests {
     use std::sync::mpsc::channel;
 
     fn app() -> App {
-        std::env::set_var("COSMOS_CLI_HOME", std::env::temp_dir().join("zcli-tui-test"));
+        std::env::set_var("COSMOS_CLI_HOME", std::env::temp_dir().join("cosmos-tui-test"));
         std::env::set_var("COSMOS_CLI_KEYRING", "0");
-        let _ = std::fs::create_dir_all(std::env::temp_dir().join("zcli-tui-test"));
+        let _ = std::fs::create_dir_all(std::env::temp_dir().join("cosmos-tui-test"));
         let row = |alias: &str, provider: &str, id: &str, context: u64, effort_ok: bool| ModelRow {
             alias: alias.into(),
             provider: provider.into(),
@@ -1997,7 +2026,7 @@ mod tests {
         let mut a = app();
         let ev = |kind: &str, data: Value| zproto::Event {
             v: 1, id: "e".into(), parent: None, ts: String::new(), session: "s".into(),
-            harness: "zcli".into(), kind: kind.into(), data,
+            harness: "cosmostui".into(), kind: kind.into(), data,
         };
         a.on_msg(Msg::Event(ev("assistant", serde_json::json!({"text": "", "tool_calls": [{"id": "t1", "name": "bash", "input": {"command": "cargo test"}}]}))));
         assert_eq!(a.tools.len(), 1);
@@ -2007,6 +2036,60 @@ mod tests {
         let rows: Vec<String> = a.out.iter().map(text).collect();
         assert!(rows.iter().any(|r| r.contains("Bash") && r.contains("cargo test")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("ok. 3 passed")));
+
+        // a deferred tool via the built-in server renders as itself
+        a.on_msg(Msg::Event(ev("assistant", serde_json::json!({"text": "", "tool_calls": [{"id": "t2", "name": "mcp_call",
+            "input": {"server": "cosmos", "tool": "memory_search", "arguments": {"query": "tabs"}}}]}))));
+        assert_eq!(a.tools[0].name, "memory_search");
+        a.on_msg(Msg::Event(ev("tool_result", serde_json::json!({"tool_use_id": "t2", "name": "memory_search", "content": "{\"results\":[]}", "is_error": false}))));
+        let rows: Vec<String> = a.out.iter().map(text).collect();
+        assert!(rows.iter().any(|r| r.contains("Recall") && r.contains("tabs")), "{rows:?}");
+
+        // a subscription agent's tool shows up from its tool_call event
+        a.on_msg(Msg::Event(ev("tool_call", serde_json::json!({"id": "x", "name": "devin:edit", "title": "Edit a.rs",
+            "status": "completed", "output": "wrote a.rs", "source": "acp"}))));
+        let rows: Vec<String> = a.out.iter().map(text).collect();
+        assert!(rows.iter().any(|r| r.contains("devin:edit") && r.contains("Edit a.rs")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("wrote a.rs")), "{rows:?}");
+    }
+
+    #[test]
+    fn status_line_shows_the_cost_ledger() {
+        let _env = crate::env_lock();
+        let mut a = app();
+        let ev = |data: Value| zproto::Event {
+            v: 1, id: "e".into(), parent: None, ts: String::new(), session: "s".into(),
+            harness: "cosmostui".into(), kind: "usage".into(), data,
+        };
+        a.on_msg(Msg::Event(ev(serde_json::json!({"input": 1204, "cache_read": 18400, "cache_write": 0, "output": 312, "usd": 0.0041, "cum_usd": 0.0213}))));
+        // narrow terminals get the short form
+        let (lines, _) = view::live(&a);
+        assert!(lines.iter().map(text).any(|r| r.contains("Σ $0.0213 · ctx") && !r.contains("turn 1")));
+        a.width = 160;
+        let (lines, _) = view::live(&a);
+        let rows: Vec<String> = lines.iter().map(text).collect();
+        let status = rows.iter().find(|r| r.contains("ctx")).unwrap_or_else(|| panic!("{rows:?}"));
+        assert!(status.contains("turn 1 · in 1.2k · cache_r 18k · cache_w 0 · out 312 · $0.0041 · Σ $0.0213 · ctx"), "{status}");
+        // a subscription turn has no per-token price: "plan", never a guess
+        a.on_msg(Msg::Event(ev(serde_json::json!({"input": 0, "cache_read": 0, "cache_write": 0, "output": 0, "usd": null, "billing": "subscription"}))));
+        let (lines, _) = view::live(&a);
+        let rows: Vec<String> = lines.iter().map(text).collect();
+        assert!(rows.iter().any(|r| r.contains("turn 2") && r.contains("· plan ·")), "{rows:?}");
+    }
+
+    #[test]
+    fn harness_commands_never_reach_the_model() {
+        let _env = crate::env_lock();
+        let mut a = app();
+        let (tx, rx) = channel();
+        a.run_slash("compact", "focus: the parser", &tx);
+        a.run_slash("undo", "", &tx);
+        a.run_slash("skillify", "release steps", &tx);
+        let sent: Vec<Cmd> = rx.try_iter().collect();
+        assert!(matches!(&sent[0], Cmd::Local(LocalCmd::Compact(Some(f))) if f == "the parser"), "{sent:?}");
+        assert!(matches!(&sent[1], Cmd::Local(LocalCmd::Undo)));
+        assert!(matches!(&sent[2], Cmd::Local(LocalCmd::Skillify(n)) if n == "release steps"));
+        assert!(!sent.iter().any(|c| matches!(c, Cmd::Prompt(_))), "no prompt sent to the model");
     }
 
     #[test]
@@ -2035,7 +2118,7 @@ mod tests {
         let mut a = app();
         let (tx, rx) = channel();
         let flag = Arc::new(AtomicBool::new(false));
-        for c in "!echo zcli-shell-ok".chars() {
+        for c in "!echo cosmos-shell-ok".chars() {
             a.on_key(key(KeyCode::Char(c)), &tx, &flag);
         }
         a.on_key(key(KeyCode::Enter), &tx, &flag);
@@ -2047,12 +2130,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let rows: Vec<String> = a.out.iter().map(text).collect();
-        assert!(rows.iter().any(|r| r.contains("zcli-shell-ok")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("cosmos-shell-ok")), "{rows:?}");
         for c in "what happened?".chars() {
             a.on_key(key(KeyCode::Char(c)), &tx, &flag);
         }
         a.on_key(key(KeyCode::Enter), &tx, &flag);
         let sent: Vec<Cmd> = rx.try_iter().collect();
-        assert!(matches!(&sent[0], Cmd::Prompt(p) if p.contains("<shell-output") && p.contains("zcli-shell-ok") && p.ends_with("what happened?")));
+        assert!(matches!(&sent[0], Cmd::Prompt(p) if p.contains("<shell-output") && p.contains("cosmos-shell-ok") && p.ends_with("what happened?")));
     }
 }

@@ -19,12 +19,80 @@ pub struct Event {
     pub data: Value,
 }
 
-pub fn new_id() -> String {
-    ulid::Ulid::new().to_string().to_lowercase()
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
+/// A lowercase ULID: 48-bit millisecond time + 80 random bits, Crockford
+/// base32 (26 chars). Sorts by creation time like `ulid::Ulid`.
+pub fn new_id() -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+    let mut rnd = [0u8; 10];
+    if getrandom::fill(&mut rnd).is_err() {
+        // no OS RNG: fall back to time + address entropy (ids stay unique per process)
+        let seed = unix_ms() ^ (&rnd as *const _ as u64).rotate_left(17) ^ std::process::id() as u64;
+        for (i, b) in rnd.iter_mut().enumerate() {
+            *b = (seed >> ((i % 8) * 8)) as u8 ^ i as u8;
+        }
+    }
+    let mut v: u128 = (unix_ms() as u128 & 0xffff_ffff_ffff) << 80;
+    for (i, b) in rnd.iter().enumerate() {
+        v |= (*b as u128) << (72 - i * 8);
+    }
+    (0..26).rev().map(|i| ALPHABET[((v >> (i * 5)) & 31) as usize] as char).collect()
+}
+
+/// Current UTC time as RFC 3339 with milliseconds (`2026-10-01T08:17:50.755Z`).
 pub fn now_ts() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    ts_from_ms(unix_ms())
+}
+
+fn ts_from_ms(ms: u64) -> String {
+    let (secs, milli) = (ms / 1000, ms % 1000);
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // civil-from-days (Howard Hinnant)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{milli:03}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_match_rfc3339() {
+        assert_eq!(ts_from_ms(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(ts_from_ms(951_782_400_000), "2000-02-29T00:00:00.000Z");
+        assert_eq!(ts_from_ms(1_790_843_870_755), "2026-10-01T08:37:50.755Z");
+        assert_eq!(now_ts().len(), 24);
+    }
+
+    #[test]
+    fn ids_are_ulid_shaped_and_sortable() {
+        let a = new_id();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = new_id();
+        assert_eq!(a.len(), 26);
+        assert!(a.chars().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()));
+        assert!(a < b, "{a} < {b}");
+        assert_ne!(new_id(), new_id());
+    }
 }
 
 impl Event {

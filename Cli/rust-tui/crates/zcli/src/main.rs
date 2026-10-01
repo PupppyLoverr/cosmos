@@ -1,4 +1,5 @@
-//! zcli — Cosmos Rust harness. `zcli -p "task"` headless, bare `zcli` REPL.
+//! cosmostui — the Cosmos coding agent for your terminal. `cosmostui -p "task"`
+//! headless, bare `cosmostui` interactive. (`cosmos` itself is the desktop app.)
 
 use std::path::PathBuf;
 
@@ -9,20 +10,21 @@ use zproto::{exit, OutputMode, RunOpts};
 mod completion;
 
 const HELP: &str = "\
-zcli — Cosmos coding-agent harness (Rust)
+cosmostui — the Cosmos coding agent for your terminal (any model, your keys)
 
 usage:
-  zcli                        interactive session (REPL)
-  zcli -p \"<task>\" [flags]    headless run; -p - reads the task from stdin
-  zcli tools dump             canonical tools.json (byte-identical to zdev/zagy)
-  zcli session list           sessions in COSMOS_CLI_HOME
-  zcli session export <id> [--format md|jsonl]
-  zcli session branch <id> --at <event_id>
-  zcli memory search <q>      search the shared Meridian vault
-  zcli memory add <text>      append to the vault (scope: zcli)
-  zcli auth [login|logout] …  API keys (30 providers) and ChatGPT sign-in
-  zcli models [provider]      models you can use now
-  zcli onboarding             run the first-run setup again (until it retires itself)
+  cosmostui                     interactive session
+  cosmostui -p \"<task>\" [flags] headless run; -p - reads the task from stdin
+  cosmostui tools dump          canonical tools.json (byte-identical to zdev/zagy)
+  cosmostui session list        sessions in COSMOS_CLI_HOME
+  cosmostui session export <id> [--format md|jsonl]
+  cosmostui session branch <id> --at <event_id>
+  cosmostui session tree <id>     the session's event tree (branch points indent)
+  cosmostui memory search <q>   search local memory
+  cosmostui memory add <text>   remember a fact (scope: global)
+  cosmostui auth [login|logout] … API keys (30 providers) and ChatGPT sign-in
+  cosmostui models [provider]   models you can use now
+  cosmostui onboarding          run the first-run setup again (until it retires itself)
 
 flags:
   --output/--output-format text|json|stream-json   (default text)
@@ -49,9 +51,10 @@ flags:
   --version | --help
 
 commands:
-  zcli compact --session <id> [--focus …]
-  zcli undo --session <id>
-  zcli checkpoint restore --last [--session <id>]
+  cosmostui compact --session <id> [--focus …]
+  cosmostui undo --session <id>
+  cosmostui review --session <id>  remember what a session taught (runs after the TUI)
+  cosmostui checkpoint restore --last [--session <id>]
 ";
 
 fn split_list(s: &str) -> Vec<String> {
@@ -109,9 +112,14 @@ fn parse(args: &[String]) -> Result<RunOpts, String> {
             }
             "--self-improve" => o.self_improve = Some(true),
             "--no-self-improve" => o.self_improve = Some(false),
-            "--version" | "--help" | "-h" | "-V" => {
+            "--version" | "-V" => {
+                println!("{} {}", zcore::NAME, env!("CARGO_PKG_VERSION"));
+                std::process::exit(exit::DONE);
+            }
+            "--help" | "-h" => {
                 println!(
-                    "zcli {} (contract v{})\n{HELP}",
+                    "{} {} (contract v{})\n{HELP}",
+                    zcore::NAME,
                     env!("CARGO_PKG_VERSION"),
                     zproto::CONTRACT_VERSION
                 );
@@ -128,7 +136,21 @@ fn parse(args: &[String]) -> Result<RunOpts, String> {
     Ok(o)
 }
 
+/// Launched as `zcli` (the pre-rename name, kept as an alias for one
+/// release): say so once, then carry on as cosmostui.
+fn deprecated_alias() {
+    let argv0 = std::env::args_os().next().unwrap_or_default();
+    let stem = std::path::Path::new(&argv0)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if stem == "zcli" {
+        eprintln!("zcli is now cosmostui — this alias goes away next release");
+    }
+}
+
 fn main() {
+    deprecated_alias();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let code = match args.first().map(String::as_str) {
@@ -137,22 +159,27 @@ fn main() {
                 print!("{}", ztools::tools_dump());
                 exit::DONE
             } else {
-                eprintln!("usage: zcli tools dump");
+                eprintln!("usage: cosmostui tools dump");
                 exit::USAGE
             }
         }
         Some("completion") => {
             let shell = args.get(1).map(String::as_str).unwrap_or("bash");
-            if !["bash", "zsh", "fish"].contains(&shell) {
-                eprintln!("completion shell must be bash, zsh, or fish");
-                std::process::exit(exit::USAGE);
+            match completion::script(shell, zcore::NAME) {
+                Some(s) => {
+                    print!("{s}");
+                    exit::DONE
+                }
+                None => {
+                    eprintln!("completion shell must be one of: {}", completion::SHELLS.join(", "));
+                    exit::USAGE
+                }
             }
-            print!("{}", completion::script(shell, "zcli").unwrap());
-            exit::DONE
         }
         Some("session") => session_cmd(&args[1..]),
         Some("compact") => compact_cmd(&args[1..]),
         Some("undo") => undo_cmd(&args[1..]),
+        Some("review") => review_cmd(&args[1..]),
         Some("checkpoint") => checkpoint_cmd(&args[1..]),
         Some("memory") => memory_cmd(&args[1..]),
         Some("auth") | Some("login") => auth_cmd::auth_cmd(if args[0] == "login" { &args[..] } else { &args[1..] }),
@@ -161,7 +188,7 @@ fn main() {
         Some("onboarding") | Some("onboard") => match zcore::welcome::launch() {
             zcore::welcome::Outcome::Done | zcore::welcome::Outcome::Quit => exit::DONE,
             zcore::welcome::Outcome::Missing => {
-                eprintln!("onboarding already ran and removed itself — use /connect, /login and /model inside zcli, or  zcli auth login <provider>");
+                eprintln!("onboarding already ran and removed itself — use /connect, /login and /model inside cosmostui, or  cosmostui auth login <provider>");
                 exit::DONE
             }
             zcore::welcome::Outcome::Failed(e) => {
@@ -179,7 +206,7 @@ fn main() {
                 }
             };
             if opts.prompt.is_some() {
-                match run_headless(&opts, "zcli", &cwd, &mut emitter(opts.output)) {
+                match run_headless(&opts, zcore::NAME, &cwd, &mut emitter(opts.output)) {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("{e:#}");
@@ -253,34 +280,8 @@ fn session_cmd(args: &[String]) -> i32 {
             let file = home.join("sessions").join(format!("{id}.jsonl"));
             match zcore::session::read_events(&file) {
                 Ok(events) => {
-                    use std::collections::HashMap;
-                    let by_parent: HashMap<Option<String>, Vec<&zproto::Event>> = {
-                        let mut m: HashMap<Option<String>, Vec<&zproto::Event>> = HashMap::new();
-                        for e in &events {
-                            m.entry(e.parent.clone()).or_default().push(e);
-                        }
-                        m
-                    };
-                    fn walk(
-                        parent: &Option<String>,
-                        depth: usize,
-                        by: &HashMap<Option<String>, Vec<&zproto::Event>>,
-                    ) {
-                        if let Some(kids) = by.get(parent) {
-                            for e in kids {
-                                println!("{}{} [{}] {}", "  ".repeat(depth), e.id, e.kind, e.ts);
-                                walk(&Some(e.id.clone()), depth + 1, by);
-                            }
-                        }
-                    }
-                    walk(&None, 0, &by_parent);
-                    // orphans (parent points at a checkout target mid-file)
-                    for e in &events {
-                        if e.parent.is_some()
-                            && !events.iter().any(|x| Some(&x.id) == e.parent.as_ref())
-                        {
-                            println!("  {} [{}] {} (orphan)", e.id, e.kind, e.ts);
-                        }
+                    for line in zcore::session::tree(&events) {
+                        println!("{line}");
                     }
                     exit::DONE
                 }
@@ -291,7 +292,7 @@ fn session_cmd(args: &[String]) -> i32 {
             }
         }
         _ => {
-            eprintln!("usage: zcli session list|export|branch|tree");
+            eprintln!("usage: cosmostui session list|export|branch|tree");
             exit::USAGE
         }
     }
@@ -307,10 +308,79 @@ fn flag_val(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// The post-session self-improve pass (contract §13). The TUI starts it
+/// detached after a clean exit; it can also be run by hand.
+fn review_cmd(args: &[String]) -> i32 {
+    let Some(id) = flag_val(args, "--session") else {
+        eprintln!("usage: cosmostui review --session <id>");
+        return exit::USAGE;
+    };
+    let home = zcore::cli_home();
+    let file = home.join("sessions").join(format!("{id}.jsonl"));
+    let events = match zcore::session::read_events(&file) {
+        Ok(all) => zcore::session::chain(&all),
+        Err(e) => {
+            eprintln!("no session {id}: {e}");
+            return exit::FAILED;
+        }
+    };
+    let cfg = zcore::config::Config::load(&home);
+    let start = events.iter().find(|e| e.kind == "session_start");
+    let workspace = start
+        .and_then(|e| e.data["cwd"].as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    // the model the session used ("alias (id)" in session_start)
+    let alias = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == "session_start")
+        .and_then(|e| e.data["model"].as_str())
+        .map(|m| m.split(" (").next().unwrap_or(m).to_string());
+    let mut provider = alias.as_deref().and_then(|a| cfg.provider_for(a)).map(|(p, _)| p);
+    if let Some(p) = provider.as_mut().filter(|p| p.kind == zproviders::ProviderKind::ChatGpt) {
+        if let Some(t) = zcore::chatgpt::fresh() {
+            p.api_key = Some(t.access);
+            p.account_id = Some(t.account_id);
+        }
+    }
+    let allowed = cfg.allowed_hosts();
+    let r = match zcore::improve::review(&home, &workspace, &events, provider.as_ref().map(|p| (p, allowed.as_slice()))) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("review failed: {e:#}");
+            return exit::FAILED;
+        }
+    };
+    if let Ok(mut s) = Session::open(&home, &id) {
+        s.append(
+            "self_improve",
+            zcore::improve::event_data(
+                "review",
+                serde_json::json!({
+                    "memories": r.memories.iter().map(|(k, t)| serde_json::json!({"type": k, "text": t})).collect::<Vec<_>>(),
+                    "skill": r.skill.as_ref().map(|p| p.display().to_string()),
+                    "notes": r.notes,
+                }),
+            ),
+        );
+    }
+    for (k, t) in &r.memories {
+        println!("remembered [{k}] {t}");
+    }
+    if let Some(p) = &r.skill {
+        println!("new skill {}", p.display());
+    }
+    for n in &r.notes {
+        println!("note: {n}");
+    }
+    exit::DONE
+}
+
 fn compact_cmd(args: &[String]) -> i32 {
     let id = flag_val(args, "--session").unwrap_or_default();
     if id.is_empty() {
-        eprintln!("usage: zcli compact --session <id> [--focus …]");
+        eprintln!("usage: cosmostui compact --session <id> [--focus …]");
         return exit::USAGE;
     }
     let focus = flag_val(args, "--focus");
@@ -324,7 +394,7 @@ fn compact_cmd(args: &[String]) -> i32 {
         opts.prompt = Some(format!("/compact focus: {f}"));
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match run_headless(&opts, "zcli", &cwd, &mut emitter(OutputMode::Text)) {
+    match run_headless(&opts, zcore::NAME, &cwd, &mut emitter(OutputMode::Text)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e:#}");
@@ -345,7 +415,7 @@ fn undo_cmd(args: &[String]) -> i32 {
         id
     };
     if sid.is_empty() {
-        eprintln!("usage: zcli undo --session <id>");
+        eprintln!("usage: cosmostui undo --session <id>");
         return exit::USAGE;
     }
     match ztools::ckpt::restore_last(&home, &sid) {
@@ -364,28 +434,24 @@ fn checkpoint_cmd(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("restore") {
         return undo_cmd(args);
     }
-    eprintln!("usage: zcli checkpoint restore --last [--session <id>]");
+    eprintln!("usage: cosmostui checkpoint restore --last [--session <id>]");
     exit::USAGE
 }
 
 fn memory_cmd(args: &[String]) -> i32 {
-    let home = zcore::cli_home();
     let ws = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut ctx = ztools::ToolContext::new(&ws);
-    let _ = home;
-    match args.first().map(String::as_str) {
+    ctx.home = zcore::cli_home();
+    ctx.allowed_hosts = zcore::config::Config::load(&ctx.home).allowed_hosts();
+    let (tool, input) = match args.first().map(String::as_str) {
         Some("search") => {
             let q = args.get(1..).map(|a| a.join(" ")).unwrap_or_default();
-            println!(
-                "{}",
-                ztools::run(&mut ctx, "memory_search", &serde_json::json!({"query": q}))
-            );
-            exit::DONE
+            ("memory_search", serde_json::json!({"query": q}))
         }
         Some("add") => {
             let mut ty = "map".to_string();
             let mut words: Vec<String> = Vec::new();
-            let mut it = args[1..].iter().peekable();
+            let mut it = args[1..].iter();
             while let Some(a) = it.next() {
                 if a == "--type" {
                     ty = it.next().cloned().unwrap_or_else(|| "map".into());
@@ -393,20 +459,18 @@ fn memory_cmd(args: &[String]) -> i32 {
                     words.push(a.clone());
                 }
             }
-            let text = words.join(" ");
-            println!(
-                "{}",
-                ztools::run(
-                    &mut ctx,
-                    "memory_write",
-                    &serde_json::json!({"type": ty, "text": text, "scope": "zcli"})
-                )
-            );
-            exit::DONE
+            ("memory_write", serde_json::json!({"type": ty, "text": words.join(" "), "scope": "global"}))
         }
         _ => {
-            eprintln!("usage: zcli memory search|add");
-            exit::USAGE
+            eprintln!("usage: cosmostui memory search <query> | add [--type T] <text>");
+            return exit::USAGE;
         }
+    };
+    let out = ztools::run(&mut ctx, tool, &input);
+    if out.starts_with("ERROR") {
+        eprintln!("{out}");
+        return exit::FAILED;
     }
+    println!("{out}");
+    exit::DONE
 }

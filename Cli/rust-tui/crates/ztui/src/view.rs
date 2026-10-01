@@ -6,7 +6,7 @@
 //! ❯ Hello what can you do   ← user turn: full-width grey bar
 //!  I can help with …        ← reply, one-column margin, • bullets
 //! ────────────────────────  ← rule
-//! ❯ Ask zcli to build …     ← composer
+//! ❯ Ask Cosmos to build …     ← composer
 //! ────────────────────────  ← rule
 //! r9 Medium          ? for shortcuts   ← status line
 //!   /model …  Interactively choose …   ← menus open *below* the status line
@@ -14,8 +14,8 @@
 
 use std::collections::HashMap;
 
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui_core::style::{Modifier, Style};
+use ratatui_core::text::{Line, Span};
 use serde_json::Value;
 use zcore::agent::Mode;
 
@@ -390,11 +390,37 @@ pub fn context(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
+/// `/tree` — the session's event tree; a straight run stays at one depth and
+/// branch points (checkout rewinds) indent. Ids are the short suffixes
+/// `--resume <session>@<id>` accepts.
+pub fn tree(app: &App) -> Vec<Line<'static>> {
+    let file = zcore::cli_home().join("sessions").join(format!("{}.jsonl", app.session));
+    let events = zcore::session::read_events(&file).unwrap_or_default();
+    if events.is_empty() {
+        return vec![Line::from(dim("   no events yet"))];
+    }
+    let rows = zcore::session::tree(&events);
+    let mut out = vec![Line::from(vec![
+        sp(" "),
+        Span::styled("Session tree", theme::bold(Style::new())),
+        dim(format!("  {} events", events.len())),
+    ])];
+    let keep = 200usize;
+    for r in rows.iter().take(keep) {
+        out.push(Line::from(vec![sp("   "), dim(r.clone())]));
+    }
+    if rows.len() > keep {
+        out.push(Line::from(dim(format!("   … +{} rows", rows.len() - keep))));
+    }
+    out.push(Line::from(dim("   resume a point with  cosmostui --resume <session>@<id>")));
+    out
+}
+
 pub fn farewell(app: &App) -> Vec<Line<'static>> {
     if app.session.is_empty() {
         return Vec::new();
     }
-    vec![Line::default(), Line::from(vec![dim(" Resume this session with  "), sp(format!("zcli --resume {}", app.session))]), Line::default()]
+    vec![Line::default(), Line::from(vec![dim(" Resume this session with  "), sp(format!("cosmostui --resume {}", app.session))]), Line::default()]
 }
 
 /// The sign-in URL, shown in case the browser didn't open.
@@ -507,6 +533,14 @@ fn status_line(app: &App, w: usize) -> Line<'static> {
         Mode::Agent => {}
     }
     let first = app.input.first().copied();
+    // contract §8 ledger once a turn has run, unless a hint matters more
+    let quiet = app.popup.is_none() && app.key_entry.is_none() && !app.busy && !app.plan_pending && !matches!(first, Some('!') | Some('#'));
+    if quiet && app.usage.turns > 0 {
+        let lw: usize = left.iter().map(|s| width_of(&s.content)).sum();
+        let (full, short) = ledger(app);
+        let pick = if lw + width_of(&full) + 2 <= w { full } else { short };
+        return split_row(left, vec![dim(pick)], w);
+    }
     let hint = if matches!(app.popup, Some(Popup::Slash { .. } | Popup::Files { .. })) {
         "tab next · shift+tab prev · ↵ accept · esc close".to_string()
     } else if app.key_entry.is_some() {
@@ -525,6 +559,33 @@ fn status_line(app: &App, w: usize) -> Line<'static> {
         "shift+↵ newline · @ to mention a file".to_string()
     };
     split_row(left, vec![dim(hint)], w)
+}
+
+/// `turn 3 · in 1.2k · cache_r 18k · cache_w 0 · out 312 · $0.0041 · Σ $0.0213 · ctx 41%`
+/// and a short form for narrow terminals. Unknown prices print `$?`, never
+/// a guess; subscription turns print `plan`.
+pub fn ledger(app: &App) -> (String, String) {
+    let u = &app.usage;
+    let window = app.models.iter().find(|m| m.alias == app.alias).map(|m| m.context).unwrap_or(128_000).max(1);
+    let pct = (u.last_prompt as f64 / window as f64 * 100.0).round().min(100.0) as u64;
+    let money = |v: Option<f64>| match v {
+        Some(c) => format!("${c:.4}"),
+        None if u.plan => "plan".to_string(),
+        None => "$?".to_string(),
+    };
+    let [i, cr, cw, o] = u.last;
+    let full = format!(
+        "turn {} · in {} · cache_r {} · cache_w {} · out {} · {} · Σ {} · ctx {pct}%",
+        u.turns,
+        kfmt(i),
+        kfmt(cr),
+        kfmt(cw),
+        kfmt(o),
+        money(u.last_usd),
+        money(u.cum_usd)
+    );
+    let short = format!("Σ {} · ctx {pct}%", money(u.cum_usd));
+    (full, short)
 }
 
 fn menu_row(on: bool, label: String, col: usize, desc: String, w: usize) -> Line<'static> {
@@ -703,7 +764,7 @@ fn model_picker(app: &App, filter: &[char], sel: usize, effort: usize, w: usize)
             } else {
                 " · no quota consumed"
             };
-            vec![sp("  "), Span::styled(" FREE ", Style::new().fg(ratatui::style::Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)), dim(what)]
+            vec![sp("  "), Span::styled(" FREE ", Style::new().fg(ratatui_core::style::Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)), dim(what)]
         } else {
             vec![sp("  "), sp(format!("${:.2} in · ${:.2} out", m.price.input, m.price.output)), dim(" per 1M tokens")]
         };
@@ -740,15 +801,13 @@ fn connect_picker(filter: &[char], sel: usize, w: usize) -> (Vec<Line<'static>>,
                 ),
                 None => dim("sign in"),
             },
-            "devin" => match zcore::devin::peek() {
-                Some((true, d)) => Span::styled(format!("✓ {d}"), theme::fg(GREEN)),
-                Some((false, d)) => dim(d),
-                None => match zcore::live::cached("devin") {
-                    Some(m) if !m.is_empty() => Span::styled(format!("✓ cached · {} models", m.len()), theme::fg(GREEN)),
-                    _ if zcore::devin::signed_in() => dim("enter to connect"),
-                    _ => dim(if zcore::devin::executable().is_some() { "enter to connect" } else { "devin auth login" }),
-                },
-            },
+            "acp" => {
+                if zcore::acp_client::installed(&p.id) {
+                    Span::styled("✓ CLI installed", theme::fg(GREEN))
+                } else {
+                    dim("not installed")
+                }
+            }
             _ => match zcore::creds::key_for(&p.id, &p.env) {
                 Some((k, src)) => Span::styled(format!("✓ {} · {}", zcore::creds::mask(&k), src.label()), theme::fg(GREEN)),
                 None => dim(format!("{} models", p.models.len())),
@@ -767,7 +826,10 @@ fn connect_picker(filter: &[char], sel: usize, w: usize) -> (Vec<Line<'static>>,
     if let Some(p) = order.get(sel).map(|&i| &ps[i]) {
         let how = match p.kind.as_str() {
             "chatgpt" => "Opens your browser — use your ChatGPT Plus/Pro plan instead of an API key".to_string(),
-            "devin" => "Uses your Devin subscription models. Cosmos runs the tools — not Devin's agent.".to_string(),
+            "acp" => match zcore::acp_client::plugin(&p.id) {
+                Some(a) => format!("Runs {}'s own agent on your plan (ACP) · sign in once with `{}`", a.name, a.login.join(" ")),
+                None => String::new(),
+            },
             _ => format!("Paste a key, or set {} · {}", p.env.join(" / "), p.base_url),
         };
         out.push(Line::from(dim(format!("  {}", ellipsize(&how, w.saturating_sub(3))))));
@@ -810,7 +872,7 @@ fn perm_prompt(p: &Perm, w: usize) -> Vec<Line<'static>> {
     let opts = [
         "Yes".to_string(),
         format!("Yes, and don't ask again for {label} this session"),
-        "No, tell zcli what to do instead".to_string(),
+        "No, tell Cosmos what to do instead".to_string(),
     ];
     for (i, o) in opts.iter().enumerate() {
         let on = i == p.sel;
@@ -1067,8 +1129,8 @@ mod tests {
     fn dump_screens() {
         let _env = crate::env_lock();
         use crate::tui::ModelRow;
-        std::env::set_var("COSMOS_CLI_HOME", std::env::temp_dir().join("zcli-view-test"));
-        let _ = std::fs::create_dir_all(std::env::temp_dir().join("zcli-view-test"));
+        std::env::set_var("COSMOS_CLI_HOME", std::env::temp_dir().join("cosmos-view-test"));
+        let _ = std::fs::create_dir_all(std::env::temp_dir().join("cosmos-view-test"));
         let w = 96;
         let free = zproto::Prices::default();
         let paid = zproto::Prices { input: 3.0, cache_read: 0.3, cache_write: 3.75, output: 15.0 };
@@ -1091,7 +1153,7 @@ mod tests {
         app.session = "01k5zq8m3v".into();
         app.effort = 2;
 
-        let mut scroll: Vec<Line<'static>> = crate::logo::banner("zcli", "v0.1.0");
+        let mut scroll: Vec<Line<'static>> = crate::logo::banner("cosmos", "v0.1.0");
         scroll.push(Line::default());
         scroll.push(info_line(&app));
         scroll.push(Line::default());

@@ -85,7 +85,7 @@ pub fn authorize_url(p: &Pkce, state: &str) -> String {
         ("state", state),
         ("id_token_add_organizations", "true"),
         ("codex_cli_simplified_flow", "true"),
-        ("originator", "zcli"),
+        ("originator", crate::NAME),
     ]
     .iter()
     .map(|(k, v)| format!("{k}={}", enc(v)))
@@ -120,7 +120,9 @@ fn tokens_from(v: &Value, prev_refresh: Option<&str>) -> Result<Tokens> {
 
 fn token_request(form: &[(&str, &str)]) -> Result<Value> {
     let body = form.iter().map(|(k, v)| format!("{k}={}", enc(v))).collect::<Vec<_>>().join("&");
-    let mut resp = ureq::post(&format!("{ISSUER}/oauth/token"))
+    let url = format!("{ISSUER}/oauth/token");
+    zproviders::host_allowed(&url, &crate::config::Config::load(&crate::cli_home()).allowed_hosts())?;
+    let mut resp = ureq::post(&url)
         .header("content-type", "application/x-www-form-urlencoded")
         .config()
         .http_status_as_error(false)
@@ -201,7 +203,7 @@ pub fn open_browser(url: &str) -> bool {
     r.is_ok()
 }
 
-const PAGE: &str = "<!doctype html><meta charset=utf-8><title>zcli</title><body style=\"font:16px system-ui;background:#0b0b0c;color:#eee;display:grid;place-items:center;height:100vh;margin:0\"><div><h2 style=font-weight:600>Signed in to zcli</h2><p style=color:#8a8a8a>You can close this tab and return to the terminal.</p></div>";
+const PAGE: &str = "<!doctype html><meta charset=utf-8><title>Cosmos</title><body style=\"font:16px system-ui;background:#0b0b0c;color:#eee;display:grid;place-items:center;height:100vh;margin:0\"><div><h2 style=font-weight:600>Signed in to cosmos</h2><p style=color:#8a8a8a>You can close this tab and return to the terminal.</p></div>";
 
 fn query_param(q: &str, key: &str) -> Option<String> {
     q.split('&').find_map(|kv| {
@@ -232,7 +234,7 @@ fn query_param(q: &str, key: &str) -> Option<String> {
 /// shows it and opens the browser). Blocks until the callback arrives, the
 /// user cancels, or five minutes pass. Saves and returns the session.
 pub fn login(cancel: &AtomicBool, on_url: impl FnOnce(&str)) -> Result<Tokens> {
-    let listener = TcpListener::bind(("127.0.0.1", PORT)).with_context(|| format!("port {PORT} is busy — close other Codex/zcli sign-ins and retry"))?;
+    let listener = TcpListener::bind(("127.0.0.1", PORT)).with_context(|| format!("port {PORT} is busy — close other Codex/cosmostui sign-ins and retry"))?;
     listener.set_nonblocking(true)?;
     let p = pkce();
     let state = URL_SAFE_NO_PAD.encode(random_bytes::<16>());
@@ -267,7 +269,7 @@ pub fn login(cancel: &AtomicBool, on_url: impl FnOnce(&str)) -> Result<Tokens> {
             let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
         };
         if query_param(query, "state").as_deref() != Some(state.as_str()) {
-            reply(&mut s, "State mismatch — start the sign-in again from zcli.");
+            reply(&mut s, "State mismatch — start the sign-in again from cosmostui.");
             bail!("sign-in state mismatch");
         }
         if let Some(err) = query_param(query, "error") {
@@ -301,8 +303,11 @@ mod tests {
     #[test]
     fn pkce_challenge_is_s256_of_verifier() {
         let p = pkce();
-        assert!(p.verifier.len() >= 43);
+        // RFC 7636 §4.1: 43–128 chars from the unreserved set
+        assert!((43..=128).contains(&p.verifier.len()), "{}", p.verifier.len());
+        assert!(p.verifier.chars().all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)), "{}", p.verifier);
         assert_eq!(p.challenge, URL_SAFE_NO_PAD.encode(Sha256::digest(p.verifier.as_bytes())));
+        assert_ne!(pkce().verifier, p.verifier, "fresh verifier per sign-in");
     }
 
     #[test]

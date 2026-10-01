@@ -1,10 +1,10 @@
 # Cosmos eval runner — runs eval\tasks\* against each harness.
-#   powershell -File eval\run.ps1 [-Harness zcli|zdev|zagy|all]
+#   powershell -File eval\run.ps1 [-Harness cosmostui|zdev|zagy|all]
 # Deterministic: uses the fixture provider via `tool:` prompts.
 param([string]$Harness = "all")
 $ErrorActionPreference = "Stop"
 $root  = Split-Path -Parent $PSScriptRoot
-$cli   = Join-Path $root "rust-tui\target\debug\zcli.exe"
+$cli   = Join-Path $root "rust-tui\target\debug\cosmostui.exe"
 $zagy  = Join-Path $root "go-ssh\zagy.exe"
 $zdev  = Join-Path $root "zdev\dist\zdev.exe"
 $env:MERIDIAN_BIN = Join-Path $root "meridian-bridge\target\debug\meridian.exe"
@@ -17,7 +17,7 @@ function RunHarness($h, $prompt, $ws) {
     $argv = @("-p", $prompt, "--model", "fixture", "--allow", "read,edit,write,ls,glob,grep,bash",
               "--cwd", $ws, "--output", "json-stream")
     switch ($h) {
-      "zcli" { & $cli @argv 2>$null }
+      "cosmostui" { & $cli @argv 2>$null }
       "zagy" { & $zagy @argv 2>$null }
       "zdev" { & $zdev @argv 2>$null }
     }
@@ -30,7 +30,7 @@ function LastToolResult($lines) {
 
 foreach ($taskDir in Get-ChildItem (Join-Path $root "eval\tasks") -Directory) {
   $task = $taskDir.Name
-  foreach ($h in @("zcli","zdev","zagy")) {
+  foreach ($h in @("cosmostui","zdev","zagy")) {
     if ($Harness -ne "all" -and $Harness -ne $h) { continue }
     $ws = Join-Path $env:TEMP ("eval-" + $task + "-" + $h)
     if (Test-Path $ws) { Remove-Item -Recurse -Force $ws }
@@ -66,20 +66,22 @@ foreach ($taskDir in Get-ChildItem (Join-Path $root "eval\tasks") -Directory) {
       $r = LastToolResult $o
       if ($ok -and $r.data.content -notmatch "v2") { $ok=$false; $why="grep missed v2" }
       # 5. every emitted stream is schema-valid
-      Get-ChildItem (Join-Path $env:COSMOS_CLI_HOME "sessions") -Filter *.jsonl |
+      $eapv = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+      $vout = Get-ChildItem (Join-Path $env:COSMOS_CLI_HOME "sessions") -Filter *.jsonl |
         ForEach-Object { Get-Content $_.FullName } |
-        & node (Join-Path $root "eval\validate-events.mjs") | Out-Null
-      if ($ok -and $LASTEXITCODE -ne 0) { $ok=$false; $why="session events invalid" }
+        & node (Join-Path $root "eval\validate-events.mjs") 2>&1
+      $vcode = $LASTEXITCODE; $ErrorActionPreference = $eapv
+      if ($ok -and $vcode -ne 0) { $ok=$false; $why="session events invalid: $(($vout | Select-Object -First 3) -join ' | ')" }
     }
 
     if ($task -eq "t02-compact-resume") {
       $o = RunHarness $h "ship the login form" $ws
       if ($LASTEXITCODE -ne 0) { $ok=$false; $why="seed exit $LASTEXITCODE" }
-      $list = switch ($h) { "zcli" { & $cli session list 2>$null } "zagy" { & $zagy session list 2>$null } default { & $zdev session list 2>$null } }
+      $list = switch ($h) { "cosmostui" { & $cli session list 2>$null } "zagy" { & $zagy session list 2>$null } default { & $zdev session list 2>$null } }
       $id = ($list | Select-String -Pattern '01[0-9a-z]{24}').Matches[0].Value
       $argv = @("-p","/compact","--model","fixture","--resume",$id,"--output","json-stream")
       $ErrorActionPreference = "Continue"
-      switch ($h) { "zcli" { & $cli @argv 2>$null } "zagy" { & $zagy @argv 2>$null } default { & $zdev @argv 2>$null } }
+      switch ($h) { "cosmostui" { & $cli @argv 2>$null } "zagy" { & $zagy @argv 2>$null } default { & $zdev @argv 2>$null } }
       $ErrorActionPreference = "Stop"
       $world = Join-Path $env:COSMOS_CLI_HOME "world\$id.md"
       if ($ok -and -not (Test-Path $world)) { $ok=$false; $why="world.md missing" }

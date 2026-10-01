@@ -2,7 +2,7 @@
 //! uses) shared by the command menu, the model picker and `@` mentions.
 //!
 //! Besides the built-ins, markdown files become commands, Claude-Code style:
-//! `.zcli/commands/<name>.md` (project), `~/.cosmos-cli/commands/<name>.md`
+//! `.cosmos/commands/<name>.md` (project; `.zcli/` still read), `~/.cosmos-cli/commands/<name>.md`
 //! (personal) and `.claude/commands/<name>.md` (so existing Claude Code
 //! commands work as-is). The first line (or a `description:` front-matter
 //! field) is the menu description; `$ARGUMENTS` is replaced by what follows
@@ -45,13 +45,13 @@ const BUILTIN: &[(&str, &str, &str)] = &[
     ("compact", "[focus: …]", "Five-layer compact; optional focus steers the summary"),
     ("undo", "", "Restore the last file checkpoint"),
     ("skillify", "[name]", "Distill this session into a skill"),
-    ("refine", "<id|skill>", "Propose or apply a bounded skill/playbook edit"),
     ("yolo", "", "Switch to yolo mode"),
     ("session", "", "Show the session id and how to resume it"),
+    ("tree", "", "Show the session's event tree and branch points"),
     ("clear", "", "Clear the screen"),
     ("onboarding", "", "Replay the first-run setup (until it retires itself)"),
     ("help", "", "Keyboard shortcuts"),
-    ("quit", "", "Exit zcli"),
+    ("quit", "", "Exit Cosmos"),
 ];
 
 pub fn builtins() -> Vec<Slash> {
@@ -99,7 +99,7 @@ fn scan(dir: &Path, out: &mut Vec<Slash>) {
 /// Built-ins plus custom commands for `cwd`.
 pub fn load(cwd: &Path) -> Vec<Slash> {
     let mut all = builtins();
-    scan(&cwd.join(".zcli").join("commands"), &mut all);
+    scan(&zcore::project_path(cwd, "commands"), &mut all);
     scan(&zcore::cli_home().join("commands"), &mut all);
     scan(&cwd.join(".claude").join("commands"), &mut all);
     all

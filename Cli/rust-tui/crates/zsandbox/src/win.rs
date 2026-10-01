@@ -39,11 +39,11 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CreateProcessW, CreateProcessWithTokenW, DeleteProcThreadAttributeList, GetCurrentProcess,
+    CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
     GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread,
     TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, EXTENDED_STARTUPINFO_PRESENT,
-    LOGON_WITH_PROFILE, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, STARTUPINFOW,
 };
 
@@ -238,6 +238,77 @@ fn grant_cached(path: &Path, sid: PSID, mask: u32, secs: u64) -> bool {
     ok
 }
 
+/// Give `path` (and everything under it) a low mandatory label, inherited
+/// by new files and folders, so a low-integrity child may write there.
+/// Medium-integrity processes — the operator's own tools — are unaffected.
+unsafe fn label_low_tree(path: &Path) -> Result<()> {
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{GetSecurityDescriptorSacl, LABEL_SECURITY_INFORMATION};
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        PCWSTR(wide("S:(ML;OICI;NW;;;LW)").as_ptr()),
+        SDDL_REVISION_1,
+        &mut sd,
+        None,
+    )
+    .context("low label SDDL")?;
+    let mut present = windows::Win32::Foundation::BOOL(0);
+    let mut defaulted = windows::Win32::Foundation::BOOL(0);
+    let mut sacl: *mut ACL = ptr::null_mut();
+    let got = GetSecurityDescriptorSacl(sd, &mut present, &mut sacl, &mut defaulted);
+    let rc = if got.is_ok() && !sacl.is_null() {
+        let wpath = wide(&path.to_string_lossy());
+        TreeSetNamedSecurityInfoW(
+            PCWSTR(wpath.as_ptr()),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            Some(sacl),
+            TREE_SEC_INFO_SET,
+            None,
+            windows::Win32::Security::Authorization::PROG_INVOKE_SETTING(0),
+            None,
+        )
+        .0
+    } else {
+        u32::MAX
+    };
+    LocalFree(HLOCAL(sd.0));
+    if rc != 0 {
+        bail!("labelling {} low-integrity failed ({rc})", path.display());
+    }
+    Ok(())
+}
+
+/// `label_low_tree` with a time box, remembered in the grants cache.
+fn label_low_cached(path: &Path, secs: u64) -> bool {
+    let key = format!("low:{}", path.to_string_lossy().to_lowercase());
+    if let Some(f) = grants_cache_file() {
+        if let Ok(text) = fs::read_to_string(&f) {
+            if let Some(tag) = text.lines().find_map(|l| l.split_once('|').filter(|(_, p)| *p == key).map(|(t, _)| t == "ok")) {
+                return tag;
+            }
+        }
+    }
+    let dir = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || unsafe {
+        let _ = tx.send(label_low_tree(&dir).is_ok());
+    });
+    let ok = rx.recv_timeout(std::time::Duration::from_secs(secs)).unwrap_or(false);
+    if let Some(f) = grants_cache_file() {
+        if let Ok(mut fd) = fs::OpenOptions::new().create(true).append(true).open(&f) {
+            use std::io::Write;
+            let _ = writeln!(fd, "{}|{}", if ok { "ok" } else { "fail" }, key);
+        }
+    }
+    ok
+}
+
 /// Environment for the child: inherited minus anything that smells like a
 /// credential, with TEMP/TMP pointed inside the workspace.
 fn child_env(workspace: &Path) -> Vec<u16> {
@@ -316,7 +387,7 @@ fn collect(t: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
 
 /// Read a pipe to EOF on a thread. HANDLE is `*mut c_void` (not Send) — pass
 /// the raw value and reconstruct inside the thread.
-fn reader_thread(handle: HANDLE) -> std::thread::JoinHandle<Vec<u8>> {
+fn reader_thread(handle: HANDLE, log: Option<PathBuf>) -> std::thread::JoinHandle<Vec<u8>> {
     let raw = handle.0 as usize;
     std::thread::spawn(move || unsafe {
         let handle = HANDLE(raw as *mut _);
@@ -329,6 +400,7 @@ fn reader_thread(handle: HANDLE) -> std::thread::JoinHandle<Vec<u8>> {
                 break;
             }
             out.extend_from_slice(&buf[..read as usize]);
+            crate::tee(log.as_deref(), &buf[..read as usize]);
         }
         let _ = CloseHandle(handle);
         out
@@ -377,11 +449,25 @@ pub fn exec(opts: &ExecOpts) -> Result<ExecResult> {
             None => c,
         }
     };
-    match exec_appcontainer(&workspace, opts) {
+    let tier = std::env::var("ZSANDBOX_TIER")
+        .ok()
+        .and_then(|t| crate::Tier::parse(&t))
+        .unwrap_or(opts.tier);
+    let first = match tier {
+        crate::Tier::AppContainer => exec_appcontainer(&workspace, opts),
+        crate::Tier::Restricted => Err(anyhow::anyhow!("not attempted (tier=restricted)")),
+        crate::Tier::JobOnly => Err(anyhow::anyhow!("not attempted (tier=job)")),
+    };
+    match first {
         Ok(r) => Ok(r),
         Err(e) => {
             let ac_err = format!("{e:#}");
-            match exec_restricted(&workspace, opts) {
+            let second = if tier == crate::Tier::JobOnly {
+                Err(anyhow::anyhow!("not attempted (tier=job)"))
+            } else {
+                exec_restricted(&workspace, opts)
+            };
+            match second {
                 Ok(mut r) => {
                     r.degraded = Some(format!("appcontainer_unavailable: {ac_err}"));
                     Ok(r)
@@ -432,7 +518,7 @@ fn exec_plain(workspace: &Path, opts: &ExecOpts) -> Result<ExecResult> {
             None,
             None,
             true,
-            CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NO_WINDOW,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | CREATE_NO_WINDOW,
             Some(env.as_ptr() as *const _),
             PCWSTR(wdir.as_ptr()),
             &si,
@@ -565,7 +651,6 @@ fn exec_appcontainer(workspace: &Path, opts: &ExecOpts) -> Result<ExecResult> {
             EXTENDED_STARTUPINFO_PRESENT
                 | CREATE_UNICODE_ENVIRONMENT
                 | CREATE_SUSPENDED
-                | DETACHED_PROCESS
                 | CREATE_NO_WINDOW,
             Some(env.as_ptr() as *const _),
             PCWSTR(wdir.as_ptr()),
@@ -700,6 +785,13 @@ fn exec_restricted(workspace: &Path, opts: &ExecOpts) -> Result<ExecResult> {
         )
         .context("SetTokenInformation(TokenIntegrityLevel)")?;
 
+        // a low-integrity child can only write where the label allows
+        let _ = fs::create_dir_all(workspace.join(".zsandbox-tmp"));
+        if !label_low_cached(workspace, 60) {
+            let _ = CloseHandle(restricted);
+            bail!("could not label the workspace for low-integrity writes");
+        }
+
         let out_pipe = make_pipe()?;
         let err_pipe = make_pipe()?;
         let in_pipe = make_pipe()?;
@@ -720,12 +812,17 @@ fn exec_restricted(workspace: &Path, opts: &ExecOpts) -> Result<ExecResult> {
         let env = child_env(workspace);
         let wdir = wide(&workspace.to_string_lossy());
         let mut pi = PROCESS_INFORMATION::default();
-        let created = CreateProcessWithTokenW(
+        // CreateProcessAsUserW needs no special privilege for a filtered
+        // copy of our own token, and (unlike CreateProcessWithTokenW) it
+        // passes the inheritable pipe handles to the child.
+        let created = CreateProcessAsUserW(
             restricted,
-            LOGON_WITH_PROFILE,
             PCWSTR::null(),
             PWSTR(wcmd.as_mut_ptr()),
-            CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | DETACHED_PROCESS | CREATE_NO_WINDOW,
+            None,
+            None,
+            true,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | CREATE_NO_WINDOW,
             Some(env.as_ptr() as *const _),
             PCWSTR(wdir.as_ptr()),
             &si,
@@ -737,7 +834,7 @@ fn exec_restricted(workspace: &Path, opts: &ExecOpts) -> Result<ExecResult> {
         let _ = CloseHandle(in_pipe.write);
         let _ = CloseHandle(restricted);
         if let Err(e) = created {
-            return Err(anyhow::anyhow!("CreateProcessWithTokenW: {e}"));
+            return Err(anyhow::anyhow!("CreateProcessAsUserW: {e}"));
         }
         finish_run(pi, opts, out_pipe.read, err_pipe.read, None)
     }
@@ -764,8 +861,11 @@ fn finish_run(
                 pi.dwProcessId
             );
         }
-        let out_thread = reader_thread(out_read);
-        let err_thread = reader_thread(err_read);
+        if let Some(cell) = &opts.pid {
+            cell.store(pi.dwProcessId, std::sync::atomic::Ordering::Relaxed);
+        }
+        let out_thread = reader_thread(out_read, opts.log.clone());
+        let err_thread = reader_thread(err_read, opts.log.clone());
 
         let ms = opts.timeout.as_millis().min(u32::MAX as u128) as u32;
         let wait = WaitForSingleObject(pi.hProcess, ms);

@@ -123,8 +123,9 @@ fn default_keep_tail() -> usize {
 fn default_ratio() -> f64 {
     0.80
 }
+/// 0 = provider default TTL (Anthropic 300 s, others 600 s).
 fn default_warm() -> u64 {
-    240
+    0
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,6 +221,8 @@ pub struct ModelChoice {
 pub fn provider_ready(p: &crate::catalog::ProviderDef) -> bool {
     match p.kind.as_str() {
         "chatgpt" => crate::chatgpt::load().is_some(),
+        "acp" => crate::acp_client::installed(&p.id),
+        #[cfg(feature = "devin-direct")]
         "devin" => crate::devin::known_ready(),
         _ if p.env.is_empty() => false, // local servers list their models via config.toml
         _ => crate::creds::key_for(&p.id, &p.env).is_some(),
@@ -345,7 +348,7 @@ impl Config {
     /// Two forms: a `[models]` alias from config.toml (`r9`), or a catalog
     /// reference `provider/model` (`anthropic/claude-opus-5-5`,
     /// `chatgpt/gpt-5.5`, `openrouter/qwen/qwen3.8-max`). Keys come from the
-    /// provider's env vars or the credential store (`zcli auth login`).
+    /// provider's env vars or the credential store (`cosmostui auth login`).
     pub fn provider_for(&self, alias: &str) -> Option<(ProviderCfg, String)> {
         if let Some(m) = self.models.get(alias) {
             let p = self.providers.get(&m.provider)?;
@@ -394,11 +397,13 @@ impl Config {
             crate::live::cached(pid).and_then(|ms| ms.into_iter().find(|m| m.id == mid))
         });
         let (api_key, account_id) = match def.kind.as_str() {
-            "chatgpt" => match crate::chatgpt::fresh() {
+            // stored token only — Agent::turn refreshes right before each
+            // request, so resolving a model never blocks on the network
+            "chatgpt" => match crate::chatgpt::load() {
                 Some(t) => (Some(t.access), Some(t.account_id)),
                 None => (None, None),
             },
-            "devin" => (None, None),
+            "devin" | "acp" => (None, None),
             _ => (crate::creds::key_for(pid, &def.env).map(|(k, _)| k), None),
         };
         Some((
@@ -425,13 +430,20 @@ impl Config {
             .values()
             .filter(|p| !p.base_url.is_empty())
             .map(|p| crate::catalog::host_of(&p.base_url))
-            .chain(crate::catalog::providers().iter().map(|p| p.host()))
-            .chain([
-                "auth.openai.com".to_string(),
-                "server.codeium.com".to_string(),
-                "inference.codeium.com".to_string(),
-                "api.devin.ai".to_string(),
-            ])
+            // ACP plugins are local processes, not hosts
+            .chain(crate::catalog::providers().iter().filter(|p| p.kind != "acp").map(|p| p.host()))
+            .chain(["auth.openai.com".to_string()])
+            // the optional memory mirror — only once the operator set a key
+            .chain(ztools::supermemory::enabled().then(|| ztools::supermemory::HOST.to_string()))
+            .chain(if cfg!(feature = "devin-direct") {
+                vec![
+                    "server.codeium.com".to_string(),
+                    "inference.codeium.com".to_string(),
+                    "api.devin.ai".to_string(),
+                ]
+            } else {
+                Vec::new()
+            })
             .filter(|h| !h.is_empty())
             .collect();
         hosts.sort();
@@ -492,7 +504,6 @@ impl Config {
         crate::compact::CompactCfg {
             large_read_lines: self.bridge.large_read_lines,
             reserved_output_tokens: self.compact.reserved_output_tokens,
-            keep_tail: self.compact.keep_tail,
             cache_warm_secs: self.compact.cache_warm_secs,
             trigger_ratio: self.compact.trigger_ratio,
         }

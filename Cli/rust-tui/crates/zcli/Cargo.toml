@@ -1,5 +1,5 @@
 [package]
-name = "zcli"
+name = "cosmostui"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -10,9 +10,15 @@ serde_json = "1"
 zproto = { path = "../zproto" }
 zcore = { path = "../zcore" }
 ztools = { path = "../ztools" }
-ztui = { path = "../ztui" }
+zproviders = { path = "../zproviders" }
+ztui = { path = "../ztui", default-features = false }
 crossterm = "0.29.0"
 
+[features]
+default = ["voice"]
+voice = ["ztui/voice"]
+highlight = ["ztui/highlight"]
+
 [[bin]]
-name = "zcli"
+name = "cosmostui"
 path = "src/main.rs"

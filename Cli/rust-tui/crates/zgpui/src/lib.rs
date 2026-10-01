@@ -1,5 +1,5 @@
-//! Typed ACP client for Cosmos GPUI. zcli itself does not link GPUI.
-//! Transport: spawn `zcli acp` and speak JSON-RPC over stdio.
+//! Typed ACP client for Cosmos GPUI. cosmostui itself does not link GPUI.
+//! Transport: spawn `cosmostui acp` and speak JSON-RPC over stdio.
 
 pub mod client;
 

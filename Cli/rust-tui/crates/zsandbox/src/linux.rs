@@ -44,17 +44,34 @@ pub fn exec(opts: &ExecOpts) -> Result<ExecResult> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().context("spawn bwrap")?;
+    if let Some(cell) = &opts.pid {
+        cell.store(child.id(), std::sync::atomic::Ordering::Relaxed);
+    }
+    // drain both pipes from the start: a child that fills the pipe buffer
+    // would otherwise block forever and only end at the timeout
+    let drain = |mut r: Box<dyn Read + Send>, log: Option<std::path::PathBuf>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = r.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+                crate::tee(log.as_deref(), &buf[..n]);
+            }
+            out
+        })
+    };
+    let out_t = drain(Box::new(child.stdout.take().unwrap()), opts.log.clone());
+    let err_t = drain(Box::new(child.stderr.take().unwrap()), opts.log.clone());
     let deadline = Instant::now() + opts.timeout;
     loop {
         if let Some(status) = child.try_wait()? {
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            child.stdout.take().unwrap().read_to_end(&mut stdout).ok();
-            child.stderr.take().unwrap().read_to_end(&mut stderr).ok();
             return Ok(ExecResult {
                 code: status.code().unwrap_or(1),
-                stdout,
-                stderr,
+                stdout: out_t.join().unwrap_or_default(),
+                stderr: err_t.join().unwrap_or_default(),
                 timed_out: false,
                 degraded: None,
             });
@@ -62,10 +79,12 @@ pub fn exec(opts: &ExecOpts) -> Result<ExecResult> {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            let mut stderr = err_t.join().unwrap_or_default();
+            stderr.extend_from_slice(b"zsandbox: timeout");
             return Ok(ExecResult {
                 code: 124,
-                stdout: Vec::new(),
-                stderr: b"zsandbox: timeout".to_vec(),
+                stdout: out_t.join().unwrap_or_default(),
+                stderr,
                 timed_out: true,
                 degraded: None,
             });

@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 use zgpui::client::AcpClient;
 
-fn zcli_bin() -> Option<PathBuf> {
+fn cosmos_bin() -> Option<PathBuf> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     for p in [
-        root.join("target/debug/zcli.exe"),
-        root.join("target/debug/zcli"),
-        root.join("target/release/zcli.exe"),
-        root.join("target/release/zcli"),
+        root.join("target/debug/cosmostui.exe"),
+        root.join("target/debug/cosmostui"),
+        root.join("target/release/cosmostui.exe"),
+        root.join("target/release/cosmostui"),
     ] {
         if p.is_file() {
             return Some(p);
@@ -18,15 +18,15 @@ fn zcli_bin() -> Option<PathBuf> {
 
 #[test]
 fn acp_initialize_and_ping_pong() {
-    let Some(bin) = zcli_bin() else {
-        eprintln!("zcli binary not built — skip live ACP (types still compile)");
+    let Some(bin) = cosmos_bin() else {
+        eprintln!("cosmostui binary not built — skip live ACP (types still compile)");
         return;
     };
     let home = tempfile_dir();
     std::env::set_var("COSMOS_CLI_HOME", &home);
-    let mut c = AcpClient::spawn(bin).expect("spawn zcli acp");
+    let mut c = AcpClient::spawn(bin).expect("spawn cosmostui acp");
     let init = c.initialize().expect("initialize");
-    assert!(init["agentInfo"]["name"].as_str() == Some("zcli") || init.get("protocolVersion").is_some());
+    assert!(init["agentInfo"]["name"].as_str() == Some("cosmostui") || init.get("protocolVersion").is_some());
     let sid = c.session_new(&home.to_string_lossy()).expect("session/new");
     assert!(!sid.is_empty());
     let evs = c.prompt(&sid, "ping").expect("prompt");

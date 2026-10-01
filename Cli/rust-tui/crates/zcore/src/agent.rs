@@ -3,15 +3,17 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use zproto::{Block, Chunk, Event, Message, OutputMode, Role, RunOpts, Usage};
 use zproviders::{complete, ProviderCfg, ProviderKind, Request};
-use ztools::{is_readonly, tool_specs, ToolContext, PLAN_TOOLS};
+use ztools::{is_readonly, ToolContext, PLAN_TOOLS};
 
-use crate::compact::{self, CompactCfg};
+use crate::compact::{self, CompactCfg, Trigger, ViewOp};
 use crate::config::Config;
 use crate::improve::{self, SelfImproveCfg};
 use crate::session::Session;
@@ -23,11 +25,11 @@ fn dispatch_complete(
     sink: &mut dyn FnMut(Chunk),
     allowed: &[String],
 ) -> Result<()> {
+    #[cfg(feature = "devin-direct")]
     if cfg.kind == ProviderKind::Devin {
-        crate::devin::complete(cfg, req, sink)
-    } else {
-        complete(cfg, req, sink, allowed)
+        return crate::devin::complete(cfg, req, sink);
     }
+    complete(cfg, req, sink, allowed)
 }
 
 pub struct Agent {
@@ -59,8 +61,12 @@ pub struct Agent {
     pub world: World,
     pub last_model_at: Option<Instant>,
     pub prefix_hash: String,
-    pub last_l5_before: Option<u64>,
-    pub last_l5_after: Option<u64>,
+    /// Sticky compaction ops — the model sees `project(messages, view_ops)`.
+    pub view_ops: Vec<ViewOp>,
+    /// L5 ran at the previous check — a refill right after is thrash.
+    pub l5_last: bool,
+    /// set by thrash; only an operator `/compact` runs L5 again
+    pub auto_l5_off: bool,
     pub improve: SelfImproveCfg,
     pub compact_cfg: CompactCfg,
     pub sandbox_mode: String,
@@ -69,6 +75,12 @@ pub struct Agent {
     pub compact_focus: Option<String>,
     pub doom: Vec<u64>,
     pub stale_hits: u32,
+    /// Set by the UI to interrupt a running turn (ACP turns poll it).
+    pub interrupt: Option<Arc<AtomicBool>>,
+    /// The vendor agent process for an ACP provider, started on first use.
+    acp: Option<crate::acp_client::AcpSession>,
+    /// `messages[..acp_sent]` have already been given to the vendor agent.
+    acp_sent: usize,
     pub home: PathBuf,
     cfg: Config,
 }
@@ -118,69 +130,6 @@ impl Mode {
     }
 }
 
-fn meridian_bin() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("MERIDIAN_BIN") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for n in ["meridian.exe", "meridian"] {
-                let c = dir.join(n);
-                if c.is_file() {
-                    return Some(c);
-                }
-            }
-        }
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for d in std::env::split_paths(&path) {
-            for n in ["meridian.exe", "meridian"] {
-                let c = d.join(n);
-                if c.is_file() {
-                    return Some(c);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Layer-3 boot context via the bridge; falls back to the snippet alone.
-fn boot_context(workspace: &Path) -> (String, u64, Vec<String>) {
-    if let Some(bin) = meridian_bin() {
-        let mut cmd = std::process::Command::new(bin);
-        cmd.args(["boot", "--repo"]).arg(workspace);
-        if let Ok(v) = std::env::var("MERIDIAN_VAULT") {
-            cmd.env("MERIDIAN_VAULT", v);
-        }
-        if let Ok(out) = cmd.output() {
-            if out.status.success() {
-                if let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) {
-                    let ctx = v["context"].as_str().unwrap_or("").to_string();
-                    let tokens = v["tokens"].as_u64().unwrap_or(0);
-                    let warnings = v["warnings"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|w| w.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    return (ctx, tokens, warnings);
-                }
-            }
-        }
-    }
-    (
-        crate::system_snippet(),
-        0,
-        vec!["meridian bridge not found; boot context is the contract snippet only".into()],
-    )
-}
-
 fn default_provider() -> ProviderCfg {
     ProviderCfg {
         kind: zproviders::ProviderKind::Fixture,
@@ -195,6 +144,11 @@ fn default_provider() -> ProviderCfg {
     }
 }
 
+/// The tools block exactly as serialized for the wire (prefix hashing).
+fn tools_json(tools: &[zproto::ToolSpec]) -> String {
+    serde_json::to_string(tools).unwrap_or_default()
+}
+
 fn load_prompt(value: &str) -> Result<String> {
     if let Some(path) = value.strip_prefix('@') {
         return Ok(std::fs::read_to_string(path)
@@ -204,7 +158,7 @@ fn load_prompt(value: &str) -> Result<String> {
 }
 
 impl Agent {
-    /// Create or resume an agent. `harness` is `zcli`/`zdev`/`zagy`.
+    /// Create or resume an agent. `harness` is `cosmostui`/`zdev`/`zagy`.
     pub fn new(opts: &RunOpts, harness: &str, cwd: &Path) -> Result<Agent> {
         let home = crate::cli_home();
         let cfg = Config::load(&home);
@@ -236,6 +190,11 @@ impl Agent {
             .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
             .collect();
         ctx.mcp_servers = cfg.mcp_servers();
+        ctx.allowed_hosts = cfg.allowed_hosts();
+        ctx.allow_self_mutate = opts.allow_self_mutate;
+        if !ctx.no_sandbox {
+            ctx.sandbox_degraded = ztools::shell::last_sandbox(&home).flatten();
+        }
         ctx.large_read_lines = cfg.bridge.large_read_lines;
         ctx.no_sandbox = opts.no_sandbox;
         ctx.escalations = opts.allow_escalation.clone();
@@ -260,34 +219,32 @@ impl Agent {
             Some(id) => Some(id.to_owned()),
             None => None,
         };
-        let (session, messages) = if let Some(id) = resume_id {
-            let s = Session::open(&home, &id)?;
-            let msgs = Session::replay(&home, &id)?;
-            (s, msgs)
+        // `--resume <id>@<event>` resumes from any event, compaction nodes included
+        let (session, messages, view_ops) = if let Some(id) = resume_id {
+            let (id, at) = match id.split_once('@') {
+                Some((i, a)) => (i.to_string(), Some(a.to_string())),
+                None => (id, None),
+            };
+            let s = Session::open_at(&home, &id, at.as_deref())?;
+            let (msgs, ops) = Session::replay_view(&home, &id, s.leaf.as_deref())?;
+            (s, msgs, ops)
         } else {
-            (Session::create(&home, harness)?, Vec::new())
+            (Session::create(&home, harness)?, Vec::new(), Vec::new())
         };
         // resumed sessions keep their own harness name in history; new events
         // carry ours — that IS the handoff mechanism (shared home).
         let mut session = session;
         session.harness = harness.into();
 
-        let (boot, boot_tokens, _warnings) = boot_context(&workspace);
-        let tools = tool_specs();
-        let mut system = if let Some(prompt) = &opts.system_prompt {
-            vec![load_prompt(prompt)?]
-        } else {
-            vec![boot]
+        // §4 layers: 1 snippet, 2 tools, 3 boot — fixed for the session
+        let boot = crate::boot::build(&workspace, &home);
+        let boot_tokens = boot.tokens;
+        let tools = ztools::wire_tools(mode == Mode::Plan);
+        let mut system = match &opts.system_prompt {
+            Some(prompt) => vec![load_prompt(prompt)?],
+            None => vec![crate::system_snippet()],
         };
-        if opts.system_prompt.is_none()
-            && !crate::system_snippet().is_empty()
-            && !system[0].contains("You are Cosmos")
-        {
-            system.insert(0, crate::system_snippet());
-        }
-        if let Some(p) = crate::project_instructions(&workspace) {
-            system.push(p);
-        }
+        system.push(boot.text);
         if !opts.add_dirs.is_empty() {
             system.push(format!(
                 "Additional tool roots granted for this run: {}",
@@ -300,7 +257,7 @@ impl Agent {
         let prices = provider.prices;
         let context_window = provider.context;
         let allowed = cfg.allowed_hosts();
-        let prefix = compact::prefix_hash(&system, ztools::TOOLS_JSON);
+        let prefix = compact::prefix_hash(&system, &tools_json(&tools));
         ctx.session_id = session.id.clone();
         restore_read_state(&mut ctx, &messages);
         let world = World::load(&home, &session.id);
@@ -334,8 +291,9 @@ impl Agent {
             world,
             last_model_at: None,
             prefix_hash: prefix,
-            last_l5_before: None,
-            last_l5_after: None,
+            view_ops,
+            l5_last: false,
+            auto_l5_off: false,
             improve: {
                 let mut i = SelfImproveCfg {
                     enabled: cfg.self_improve.enabled,
@@ -360,6 +318,9 @@ impl Agent {
             compact_focus: None,
             doom: Vec::new(),
             stale_hits: 0,
+            interrupt: None,
+            acp: None,
+            acp_sent: 0,
             home,
             cfg,
         })
@@ -398,6 +359,14 @@ impl Agent {
             .session
             .append("mode", json!({"from": from, "to": self.mode.name()}));
         emit(&ev);
+        // the tools block never changes mid-session (cache); tell the model
+        // about the mode in the conversation instead
+        if self.mode == Mode::Plan && !self.tools.iter().any(|t| t.name == "submit_plan") {
+            self.push_note(format!(
+                "[plan mode: read-only tools only. When the plan is ready, call mcp_call {{\"server\": \"{}\", \"tool\": \"submit_plan\", \"arguments\": {{\"plan\": \"…\"}}}}]",
+                ztools::SELF_SERVER
+            ));
+        }
     }
 
     pub fn compact_now(&mut self, focus: Option<&str>, emit: &mut dyn FnMut(&Event)) {
@@ -422,17 +391,21 @@ impl Agent {
         }
     }
 
+    /// The events on this session's current branch.
+    pub fn branch_events(&self) -> Vec<Event> {
+        crate::session::read_events(&self.session.file)
+            .map(|all| match &self.session.leaf {
+                Some(leaf) => crate::session::chain_from(&all, leaf),
+                None => Vec::new(),
+            })
+            .unwrap_or_default()
+    }
+
+    /// `/skillify <name>` — an explicit operator command, so it runs even
+    /// when automatic self-improvement is off.
     pub fn skillify(&mut self, name: &str, emit: &mut dyn FnMut(&Event)) -> String {
-        if !self.improve.enabled && !self.opts.yolo {
-            return "self_improve disabled".into();
-        }
-        match improve::skillify(
-            &self.home,
-            name,
-            &self.world,
-            false,
-            self.improve.allow_self_mutate,
-        ) {
+        let events = self.branch_events();
+        match improve::skillify(&self.home, name, &self.world, &events, false) {
             Ok((p, detail)) => {
                 let ev = self
                     .session
@@ -444,8 +417,203 @@ impl Agent {
         }
     }
 
+    /// Hash of layers 1–3 as they would be sent now.
+    pub fn prefix_now(&self) -> String {
+        compact::prefix_hash(&self.system, &tools_json(&self.tools))
+    }
+
+    /// Contract §4: the next request pays the whole prompt again (new model,
+    /// or a resumed session's own prefix). Log it with the estimated cost.
+    pub fn log_cache_break(&mut self, reason: &str, emit: &mut dyn FnMut(&Event)) {
+        let prefix_chars: usize =
+            self.system.iter().map(String::len).sum::<usize>() + tools_json(&self.tools).len();
+        let tokens = prefix_chars as u64 / 4 + compact::estimate_tokens(&self.model_view(), 0);
+        let price = if self.prices.cache_write > 0.0 {
+            self.prices.cache_write
+        } else {
+            self.prices.input
+        };
+        let usd = (price > 0.0).then(|| tokens as f64 * price / 1_000_000.0);
+        let ev = self.session.append(
+            "cache_break",
+            json!({"reason": reason, "tokens": tokens, "est_usd": usd}),
+        );
+        emit(&ev);
+    }
+
+    /// One turn on a subscription agent over ACP: the user text not yet sent
+    /// goes to the vendor's agent, which works until it stops. Its replies
+    /// stream to the UI; its tool activity is logged as `tool_call` events
+    /// (`source: "acp"` — never replayed as our own tool turns); permission
+    /// requests go to the operator. Always ends the turn.
+    fn acp_turn(&mut self, emit: &mut dyn FnMut(&Event)) -> Result<bool> {
+        let plugin = crate::acp_client::id_of(&self.provider.base_url)
+            .context("ACP provider without an acp:// address")?
+            .to_string();
+        let from = self.acp_sent.min(self.messages.len());
+        let fresh: Vec<String> = self.messages[from..]
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                Block::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        if fresh.is_empty() {
+            return Ok(true);
+        }
+        let mut prompt = fresh.join("\n\n");
+        let mut session = match self.acp.take() {
+            Some(s) => s,
+            None => {
+                let s = crate::acp_client::AcpSession::start(&plugin, &self.ctx.workspace, &self.provider.model)?;
+                if let Some(note) = &s.model_note {
+                    if let Some(f) = self.on_delta.as_mut() {
+                        f(&format!("[{note}]\n"));
+                    }
+                }
+                // a resumed session or a model switch: the vendor never saw
+                // what came before, so it gets a short recap
+                let recap = acp_recap(&self.messages[..from]);
+                if !recap.is_empty() {
+                    prompt = format!("[Earlier in this session]\n{recap}\n\n[Now]\n{prompt}");
+                }
+                s
+            }
+        };
+        self.acp_sent = self.messages.len();
+
+        let mut text = String::new();
+        let mut tools: Vec<(String, String, String, Value, String, String)> = Vec::new();
+        let mode = self.mode;
+        let allow: Vec<String> = self.opts.allow.iter().chain(self.cfg.permissions.allow.iter()).cloned().collect();
+        let interrupt = self.interrupt.clone();
+        let result = {
+            let delta = &mut self.on_delta;
+            let asker = &mut self.asker;
+            let log = &mut self.session;
+            let mut on = |u: crate::acp_client::Update| match u {
+                crate::acp_client::Update::Text(t) => {
+                    if let Some(f) = delta.as_mut() {
+                        f(&t);
+                    }
+                    text.push_str(&t);
+                }
+                crate::acp_client::Update::Tool { id, kind, title, status, input, output } => {
+                    match tools.iter_mut().find(|t| t.0 == id) {
+                        Some(t) => {
+                            if !kind.is_empty() {
+                                t.1 = kind;
+                            }
+                            if !title.is_empty() {
+                                t.2 = title;
+                            }
+                            if !input.is_null() {
+                                t.3 = input;
+                            }
+                            if !status.is_empty() {
+                                t.4 = status;
+                            }
+                            if !output.is_empty() {
+                                t.5 = output;
+                            }
+                        }
+                        None => tools.push((id, kind, title, input, status, output)),
+                    }
+                }
+            };
+            let mut decide = |title: &str, params: &Value| -> bool {
+                let kind = params["toolCall"]["kind"].as_str().unwrap_or("");
+                let label = format!("{plugin}: {title}");
+                log.append("permission_request", json!({"tool": label, "kind": kind, "source": "acp"}));
+                let granted = mode == Mode::Yolo
+                    || allow.iter().any(|a| a == "acp" || a == &plugin || (!kind.is_empty() && a == kind))
+                    || asker.as_mut().map(|f| f(&label)).unwrap_or(false);
+                log.append("permission_decision", json!({"tool": label, "granted": granted, "source": "acp"}));
+                granted
+            };
+            session.prompt(&prompt, &mut on, &mut decide, interrupt.as_deref())
+        };
+        for (id, kind, title, input, status, output) in tools {
+            let out: String = output.chars().take(2000).collect();
+            let ev = self.session.append(
+                "tool_call",
+                json!({"id": id, "name": format!("{plugin}:{}", if kind.is_empty() { "tool" } else { &kind }),
+                       "title": title, "input": input, "status": status, "output": out, "source": "acp"}),
+            );
+            emit(&ev);
+        }
+        let stop = match result {
+            Ok(stop) => {
+                self.acp = Some(session);
+                stop
+            }
+            // the agent process is gone or broken — start fresh next turn
+            Err(e) => return Err(e),
+        };
+        self.last_model_at = Some(Instant::now());
+        let ev = self.session.append("assistant", json!({"text": text, "tool_calls": [], "stop_reason": stop}));
+        emit(&ev);
+        let uev = self.session.append(
+            "usage",
+            json!({"input": 0, "cache_read": 0, "cache_write": 0, "output": 0,
+                   "usd": null, "cum_usd": self.cum_usd, "model": self.model_alias,
+                   "billing": "subscription", "plugin": plugin}),
+        );
+        emit(&uev);
+        if !text.is_empty() {
+            self.messages.push(Message::text(Role::Assistant, text));
+        }
+        eprintln!("turn · {plugin} subscription · stop {stop}");
+        Ok(true)
+    }
+
+    /// Contract §5 `session_start` fields: "off", the platform sandbox, or
+    /// "degraded" with the reason last observed on this machine.
+    pub fn sandbox_status(&self) -> Value {
+        if self.ctx.no_sandbox {
+            return json!({"sandbox": "off"});
+        }
+        let kind = if cfg!(windows) {
+            "appcontainer"
+        } else if cfg!(target_os = "macos") {
+            "seatbelt"
+        } else {
+            "bwrap"
+        };
+        match (&self.ctx.sandbox_degraded, ztools::shell::last_sandbox(&self.home)) {
+            (Some(r), _) => json!({"sandbox": "degraded", "sandbox_reason": r}),
+            // the first bash call on this machine runs the tier check
+            (None, None) if cfg!(windows) => json!({"sandbox": kind, "sandbox_checked": false}),
+            _ => json!({"sandbox": kind}),
+        }
+    }
+
+    /// `session_start` data with the fields every front end logs.
+    pub fn start_data(&self, extra: Value) -> Value {
+        let mut d = json!({"model": self.model_alias, "mode": self.mode.name(), "boot_tokens": self.boot_tokens});
+        for v in [self.sandbox_status(), extra] {
+            if let Value::Object(m) = v {
+                for (k, x) in m {
+                    d[k] = x;
+                }
+            }
+        }
+        d
+    }
+
+    /// Exactly what the next request sends as the conversation (§9).
+    pub fn model_view(&self) -> Vec<Message> {
+        compact::project(&self.messages, &self.view_ops)
+    }
+
+    fn cache_ttl(&self) -> u64 {
+        compact::cache_ttl_secs(&self.compact_cfg, self.provider.kind == ProviderKind::Anthropic)
+    }
+
     pub fn context_report(&self) -> String {
-        let tokens = compact::estimate_tokens(&self.messages, self.boot_tokens);
+        let tokens = compact::estimate_tokens(&self.model_view(), self.boot_tokens);
         let pct = if self.context_window == 0 {
             0
         } else {
@@ -456,7 +624,7 @@ impl Agent {
             &self.prefix_hash,
             &self.prefix_hash,
             Instant::now(),
-            self.compact_cfg.cache_warm_secs,
+            self.cache_ttl(),
         );
         format!(
             "{{\"tokens_in\":{tokens},\"tokens_budget\":{},\"percent\":{pct},\"cache_warm\":{warm}}}",
@@ -467,6 +635,9 @@ impl Agent {
     /// §9 compaction check, then one provider turn. Returns true when the
     /// model produced no tool calls (turn ends).
     pub fn turn(&mut self, emit: &mut dyn FnMut(&Event)) -> Result<bool> {
+        if self.provider.kind == ProviderKind::Acp {
+            return self.acp_turn(emit);
+        }
         self.maybe_compact(emit);
         self.drain_jobs(emit);
         // subscription tokens are short-lived — renew before they lapse
@@ -479,7 +650,7 @@ impl Agent {
         let mut text = String::new();
         let mut calls: Vec<Block> = Vec::new();
         let mut usage = Usage::default();
-        let projected = compact::layer4_collapse(&self.messages);
+        let projected = self.model_view();
         let req = Request {
             system: self.system.clone(),
             tools: &self.tools,
@@ -503,7 +674,8 @@ impl Agent {
                     calls.push(Block::ToolUse { id, name, input })
                 }
                 Chunk::Done(u) => {
-                    // providers may emit several Done chunks (input est, then output)
+                    // providers emit one merged Done per call; summing keeps
+                    // any multi-call provider (Devin) correct too
                     usage.input += u.input;
                     usage.cache_read += u.cache_read;
                     usage.cache_write += u.cache_write;
@@ -548,11 +720,14 @@ impl Agent {
             blocks.push(Block::Text { text });
         }
         blocks.extend(calls.iter().cloned());
-        self.messages.push(Message {
-            role: Role::Assistant,
-            content: blocks,
-        });
-        let tokens = compact::estimate_tokens(&self.messages, self.boot_tokens);
+        // an empty reply is logged but not replayed — keep memory == replay
+        if !blocks.is_empty() {
+            self.messages.push(Message {
+                role: Role::Assistant,
+                content: blocks,
+            });
+        }
+        let tokens = compact::estimate_tokens(&self.model_view(), self.boot_tokens);
         let pct = if self.context_window == 0 {
             0
         } else {
@@ -580,6 +755,12 @@ impl Agent {
         input: &Value,
         emit: &mut dyn FnMut(&Event),
     ) -> (String, bool) {
+        // a deferred tool called through the built-in server is that tool
+        let unwrapped = ztools::unwrap_self_call(name, input);
+        let (name, input) = match &unwrapped {
+            Some((n, i)) => (n.as_str(), i),
+            None => (name, input),
+        };
         let repaired = ztools::repair::repair(name, input);
         for r in &repaired.repairs {
             let ev = self.session.append(
@@ -620,6 +801,11 @@ impl Agent {
             );
             emit(&ev);
             let msg = "doom_loop: same tool+args fired 3 times with no file change — stop and ask";
+            // log it so a resumed session replays the same conversation
+            self.session.append(
+                "tool_result",
+                json!({"tool_use_id":id,"name":name,"content":msg,"is_error":true}),
+            );
             self.messages.push(Message {
                 role: Role::User,
                 content: vec![Block::ToolResult {
@@ -681,6 +867,8 @@ impl Agent {
             }
             Permission::Allow => self.dispatch(name, input, emit),
         };
+        // §9 L1: big results go to disk once; log and model keep the preview
+        let text = compact::budget_result(&self.home, name, text);
         let ev = self.session.append(
             "tool_result",
             json!({"tool_use_id":id,"name":name,"content":text,"is_error":is_error}),
@@ -762,12 +950,14 @@ impl Agent {
                         && self.improve.auto_writes < improve::AUTO_WRITE_CAP
                     {
                         self.improve.auto_writes += 1;
+                        // remembered for every later session in this repo
+                        let path = input["path"].as_str().unwrap_or("a file");
+                        let text = format!("{name} on {path} went STALE twice — read the file again right before editing it");
+                        let scope = improve::repo_scope(&self.ctx.workspace);
+                        let saved = ztools::memory::add(&self.home, "correction", &text, &scope, &format!("cosmostui/{}", self.session.id)).is_ok();
                         let ev = self.session.append(
                             "self_improve",
-                            improve::event_data(
-                                "correction",
-                                json!({"text": improve::correction_row(name, "re-read then edit")}),
-                            ),
+                            improve::event_data("correction", json!({"text": text, "saved": saved})),
                         );
                         emit(&ev);
                     }
@@ -783,6 +973,18 @@ impl Agent {
                                 let ev = self.session.append(
                                     "verify",
                                     json!({"path": p, "diagnostics": diag}),
+                                );
+                                emit(&ev);
+                            }
+                        }
+                    }
+                    if name == "bash" && input["wait"] == "now" {
+                        if let Ok(v) = serde_json::from_str::<Value>(&out) {
+                            if !v["task_id"].is_null() {
+                                let ev = self.session.append(
+                                    "job_start",
+                                    json!({"task_id": v["task_id"], "pid": v["pid"], "log_path": v["log_path"],
+                                           "command": input["command"]}),
                                 );
                                 emit(&ev);
                             }
@@ -809,7 +1011,9 @@ impl Agent {
                 json!({
                     "task_id": j.task_id,
                     "exit_code": j.exit_code,
+                    "note": ztools::jobs::exit_note(Some(j.exit_code), ""),
                     "log_path": j.log_path.display().to_string(),
+                    "degraded": j.degraded,
                 }),
             );
             emit(&ev);
@@ -864,6 +1068,7 @@ impl Agent {
                 for (k, v) in state {
                     self.ctx.read_state.insert(k, v);
                 }
+                let text = compact::budget_result(&self.home, &name, text);
                 self.session
                     .append("tool_call", json!({"id":id,"name":name,"input":input}));
                 let err = text.starts_with("ERROR");
@@ -929,7 +1134,7 @@ impl Agent {
         );
         emit(&ev);
         child.append("session_start", json!({"model": self.model_alias, "mode": "agent",
-                                           "sandbox": "appcontainer", "boot_tokens": self.boot_tokens,
+                                           "sandbox": self.sandbox_status()["sandbox"], "boot_tokens": self.boot_tokens,
                                            "parent_session": self.session.id}));
         // Worktree subagents run their tools against the worktree root.
         let mut child_ctx = self.worktrees.last().map(|(p, _)| self.child_ctx(p));
@@ -1040,8 +1245,6 @@ impl Agent {
     fn child_ctx(&self, workspace: &Path) -> ToolContext {
         let mut c = ToolContext::new(workspace);
         c.sandbox_bin = self.ctx.sandbox_bin.clone();
-        c.meridian_bin = self.ctx.meridian_bin.clone();
-        c.meridian_vault = self.ctx.meridian_vault.clone();
         c.escalations = self.ctx.escalations.clone();
         c.net_allow = self.ctx.net_allow;
         c.sandbox_degraded = self.ctx.sandbox_degraded.clone();
@@ -1051,6 +1254,8 @@ impl Agent {
         c.home = self.ctx.home.clone();
         c.session_id = self.ctx.session_id.clone();
         c.sandbox_mode = self.ctx.sandbox_mode.clone();
+        c.allowed_hosts = self.ctx.allowed_hosts.clone();
+        c.allow_self_mutate = self.ctx.allow_self_mutate;
         c
     }
 
@@ -1070,6 +1275,14 @@ impl Agent {
         self.messages.push(Message::text(Role::User, text));
     }
 
+    /// A harness-authored user message. Logged (`synthetic`) so a resumed
+    /// session replays exactly the conversation the model saw.
+    pub fn push_note(&mut self, text: String) {
+        self.session
+            .append("user", json!({"text": text, "synthetic": true}));
+        self.messages.push(Message::text(Role::User, text));
+    }
+
     /// `/approve` — pin the pending plan as the next user message and switch
     /// to agent mode (contract §3).
     pub fn approve_plan(&mut self, emit: &mut dyn FnMut(&Event)) {
@@ -1079,57 +1292,149 @@ impl Agent {
                 .session
                 .append("mode", json!({"from": "plan", "to": "agent"}));
             emit(&ev);
-            self.messages.push(Message::text(
-                Role::User,
-                format!("[approved plan]\n{plan}"),
-            ));
+            self.push_note(format!("[approved plan]\n{plan}"));
         }
     }
 
-    /// Five-layer compact before every model call.
+    /// §9 checkpoint before every model call. Does nothing on a warm cache
+    /// under the hot threshold; otherwise decides sticky L2–L4 ops and, if
+    /// still over, an L5 world summary. Every op is logged so resume replays
+    /// the same view.
     fn maybe_compact(&mut self, emit: &mut dyn FnMut(&Event)) {
-        let now = Instant::now();
-        let prefix_now = compact::prefix_hash(&self.system, ztools::TOOLS_JSON);
+        let prefix_now = self.prefix_now();
         let warm = compact::cache_is_warm(
             self.last_model_at,
             &prefix_now,
             &self.prefix_hash,
-            now,
-            self.compact_cfg.cache_warm_secs,
+            Instant::now(),
+            self.cache_ttl(),
         );
-        crate::hooks::run(
-            &self.cfg,
-            "pre_compact",
-            "",
-            &json!({}),
-            &self.session.id.clone(),
-        );
-        let force = self.force_compact;
-        let focus = self.compact_focus.clone();
-        let outcome = compact::compact(
-            &mut self.messages,
-            &self.home,
-            &self.session.id,
-            &self.compact_cfg,
-            self.context_window,
-            self.boot_tokens,
-            warm,
-            force,
-            focus.as_deref(),
-            self.last_l5_before,
-            self.last_l5_after,
-        );
-        if outcome.world_md.is_some() {
-            self.last_l5_before = Some(outcome.tokens_before);
-            self.last_l5_after = Some(outcome.tokens_after);
-            if let Some(md) = &outcome.world_md {
-                self.world.apply_compact_md(md);
-                self.world.save(&self.home, &self.session.id);
-            }
+        let view = self.model_view();
+        let tokens = compact::estimate_tokens(&view, self.boot_tokens);
+        let why = if self.force_compact {
+            Some(Trigger::Operator)
+        } else {
+            compact::trigger(
+                tokens,
+                self.context_window,
+                self.compact_cfg.reserved_output_tokens,
+                warm,
+                self.compact_cfg.trigger_ratio,
+            )
+        };
+        let l5_last = std::mem::replace(&mut self.l5_last, false);
+        let Some(why) = why else {
+            return;
+        };
+        crate::hooks::run(&self.cfg, "pre_compact", "", &json!({}), &self.session.id.clone());
+        // thrash: L5 just ran and the context is already over the line again
+        if why == Trigger::Hot && l5_last && !self.auto_l5_off {
+            self.auto_l5_off = true;
+            let ev = self.session.append(
+                "compact_thrash",
+                json!({"tokens": tokens, "window": self.context_window,
+                       "note": "auto-compact off until /compact"}),
+            );
+            emit(&ev);
         }
-        for ev in outcome.events {
-            let e = self.session.append(&ev.kind, ev.data);
-            emit(&e);
+        if why == Trigger::Operator {
+            self.auto_l5_off = false;
+        }
+        let cp = compact::checkpoint(
+            &self.messages,
+            &self.view_ops,
+            self.boot_tokens,
+            self.context_window,
+            &self.compact_cfg,
+            why,
+        );
+        for op in cp.ops {
+            let data = match &op {
+                ViewOp::Snip { dropped, .. } => json!({"view": op, "dropped": dropped}),
+                ViewOp::Stub { layer, stubs } => json!({"view": op, "layer": layer, "count": stubs.len()}),
+                ViewOp::World { .. } => json!({"view": op}),
+            };
+            let ev = self.session.append(op.kind(), data);
+            emit(&ev);
+            self.view_ops.push(op);
+        }
+        if !cp.needs_world || (self.auto_l5_off && why != Trigger::Operator) {
+            return;
+        }
+        let focus = self.compact_focus.clone();
+        let md = self.summarize(focus.as_deref());
+        let dest = self.home.join("world").join(format!("{}.md", self.session.id));
+        if let Some(p) = dest.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        let _ = std::fs::write(&dest, &md);
+        self.world.apply_compact_md(&md);
+        self.world.save(&self.home, &self.session.id);
+        let op = compact::plan_world(&self.messages, &self.view_ops, md);
+        let mut ops = self.view_ops.clone();
+        ops.push(op.clone());
+        let after = compact::estimate_tokens(&compact::project(&self.messages, &ops), self.boot_tokens);
+        let ev = self.session.append(
+            "compaction",
+            json!({
+                "view": op,
+                "before_tokens": cp.tokens_before,
+                "after_tokens": after,
+                "reason": match why { Trigger::Operator => "operator", Trigger::Hot => "auto", Trigger::Cold => "cold_cache" },
+                "focus": focus,
+            }),
+        );
+        emit(&ev);
+        self.view_ops.push(op);
+        self.l5_last = why != Trigger::Operator;
+    }
+
+    /// L5 summary. One model call over the *current* prefix and view (so it
+    /// reads from the prompt cache) plus the template as the final user turn.
+    /// Fixture provider, a tool call instead of text, or any error → the
+    /// deterministic extractor.
+    fn summarize(&mut self, focus: Option<&str>) -> String {
+        let view = self.model_view();
+        let fallback = || compact::summarize_deterministic(&view, focus);
+        if matches!(self.provider.kind, ProviderKind::Fixture | ProviderKind::Devin | ProviderKind::Acp) {
+            return fallback();
+        }
+        let mut msgs = view.clone();
+        let ask = match focus {
+            Some(f) => format!("{}\nFocus on: {f}", compact::SUMMARY_PROMPT),
+            None => compact::SUMMARY_PROMPT.to_string(),
+        };
+        msgs.push(Message::text(Role::User, ask));
+        let req = Request {
+            system: self.system.clone(),
+            tools: &self.tools,
+            messages: &msgs,
+            session_id: &self.session.id,
+            max_tokens: 1500,
+        };
+        let mut text = String::new();
+        let mut usage = Usage::default();
+        let ok = dispatch_complete(
+            &self.provider,
+            &req,
+            &mut |c| match c {
+                Chunk::Text(t) => text.push_str(&t),
+                Chunk::Done(u) => usage = u,
+                _ => {}
+            },
+            &self.allowed,
+        )
+        .is_ok();
+        if let Some(c) = self.prices.cost(&usage) {
+            self.cum_usd += c;
+        }
+        if !ok || !text.contains("goal:") {
+            return fallback();
+        }
+        let text = text.trim().to_string();
+        match focus {
+            Some(f) if !text.contains("focus:") => text.replacen("# World\n", &format!("# World\nfocus: {f}\n"), 1),
+            _ => text,
         }
     }
 }
@@ -1196,6 +1501,28 @@ fn restore_read_state(ctx: &mut ToolContext, messages: &[Message]) {
     }
 }
 
+/// Plain-text recap of earlier turns for an agent that wasn't there,
+/// newest last, capped at ~12k chars.
+fn acp_recap(messages: &[Message]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for m in messages {
+        for b in &m.content {
+            if let Block::Text { text } = b {
+                let who = if m.role == Role::Assistant { "assistant" } else { "user" };
+                lines.push(format!("{who}: {}", text.trim()));
+            }
+        }
+    }
+    let mut out = String::new();
+    for l in lines.iter().rev() {
+        if out.len() + l.len() > 12_000 {
+            break;
+        }
+        out = if out.is_empty() { l.clone() } else { format!("{l}\n{out}") };
+    }
+    out
+}
+
 enum Permission {
     Allow,
     Ask,
@@ -1220,20 +1547,8 @@ pub fn run_headless(
         None => bail!("run_headless needs a prompt"),
     };
     let mut agent = Agent::new(opts, harness, cwd)?;
-    let sandbox_state = if agent.ctx.no_sandbox {
-        "off"
-    } else {
-        "appcontainer"
-    };
-    let ev = agent.session.append(
-        "session_start",
-        json!({
-            "model": agent.model_alias, "mode": agent.mode.name(),
-            "sandbox": sandbox_state, "boot_tokens": agent.boot_tokens,
-            "resume": opts.resume,
-            "cwd": agent.ctx.workspace,
-        }),
-    );
+    let start = agent.start_data(json!({"resume": opts.resume, "cwd": agent.ctx.workspace}));
+    let ev = agent.session.append("session_start", start);
     emit(&ev);
     crate::hooks::run(
         &agent.cfg,
@@ -1285,7 +1600,23 @@ pub fn run_headless(
                 return Ok(zproto::exit::BUDGET);
             }
         }
-        let done = agent.turn(emit)?;
+        // turn() only fails on the provider/network path — contract §7 exit 4
+        let done = match agent.turn(emit) {
+            Ok(d) => d,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                eprintln!("{msg}");
+                let ev = agent
+                    .session
+                    .append("error", json!({"kind": "provider", "message": msg}));
+                emit(&ev);
+                let ev = agent
+                    .session
+                    .append("session_end", json!({"reason":"provider_error"}));
+                emit(&ev);
+                return Ok(zproto::exit::PROVIDER);
+            }
+        };
         if done {
             if let Some(gate) = &opts.autonomous_gate {
                 if opts.autonomous || opts.autonomous_gate.is_some() {
@@ -1308,31 +1639,21 @@ pub fn run_headless(
                                 String::from_utf8_lossy(&o.stdout),
                                 String::from_utf8_lossy(&o.stderr)
                             );
-                            agent.messages.push(Message::text(
-                                Role::User,
-                                format!("[autonomous-gate failed]\n{body}"),
-                            ));
+                            agent.push_note(format!("[autonomous-gate failed]\n{body}"));
                             continue;
                         }
                         Err(e) => {
-                            agent.messages.push(Message::text(
-                                Role::User,
-                                format!("[autonomous-gate error] {e}"),
-                            ));
+                            agent.push_note(format!("[autonomous-gate error] {e}"));
                             continue;
                         }
                     }
                 }
             }
-            if agent.improve.enabled && agent.improve.write_skills {
+            // headless runs write a draft skill only when asked (--self-improve)
+            if opts.self_improve == Some(true) && agent.improve.write_skills {
                 let draft = format!("draft-{}", &agent.session.id[..8.min(agent.session.id.len())]);
-                if let Ok((_, detail)) = improve::skillify(
-                    &agent.home,
-                    &draft,
-                    &agent.world,
-                    true,
-                    agent.improve.allow_self_mutate,
-                ) {
+                let events = agent.branch_events();
+                if let Ok((_, detail)) = improve::skillify(&agent.home, &draft, &agent.world, &events, true) {
                     let ev = agent
                         .session
                         .append("self_improve", improve::event_data("draft_skill", detail));
@@ -1364,12 +1685,13 @@ pub fn run_headless(
         let mut denied_exit = false;
         let results = agent.exec_tools_batch(&calls, emit);
         for ((_id, name, input), (_n, text, is_error)) in calls.into_iter().zip(results) {
+            let (name, input) = ztools::unwrap_self_call(&name, &input).unwrap_or((name, input));
             if name == "submit_plan" && !is_error {
                 if agent.opts.approve_plan {
                     agent.mode = Mode::Agent;
-                    agent.messages.push(Message::text(
-                        Role::User,
-                        format!("[approved plan]\n{}", input["plan"].as_str().unwrap_or("")),
+                    agent.push_note(format!(
+                        "[approved plan]\n{}",
+                        input["plan"].as_str().unwrap_or("")
                     ));
                 } else {
                     let ev = agent

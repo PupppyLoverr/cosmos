@@ -5915,10 +5915,22 @@ impl Composer {
         );
         let cloud_settings = cx.subscribe(
             &pickers,
-            |_, _, _: &crate::pickers::OpenCloudComputer, cx| {
-                cx.emit(ComposerEvent::WorkspaceCommand(
-                    WorkspaceCommand::CloudComputer,
-                ));
+            |this: &mut Self, _, action: &crate::pickers::CloudChipAction, cx| match action {
+                crate::pickers::CloudChipAction::OpenSettings => {
+                    cx.emit(ComposerEvent::WorkspaceCommand(
+                        WorkspaceCommand::CloudComputer,
+                    ));
+                }
+                crate::pickers::CloudChipAction::StartTrial => {
+                    this.clear_failure(cx);
+                    this.start_railway_trial(cx);
+                }
+                crate::pickers::CloudChipAction::SeatPicked { restart_trial } => {
+                    this.clear_failure(cx);
+                    if *restart_trial {
+                        this.start_railway_trial(cx);
+                    }
+                }
             },
         );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
@@ -6038,10 +6050,22 @@ impl Composer {
         );
         let cloud_settings = cx.subscribe(
             &pickers,
-            |_, _, _: &crate::pickers::OpenCloudComputer, cx| {
-                cx.emit(ComposerEvent::WorkspaceCommand(
-                    WorkspaceCommand::CloudComputer,
-                ));
+            |this: &mut Self, _, action: &crate::pickers::CloudChipAction, cx| match action {
+                crate::pickers::CloudChipAction::OpenSettings => {
+                    cx.emit(ComposerEvent::WorkspaceCommand(
+                        WorkspaceCommand::CloudComputer,
+                    ));
+                }
+                crate::pickers::CloudChipAction::StartTrial => {
+                    this.clear_failure(cx);
+                    this.start_railway_trial(cx);
+                }
+                crate::pickers::CloudChipAction::SeatPicked { restart_trial } => {
+                    this.clear_failure(cx);
+                    if *restart_trial {
+                        this.start_railway_trial(cx);
+                    }
+                }
             },
         );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
@@ -6155,10 +6179,22 @@ impl Composer {
         );
         let cloud_settings = cx.subscribe(
             &pickers,
-            |_, _, _: &crate::pickers::OpenCloudComputer, cx| {
-                cx.emit(ComposerEvent::WorkspaceCommand(
-                    WorkspaceCommand::CloudComputer,
-                ));
+            |this: &mut Self, _, action: &crate::pickers::CloudChipAction, cx| match action {
+                crate::pickers::CloudChipAction::OpenSettings => {
+                    cx.emit(ComposerEvent::WorkspaceCommand(
+                        WorkspaceCommand::CloudComputer,
+                    ));
+                }
+                crate::pickers::CloudChipAction::StartTrial => {
+                    this.clear_failure(cx);
+                    this.start_railway_trial(cx);
+                }
+                crate::pickers::CloudChipAction::SeatPicked { restart_trial } => {
+                    this.clear_failure(cx);
+                    if *restart_trial {
+                        this.start_railway_trial(cx);
+                    }
+                }
             },
         );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
@@ -9513,16 +9549,39 @@ impl Composer {
         self.state.read(cx).cloud_view()
     }
 
-    /// Mint the `CloudSeatBinding` the chat row persists.
-    fn seat_binding(&self, cx: &App) -> Option<zeron_proto::CloudSeatBinding> {
+    /// Mint the `CloudSeatBinding` the chat row persists. A repo-less chat
+    /// owns `<seat workspace>/chats/<chat>` — its files, checkpoints and
+    /// backups never mix with another thread's.
+    fn seat_binding(&self, chat_id: &str, cx: &App) -> Option<zeron_proto::CloudSeatBinding> {
         let state = self.state.read(cx);
         let seat = state.active_cloud_seat()?;
+        // A non-default branch pick gets its own checkout beside the
+        // default branch's (`<repo>@<branch>`).
+        let branch = state.cloud_repo_pick.as_ref().and_then(|pick| {
+            state
+                .cloud_branch_pick
+                .clone()
+                .filter(|b| !b.trim().is_empty() && *b != pick.default_branch)
+        });
         let (repo, workspace_path) = match &state.cloud_repo_pick {
             Some(pick) => (
                 Some(pick.full_name.clone()),
-                Some(crate::cloud::repo_workspace(&seat.config, &pick.full_name)),
+                Some(zeron_engine::cloud::repo_workspace(
+                    &seat.config.workspace(),
+                    &pick.full_name,
+                    branch.as_deref(),
+                )),
             ),
-            None => (seat.config.repo.clone(), seat.config.workspace_path.clone()),
+            None if seat.config.repo.is_some() => {
+                (seat.config.repo.clone(), seat.config.workspace_path.clone())
+            }
+            None => (
+                None,
+                Some(zeron_engine::cloud::chat_workspace(
+                    &seat.config.workspace(),
+                    chat_id,
+                )),
+            ),
         };
         Some(zeron_proto::CloudSeatBinding {
             seat_id: seat.config.id.clone(),
@@ -9530,6 +9589,7 @@ impl Composer {
             label: seat.config.label.clone(),
             repo,
             workspace_path,
+            branch,
             model_label: self
                 .cloud_view(cx)
                 .map(|view| view.cloud_model_label().to_string()),
@@ -9543,14 +9603,37 @@ impl Composer {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        // Single-flight: a second click (or the auto on-ramp racing a
+        // click) never provisions twice.
+        if self.state.read(cx).cloud_trial_starting {
+            return;
+        }
+        self.state.update(cx, |state, cx| {
+            state.cloud_trial_starting = true;
+            cx.notify();
+        });
         cx.spawn(async move |this, cx| {
-            let current_view = engine
-                .client()
-                .call(zeron_rpc::methods::CLOUD_GET_CONFIG, serde_json::json!({}))
-                .await;
-            let current_view = match current_view {
-                Ok(value) => match serde_json::from_value::<crate::cloud::CloudView>(value) {
-                    Ok(view) => view,
+            (async {
+                let current_view = engine
+                    .client()
+                    .call(zeron_rpc::methods::CLOUD_GET_CONFIG, serde_json::json!({}))
+                    .await;
+                let current_view = match current_view {
+                    Ok(value) => match serde_json::from_value::<crate::cloud::CloudView>(value) {
+                        Ok(view) => view,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "railway trial seat lookup failed");
+                            this.update(cx, |_, _| {
+                                crate::notify::post(
+                                    "Railway trial couldn't start",
+                                    &err.to_string(),
+                                    None,
+                                )
+                            })
+                            .ok();
+                            return;
+                        }
+                    },
                     Err(err) => {
                         tracing::warn!(error = %err, "railway trial seat lookup failed");
                         this.update(cx, |_, _| {
@@ -9563,123 +9646,140 @@ impl Composer {
                         .ok();
                         return;
                     }
-                },
-                Err(err) => {
-                    tracing::warn!(error = %err, "railway trial seat lookup failed");
-                    this.update(cx, |_, _| {
-                        crate::notify::post("Railway trial couldn't start", &err.to_string(), None)
-                    })
-                    .ok();
-                    return;
+                };
+                let existing_seat = current_view
+                    .seats
+                    .iter()
+                    .find(|seat| seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway));
+                let existing_seat_id = existing_seat.map(|seat| seat.config.id.clone());
+                // A seat that never came online (no ssh key the first time) or whose hour
+                // is up asks railway.new afresh — a working key gets a box, a truly
+                // expired one gets Railway's claim link.
+                let fresh = existing_seat.is_some_and(|seat| {
+                    seat.config.expired()
+                        || seat
+                            .config
+                            .last_probe
+                            .as_ref()
+                            .is_none_or(|probe| !probe.online)
+                });
+                let seat_id = existing_seat_id
+                    .clone()
+                    .unwrap_or_else(|| format!("seat-{}", uuid::Uuid::new_v4().simple()));
+                if existing_seat_id.is_none() {
+                    let saved = engine
+                        .client()
+                        .call(
+                            zeron_rpc::methods::CLOUD_SAVE_SEAT,
+                            serde_json::json!({
+                                "seat": {
+                                    "id": seat_id,
+                                    "kind": zeron_proto::CloudSeatKind::Railway,
+                                    "label": "Railway trial",
+                                    "sshAlias": "railway.new",
+                                    "workspacePath": "/app",
+                                    "harnessCommand": "opencode run -m opencode/big-pickle",
+                                    // A trial VM dies at the hour regardless — the
+                                    // detached flag stays honest about what survives
+                                    // the desktop closing.
+                                    "detached": true,
+                                },
+                                "secrets": {},
+                            }),
+                        )
+                        .await;
+                    if let Err(err) = saved {
+                        tracing::warn!(error = %err, "railway trial seat save failed");
+                        this.update(cx, |_, _| {
+                            crate::notify::post(
+                                "Railway trial couldn't start",
+                                &err.to_string(),
+                                None,
+                            )
+                        })
+                        .ok();
+                        return;
+                    }
                 }
-            };
-            let existing_seat_id = current_view
-                .seats
-                .iter()
-                .find(|seat| seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway))
-                .map(|seat| seat.config.id.clone());
-            let seat_id = existing_seat_id
-                .clone()
-                .unwrap_or_else(|| format!("seat-{}", uuid::Uuid::new_v4().simple()));
-            if existing_seat_id.is_none() {
-                let saved = engine
+                // The probe IS the provisioning handshake — it can take tens of
+                // seconds while Railway brings the VM up.
+                let probe = engine
                     .client()
                     .call(
-                        zeron_rpc::methods::CLOUD_SAVE_SEAT,
-                        serde_json::json!({
-                            "seat": {
-                                "id": seat_id,
-                                "kind": zeron_proto::CloudSeatKind::Railway,
-                                "label": "Railway trial",
-                                "sshAlias": "railway.new",
-                                "workspacePath": "/app",
-                                "harnessCommand": "opencode run -m opencode/big-pickle",
-                                // A trial VM dies at the hour regardless — the
-                                // detached flag stays honest about what survives
-                                // the desktop closing.
-                                "detached": true,
-                            },
-                            "secrets": {},
-                        }),
+                        zeron_rpc::methods::CLOUD_PROBE_SEAT,
+                        serde_json::json!({ "seatId": seat_id.clone(), "fresh": fresh }),
                     )
                     .await;
-                if let Err(err) = saved {
-                    tracing::warn!(error = %err, "railway trial seat save failed");
-                    this.update(cx, |_, _| {
-                        crate::notify::post("Railway trial couldn't start", &err.to_string(), None)
+                // Re-read the view so the picked row carries the stamped
+                // deadline/capabilities (the shared refresh settles later).
+                let view = engine
+                    .client()
+                    .call(zeron_rpc::methods::CLOUD_GET_CONFIG, serde_json::json!({}))
+                    .await
+                    .ok()
+                    .and_then(|v| serde_json::from_value::<crate::cloud::CloudView>(v).ok());
+                let picked_row = view
+                    .as_ref()
+                    .and_then(|view| view.seats.iter().find(|s| s.config.id == seat_id))
+                    .or_else(|| {
+                        existing_seat_id
+                            .as_deref()
+                            .and_then(|id| current_view.seat(id))
                     })
-                    .ok();
-                    return;
-                }
-            }
-            // The probe IS the provisioning handshake — it can take tens of
-            // seconds while Railway brings the VM up.
-            let probe = engine
-                .client()
-                .call(
-                    zeron_rpc::methods::CLOUD_PROBE_SEAT,
-                    serde_json::json!({ "seatId": seat_id.clone() }),
-                )
-                .await;
-            // Re-read the view so the picked row carries the stamped
-            // deadline/capabilities (the shared refresh settles later).
-            let view = engine
-                .client()
-                .call(zeron_rpc::methods::CLOUD_GET_CONFIG, serde_json::json!({}))
-                .await
-                .ok()
-                .and_then(|v| serde_json::from_value::<crate::cloud::CloudView>(v).ok());
-            let picked_row = view
-                .as_ref()
-                .and_then(|view| view.seats.iter().find(|s| s.config.id == seat_id))
-                .or_else(|| {
-                    existing_seat_id
-                        .as_deref()
-                        .and_then(|id| current_view.seat(id))
-                })
-                .cloned();
-            this.update(cx, |composer, cx| {
-                composer.state.update(cx, |state, cx| {
-                    state.refresh_cloud(None, cx);
-                });
-                let probe_error = match probe.as_ref() {
-                    Err(err) => Some(err.to_string()),
-                    Ok(value) if value.get("online").and_then(|v| v.as_bool()) == Some(false) => {
-                        Some(
-                            value
-                                .get("detail")
-                                .and_then(|v| v.as_str())
-                                .filter(|s| !s.trim().is_empty())
-                                .unwrap_or("railway.new refused the connection")
-                                .to_string(),
-                        )
-                    }
-                    Ok(_) => None,
-                };
-                composer.state.update(cx, |state, _| {
-                    state.cloud_trial_failure = probe_error.clone();
-                });
-                if let Some(row) = picked_row {
-                    if let Some(err) = probe_error {
+                    .cloned();
+                this.update(cx, |composer, cx| {
+                    composer.state.update(cx, |state, cx| {
+                        state.refresh_cloud(None, cx);
+                    });
+                    let probe_error = match probe.as_ref() {
+                        Err(err) => Some(err.to_string()),
+                        Ok(value)
+                            if value.get("online").and_then(|v| v.as_bool()) == Some(false) =>
+                        {
+                            Some(
+                                value
+                                    .get("detail")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.trim().is_empty())
+                                    .unwrap_or("railway.new refused the connection")
+                                    .to_string(),
+                            )
+                        }
+                        Ok(_) => None,
+                    };
+                    composer.state.update(cx, |state, _| {
+                        state.cloud_trial_failure = probe_error.clone();
+                    });
+                    if let Some(row) = picked_row {
+                        if let Some(err) = probe_error {
+                            tracing::warn!(error = %err, "railway trial provision failed");
+                            crate::notify::post("Railway trial couldn't start", &err, None);
+                        } else {
+                            composer.clear_failure(cx);
+                        }
+                        composer.state.update(cx, |state, cx| {
+                            state.cloud_seat_pick = Some(row);
+                            state.cloud_mode = true;
+                            crate::settings::update(
+                                crate::settings::SavePolicy::Debounced,
+                                cx,
+                                |settings| settings.cloud_mode = true,
+                            );
+                        });
+                    } else if let Some(err) = probe_error {
                         tracing::warn!(error = %err, "railway trial provision failed");
                         crate::notify::post("Railway trial couldn't start", &err, None);
-                    } else {
-                        composer.clear_failure(cx);
                     }
-                    composer.state.update(cx, |state, cx| {
-                        state.cloud_seat_pick = Some(row);
-                        state.cloud_mode = true;
-                        crate::settings::update(
-                            crate::settings::SavePolicy::Debounced,
-                            cx,
-                            |settings| settings.cloud_mode = true,
-                        );
-                    });
-                } else if let Some(err) = probe_error {
-                    tracing::warn!(error = %err, "railway trial provision failed");
-                    crate::notify::post("Railway trial couldn't start", &err, None);
-                }
-                cx.notify();
+                    cx.notify();
+                })
+                .ok();
+            })
+            .await;
+            this.update(cx, |composer, cx| {
+                composer.state.update(cx, |state, cx| {
+                    state.cloud_trial_starting = false;
+                    cx.notify();
+                });
             })
             .ok();
         })
@@ -9823,14 +9923,35 @@ impl Composer {
         // The seat pick binds the chat to a cloud/GitHub seat. A picked but
         // unprovisioned seat (missing token/host/repo) keeps the option
         // visible while blocking Start with one line of copy.
-        let cloud_seat = self.seat_binding(cx);
+        let cloud_seat = self.seat_binding(&chat_id, cx);
         if is_new
             && self.state.read(cx).cloud_mode
             && self.state.read(cx).active_cloud_seat().is_none()
         {
-            self.failure = Some(
-                "Cloud mode is on — choose a seat in the sidebar (or switch to Agent).".into(),
-            );
+            // Every user's on-ramp: with no seat yet, the free Railway trial
+            // starts right here (a saved Boat token would already be picked).
+            let (starting, has_seats, failed) = {
+                let state = self.state.read(cx);
+                (
+                    state.cloud_trial_starting,
+                    !state.cloud_seats().is_empty(),
+                    state.cloud_trial_failure.clone(),
+                )
+            };
+            self.failure = Some(if starting {
+                "Your cloud computer is starting — send again in a moment.".into()
+            } else if let Some(reason) = failed {
+                format!(
+                    "The free cloud trial couldn't start ({reason}). Add a Boat token in Settings → Cloud computer, or switch to Agent."
+                )
+                .into()
+            } else if has_seats {
+                "Cloud mode is on — pick a seat from the cloud chip above the composer (or switch to Agent).".into()
+            } else {
+                self.start_railway_trial(cx);
+                "Starting your free cloud computer (60-minute Railway trial) — send again once it's ready."
+                    .into()
+            });
             self.failure_key = Some(key.clone());
             cx.notify();
             return;
@@ -11947,6 +12068,9 @@ impl Render for Composer {
                         ),
                 )
         };
+        // Same chips in both modes: machine + project + checkout/ref locally;
+        // in Cloud mode the machine chip is the seat, the project chip picks
+        // a GitHub repo, and the ref chip picks its branch.
         let new_thread_target_selectors = (new_thread_chrome_opacity > 0.0).then(|| {
             self.pickers.update(cx, |pickers, cx| {
                 pickers.render_new_thread_target_selectors(cx)
@@ -11959,11 +12083,16 @@ impl Render for Composer {
                 })
             })
             .flatten();
-        let has_new_thread_git_selectors = self
-            .state
-            .read(cx)
-            .selected_space_row()
-            .is_some_and(|space| space.git_detected);
+        let has_new_thread_git_selectors = {
+            let state = self.state.read(cx);
+            if state.cloud_mode {
+                state.cloud_repo_pick.is_some()
+            } else {
+                state
+                    .selected_space_row()
+                    .is_some_and(|space| space.git_detected)
+            }
+        };
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.

@@ -24,8 +24,10 @@ pub enum ProviderKind {
     Anthropic,
     Google,
     Fixture,
-    /// Devin subscription models — handled by zcore::devin over GetChatMessage.
+    /// Devin subscription models — zcore::devin over GetChatMessage (`devin-direct` builds only).
     Devin,
+    /// A vendor agent (Cursor, Devin, Codex) over the Agent Client Protocol — zcore::acp_client.
+    Acp,
 }
 
 impl ProviderKind {
@@ -38,6 +40,7 @@ impl ProviderKind {
             "google" => Some(Self::Google),
             "fixture" => Some(Self::Fixture),
             "devin" => Some(Self::Devin),
+            "acp" => Some(Self::Acp),
             _ => None,
         }
     }
@@ -157,7 +160,7 @@ fn http_error(status: u16, body: &str) -> anyhow::Error {
         })
         .unwrap_or_else(|| body.chars().take(400).collect());
     let hint = match status {
-        401 | 403 => " — check the API key (zcli auth login <provider>)",
+        401 | 403 => " — check the API key (cosmostui auth login <provider>)",
         404 => " — unknown model or endpoint for this provider",
         429 => " — rate limited or out of quota",
         _ => "",
@@ -440,7 +443,25 @@ fn anthropic_messages(req: &Request) -> Vec<Value> {
             Role::System => {}
         }
     }
+    // §4 third breakpoint: the last user turn, so the next request reads the
+    // whole conversation so far from cache.
+    if let Some(last) = out.iter_mut().rev().find(|m| m["role"] == "user") {
+        if let Some(part) = last["content"].as_array_mut().and_then(|p| p.last_mut()) {
+            part["cache_control"] = json!({"type":"ephemeral"});
+        }
+    }
     out
+}
+
+/// Merge Anthropic usage objects: `message_start` carries input/cache counts,
+/// `message_delta` carries cumulative output (and, on newer API versions,
+/// the same input/cache counts again). Max per field — never a sum.
+fn anthropic_usage_merge(acc: &mut Usage, u: &Value) {
+    let f = |k: &str| u[k].as_u64().unwrap_or(0);
+    acc.input = acc.input.max(f("input_tokens"));
+    acc.cache_read = acc.cache_read.max(f("cache_read_input_tokens"));
+    acc.cache_write = acc.cache_write.max(f("cache_creation_input_tokens"));
+    acc.output = acc.output.max(f("output_tokens"));
 }
 
 fn anthropic_complete(
@@ -452,13 +473,14 @@ fn anthropic_complete(
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
     host_allowed(&url, allowed)?;
     // system layers as block array with cache_control breakpoints (§4)
-    let sys: Vec<Value> = req
-        .system
+    // empty text blocks are rejected by the API — skip them
+    let layers: Vec<&String> = req.system.iter().filter(|s| !s.trim().is_empty()).collect();
+    let sys: Vec<Value> = layers
         .iter()
         .enumerate()
         .map(|(i, s)| {
             let mut b = json!({"type":"text","text":s});
-            if i == req.system.len() - 1 {
+            if i + 1 == layers.len() {
                 b["cache_control"] = json!({"type":"ephemeral"});
             }
             b
@@ -477,7 +499,7 @@ fn anthropic_complete(
             })
             .collect(),
     );
-    let body = json!({
+    let mut body = json!({
         "model": cfg.model,
         "system": sys,
         "messages": anthropic_messages(req),
@@ -485,6 +507,9 @@ fn anthropic_complete(
         "max_tokens": req.max_tokens,
         "stream": true,
     });
+    if req.tools.is_empty() {
+        body.as_object_mut().unwrap().remove("tools");
+    }
     let key = api_key(cfg);
     let mut call = ureq::post(&url)
         .header("content-type", "application/json")
@@ -503,6 +528,8 @@ fn anthropic_complete(
     }
     // accumulate tool_use input_json fragments per content block index
     let mut tool_idx: Vec<(String, String, String)> = Vec::new();
+    let mut usage = Usage::default();
+    let mut failure: Option<String> = None;
     let reader = resp.body_mut().as_reader();
     sse(reader, |data| {
         let v: Value = match serde_json::from_str(data) {
@@ -535,39 +562,24 @@ fn anthropic_complete(
                     }
                 }
             }
-            "message_delta" => {
-                let u = &v["usage"];
-                sink(Chunk::Done(Usage {
-                    input: v["message"]["usage"]["input_tokens"]
-                        .as_u64()
-                        .unwrap_or(0)
-                        .max(u["input_tokens"].as_u64().unwrap_or(0)),
-                    cache_read: u["cache_read_input_tokens"].as_u64().unwrap_or(0).max(
-                        v["message"]["usage"]["cache_read_input_tokens"]
-                            .as_u64()
-                            .unwrap_or(0),
-                    ),
-                    cache_write: u["cache_creation_input_tokens"].as_u64().unwrap_or(0).max(
-                        v["message"]["usage"]["cache_creation_input_tokens"]
-                            .as_u64()
-                            .unwrap_or(0),
-                    ),
-                    output: u["output_tokens"].as_u64().unwrap_or(0),
-                }));
-            }
-            "message_start" => {
-                let u = &v["message"]["usage"];
-                sink(Chunk::Done(Usage {
-                    input: u["input_tokens"].as_u64().unwrap_or(0),
-                    cache_read: u["cache_read_input_tokens"].as_u64().unwrap_or(0),
-                    cache_write: u["cache_creation_input_tokens"].as_u64().unwrap_or(0),
-                    output: u["output_tokens"].as_u64().unwrap_or(0),
-                }));
+            "message_delta" => anthropic_usage_merge(&mut usage, &v["usage"]),
+            "message_start" => anthropic_usage_merge(&mut usage, &v["message"]["usage"]),
+            "error" => {
+                failure = Some(
+                    v["error"]["message"]
+                        .as_str()
+                        .unwrap_or("stream error")
+                        .to_string(),
+                );
+                return Ok(true);
             }
             _ => {}
         }
         Ok(false)
     })?;
+    if let Some(f) = failure {
+        bail!("provider error: {f}");
+    }
     for (id, name, args) in tool_idx {
         if !name.is_empty() {
             sink(Chunk::ToolUse {
@@ -577,6 +589,7 @@ fn anthropic_complete(
             });
         }
     }
+    sink(Chunk::Done(usage));
     Ok(())
 }
 
@@ -630,11 +643,14 @@ fn google_complete(
         .iter()
         .map(|t| json!({"name":t.name,"description":t.description,"parameters":t.input_schema}))
         .collect();
-    let body = json!({
+    let mut body = json!({
         "systemInstruction": {"parts": sys},
         "contents": contents,
-        "tools": [{"functionDeclarations": decls}],
+        "generationConfig": {"maxOutputTokens": req.max_tokens},
     });
+    if !decls.is_empty() {
+        body["tools"] = json!([{"functionDeclarations": decls}]);
+    }
     let key = api_key(cfg);
     let mut call = ureq::post(&url)
         .header("content-type", "application/json")
@@ -650,6 +666,7 @@ fn google_complete(
         let text = resp.body_mut().read_to_string().unwrap_or_default();
         return Err(http_error(status, &text));
     }
+    let mut usage = Usage::default();
     let reader = resp.body_mut().as_reader();
     sse(reader, |data| {
         let v: Value = match serde_json::from_str(data) {
@@ -674,19 +691,19 @@ fn google_complete(
                 }
             }
         }
+        // usageMetadata is a running total on every chunk — keep the latest
         if let Some(u) = v.get("usageMetadata") {
-            sink(Chunk::Done(Usage {
-                input: u["promptTokenCount"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    .saturating_sub(u["cachedContentTokenCount"].as_u64().unwrap_or(0)),
-                cache_read: u["cachedContentTokenCount"].as_u64().unwrap_or(0),
+            let cached = u["cachedContentTokenCount"].as_u64().unwrap_or(0);
+            usage = Usage {
+                input: u["promptTokenCount"].as_u64().unwrap_or(0).saturating_sub(cached),
+                cache_read: cached,
                 cache_write: 0,
                 output: u["candidatesTokenCount"].as_u64().unwrap_or(0),
-            }));
+            };
         }
         Ok(false)
     })?;
+    sink(Chunk::Done(usage));
     Ok(())
 }
 
@@ -726,12 +743,6 @@ fn fixture_complete(cfg: &ProviderCfg, req: &Request, sink: &mut dyn FnMut(Chunk
             _ => 4,
         })
         .sum();
-    sink(Chunk::Done(Usage {
-        input: sys_tokens + msg_tokens,
-        cache_read: 0,
-        cache_write: 0,
-        output: 0,
-    }));
     let lower = last.to_lowercase();
     if has_tool_result {
         sink(Chunk::Text("done.".into()));
@@ -756,7 +767,7 @@ fn fixture_complete(cfg: &ProviderCfg, req: &Request, sink: &mut dyn FnMut(Chunk
         )));
     }
     sink(Chunk::Done(Usage {
-        input: 0,
+        input: sys_tokens + msg_tokens,
         cache_read: 0,
         cache_write: 0,
         output: est(&format!("{cfg:?}")) / 8 + 8,
@@ -819,6 +830,10 @@ fn responses_complete(
     allowed: &[String],
 ) -> Result<()> {
     let chatgpt = cfg.kind == ProviderKind::ChatGpt;
+    if cfg.model.trim().is_empty() {
+        // the ChatGPT backend answers a model-less request with a bare 400
+        bail!("no model id — pick one as {}/<model>", if chatgpt { "chatgpt" } else { "provider" });
+    }
     let base = cfg.base_url.trim_end_matches('/');
     let url = if chatgpt {
         format!("{base}/codex/responses")
@@ -861,7 +876,7 @@ fn responses_complete(
     if chatgpt {
         call = call
             .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "zcli")
+            .header("originator", "cosmostui")
             .header("session_id", req.session_id);
         if let Some(a) = &cfg.account_id {
             call = call.header("chatgpt-account-id", a);
@@ -943,7 +958,7 @@ fn responses_complete(
 pub fn transcribe(base_url: &str, key: &str, model: &str, wav: &[u8], allowed: &[String]) -> Result<String> {
     let url = format!("{}/audio/transcriptions", base_url.trim_end_matches('/'));
     host_allowed(&url, allowed)?;
-    let boundary = format!("zcli{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let boundary = format!("cosmos{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     let mut body: Vec<u8> = Vec::with_capacity(wav.len() + 512);
     let field = |b: &mut Vec<u8>, name: &str, value: &str| {
         b.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
@@ -978,7 +993,7 @@ pub fn transcribe(base_url: &str, key: &str, model: &str, wav: &[u8], allowed: &
 pub fn transcribe_chatgpt(base_url: &str, access: &str, account_id: &str, wav: &[u8], allowed: &[String]) -> Result<String> {
     let url = format!("{}/transcribe", base_url.trim_end_matches('/'));
     host_allowed(&url, allowed)?;
-    let boundary = format!("zcli{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let boundary = format!("cosmos{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     let mut body: Vec<u8> = Vec::with_capacity(wav.len() + 256);
     body.extend_from_slice(
         format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"dictation.wav\"\r\nContent-Type: audio/wav\r\n\r\n").as_bytes(),
@@ -988,7 +1003,7 @@ pub fn transcribe_chatgpt(base_url: &str, access: &str, account_id: &str, wav: &
     let mut req = ureq::post(&url)
         .header("authorization", &format!("Bearer {access}"))
         .header("content-type", &format!("multipart/form-data; boundary={boundary}"))
-        .header("originator", "zcli");
+        .header("originator", "cosmostui");
     if !account_id.is_empty() {
         req = req.header("chatgpt-account-id", account_id);
     }
@@ -1020,6 +1035,7 @@ pub fn complete(
         ProviderKind::Responses | ProviderKind::ChatGpt => responses_complete(cfg, req, sink, allowed),
         ProviderKind::Anthropic => anthropic_complete(cfg, req, sink, allowed),
         ProviderKind::Google => google_complete(cfg, req, sink, allowed),
-        ProviderKind::Devin => bail!("Devin turns run through the local `devin` CLI (zcore::devin)"),
+        ProviderKind::Devin => bail!("Devin-direct turns run in zcore::devin"),
+        ProviderKind::Acp => bail!("ACP plugin turns run in zcore::acp_client"),
     }
 }

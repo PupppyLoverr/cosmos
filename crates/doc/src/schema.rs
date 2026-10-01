@@ -396,6 +396,29 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// Raw index of the entry with `entry_id` in the messages list (what
+    /// [`SegmentWriter::resume`] takes) and its parts as stored.
+    pub fn find_entry(&self, entry_id: &str) -> Option<(usize, Vec<MessagePart>)> {
+        let messages = self.doc.get_list("messages");
+        let index = (0..messages.len()).find(|&i| match messages.get(i) {
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => {
+                matches!(
+                    map.get("id"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(id))) if id.as_str() == entry_id
+                )
+            }
+            _ => false,
+        })?;
+        let parts = self
+            .read_entries()
+            .ok()?
+            .into_iter()
+            .find(|entry| entry.id == entry_id)
+            .map(|entry| entry.parts)
+            .unwrap_or_default();
+        Some((index, parts))
+    }
+
     /// Read all entries (continuations NOT joined — see `join_continuation_entries`).
     ///
     /// Malformed entries are SKIPPED, not fatal: a torn intermediate state

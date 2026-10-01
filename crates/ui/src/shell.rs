@@ -4825,9 +4825,13 @@ impl Shell {
             let page = cx.new(|cx| crate::cloud::boards::KanbanPage::new(state, cx));
             self.kanban_sub = Some(cx.subscribe(
                 &page,
-                |this: &mut Shell, _, event: &crate::cloud::boards::BoardsEvent, cx| {
-                    let crate::cloud::boards::BoardsEvent::OpenChat(chat_id) = event;
-                    this.apply_nav(NavEntry::Chat(chat_id.clone()), cx);
+                |this: &mut Shell, _, event: &crate::cloud::boards::BoardsEvent, cx| match event {
+                    crate::cloud::boards::BoardsEvent::OpenChat(chat_id) => {
+                        this.apply_nav(NavEntry::Chat(chat_id.clone()), cx);
+                    }
+                    crate::cloud::boards::BoardsEvent::OpenAutomations => {
+                        this.open_automations(cx);
+                    }
                 },
             ));
             self.kanban_page = Some(page);
@@ -4844,9 +4848,13 @@ impl Shell {
             let page = cx.new(|cx| crate::cloud::boards::AutomationsPage::new(state, cx));
             self.automations_sub = Some(cx.subscribe(
                 &page,
-                |this: &mut Shell, _, event: &crate::cloud::boards::BoardsEvent, cx| {
-                    let crate::cloud::boards::BoardsEvent::OpenChat(chat_id) = event;
-                    this.apply_nav(NavEntry::Chat(chat_id.clone()), cx);
+                |this: &mut Shell, _, event: &crate::cloud::boards::BoardsEvent, cx| match event {
+                    crate::cloud::boards::BoardsEvent::OpenChat(chat_id) => {
+                        this.apply_nav(NavEntry::Chat(chat_id.clone()), cx);
+                    }
+                    crate::cloud::boards::BoardsEvent::OpenAutomations => {
+                        this.open_automations(cx);
+                    }
                 },
             ));
             self.automations_page = Some(page);
@@ -8146,15 +8154,35 @@ impl Shell {
             if let Some(picked) = picked {
                 state.cloud_seat_pick = Some(picked);
             } else if (picked_id.is_none() || view_loaded)
-                && let Some(seat) = seats
-                    .iter()
-                    .find(|seat| crate::cloud::CloudView::seat_ready(seat))
-                    .cloned()
+                && let Some(seat) = crate::cloud::CloudView::preferred_seat(&seats).cloned()
             {
                 state.cloud_seat_pick = Some(seat);
             }
             state.refresh_cloud(Some(Duration::from_secs(10)), cx);
         });
+        self.maybe_autostart_cloud_trial(cx);
+    }
+
+    /// First-run on-ramp: a user in Cloud mode with no seat at all gets the
+    /// free Railway trial started for them — once per session, never a retry
+    /// loop (a refused trial surfaces its reason instead). A saved Boat token
+    /// or any other seat means there's nothing to start.
+    fn maybe_autostart_cloud_trial(&mut self, cx: &mut Context<Self>) {
+        let should = {
+            let state = self.state.read(cx);
+            state.cloud_mode
+                && !state.cloud_trial_autostarted
+                && !state.cloud_trial_starting
+                && state.cloud_trial_failure.is_none()
+                && state.cloud_view().is_some_and(|view| view.seats.is_empty())
+        };
+        if !should {
+            return;
+        }
+        self.state
+            .update(cx, |state, _| state.cloud_trial_autostarted = true);
+        self.composer
+            .update(cx, |composer, cx| composer.start_railway_trial(cx));
     }
 
     fn set_cloud_mode(&mut self, cloud_mode: bool, cx: &mut Context<Self>) {
@@ -8284,29 +8312,7 @@ impl Shell {
                         cx: &mut Context<Self>| {
             let seat_data = seat.clone();
             let selected = picked.as_deref() == Some(seat.config.id.as_str());
-            let ready = crate::cloud::CloudView::seat_ready(seat);
-            let status = match seat.config.kind {
-                Some(zeron_proto::CloudSeatKind::Railway) if seat.config.expired() => {
-                    Some("trial ended")
-                }
-                Some(zeron_proto::CloudSeatKind::Ssh)
-                    if seat
-                        .config
-                        .last_probe
-                        .as_ref()
-                        .is_some_and(|probe| !probe.online) =>
-                {
-                    Some("offline")
-                }
-                Some(zeron_proto::CloudSeatKind::GitHub)
-                    if seat.config.repo.is_none() || !seat.has_github_pat =>
-                {
-                    Some("needs token")
-                }
-                Some(zeron_proto::CloudSeatKind::Box) if !seat.has_box_token => Some("needs token"),
-                _ if !ready => Some("needs credentials"),
-                _ => None,
-            };
+            let status = crate::cloud::seat_status_note(seat);
             let mut row = popover::menu_row(
                 theme,
                 selected,
@@ -8370,6 +8376,14 @@ impl Shell {
                         state.cloud_mode = true;
                     });
                     this.close_cloud_seat_menu(cx);
+                    // A trial seat that isn't live (it never connected, or
+                    // its hour is up) re-asks Railway — the honest "retry".
+                    if crate::cloud::stalled_trial(&seat_data) {
+                        this.state
+                            .update(cx, |state, _| state.cloud_trial_failure = None);
+                        this.composer
+                            .update(cx, |composer, cx| composer.start_railway_trial(cx));
+                    }
                     cx.notify();
                 }))
         };
@@ -8465,25 +8479,7 @@ impl Shell {
     fn render_cloud_seat_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let seat = self.state.read(cx).active_cloud_seat().cloned();
         let trial_failed = self.state.read(cx).cloud_trial_failure.is_some();
-        let label: SharedString = match seat.as_ref() {
-            Some(seat) if seat.config.kind == Some(zeron_proto::CloudSeatKind::GitHub) => {
-                format!("GitHub — {}", seat.config.label).into()
-            }
-            Some(seat) if seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway) => {
-                match seat.config.expires_at {
-                    None if trial_failed => "Railway trial — unavailable".into(),
-                    None => "Railway trial — starting…".into(),
-                    Some(_) if seat.config.expired() => "Railway trial — ended".into(),
-                    Some(at) => format!(
-                        "Railway trial — {}m",
-                        at.signed_duration_since(Utc::now()).num_minutes().max(0)
-                    )
-                    .into(),
-                }
-            }
-            Some(seat) => format!("Cloud — {}", seat.config.label).into(),
-            None => "Choose a seat…".into(),
-        };
+        let label: SharedString = crate::cloud::seat_chip_label(seat.as_ref(), trial_failed).into();
         let open = self.cloud_seat_menu.is_open();
         let trigger = div()
             .id("sidebar-cloud-seat")
@@ -10580,9 +10576,11 @@ impl Shell {
         let has_spaces = !self.state.read(cx).spaces.is_empty();
         let has_appshots = !self.composer.read(cx).staged_appshots().is_empty();
         let no_project = self.state.read(cx).no_project;
+        // Cloud mode works on the seat — no local folder is needed to start.
+        let cloud_mode = self.state.read(cx).cloud_mode;
         let transcript_geometry_ready = bottom_stack_measurement_matches(
             self.bottom_stack_has_composer.get(),
-            (has_spaces || no_project || has_appshots) && has_selection,
+            (has_spaces || no_project || cloud_mode || has_appshots) && has_selection,
         );
         let ui_settings = settings::current(cx);
         let new_thread_background_setting = ui_settings.new_thread_composer_background;
@@ -10682,7 +10680,7 @@ impl Shell {
                     el.child(div().absolute().inset_0().occlude())
                 })
                 .into_any_element()
-        } else if !has_spaces && !no_project {
+        } else if !has_spaces && !no_project && !cloud_mode {
             // Onboarding (first boot / after the destructive wipe): no folders
             // to work in yet — one clear affordance.
             let _ = faint;
@@ -10844,7 +10842,8 @@ impl Shell {
             .child({
                 let measured = self.bottom_stack.clone();
                 let measured_has_composer = self.bottom_stack_has_composer.clone();
-                let contains_composer = (has_spaces || no_project || has_appshots) && has_selection;
+                let contains_composer =
+                    (has_spaces || no_project || cloud_mode || has_appshots) && has_selection;
                 let composer = self.composer.clone();
                 div()
                     .flex_none()
@@ -10871,27 +10870,30 @@ impl Shell {
                         .inset_0(),
                     )
                     .child(status)
-                    .when(has_spaces || no_project || has_appshots, |el| {
-                        let composer_opacity = self.composer_dock.borrow().opacity();
-                        el.child(crate::composer_dock::docked_composer(
-                            div()
-                                .id("persistent-composer")
-                                .relative()
-                                .w(px(composer_width))
-                                .opacity(composer_opacity)
-                                .mx_auto()
-                                .child(self.composer.clone())
-                                .children(if has_selection {
-                                    self.render_jump_to_bottom(cx)
-                                } else {
-                                    None
-                                }),
-                            self.composer_dock.clone(),
-                            self.viewport_height,
-                            self.reduced_motion,
-                            frame_time,
-                        ))
-                    })
+                    .when(
+                        has_spaces || no_project || cloud_mode || has_appshots,
+                        |el| {
+                            let composer_opacity = self.composer_dock.borrow().opacity();
+                            el.child(crate::composer_dock::docked_composer(
+                                div()
+                                    .id("persistent-composer")
+                                    .relative()
+                                    .w(px(composer_width))
+                                    .opacity(composer_opacity)
+                                    .mx_auto()
+                                    .child(self.composer.clone())
+                                    .children(if has_selection {
+                                        self.render_jump_to_bottom(cx)
+                                    } else {
+                                        None
+                                    }),
+                                self.composer_dock.clone(),
+                                self.viewport_height,
+                                self.reduced_motion,
+                                frame_time,
+                            ))
+                        },
+                    )
                     .child(self.render_terminal_container(window, cx))
             })
             .child(

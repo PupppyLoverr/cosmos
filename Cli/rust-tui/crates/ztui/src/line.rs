@@ -72,9 +72,10 @@ fn prompt_line(prompt: &str) -> Option<String> {
 
 /// Interactive line-mode session loop. Returns the process exit code.
 pub fn repl(opts: &RunOpts, cwd: &Path) -> Result<i32> {
-    let mut agent = Agent::new(opts, "zcli", cwd)?;
+    let mut agent = Agent::new(opts, zcore::NAME, cwd)?;
     eprintln!(
-        "zcli · {} · mode {} · session {}",
+        "{} · {} · mode {} · session {}",
+        zcore::NAME,
         agent.model_alias,
         agent.mode.name(),
         &agent.session.id[..8]
@@ -91,11 +92,7 @@ pub fn repl(opts: &RunOpts, cwd: &Path) -> Result<i32> {
     let mut emit = |ev: &Event| render(ev);
     let start = agent.session.append(
         "session_start",
-        serde_json::json!({
-            "model": agent.model_alias, "mode": agent.mode.name(),
-            "sandbox": if agent.ctx.no_sandbox {"off"} else {"appcontainer"},
-            "boot_tokens": agent.boot_tokens,
-        }),
+        agent.start_data(serde_json::json!({})),
     );
     emit(&start);
     // If -p carried a prompt into the REPL (resume), run it first.

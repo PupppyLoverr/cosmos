@@ -1,51 +1,16 @@
-//! Syntax highlighting for fenced code — tree-sitter-highlight, the same
-//! engine Devin CLI ships. Grammars compile in; each language's query is
-//! built lazily on first use and cached for the session.
+//! Syntax colour for fenced code.
+//!
+//! The default build uses a small built-in lexer (keywords, strings,
+//! comments, numbers, calls, types) — no grammar crates, so the binary stays
+//! small. Build with `--features highlight` to use tree-sitter grammars
+//! instead (`highlight_ts.rs`).
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
+use ratatui_core::style::{Color, Modifier, Style};
+use ratatui_core::text::Span;
 
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
-use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
+pub(crate) const BASE: Color = Color::Rgb(0xd4, 0xd4, 0xd4);
 
-/// Capture names we colour; index = `Highlight.0` in events.
-const NAMES: &[&str] = &[
-    "attribute",
-    "boolean",
-    "comment",
-    "constant",
-    "constant.builtin",
-    "constructor",
-    "escape",
-    "function",
-    "function.builtin",
-    "function.macro",
-    "function.method",
-    "keyword",
-    "label",
-    "module",
-    "number",
-    "operator",
-    "property",
-    "punctuation",
-    "punctuation.bracket",
-    "punctuation.delimiter",
-    "punctuation.special",
-    "string",
-    "string.escape",
-    "string.special",
-    "tag",
-    "type",
-    "type.builtin",
-    "variable.builtin",
-    "variable.parameter",
-];
-
-const BASE: Color = Color::Rgb(0xd4, 0xd4, 0xd4);
-
-fn style_for(name: &str) -> Style {
+pub(crate) fn style_for(name: &str) -> Style {
     let c = |r, g, b| Style::new().fg(Color::Rgb(r, g, b));
     match name {
         "comment" => c(0x6a, 0x73, 0x7d).add_modifier(Modifier::ITALIC),
@@ -64,7 +29,7 @@ fn style_for(name: &str) -> Style {
     }
 }
 
-/// Canonical grammar name for a fence info string.
+/// Canonical language name for a fence info string.
 pub fn canonical(lang: &str) -> Option<&'static str> {
     let l = lang.trim().to_ascii_lowercase();
     let l = l.split([' ', ',', '{']).next().unwrap_or("");
@@ -83,125 +48,219 @@ pub fn canonical(lang: &str) -> Option<&'static str> {
         "cpp" | "c++" | "cc" | "cxx" | "hpp" => "cpp",
         "css" | "scss" => "css",
         "html" | "htm" | "xml" | "svg" | "vue" => "html",
+        "java" | "kotlin" | "kt" | "cs" | "csharp" | "swift" => "java",
+        "sql" => "sql",
         _ => return None,
     })
 }
 
-fn build(lang: &str) -> Option<HighlightConfiguration> {
-    let js = tree_sitter_javascript::HIGHLIGHT_QUERY;
-    let (language, name, query): (tree_sitter::Language, &str, String) = match lang {
-        "rust" => (tree_sitter_rust::LANGUAGE.into(), "rust", tree_sitter_rust::HIGHLIGHTS_QUERY.into()),
-        "python" => (tree_sitter_python::LANGUAGE.into(), "python", tree_sitter_python::HIGHLIGHTS_QUERY.into()),
-        "javascript" => (
-            tree_sitter_javascript::LANGUAGE.into(),
-            "javascript",
-            format!("{js}\n{}", tree_sitter_javascript::JSX_HIGHLIGHT_QUERY),
-        ),
-        "typescript" => (
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "typescript",
-            format!("{}\n{js}", tree_sitter_typescript::HIGHLIGHTS_QUERY),
-        ),
-        "tsx" => (
-            tree_sitter_typescript::LANGUAGE_TSX.into(),
-            "tsx",
-            format!(
-                "{}\n{js}\n{}",
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
-                tree_sitter_javascript::JSX_HIGHLIGHT_QUERY
-            ),
-        ),
-        "go" => (tree_sitter_go::LANGUAGE.into(), "go", tree_sitter_go::HIGHLIGHTS_QUERY.into()),
-        "bash" => (tree_sitter_bash::LANGUAGE.into(), "bash", tree_sitter_bash::HIGHLIGHT_QUERY.into()),
-        "json" => (tree_sitter_json::LANGUAGE.into(), "json", tree_sitter_json::HIGHLIGHTS_QUERY.into()),
-        "toml" => (tree_sitter_toml_ng::LANGUAGE.into(), "toml", tree_sitter_toml_ng::HIGHLIGHTS_QUERY.into()),
-        "yaml" => (tree_sitter_yaml::LANGUAGE.into(), "yaml", tree_sitter_yaml::HIGHLIGHTS_QUERY.into()),
-        "c" => (tree_sitter_c::LANGUAGE.into(), "c", tree_sitter_c::HIGHLIGHT_QUERY.into()),
-        "cpp" => (
-            tree_sitter_cpp::LANGUAGE.into(),
-            "cpp",
-            format!("{}\n{}", tree_sitter_cpp::HIGHLIGHT_QUERY, tree_sitter_c::HIGHLIGHT_QUERY),
-        ),
-        "css" => (tree_sitter_css::LANGUAGE.into(), "css", tree_sitter_css::HIGHLIGHTS_QUERY.into()),
-        "html" => (tree_sitter_html::LANGUAGE.into(), "html", tree_sitter_html::HIGHLIGHTS_QUERY.into()),
-        _ => return None,
-    };
-    let mut cfg = HighlightConfiguration::new(language, name, &query, "", "").ok()?;
-    cfg.configure(NAMES);
-    Some(cfg)
-}
-
-thread_local! {
-    static CONFIGS: RefCell<HashMap<&'static str, Option<Rc<HighlightConfiguration>>>> = RefCell::new(HashMap::new());
-    static HL: RefCell<Highlighter> = RefCell::new(Highlighter::new());
-}
-
-fn config(lang: &'static str) -> Option<Rc<HighlightConfiguration>> {
-    CONFIGS.with(|c| {
-        c.borrow_mut()
-            .entry(lang)
-            .or_insert_with(|| build(lang).map(Rc::new))
-            .clone()
-    })
-}
-
-/// Highlight `code`, returning one span list per source line. `None` when
-/// the language is unknown (callers render plain).
+/// Highlight `code`, one span list per source line. `None` when the language
+/// is unknown (callers render plain).
+#[cfg(feature = "highlight")]
 pub fn highlight(lang: &str, code: &str) -> Option<Vec<Vec<Span<'static>>>> {
-    let cfg = config(canonical(lang)?)?;
-    let events: Vec<HighlightEvent> = HL.with(|h| {
-        let mut h = h.borrow_mut();
-        h.highlight(&cfg, code.as_bytes(), None, |_| None)
-            .ok()
-            .map(|it| it.filter_map(Result::ok).collect())
-    })?;
+    crate::highlight_ts::highlight(lang, code)
+}
 
-    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    let mut stack: Vec<Style> = Vec::new();
-    for ev in events {
-        match ev {
-            HighlightEvent::HighlightStart(h) => stack.push(style_for(NAMES[h.0])),
-            HighlightEvent::HighlightEnd => {
-                stack.pop();
+/// Highlight `code`, one span list per source line. `None` when the language
+/// is unknown (callers render plain).
+#[cfg(not(feature = "highlight"))]
+pub fn highlight(lang: &str, code: &str) -> Option<Vec<Vec<Span<'static>>>> {
+    lite(canonical(lang)?, code)
+}
+
+fn keywords(lang: &str) -> &'static [&'static str] {
+    match lang {
+        "rust" => &[
+            "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn", "for", "if",
+            "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct",
+            "super", "trait", "true", "type", "unsafe", "use", "where", "while",
+        ],
+        "python" => &[
+            "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except", "False",
+            "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "None", "nonlocal", "not", "or", "pass",
+            "raise", "return", "True", "try", "while", "with", "yield", "self",
+        ],
+        "javascript" | "typescript" | "tsx" => &[
+            "as", "async", "await", "break", "case", "catch", "class", "const", "continue", "default", "delete", "do", "else",
+            "enum", "export", "extends", "false", "finally", "for", "from", "function", "if", "implements", "import", "in",
+            "instanceof", "interface", "let", "new", "null", "of", "private", "protected", "public", "readonly", "return",
+            "static", "super", "switch", "this", "throw", "true", "try", "type", "typeof", "undefined", "var", "void", "while",
+            "yield",
+        ],
+        "go" => &[
+            "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough", "false", "for", "func", "go",
+            "goto", "if", "import", "interface", "map", "nil", "package", "range", "return", "select", "struct", "switch", "true",
+            "type", "var",
+        ],
+        "bash" => &[
+            "case", "do", "done", "elif", "else", "esac", "export", "fi", "for", "function", "if", "in", "local", "return", "then",
+            "until", "while", "echo", "cd", "set", "param", "foreach",
+        ],
+        "c" | "cpp" | "java" => &[
+            "auto", "bool", "break", "case", "catch", "char", "class", "const", "continue", "default", "delete", "do", "double",
+            "else", "enum", "extends", "extern", "false", "final", "float", "for", "fun", "if", "import", "include", "int",
+            "interface", "long", "namespace", "new", "null", "nullptr", "override", "package", "private", "protected", "public",
+            "return", "short", "signed", "sizeof", "static", "struct", "switch", "template", "this", "throw", "true", "try",
+            "typedef", "union", "unsigned", "using", "val", "var", "virtual", "void", "while",
+        ],
+        "sql" => &[
+            "select", "from", "where", "and", "or", "not", "insert", "into", "values", "update", "set", "delete", "create", "table",
+            "join", "left", "right", "inner", "on", "group", "by", "order", "limit", "as", "null", "is", "primary", "key",
+        ],
+        "json" | "toml" | "yaml" => &["true", "false", "null", "yes", "no"],
+        _ => &[],
+    }
+}
+
+fn line_comment(lang: &str) -> &'static [&'static str] {
+    match lang {
+        "python" | "bash" | "toml" | "yaml" => &["#"],
+        "sql" => &["--"],
+        "json" | "html" | "css" => &[],
+        _ => &["//"],
+    }
+}
+
+/// Built-in lexer: good enough to read code at a glance, a few KB of binary.
+fn lite(lang: &'static str, code: &str) -> Option<Vec<Vec<Span<'static>>>> {
+    let kw = keywords(lang);
+    let lc = line_comment(lang);
+    let block = !matches!(lang, "python" | "bash" | "toml" | "yaml" | "json");
+    let ci = lang == "sql";
+    let mut in_block = false;
+    let mut out = Vec::new();
+    for raw in code.split('\n') {
+        let line = raw.trim_end_matches('\r');
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let push = |spans: &mut Vec<Span<'static>>, s: &str, kind: &str| {
+            if !s.is_empty() {
+                spans.push(Span::styled(s.to_string(), style_for(kind)));
             }
-            HighlightEvent::Source { start, end } => {
-                let style = stack.last().copied().unwrap_or(Style::new().fg(BASE));
-                let text = &code[start..end];
-                for (i, part) in text.split('\n').enumerate() {
-                    if i > 0 {
-                        lines.push(Vec::new());
-                    }
-                    let part = part.trim_end_matches('\r');
-                    if !part.is_empty() {
-                        lines.last_mut().unwrap().push(Span::styled(part.to_string(), style));
-                    }
+        };
+        let b = line.as_bytes();
+        let mut i = 0;
+        let mut plain = 0; // start of pending plain text
+        macro_rules! flush {
+            () => {
+                push(&mut spans, &line[plain..i], "");
+            };
+        }
+        while i < b.len() {
+            if in_block {
+                let end = line[i..].find("*/").map(|p| i + p + 2).unwrap_or(b.len());
+                push(&mut spans, &line[i..end], "comment");
+                i = end;
+                plain = i;
+                in_block = end == b.len() && !line.ends_with("*/");
+                continue;
+            }
+            let rest = &line[i..];
+            if lc.iter().any(|c| rest.starts_with(c)) && !(lang == "bash" && i > 0 && b[i - 1] == b'$') {
+                flush!();
+                push(&mut spans, rest, "comment");
+                i = b.len();
+                plain = i;
+                break;
+            }
+            if block && rest.starts_with("/*") {
+                flush!();
+                in_block = true;
+                continue;
+            }
+            let c = b[i];
+            if c == b'"' || c == b'\'' || c == b'`' {
+                // a Rust lifetime / char is short; treat a lone ' with no
+                // closing quote on the line as plain text
+                let close = line[i + 1..].bytes().enumerate().scan(false, |esc, (k, ch)| {
+                    let hit = !*esc && ch == c;
+                    *esc = !*esc && ch == b'\\';
+                    Some((k, hit))
+                });
+                let end = close.filter(|(_, hit)| *hit).map(|(k, _)| i + 1 + k + 1).next();
+                if let Some(end) = end {
+                    flush!();
+                    push(&mut spans, &line[i..end], "string");
+                    i = end;
+                    plain = i;
+                    continue;
                 }
             }
+            if c.is_ascii_digit() && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) {
+                let end = i + line[i..].bytes().take_while(|x| x.is_ascii_alphanumeric() || *x == b'.' || *x == b'_').count();
+                flush!();
+                push(&mut spans, &line[i..end], "number");
+                i = end;
+                plain = i;
+                continue;
+            }
+            if c.is_ascii_alphabetic() || c == b'_' {
+                let end = i + line[i..].bytes().take_while(|x| x.is_ascii_alphanumeric() || *x == b'_').count();
+                let word = &line[i..end];
+                let is_kw = if ci { kw.iter().any(|k| k.eq_ignore_ascii_case(word)) } else { kw.contains(&word) };
+                let next = line[end..].trim_start().bytes().next();
+                let kind = if is_kw {
+                    "keyword"
+                } else if next == Some(b'(') || (lang == "rust" && next == Some(b'!')) {
+                    "function"
+                } else if word.as_bytes()[0].is_ascii_uppercase() && lang != "sql" {
+                    "type"
+                } else if matches!(lang, "toml" | "yaml" | "json") && matches!(next, Some(b'=') | Some(b':')) {
+                    "property"
+                } else {
+                    ""
+                };
+                if !kind.is_empty() {
+                    flush!();
+                    push(&mut spans, word, kind);
+                    plain = end;
+                }
+                i = end;
+                continue;
+            }
+            // advance one UTF-8 char
+            i += line[i..].chars().next().map(char::len_utf8).unwrap_or(1);
         }
+        push(&mut spans, &line[plain.min(b.len())..], "");
+        out.push(spans);
     }
-    Some(lines)
+    Some(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "highlight")))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn rust_keywords_get_colour() {
-        let l = highlight("rust", "fn main() {\n    let x = 1;\n}").unwrap();
-        assert_eq!(l.len(), 3);
-        let kw = l[0].iter().find(|s| s.content == "fn").unwrap();
-        assert_eq!(kw.style, style_for("keyword"));
+    fn kinds(l: &[Span]) -> Vec<(String, Style)> {
+        l.iter().map(|s| (s.content.to_string(), s.style)).collect()
     }
 
     #[test]
-    fn every_grammar_loads() {
-        for lang in [
-            "rust", "python", "javascript", "typescript", "tsx", "go", "bash", "json", "toml",
-            "yaml", "c", "cpp", "css", "html",
-        ] {
-            assert!(config(lang).is_some(), "{lang} failed to build");
-        }
+    fn rust_keywords_strings_comments() {
+        let l = highlight("rust", "fn main() {\n    let s = \"hi\"; // note\n}").unwrap();
+        assert_eq!(l.len(), 3);
+        let k = kinds(&l[0]);
+        assert!(k.contains(&("fn".into(), style_for("keyword"))));
+        assert!(k.contains(&("main".into(), style_for("function"))));
+        let k = kinds(&l[1]);
+        assert!(k.contains(&("\"hi\"".into(), style_for("string"))));
+        assert!(k.contains(&("// note".into(), style_for("comment"))));
+        // text round-trips exactly
+        let text: String = l[1].iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "    let s = \"hi\"; // note");
+    }
+
+    #[test]
+    fn block_comments_span_lines() {
+        let l = highlight("c", "/* a\nb */ int x = 1;").unwrap();
+        assert_eq!(kinds(&l[1])[0], ("b */".into(), style_for("comment")));
+        assert!(kinds(&l[1]).contains(&("int".into(), style_for("keyword"))));
+    }
+
+    #[test]
+    fn unicode_and_lifetimes_do_not_panic() {
+        let l = highlight("rust", "fn f<'a>(x: &'a str) -> é { 42 }").unwrap();
+        let text: String = l[0].iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "fn f<'a>(x: &'a str) -> é { 42 }");
     }
 
     #[test]

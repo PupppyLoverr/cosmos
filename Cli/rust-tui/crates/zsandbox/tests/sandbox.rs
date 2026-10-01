@@ -13,12 +13,12 @@ fn workspace(tag: &str) -> PathBuf {
 }
 
 fn run(ws: &Path, net: NetPolicy, timeout_s: u64, argv: &[&str]) -> zsandbox::ExecResult {
-    exec(&ExecOpts {
-        workspace: ws.to_path_buf(),
+    exec(&ExecOpts::new(
+        ws.to_path_buf(),
         net,
-        timeout: Duration::from_secs(timeout_s),
-        argv: argv.iter().map(|s| s.to_string()).collect(),
-    })
+        Duration::from_secs(timeout_s),
+        argv.iter().map(|s| s.to_string()).collect(),
+    ))
     .unwrap()
 }
 

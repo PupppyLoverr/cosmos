@@ -1,7 +1,8 @@
 //! Live model lists, straight from each provider's own API.
 //!
 //! The built-in catalog is a snapshot; this asks the provider what the key in
-//! hand can actually use right now (`GET /models` in each wire dialect), keeps
+//! hand can actually use right now (`GET /models` in each wire dialect — ACP
+//! subscription agents answer `session/new` with `models.availableModels`), keeps
 //! the tool-capable chat models, orders them best-first (catalog order for the
 //! models it knows, newest first for the rest) and fills in context size and
 //! prices from the catalog or the provider's own metadata.
@@ -36,7 +37,9 @@ struct Raw {
 pub fn fetch(def: &ProviderDef) -> Result<Vec<ModelDef>> {
     let raw = match def.kind.as_str() {
         "chatgpt" => chatgpt()?,
+        #[cfg(feature = "devin-direct")]
         "devin" => devin()?,
+        "acp" => acp(def)?,
         "anthropic" => anthropic(def)?,
         "google" => google(def)?,
         _ => openai(def)?,
@@ -55,6 +58,9 @@ fn key(def: &ProviderDef) -> Result<String> {
 }
 
 fn get_json(url: &str, headers: &[(&str, String)]) -> Result<Value> {
+    // §12: same allowlist as every provider call
+    let allowed = crate::config::Config::load(&crate::cli_home()).allowed_hosts();
+    zproviders::host_allowed(url, &allowed)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
         .http_status_as_error(false)
@@ -81,6 +87,29 @@ fn get_json(url: &str, headers: &[(&str, String)]) -> Result<Value> {
             bail!("{host} answered {status}: {}", msg.trim())
         }
     }
+}
+
+/// A subscription agent has no HTTP `/models` — it reports the plan's live
+/// list on `session/new` as `models.availableModels`. `<id>/default` stays
+/// on top: it means "the plan decides" and keeps working mid-plan-change.
+fn acp(def: &ProviderDef) -> Result<Vec<Raw>> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let found = crate::acp_client::list_models(&def.id, &cwd)
+        .with_context(|| format!("couldn't ask {} for its model list", def.name))?;
+    if found.is_empty() {
+        bail!("{} didn't report any models — its CLI may need an update", def.name);
+    }
+    let n = found.len();
+    let mut raw = vec![Raw { id: "default".into(), ..Raw::default() }];
+    raw.extend(found.into_iter().enumerate().filter(|(_, m)| m.id != "default").map(|(i, m)| Raw {
+        id: m.id,
+        name: Some(m.name),
+        // `created` only ranks models the catalog doesn't know — feeding it
+        // the vendor's order keeps the picker's order the agent's own
+        created: (n - i) as i64,
+        ..Raw::default()
+    }));
+    Ok(raw)
 }
 
 fn u(v: &Value) -> Option<u64> {
@@ -180,6 +209,7 @@ fn google(def: &ProviderDef) -> Result<Vec<Raw>> {
 }
 
 /// Devin subscription — `GetCliModelConfigs` over the signed-in plan.
+#[cfg(feature = "devin-direct")]
 fn devin() -> Result<Vec<Raw>> {
     let models = crate::devin::models()?;
     Ok(models
@@ -203,7 +233,7 @@ fn chatgpt() -> Result<Vec<Raw>> {
         &[
             ("authorization", format!("Bearer {}", t.access)),
             ("chatgpt-account-id", t.account_id.clone()),
-            ("originator", "zcli".into()),
+            ("originator", crate::NAME.into()),
         ],
     )?;
     let items = v["models"].as_array().or(v["data"].as_array()).cloned().unwrap_or_default();
@@ -382,7 +412,7 @@ mod tests {
 
     #[test]
     fn merge_keeps_subscription_ids() {
-        let d = crate::catalog::provider("devin").unwrap().clone();
+        let d = crate::catalog::provider("chatgpt").unwrap().clone();
         let m = merge(
             &d,
             vec![Raw { id: "foo-clip-bar".into(), name: Some("Clip".into()), ..Raw::default() }],

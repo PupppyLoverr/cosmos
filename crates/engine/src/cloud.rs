@@ -22,7 +22,7 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use zeron_proto::{
     ByokProvider, CloudAutomation, CloudRun, CloudSeatBinding, CloudSeatKind, SeatCapabilities,
-    SeatProbe,
+    SeatProbe, TaskDraft, WorkspaceBackup,
 };
 
 use crate::EngineError;
@@ -173,7 +173,9 @@ impl SeatConfig {
                     files: alive,
                     git: alive,
                     pull_requests: self.repo.is_some(),
-                    computer: self.cua_endpoint.is_some(),
+                    // The seat's own virtual desktop (`seat_desktop`) rides
+                    // exec — no separate CUA endpoint needed.
+                    computer: alive || self.cua_endpoint.is_some(),
                     simulator: false,
                     // Detached (`nohup`) runs outlive the app — bounded by
                     // the trial's own expiry, which the countdown covers.
@@ -186,7 +188,7 @@ impl SeatConfig {
                 files: self.ssh_alias.is_some(),
                 git: self.ssh_alias.is_some(),
                 pull_requests: self.repo.is_some(),
-                computer: self.cua_endpoint.is_some(),
+                computer: self.ssh_alias.is_some() || self.cua_endpoint.is_some(),
                 simulator: self.simulator_endpoint.is_some(),
                 keeps_running: self.ssh_alias.is_some(),
             },
@@ -211,7 +213,7 @@ impl SeatConfig {
                 files: self.box_id.is_some(),
                 git: self.box_id.is_some(),
                 pull_requests: self.repo.is_some(),
-                computer: self.cua_endpoint.is_some(),
+                computer: self.box_id.is_some() || self.cua_endpoint.is_some(),
                 simulator: false,
                 // A hosted box outlives the desktop by definition.
                 keeps_running: true,
@@ -231,14 +233,45 @@ pub fn command_in_workspace(workspace: &str, command: &str) -> String {
 /// first run clones it through `$GITHUB_TOKEN`, later runs reuse it. The
 /// token never lands in `.git/config` — the credential helper reads it from
 /// the run's environment, so the agent can push while the run lives.
-pub fn repo_checkout_prelude(repo: &str) -> String {
+pub fn repo_checkout_prelude(repo: &str, branch: Option<&str>) -> String {
     let url = shell_word(&format!("https://github.com/{repo}.git"));
     let helper =
         shell_word("!f() { echo username=x-access-token; echo \"password=$GITHUB_TOKEN\"; }; f");
+    // The picked branch only steers the FIRST clone: later turns keep
+    // whatever branch the agent moved the checkout to.
+    let branch = branch
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(|b| format!(" --branch {}", shell_word(b)))
+        .unwrap_or_default();
     format!(
-        "if [ ! -d .git ]; then git -c credential.helper= -c credential.helper={helper} clone --quiet {url} . || exit 1; fi; \
+        "if [ ! -d .git ]; then git -c credential.helper= -c credential.helper={helper} clone --quiet{branch} {url} . || exit 1; fi; \
 git config credential.helper {helper}"
     )
+}
+
+/// Where a repo chat's checkout lives on a seat: `<workspace>/<name>` for
+/// the repo's default branch, `<workspace>/<name>@<branch>` for another
+/// branch — so two chats on different branches never share a working tree.
+pub fn repo_workspace(base: &str, full_name: &str, branch: Option<&str>) -> String {
+    let name = full_name.rsplit('/').next().unwrap_or(full_name);
+    let base = base.trim_end_matches('/');
+    match branch.map(str::trim).filter(|b| !b.is_empty()) {
+        None => format!("{base}/{name}"),
+        Some(branch) => {
+            let slug: String = branch
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            format!("{base}/{name}@{}", slug.trim_matches('.'))
+        }
+    }
 }
 
 /// Per-provider row (non-secret); the key itself lives in `cloud-keys.json`.
@@ -266,6 +299,10 @@ struct CloudConfigFile {
     providers: Vec<ProviderConfig>,
     automations: Vec<CloudAutomation>,
     default_seat: Option<String>,
+    /// Per-chat workspace snapshots on this computer (`seat-backups/`).
+    backups: Vec<WorkspaceBackup>,
+    /// Kanban drafts — tasks created but not started.
+    drafts: Vec<TaskDraft>,
 }
 
 /// Secrets — `cloud-keys.json`, 0600 on Unix. Everything optional; a missing
@@ -309,6 +346,9 @@ pub struct CloudStore {
 struct CloudStoreInner {
     dir: PathBuf,
     state: RwLock<CloudState>,
+    /// Automations asked to fire now ("Run now"), drained by the scheduler.
+    run_now: std::sync::Mutex<Vec<String>>,
+    run_now_signal: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -385,6 +425,8 @@ impl CloudStore {
                     runs,
                     load_error,
                 }),
+                run_now: std::sync::Mutex::new(Vec::new()),
+                run_now_signal: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -447,8 +489,17 @@ impl CloudStore {
 
     /// Find the seat a chat binding names; tolerant of stale ids.
     pub fn seat_for(&self, binding: &CloudSeatBinding) -> Option<SeatConfig> {
-        self.seat(&binding.seat_id)
-            .map(|seat| seat.scoped(binding.workspace_path.as_deref(), binding.repo.as_deref()))
+        self.seat(&binding.seat_id).map(|seat| {
+            let mut seat = seat.scoped(binding.workspace_path.as_deref(), binding.repo.as_deref());
+            // The chat's branch pick wins; a GitHub seat's own configured
+            // branch stays when the chat names none.
+            if let Some(branch) = binding.branch.as_deref().map(str::trim)
+                && !branch.is_empty()
+            {
+                seat.branch = Some(branch.to_string());
+            }
+            seat
+        })
     }
 
     pub fn default_seat(&self) -> Option<SeatConfig> {
@@ -734,27 +785,71 @@ impl CloudStore {
             None => state.config.automations.push(automation),
         }
         drop(state);
-        self.persist_config();
+        let _ = self.persist_config();
     }
 
     pub fn remove_automation(&self, id: &str) {
         let mut state = self.inner.state.write().unwrap();
         state.config.automations.retain(|a| a.id != id);
         drop(state);
-        self.persist_config();
+        let _ = self.persist_config();
     }
 
     /// Due automations are claimed in one mutation: each gets `next_run_at`
     /// advanced past `now` before the caller dispatches, so a crash can't
     /// double-fire the same tick.
+    /// Queue an off-schedule fire ("Run now") — the scheduler wakes at once.
+    /// Runs even when the automation is paused; its schedule is untouched.
+    pub fn request_run_now(&self, id: &str) -> Result<(), String> {
+        if !self.automations().iter().any(|a| a.id == id) {
+            return Err(format!("no such automation: {id}"));
+        }
+        self.inner.run_now.lock().unwrap().push(id.to_string());
+        self.inner.run_now_signal.notify_one();
+        Ok(())
+    }
+
+    fn take_run_now(&self) -> Vec<CloudAutomation> {
+        let ids = std::mem::take(&mut *self.inner.run_now.lock().unwrap());
+        let automations = self.automations();
+        let mut out: Vec<CloudAutomation> = Vec::new();
+        for id in ids {
+            if out.iter().any(|a| a.id == id) {
+                continue;
+            }
+            if let Some(a) = automations.iter().find(|a| a.id == id) {
+                out.push(a.clone());
+            }
+        }
+        if !out.is_empty() {
+            let now = Utc::now();
+            let mut state = self.inner.state.write().unwrap();
+            for automation in state.config.automations.iter_mut() {
+                if out.iter().any(|a| a.id == automation.id) {
+                    automation.last_run_at = Some(now);
+                }
+            }
+            drop(state);
+            let _ = self.persist_config();
+        }
+        out
+    }
+
     pub fn claim_due(&self, now: DateTime<Utc>) -> Vec<CloudAutomation> {
         let mut state = self.inner.state.write().unwrap();
         let mut due = Vec::new();
+        let mut scheduled = false;
         for automation in state.config.automations.iter_mut() {
             if !automation.enabled {
                 continue;
             }
-            let due_at = automation.next_run_at.unwrap_or(now);
+            // A row with no next fire (hand-edited config, an older build)
+            // gets scheduled from now — never fired on sight.
+            let Some(due_at) = automation.next_run_at else {
+                automation.next_run_at = next_run(&automation.schedule, now);
+                scheduled = true;
+                continue;
+            };
             if due_at > now {
                 continue;
             }
@@ -762,9 +857,9 @@ impl CloudStore {
             automation.next_run_at = next_run(&automation.schedule, now);
             due.push(automation.clone());
         }
-        if !due.is_empty() {
+        if !due.is_empty() || scheduled {
             drop(state);
-            self.persist_config();
+            let _ = self.persist_config();
         }
         due
     }
@@ -778,7 +873,7 @@ impl CloudStore {
             }
         }
         drop(state);
-        self.persist_config();
+        let _ = self.persist_config();
     }
 
     // ── run ledger ───────────────────────────────────────────────────────
@@ -801,7 +896,7 @@ impl CloudStore {
             None => state.runs.runs.push(run),
         }
         drop(state);
-        self.persist_runs();
+        let _ = self.persist_runs();
     }
 
     pub fn update_run(&self, run_id: &str, f: impl FnOnce(&mut CloudRun)) {
@@ -811,7 +906,7 @@ impl CloudStore {
             run.updated_at = Utc::now();
         }
         drop(state);
-        self.persist_runs();
+        let _ = self.persist_runs();
     }
 
     /// A redacted config view for RPC: secrets collapse to `has_*` booleans.
@@ -862,6 +957,8 @@ impl CloudStore {
             "automations": self.automations(),
             "defaultSeat": self.default_seat().map(|s| s.id),
             "runs": self.runs(),
+            "backups": self.backups(),
+            "drafts": self.drafts(),
             // Whether the shared GitHub PAT exists — the repo picker's
             // "token present" flag (never the token itself).
             "hasGithubPat": has_shared_github,
@@ -910,6 +1007,91 @@ impl CloudStore {
             .max_by_key(|s| s.backup_at)
             .and_then(|s| s.backup_path.map(PathBuf::from))
             .filter(|p| p.exists())
+    }
+
+    // ── Kanban drafts ────────────────────────────────────────────────────
+
+    pub fn drafts(&self) -> Vec<TaskDraft> {
+        self.inner.state.read().unwrap().config.drafts.clone()
+    }
+
+    pub fn save_draft(&self, draft: TaskDraft) {
+        let mut state = self.inner.state.write().unwrap();
+        state.config.drafts.retain(|d| d.chat_id != draft.chat_id);
+        state.config.drafts.push(draft);
+        drop(state);
+        let _ = self.persist_config();
+    }
+
+    /// Remove and return a draft (starting or discarding it).
+    pub fn take_draft(&self, chat_id: &str) -> Option<TaskDraft> {
+        let mut state = self.inner.state.write().unwrap();
+        let ix = state
+            .config
+            .drafts
+            .iter()
+            .position(|d| d.chat_id == chat_id)?;
+        let draft = state.config.drafts.remove(ix);
+        drop(state);
+        let _ = self.persist_config();
+        Some(draft)
+    }
+
+    // ── per-chat workspace backups ───────────────────────────────────────
+
+    pub fn backups(&self) -> Vec<WorkspaceBackup> {
+        self.inner.state.read().unwrap().config.backups.clone()
+    }
+
+    /// The chat's newest snapshot whose file still exists on disk.
+    pub fn backup_for_chat(&self, chat_id: &str) -> Option<WorkspaceBackup> {
+        self.backups()
+            .into_iter()
+            .filter(|b| b.chat_id == chat_id && Path::new(&b.path).exists())
+            .max_by_key(|b| b.taken_at)
+    }
+
+    /// Record (replace) the chat's snapshot row.
+    pub fn record_backup(&self, backup: WorkspaceBackup) {
+        let mut state = self.inner.state.write().unwrap();
+        state.config.backups.retain(|b| b.chat_id != backup.chat_id);
+        state.config.backups.push(backup);
+        drop(state);
+        let _ = self.persist_config();
+    }
+
+    pub fn mark_backup_restored(&self, chat_id: &str, seat_id: &str) {
+        let mut state = self.inner.state.write().unwrap();
+        for backup in state
+            .config
+            .backups
+            .iter_mut()
+            .filter(|b| b.chat_id == chat_id)
+        {
+            backup.restored_to = Some(seat_id.to_string());
+        }
+        drop(state);
+        let _ = self.persist_config();
+    }
+
+    /// Where a chat's snapshot lives on this computer.
+    pub fn chat_backup_path(&self, chat_id: &str) -> PathBuf {
+        let safe: String = chat_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        self.backups_dir().join(format!("chat-{safe}.tar.gz"))
+    }
+
+    /// Whether a chat has completed a turn on a seat before — the next turn
+    /// continues the harness conversation instead of starting cold.
+    pub fn harness_session_for_chat(&self, chat_id: &str, seat_id: &str) -> Option<String> {
+        self.runs()
+            .into_iter()
+            .filter(|r| r.chat_id == chat_id && r.seat_id == seat_id)
+            .filter_map(|r| r.harness_session.clone().map(|s| (r.started_at, s)))
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, s)| s)
     }
 }
 
@@ -1066,15 +1248,7 @@ pub fn harness_credentials(command: &str) -> Vec<(PathBuf, &'static str)> {
             .map(PathBuf::from)
     };
     let xdg = env_dir("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local").join("share"));
-    let bin = command
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or("")
-        .trim_end_matches(".exe")
-        .to_lowercase();
+    let bin = command_bin(command);
     let pair = |local: PathBuf, remote: &'static str| local.exists().then_some((local, remote));
     if bin.contains("claude") {
         return pair(
@@ -1257,57 +1431,714 @@ pub async fn cleanup_staged_credentials(
 /// trial safeguard the scheduler fires ~10 minutes before `expires_at`.
 /// Heavy build dirs are excluded; a cap guards memory (`output()` buffers).
 pub async fn snapshot_workspace(store: &CloudStore, seat: &SeatConfig) -> Result<PathBuf, String> {
-    let path = store.backups_dir().join(format!("{}.tar.gz", seat.id));
-    let tar = command_in_workspace(
-        &seat.workspace(),
-        "tar czf - --exclude=node_modules --exclude=target --exclude=dist \
-         --exclude=.next --exclude=.cache --exclude='*.log' .",
-    );
-    let output = match seat.kind {
-        Some(CloudSeatKind::Railway) => {
-            let alias = seat
-                .ssh_alias
-                .clone()
-                .unwrap_or_else(|| crate::railway::RAILWAY_HOST.into());
-            tokio::time::timeout(
-                Duration::from_secs(240),
-                tokio::process::Command::new("ssh")
-                    .args([
-                        "-o",
-                        "BatchMode=yes",
-                        "-o",
-                        "ConnectTimeout=15",
-                        "-o",
-                        "StrictHostKeyChecking=accept-new",
-                        alias.as_str(),
-                        tar.as_str(),
-                    ])
-                    .output(),
-            )
-            .await
-            .map_err(|_| "workspace snapshot timed out".to_string())?
-            .map_err(|e| format!("could not run ssh: {e}"))?
-        }
-        _ => return Err("snapshots only support Railway seats".into()),
-    };
-    if !output.status.success() {
-        return Err(format!(
-            "snapshot failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-                .lines()
-                .next()
-                .unwrap_or("ssh error")
-        ));
+    if seat.kind != Some(CloudSeatKind::Railway) {
+        return Err("seat-level snapshots only cover Railway trials".into());
     }
-    const MAX_SNAPSHOT: usize = 512 * 1024 * 1024;
-    if output.stdout.is_empty() {
+    let path = store.backups_dir().join(format!("{}.tar.gz", seat.id));
+    let http = reqwest::Client::new();
+    snapshot_dir(&http, store, seat, &seat.workspace(), &path).await?;
+    Ok(path)
+}
+
+// ---------------------------------------------------------------------------
+// Workspace persistence — per-chat workspaces, local git checkpoints, and
+// snapshots pulled down to this computer so a cloud workspace's progress
+// outlives the seat it ran on.
+// ---------------------------------------------------------------------------
+
+/// Snapshot excludes: build output and caches that rebuild on demand.
+const SNAPSHOT_EXCLUDES: &str = "--exclude=./node_modules --exclude=*/node_modules \
+--exclude=./target --exclude=./dist --exclude=./.next --exclude=./.cache \
+--exclude=./.venv --exclude=*/__pycache__ --exclude=*.log";
+/// Largest snapshot pulled down (compressed).
+const MAX_SNAPSHOT: usize = 512 * 1024 * 1024;
+/// Boat snapshots ride exec stdout as base64 — keep them smaller.
+const MAX_BOAT_SNAPSHOT_B64: usize = 96 * 1024 * 1024;
+
+/// The workspace a repo-less cloud chat owns on its seat:
+/// `<seat workspace>/chats/<chat>` — isolated per thread, so a checkpoint,
+/// snapshot, or restore never touches another chat's files.
+pub fn chat_workspace(base: &str, chat_id: &str) -> String {
+    let short: String = chat_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(12)
+        .collect();
+    let short = if short.is_empty() {
+        "chat".to_string()
+    } else {
+        short
+    };
+    format!("{}/chats/{short}", base.trim_end_matches('/'))
+}
+
+/// The workspace a repo-less automation reuses across fires:
+/// `<seat workspace>/automations/<id>`.
+pub fn automation_workspace(base: &str, automation_id: &str) -> String {
+    let short: String = automation_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(40)
+        .collect();
+    format!("{}/automations/{short}", base.trim_end_matches('/'))
+}
+
+// ---------------------------------------------------------------------------
+// SSH identity — Railway's trial (and a fresh VPS) need *some* key to offer.
+// ---------------------------------------------------------------------------
+
+/// Where Cosmos keeps its own key when the user has none (`<data>/ssh`).
+static SSH_KEY_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// The resolved identity, once: `None` = the user's own default key/agent.
+static SSH_IDENTITY: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+pub(crate) fn set_ssh_key_dir(data_dir: &Path) {
+    let _ = SSH_KEY_DIR.set(data_dir.join("ssh"));
+}
+
+/// The user's own default private keys (what plain `ssh` offers).
+fn default_ssh_keys() -> Vec<PathBuf> {
+    let ssh = dirs_like_home().join(".ssh");
+    [
+        "id_ed25519",
+        "id_ecdsa",
+        "id_rsa",
+        "id_ed25519_sk",
+        "id_ecdsa_sk",
+    ]
+    .into_iter()
+    .map(|name| ssh.join(name))
+    .filter(|path| path.exists())
+    .collect()
+}
+
+/// An identity for seats to use. A user with their own default key keeps
+/// using it (Railway knows a trial by the key that opened it). Without one,
+/// Cosmos mints `<data>/ssh/cosmos_ed25519` once — Railway's "run ssh-keygen
+/// then retry", done for them — and offers it on every seat connection.
+pub fn ssh_identity() -> Option<PathBuf> {
+    SSH_IDENTITY
+        .get_or_init(|| {
+            if !default_ssh_keys().is_empty() {
+                return None;
+            }
+            let dir = SSH_KEY_DIR.get()?.clone();
+            let key = dir.join("cosmos_ed25519");
+            if key.exists() {
+                return Some(key);
+            }
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                tracing::warn!(error = %e, "could not create the Cosmos ssh dir");
+                return None;
+            }
+            match mint_ssh_key(&key) {
+                Ok(()) => {
+                    tracing::info!(path = %key.display(), "created the Cosmos ssh key");
+                    Some(key)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not create an ssh key");
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+/// `ssh-keygen` an unencrypted ed25519 key at `key` (+ `key.pub`).
+fn mint_ssh_key(key: &Path) -> Result<(), String> {
+    let mut keygen = std::process::Command::new("ssh-keygen");
+    keygen
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "cosmos-desktop",
+            "-f",
+        ])
+        .arg(key)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        keygen.creation_flags(0x08000000);
+    }
+    let out = keygen.output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "ssh-keygen isn't installed (it ships with the OpenSSH client)".to_string()
+        } else {
+            format!("could not run ssh-keygen: {e}")
+        }
+    })?;
+    if out.status.success() && key.exists() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// `ssh` with the options every seat connection shares: no prompts
+/// (BatchMode), first-connect host trust, Cosmos's key when the user has
+/// none, and no console window flashing up on Windows.
+pub fn ssh() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("ssh");
+    if let Some(key) = ssh_identity() {
+        command.arg("-i").arg(key);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(0x08000000);
+    }
+    command
+}
+
+/// Spawn failures read as instructions, not `os error 2`.
+pub fn ssh_spawn_error(e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        if cfg!(windows) {
+            "the OpenSSH client isn't installed — add it in Settings → System → Optional features → OpenSSH Client, then retry".into()
+        } else {
+            "ssh isn't installed on this computer — install the OpenSSH client, then retry".into()
+        }
+    } else {
+        format!("could not run ssh: {e}")
+    }
+}
+
+/// The interactive-terminal form (`ssh -tt …`) for the Shell pane's PTY.
+pub fn ssh_terminal_prefix() -> String {
+    match ssh_identity() {
+        // cmd and PowerShell both take a double-quoted path; POSIX shells
+        // get the single-quoted word.
+        Some(key) if cfg!(windows) => format!("ssh -i \"{}\" -tt", key.display()),
+        Some(key) => format!("ssh -i {} -tt", shell_word(&key.to_string_lossy())),
+        None => "ssh -tt".into(),
+    }
+}
+
+/// `(ssh alias, remote command)` for a raw-bytes exec on an ssh-reached
+/// seat: Railway execs on the VM itself, a VPS seat inside its container
+/// (`-i` so stdin reaches `tar x`).
+fn ssh_seat_target(seat: &SeatConfig, command: &str) -> Result<(String, String), String> {
+    match seat.kind {
+        Some(CloudSeatKind::Railway) => {
+            if seat.expired() {
+                return Err("Railway trial seat expired".into());
+            }
+            Ok((
+                seat.ssh_alias
+                    .clone()
+                    .unwrap_or_else(|| crate::railway::RAILWAY_HOST.into()),
+                command.to_string(),
+            ))
+        }
+        Some(CloudSeatKind::Ssh) => Ok((
+            seat.ssh_alias
+                .clone()
+                .ok_or_else(|| "seat has no SSH alias".to_string())?,
+            format!(
+                "docker exec -i {} sh -lc {}",
+                shell_word(&seat.container_name()),
+                shell_word(command)
+            ),
+        )),
+        _ => Err("not an ssh seat".into()),
+    }
+}
+
+async fn ssh_raw(
+    alias: &str,
+    command: &str,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let mut child = ssh()
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=15",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            alias,
+            command,
+        ])
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(ssh_spawn_error)?;
+    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+        let bytes = bytes.to_vec();
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&bytes).await;
+            let _ = stdin.shutdown().await;
+        });
+    }
+    tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| format!("ssh {alias} timed out"))?
+        .map_err(ssh_spawn_error)
+}
+
+fn first_line(bytes: &[u8], fallback: &str) -> String {
+    let text = crate::railway::redact_trial_banner(&String::from_utf8_lossy(bytes));
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// Pull `workspace` off the seat as a `.tar.gz` at `dest`; returns its size.
+pub async fn snapshot_dir(
+    http: &reqwest::Client,
+    store: &CloudStore,
+    seat: &SeatConfig,
+    workspace: &str,
+    dest: &Path,
+) -> Result<u64, String> {
+    let tar = format!(
+        "cd {} 2>/dev/null || exit 3; tar czf - {SNAPSHOT_EXCLUDES} .",
+        shell_word(workspace)
+    );
+    let bytes = match seat.kind {
+        Some(CloudSeatKind::Railway | CloudSeatKind::Ssh) => {
+            let (alias, remote) = ssh_seat_target(seat, &tar)?;
+            let output = ssh_raw(&alias, &remote, None, Duration::from_secs(300)).await?;
+            if output.status.code() == Some(3) {
+                return Err("workspace doesn't exist on the seat yet".into());
+            }
+            if !output.status.success() {
+                return Err(format!(
+                    "snapshot failed: {}",
+                    first_line(&output.stderr, "ssh error")
+                ));
+            }
+            output.stdout
+        }
+        Some(CloudSeatKind::Box) => {
+            let (Some(token), Some(box_id)) = (store.box_token(&seat.id), seat.box_id.clone())
+            else {
+                return Err("Boat seat has no box yet".into());
+            };
+            let out = crate::boat::boat(http, &token, seat.box_endpoint.as_deref())
+                .exec(
+                    &box_id,
+                    &format!("{tar} | base64 | tr -d '\\n'"),
+                    None,
+                    Duration::from_secs(300),
+                )
+                .await?;
+            if !out.success && out.stdout.trim().is_empty() {
+                return Err(format!(
+                    "snapshot failed: {}",
+                    first_line(out.stderr.as_bytes(), "exec error")
+                ));
+            }
+            let b64 = out.stdout.trim();
+            if b64.len() > MAX_BOAT_SNAPSHOT_B64 {
+                return Err("workspace too large to snapshot over Boat exec".into());
+            }
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| format!("snapshot decode: {e}"))?
+        }
+        _ => return Err("this seat can't snapshot a workspace".into()),
+    };
+    if bytes.len() < 20 || bytes[..2] != [0x1f, 0x8b] {
         return Err("snapshot was empty".into());
     }
-    if output.stdout.len() > MAX_SNAPSHOT {
-        return Err("workspace too large to snapshot (>512 MB)".into());
+    if bytes.len() > MAX_SNAPSHOT {
+        return Err("workspace too large to snapshot (>512 MB compressed)".into());
     }
-    std::fs::write(&path, &output.stdout).map_err(|e| format!("write snapshot: {e}"))?;
-    Ok(path)
+    let staging = dest.with_extension("partial");
+    std::fs::write(&staging, &bytes).map_err(|e| format!("write snapshot: {e}"))?;
+    std::fs::rename(&staging, dest).map_err(|e| format!("write snapshot: {e}"))?;
+    Ok(bytes.len() as u64)
+}
+
+/// Unpack a local `.tar.gz` into `workspace` on the seat.
+pub async fn restore_dir(
+    http: &reqwest::Client,
+    store: &CloudStore,
+    seat: &SeatConfig,
+    workspace: &str,
+    src: &Path,
+) -> Result<(), String> {
+    let bytes = std::fs::read(src).map_err(|e| format!("read snapshot: {e}"))?;
+    let ws = shell_word(workspace);
+    match seat.kind {
+        Some(CloudSeatKind::Railway | CloudSeatKind::Ssh) => {
+            let (alias, remote) =
+                ssh_seat_target(seat, &format!("mkdir -p {ws} && tar xzf - -C {ws}"))?;
+            let output = ssh_raw(&alias, &remote, Some(&bytes), Duration::from_secs(300)).await?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "restore failed: {}",
+                    first_line(&output.stderr, "tar error")
+                ))
+            }
+        }
+        Some(CloudSeatKind::Box) => {
+            let (Some(token), Some(box_id)) = (store.box_token(&seat.id), seat.box_id.clone())
+            else {
+                return Err("Boat seat has no box yet".into());
+            };
+            use base64::Engine as _;
+            let api = crate::boat::boat(http, &token, seat.box_endpoint.as_deref());
+            let staged = format!("/tmp/cosmos-restore-{}.tgz.b64", crate::new_id());
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            api.write_file(&box_id, &staged, b64.as_bytes()).await?;
+            let out = api
+                .exec(
+                    &box_id,
+                    &format!(
+                        "trap 'rm -f {staged}' EXIT; mkdir -p {ws} && base64 -d {staged} | tar xzf - -C {ws}"
+                    ),
+                    None,
+                    Duration::from_secs(300),
+                )
+                .await?;
+            if out.success {
+                Ok(())
+            } else {
+                Err(format!(
+                    "restore failed: {}",
+                    first_line(out.stderr.as_bytes(), "tar error")
+                ))
+            }
+        }
+        _ => Err("this seat can't restore a workspace".into()),
+    }
+}
+
+/// Prepare a repo-less workspace: create it, and start a local-only git
+/// repo (with build output excluded) so the Changes pane can diff the
+/// agent's work and each turn can be checkpointed.
+pub fn workspace_prepare_command(workspace: &str) -> String {
+    let ws = shell_word(workspace);
+    format!(
+        "mkdir -p {ws} && cd {ws} && if command -v git >/dev/null 2>&1 && [ ! -d .git ]; then \
+git init -q && printf '%s\\n' node_modules/ target/ dist/ .next/ .cache/ .venv/ __pycache__/ '*.log' >> .git/info/exclude; fi; \
+[ -n \"$(ls -A 2>/dev/null | grep -v '^\\.git$')\" ] && echo __cosmos_ws_has || echo __cosmos_ws_empty"
+    )
+}
+
+/// Commit everything in a repo-less workspace as a checkpoint. Prints the
+/// short hash (or nothing when there was nothing new / no git).
+pub fn checkpoint_command(workspace: &str, message: &str) -> String {
+    let subject: String = message
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("agent turn")
+        .chars()
+        .take(72)
+        .collect();
+    format!(
+        "cd {} 2>/dev/null && command -v git >/dev/null 2>&1 && [ -d .git ] && git add -A >/dev/null 2>&1 && \
+git -c user.name=Cosmos -c user.email=cosmos@localhost commit -q --no-verify -m {} >/dev/null 2>&1 && git rev-parse --short HEAD",
+        shell_word(workspace),
+        shell_word(&format!("Cosmos checkpoint: {subject}"))
+    )
+}
+
+/// Snapshot a chat's workspace to this computer and record it.
+pub async fn backup_chat_workspace(
+    http: &reqwest::Client,
+    store: &CloudStore,
+    seat: &SeatConfig,
+    chat_id: &str,
+    workspace: &str,
+) -> Result<WorkspaceBackup, String> {
+    let path = store.chat_backup_path(chat_id);
+    let bytes = snapshot_dir(http, store, seat, workspace, &path).await?;
+    let backup = WorkspaceBackup {
+        chat_id: chat_id.to_string(),
+        seat_id: seat.id.clone(),
+        workspace: workspace.to_string(),
+        path: path.to_string_lossy().into_owned(),
+        bytes,
+        taken_at: Utc::now(),
+        restored_to: Some(seat.id.clone()),
+    };
+    store.record_backup(backup.clone());
+    Ok(backup)
+}
+
+/// Before a turn: make sure the chat's workspace exists on this seat, and if
+/// it came up empty while this computer holds a snapshot of it (the trial
+/// died, the box was destroyed, the chat moved seats) — restore it. Returns
+/// a transcript note when something was restored or couldn't be.
+pub async fn ensure_chat_workspace(
+    http: &reqwest::Client,
+    store: &CloudStore,
+    seat: &SeatConfig,
+    chat_id: &str,
+    workspace: &str,
+    repo_less: bool,
+) -> Option<String> {
+    let prepare = chat_workspace_prepare(workspace, repo_less);
+    let empty = match seat_exec(http, store, seat, &prepare, Duration::from_secs(40)).await {
+        Ok(out) => out.stdout.contains("__cosmos_ws_empty"),
+        Err(e) => return Some(format!("Couldn't prepare the workspace on the seat: {e}")),
+    };
+    restore_chat_workspace_if_empty(http, store, seat, chat_id, workspace, empty).await
+}
+
+/// The shell line that creates a chat's workspace (git-initialising a
+/// repo-less one) and prints `__cosmos_ws_empty` / `__cosmos_ws_has`.
+pub fn chat_workspace_prepare(workspace: &str, repo_less: bool) -> String {
+    if repo_less {
+        workspace_prepare_command(workspace)
+    } else {
+        let ws = shell_word(workspace);
+        format!(
+            "mkdir -p {ws} && cd {ws} && {{ [ -n \"$(ls -A 2>/dev/null)\" ] && echo __cosmos_ws_has || echo __cosmos_ws_empty; }}"
+        )
+    }
+}
+
+/// Restore the chat's snapshot when its workspace came up `empty`.
+pub async fn restore_chat_workspace_if_empty(
+    http: &reqwest::Client,
+    store: &CloudStore,
+    seat: &SeatConfig,
+    chat_id: &str,
+    workspace: &str,
+    empty: bool,
+) -> Option<String> {
+    if !empty {
+        return None;
+    }
+    let backup = store.backup_for_chat(chat_id)?;
+    match restore_dir(http, store, seat, workspace, Path::new(&backup.path)).await {
+        Ok(()) => {
+            store.mark_backup_restored(chat_id, &seat.id);
+            Some(format!(
+                "Restored this chat's workspace from the backup on your computer ({}, {}) — earlier work is back on the seat.",
+                human_bytes(backup.bytes),
+                backup.taken_at.format("%b %-d %H:%M UTC")
+            ))
+        }
+        Err(e) => Some(format!(
+            "This chat has a workspace backup on your computer, but restoring it failed ({e}) — the seat starts empty."
+        )),
+    }
+}
+
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Harness-native conversation continuity for seat runs: the flags that
+/// start (first turn) or resume (later turns) the same conversation, spliced
+/// into the seat's harness command. `session` is a stable UUID per chat.
+/// Harnesses without a resumable id get `None` — the caller falls back to a
+/// transcript digest in the prompt.
+pub fn continuation_flags(command: &str, session: &str, resume: bool) -> Option<String> {
+    let bin = command_bin(command);
+    if bin.contains("claude") {
+        return Some(if resume {
+            format!("--resume {session}")
+        } else {
+            format!("--session-id {session}")
+        });
+    }
+    if bin.contains("opencode") {
+        return resume.then(|| "--continue".to_string());
+    }
+    if bin.contains("codex") {
+        // `codex exec` → `codex exec resume --last` on later turns.
+        return resume.then(|| "resume --last".to_string());
+    }
+    None
+}
+
+/// The program a seat command line runs: the first word after any
+/// `KEY=value` environment prefixes, path and `.exe` stripped, lowercased.
+pub fn command_bin(command: &str) -> String {
+    command
+        .split_whitespace()
+        .find(|word| !word.contains('='))
+        .unwrap_or("")
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(".exe")
+        .to_lowercase()
+}
+
+/// How one harness runs headless on a seat: its CLI line (the prompt is
+/// appended, or fills `{prompt}`) and a best-effort install for seats that
+/// don't have it yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatHarness {
+    pub command: String,
+    pub install: String,
+}
+
+/// Quote a model id for the command line; ids are catalog strings
+/// (`claude-opus-…`, `openai/gpt-…`), but never trust them raw.
+fn model_arg(flag: &str, model: Option<&str>) -> String {
+    model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(|m| format!(" {flag} {}", shell_word(m)))
+        .unwrap_or_default()
+}
+
+/// The composer's harness + model pick, as the CLI line that runs it on a
+/// seat — the same agents and logins as on this computer, headless. Agents
+/// without a scriptable one-shot mode say so instead of guessing.
+pub fn seat_harness(
+    harness: zeron_proto::HarnessId,
+    model: Option<&str>,
+    reasoning: Option<zeron_proto::ReasoningLevel>,
+) -> Result<SeatHarness, String> {
+    use zeron_proto::HarnessId as H;
+    use zeron_proto::ReasoningLevel as R;
+    let install = |bin: &str, how: &str| {
+        format!("command -v {bin} >/dev/null 2>&1 || {{ {how} ; }} >/dev/null 2>&1 || true")
+    };
+    Ok(match harness {
+        // Root seats (Railway's VM) refuse --dangerously-skip-permissions
+        // unless the CLI is told it's in a sandbox — which a seat is.
+        H::ClaudeCode => SeatHarness {
+            command: format!(
+                "IS_SANDBOX=1 claude -p --dangerously-skip-permissions --output-format stream-json --verbose{}",
+                model_arg("--model", model)
+            ),
+            install: install(
+                "claude",
+                "npm i -g @anthropic-ai/claude-code || curl -fsSL https://claude.ai/install.sh | bash",
+            ),
+        },
+        H::Codex => {
+            let effort = match reasoning {
+                Some(R::Minimal) => Some("minimal"),
+                Some(R::Low) => Some("low"),
+                Some(R::Medium) => Some("medium"),
+                Some(R::High | R::Max | R::Ultra | R::Ultrathink) => Some("high"),
+                Some(R::XHigh | R::Ultracode) => Some("xhigh"),
+                None => None,
+            };
+            SeatHarness {
+                command: format!(
+                    "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox{}{}",
+                    model_arg("-m", model),
+                    effort
+                        .map(|e| format!(" -c model_reasoning_effort={e}"))
+                        .unwrap_or_default()
+                ),
+                install: install("codex", "npm i -g @openai/codex"),
+            }
+        }
+        H::Opencode => SeatHarness {
+            command: format!("opencode run{}", model_arg("-m", model)),
+            install: install(
+                "opencode",
+                "npm i -g opencode-ai || curl -fsSL https://opencode.ai/install | bash",
+            ),
+        },
+        H::Cursor => SeatHarness {
+            command: format!(
+                "cursor-agent -p --force --output-format text{}",
+                model_arg("--model", model)
+            ),
+            install: install(
+                "cursor-agent",
+                "curl -fsS https://cursor.com/install | bash",
+            ),
+        },
+        H::Devin => SeatHarness {
+            command: format!(
+                "devin -p --permission-mode dangerous --respect-workspace-trust false{} -- {{prompt}}",
+                model_arg("--model", model)
+            ),
+            install: install("devin", "curl -fsSL https://cli.devin.ai/install.sh | bash"),
+        },
+        H::Grok => SeatHarness {
+            command: "grok -p".into(),
+            install: install(
+                "grok",
+                "curl -fsSL https://x.ai/cli/install.sh | bash || npm i -g @xai-official/grok",
+            ),
+        },
+        H::KimiCode => SeatHarness {
+            command: format!("kimi --print{} -p", model_arg("--model", model)),
+            install: install(
+                "kimi",
+                "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash || npm i -g @moonshot-ai/kimi-code",
+            ),
+        },
+        H::Amp => SeatHarness {
+            command: "amp --dangerously-allow-all -x".into(),
+            install: install("amp", "npm i -g @sourcegraph/amp"),
+        },
+        H::Hermes | H::Pi | H::Antigravity | H::Mock => {
+            return Err(format!(
+                "{harness:?} can't run on a cloud seat yet (it has no headless one-shot mode) — pick Claude Code, Codex, OpenCode, Cursor, Devin, Grok, Kimi or Amp for cloud runs"
+            ));
+        }
+    })
+}
+
+/// Splice continuation flags into a harness command, just before the
+/// `{prompt}` slot when there is one, else at the end (the prompt is
+/// appended after).
+pub fn with_continuation(command: &str, flags: Option<&str>) -> String {
+    let Some(flags) = flags.filter(|f| !f.is_empty()) else {
+        return command.to_string();
+    };
+    if command.contains("{prompt}") {
+        command.replacen("{prompt}", &format!("{flags} {{prompt}}"), 1)
+    } else {
+        format!("{command} {flags}")
+    }
+}
+
+/// A UUID-shaped harness session id derived from the chat id, stable across
+/// turns and devices (`claude --session-id` requires a UUID).
+pub fn harness_session_id(chat_id: &str) -> String {
+    if let Ok(uuid) = uuid::Uuid::parse_str(chat_id) {
+        return uuid.to_string();
+    }
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(chat_id.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_random_bytes(bytes)
+        .into_uuid()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,7 +2237,14 @@ pub async fn probe_seat(
                 probe.detail = Some("trial hour ended — claim the box or start a new trial".into());
                 return probe;
             }
-            match crate::railway::probe_with_existing_deadline(seat.expires_at.is_some()).await {
+            match crate::railway::probe_with_existing_deadline(
+                seat.ssh_alias
+                    .as_deref()
+                    .unwrap_or(crate::railway::RAILWAY_HOST),
+                seat.expires_at.is_some(),
+            )
+            .await
+            {
                 Ok(trial) => {
                     probe.online = true;
                     probe.detail = trial.detail.or_else(|| Some("railway.new trial VM".into()));
@@ -1518,7 +2356,7 @@ pub async fn probe_seat(
                         {
                             let mut seat = seat.clone();
                             seat.ssh_endpoint = sandbox.ssh_endpoint;
-                            store.save_seat(seat);
+                            let _ = store.save_seat(seat);
                         }
                     }
                     Err(e) => probe.detail = Some(e),
@@ -1544,7 +2382,7 @@ pub async fn probe_seat(
                             let mut seat = seat.clone();
                             seat.box_id = Some(live.id.clone());
                             seat.ssh_endpoint = live.ssh_endpoint.clone();
-                            store.save_seat(seat);
+                            let _ = store.save_seat(seat);
                             probe.online = live.usable();
                             probe.sleeping = live.sleeping();
                         } else {
@@ -1607,7 +2445,7 @@ pub async fn ssh_exec(
 ) -> Result<ExecOutcome, String> {
     let output = tokio::time::timeout(
         timeout,
-        tokio::process::Command::new("ssh")
+        ssh()
             .args([
                 "-o",
                 "BatchMode=yes",
@@ -1622,7 +2460,7 @@ pub async fn ssh_exec(
     )
     .await
     .map_err(|_| format!("ssh {alias} timed out"))?
-    .map_err(|e| format!("could not run ssh: {e}"))?;
+    .map_err(ssh_spawn_error)?;
     Ok(ExecOutcome {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -1638,7 +2476,7 @@ pub async fn ssh_exec_stdin(
 ) -> Result<ExecOutcome, String> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
-    let mut child = tokio::process::Command::new("ssh")
+    let mut child = ssh()
         .args([
             "-o",
             "BatchMode=yes",
@@ -1653,7 +2491,7 @@ pub async fn ssh_exec_stdin(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not run ssh: {e}"))?;
+        .map_err(ssh_spawn_error)?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(input)
@@ -1663,7 +2501,7 @@ pub async fn ssh_exec_stdin(
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
         .map_err(|_| format!("ssh {alias} timed out"))?
-        .map_err(|e| format!("could not run ssh: {e}"))?;
+        .map_err(ssh_spawn_error)?;
     Ok(ExecOutcome {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -1762,7 +2600,7 @@ pub async fn seat_exec_stream(seat: &SeatConfig, command: &str) -> Result<ExecSt
         }
         _ => return Err("streaming exec needs an SSH or Railway seat".to_string()),
     };
-    let mut child = tokio::process::Command::new("ssh")
+    let mut child = ssh()
         .args([
             "-o",
             "BatchMode=yes",
@@ -1778,7 +2616,7 @@ pub async fn seat_exec_stream(seat: &SeatConfig, command: &str) -> Result<ExecSt
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| format!("could not spawn ssh: {e}"))?;
+        .map_err(ssh_spawn_error)?;
     let stdout = child
         .stdout
         .take()
@@ -2075,6 +2913,15 @@ pub struct RepoInfo {
 #[serde(rename_all = "camelCase", default)]
 pub struct RepoPage {
     pub items: Vec<RepoHit>,
+    pub truncated: bool,
+}
+
+/// One repo's branches for the cloud branch picker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchPage {
+    pub items: Vec<String>,
+    pub default_branch: String,
     pub truncated: bool,
 }
 
@@ -2662,6 +3509,49 @@ impl<'a> GitHub<'a> {
             .unwrap_or_else(|| "github token works".into()))
     }
 
+    /// `GET /repos/{repo}/branches` — the branch picker's rows (up to 500,
+    /// `truncated` past that), the default branch first.
+    pub async fn branches(&self, repo: &str) -> Result<BranchPage, String> {
+        let info = self.repo(repo).await?;
+        let mut items = Vec::new();
+        let mut truncated = false;
+        for page in 1..=5 {
+            let resp = self
+                .get(&format!("/repos/{repo}/branches?per_page=100&page={page}"))
+                .send()
+                .await
+                .map_err(|e| format!("github: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(Self::error(resp).await);
+            }
+            let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let rows = v.as_array().cloned().unwrap_or_default();
+            let len = rows.len();
+            items.extend(
+                rows.iter()
+                    .filter_map(|b| b["name"].as_str().map(str::to_string)),
+            );
+            if len < 100 {
+                break;
+            }
+            if page == 5 {
+                truncated = true;
+            }
+        }
+        let default_branch = info.default_branch;
+        if let Some(ix) = items.iter().position(|b| *b == default_branch) {
+            let name = items.remove(ix);
+            items.insert(0, name);
+        } else if !default_branch.is_empty() {
+            items.insert(0, default_branch.clone());
+        }
+        Ok(BranchPage {
+            items,
+            default_branch,
+            truncated,
+        })
+    }
+
     /// `GET /user/orgs` — orgs the token can see, for the picker's grouping.
     pub async fn orgs(&self) -> Result<OrgPage, String> {
         let mut out = Vec::new();
@@ -2870,6 +3760,129 @@ pub fn runs_file_name() -> &'static str {
 // Kanban) instead of erroring a chat nobody asked for.
 // ---------------------------------------------------------------------------
 
+/// What a new task (Kanban "+ New task", an automation fire) runs.
+pub struct TaskSpec {
+    pub title: String,
+    pub prompt: String,
+    /// Cloud seat; `None` = this computer.
+    pub seat_id: Option<String>,
+    /// Local project (and the project context for seat runs).
+    pub space_id: Option<String>,
+    pub harness: Option<zeron_proto::HarnessId>,
+    /// Seat workspace to use instead of the per-chat default (automations
+    /// keep one workspace across fires).
+    pub seat_workspace: Option<String>,
+}
+
+/// Create the chat a task runs in — bound to its seat (repo-less seats get
+/// the per-chat workspace) — and return `(chat_id, cwd)`.
+pub fn create_task_chat(
+    store: &CloudStore,
+    workspace: &crate::workspace_host::WorkspaceHost,
+    device_id: &str,
+    spec: &TaskSpec,
+) -> Result<(String, String), EngineError> {
+    let chat_id = crate::new_id();
+    let seat = match spec.seat_id.as_deref() {
+        Some(id) => Some(
+            store
+                .seat(id)
+                .ok_or_else(|| EngineError::Other(format!("no such seat: {id}")))?,
+        ),
+        None => None,
+    };
+    if let Some(seat) = &seat
+        && seat.expired()
+    {
+        return Err(EngineError::Other(
+            "that Railway trial has ended — pick a live seat".into(),
+        ));
+    }
+    let binding = seat.as_ref().map(|seat| CloudSeatBinding {
+        seat_id: seat.id.clone(),
+        kind: seat.kind.unwrap_or(CloudSeatKind::Ssh),
+        label: seat.label.clone(),
+        repo: seat.repo.clone(),
+        workspace_path: Some(match (&spec.seat_workspace, &seat.repo) {
+            (Some(ws), _) => ws.clone(),
+            (None, Some(_)) => seat.workspace(),
+            (None, None) => chat_workspace(&seat.workspace(), &chat_id),
+        }),
+        branch: None,
+        model_label: None,
+        expires_at: seat.expires_at,
+    });
+    let seat_cwd = binding.as_ref().and_then(|b| b.workspace_path.clone());
+    workspace.create_chat_with_parent(
+        &chat_id,
+        spec.space_id.as_deref(),
+        Some(device_id),
+        None,
+        seat_cwd.clone(),
+        None,
+        binding,
+    )?;
+    workspace
+        .rename_chat(&chat_id, &spec.title)
+        .map_err(|e| EngineError::Other(e.to_string()))?;
+    let cwd = seat_cwd
+        .or_else(|| {
+            spec.space_id
+                .as_deref()
+                .and_then(|id| workspace.space(id).ok().flatten())
+                .map(|space| space.path)
+        })
+        .unwrap_or_else(|| "~".to_string());
+    Ok((chat_id, cwd))
+}
+
+/// Queue a task's first run (the host's normal drain dispatches it —
+/// remotely for seat-bound chats).
+pub fn queue_task_run(
+    doc_host: &crate::doc_host::DocHost,
+    chat_id: &str,
+    prompt: &str,
+    cwd: &str,
+    harness: Option<zeron_proto::HarnessId>,
+) -> Result<(), EngineError> {
+    doc_host.queue_command(
+        chat_id,
+        zeron_doc::SessionCommandPayload::Run {
+            request: zeron_proto::RunRequest {
+                prompt: prompt.to_string(),
+                harness,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                cwd: cwd.to_string(),
+                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                auto_approve: true,
+                resume: None,
+                attachments: Vec::new(),
+                worktree: None,
+            },
+            message_id: crate::new_id(),
+        },
+    )?;
+    Ok(())
+}
+
+/// A task title from its prompt's first line.
+pub fn task_title(prompt: &str) -> String {
+    let line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("New task");
+    let mut chars = line.chars();
+    let head: String = chars.by_ref().take(60).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 pub struct Scheduler {
     store: CloudStore,
     doc_host: crate::doc_host::DocHost,
@@ -2906,14 +3919,25 @@ impl Scheduler {
                 if let Err(e) = self.tick().await {
                     tracing::warn!(error = %e, "cloud automation tick failed");
                 }
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                // "Run now" wakes the loop early; otherwise the 30s cadence.
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = self.store.inner.run_now_signal.notified() => {}
+                }
             }
         })
     }
 
     /// One scheduler pass: snapshot any Railway seat nearing its deadline,
-    /// then claim due automations and fire each.
+    /// then claim due automations (and any "Run now" requests) and fire each.
     async fn tick(&self) -> Result<(), EngineError> {
+        for automation in self.store.take_run_now() {
+            if let Err(e) = self.fire(&automation).await {
+                tracing::warn!(automation = %automation.id, error = %e, "automation run-now failed");
+                self.store
+                    .mark_automation(&automation.id, &format!("error:{e}"), None);
+            }
+        }
         self.backup_sweep().await;
         for automation in self.store.claim_due(Utc::now()) {
             if let Err(e) = self.fire(&automation).await {
@@ -2982,7 +4006,14 @@ impl Scheduler {
                     kind: seat.kind.unwrap_or(CloudSeatKind::Ssh),
                     label: seat.label.clone(),
                     repo: seat.repo.clone(),
-                    workspace_path: Some(seat.workspace()),
+                    // Repo-less automations keep one workspace across fires
+                    // (each fire is a fresh chat, the files carry over).
+                    workspace_path: Some(if seat.repo.is_some() {
+                        seat.workspace()
+                    } else {
+                        automation_workspace(&seat.workspace(), &automation.id)
+                    }),
+                    branch: None,
                     model_label: None,
                     expires_at: seat.expires_at,
                 })
@@ -2991,54 +4022,30 @@ impl Scheduler {
         };
 
         // The run's chat — one per fire, titled `name · timestamp`.
-        let chat_id = crate::new_id();
         let title = format!(
             "{} · {}",
             automation.name,
             Utc::now().format("%b %-d %H:%M")
         );
-        self.workspace.create_chat_with_parent(
-            &chat_id,
-            automation.space_id.as_deref(),
-            Some(&self.device_id),
-            None,
-            seat.as_ref().map(|s| s.workspace()),
-            None,
-            binding,
-        )?;
-        self.workspace
-            .rename_chat(&chat_id, &title)
-            .map_err(|e| EngineError::Other(e.to_string()))?;
-
-        let cwd = seat
-            .as_ref()
-            .map(|s| s.workspace())
-            .or_else(|| {
-                automation
-                    .space_id
-                    .as_deref()
-                    .and_then(|id| self.workspace.space(id).ok().flatten())
-                    .map(|space| space.path)
-            })
-            .unwrap_or_else(|| "~".to_string());
-        self.doc_host.queue_command(
-            &chat_id,
-            zeron_doc::SessionCommandPayload::Run {
-                request: zeron_proto::RunRequest {
-                    prompt: automation.prompt.clone(),
-                    harness: None,
-                    model: None,
-                    reasoning: None,
-                    model_options: Default::default(),
-                    cwd,
-                    sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
-                    auto_approve: true,
-                    resume: None,
-                    attachments: Vec::new(),
-                    worktree: None,
-                },
-                message_id: crate::new_id(),
+        let (chat_id, cwd) = create_task_chat(
+            &self.store,
+            &self.workspace,
+            &self.device_id,
+            &TaskSpec {
+                title,
+                prompt: automation.prompt.clone(),
+                seat_id: automation.seat_id.clone(),
+                space_id: automation.space_id.clone(),
+                harness: automation.harness,
+                seat_workspace: binding.and_then(|b| b.workspace_path),
             },
+        )?;
+        queue_task_run(
+            &self.doc_host,
+            &chat_id,
+            &automation.prompt,
+            &cwd,
+            automation.harness,
         )?;
         self.store
             .mark_automation(&automation.id, "ok", Some(&chat_id));
@@ -3107,11 +4114,326 @@ mod tests {
     }
 
     #[test]
+    fn chat_and_automation_workspaces_are_isolated_paths() {
+        assert_eq!(
+            chat_workspace("/app/", "3f2a9c1e-77aa-4b1b-9e0e-1234"),
+            "/app/chats/3f2a9c1e77aa"
+        );
+        assert_eq!(chat_workspace("/app", "../.."), "/app/chats/chat");
+        assert_eq!(
+            automation_workspace("/w", "auto-9f; rm"),
+            "/w/automations/auto-9frm"
+        );
+    }
+
+    #[test]
+    fn mints_an_ssh_key_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("cosmos_ed25519");
+        if std::process::Command::new("ssh-keygen")
+            .arg("-?")
+            .output()
+            .is_err()
+        {
+            return; // no OpenSSH on this machine
+        }
+        mint_ssh_key(&key).unwrap();
+        assert!(key.exists());
+        let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+        assert!(public.starts_with("ssh-ed25519 ") && public.contains("cosmos-desktop"));
+    }
+
+    #[test]
+    fn picked_harness_runs_headless_on_the_seat() {
+        use zeron_proto::{HarnessId, ReasoningLevel};
+        let claude = seat_harness(HarnessId::ClaudeCode, Some("claude-opus-4-5"), None).unwrap();
+        assert_eq!(
+            claude.command,
+            "IS_SANDBOX=1 claude -p --dangerously-skip-permissions --output-format stream-json --verbose --model 'claude-opus-4-5'"
+        );
+        assert_eq!(command_bin(&claude.command), "claude");
+        assert!(claude.install.starts_with("command -v claude"));
+        let codex =
+            seat_harness(HarnessId::Codex, Some("gpt-5"), Some(ReasoningLevel::High)).unwrap();
+        assert!(
+            codex
+                .command
+                .ends_with("-m 'gpt-5' -c model_reasoning_effort=high")
+        );
+        let opencode =
+            seat_harness(HarnessId::Opencode, Some("opencode/big-pickle"), None).unwrap();
+        assert_eq!(opencode.command, "opencode run -m 'opencode/big-pickle'");
+        let devin = seat_harness(HarnessId::Devin, Some("swe-2-max"), None).unwrap();
+        assert!(devin.command.ends_with("--model 'swe-2-max' -- {prompt}"));
+        // A hostile model id can't break out of its word.
+        let evil = seat_harness(HarnessId::Opencode, Some("x'; rm -rf / #"), None).unwrap();
+        assert_eq!(evil.command, "opencode run -m 'x'\\''; rm -rf / #'");
+        assert!(seat_harness(HarnessId::Mock, None, None).is_err());
+        assert_eq!(command_bin("FOO=1 /usr/bin/Codex.exe exec"), "codex");
+        // The install prelude is valid sh.
+        let ok = std::process::Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(format!("{} ; true", claude.install))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(true);
+        assert!(ok);
+    }
+
+    #[test]
+    fn continuation_flags_per_harness() {
+        let sid = harness_session_id("not-a-uuid");
+        assert!(uuid::Uuid::parse_str(&sid).is_ok());
+        assert_eq!(sid, harness_session_id("not-a-uuid"));
+        assert_eq!(
+            continuation_flags("claude -p", &sid, false).unwrap(),
+            format!("--session-id {sid}")
+        );
+        assert_eq!(
+            continuation_flags("/usr/bin/claude -p", &sid, true).unwrap(),
+            format!("--resume {sid}")
+        );
+        assert_eq!(continuation_flags("opencode run", &sid, false), None);
+        assert_eq!(
+            continuation_flags("opencode run -m x", &sid, true).as_deref(),
+            Some("--continue")
+        );
+        assert_eq!(continuation_flags("aider --yes", &sid, true), None);
+        assert_eq!(
+            with_continuation("claude -p {prompt} --verbose", Some("--resume x")),
+            "claude -p --resume x {prompt} --verbose"
+        );
+        assert_eq!(
+            with_continuation("opencode run", Some("--continue")),
+            "opencode run --continue"
+        );
+        assert_eq!(with_continuation("opencode run", None), "opencode run");
+    }
+
+    #[test]
+    fn backups_round_trip_and_resume_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CloudStore::load(dir.path());
+        let path = store.chat_backup_path("chat/../1");
+        assert!(path.ends_with("chat-chat1.tar.gz"));
+        std::fs::write(&path, b"x").unwrap();
+        store.record_backup(WorkspaceBackup {
+            chat_id: "chat/../1".into(),
+            seat_id: "s".into(),
+            workspace: "/app/chats/c1".into(),
+            path: path.to_string_lossy().into_owned(),
+            bytes: 1,
+            taken_at: Utc::now(),
+            restored_to: None,
+        });
+        assert!(store.backup_for_chat("chat/../1").is_some());
+        store.mark_backup_restored("chat/../1", "s2");
+        let reloaded = CloudStore::load(dir.path());
+        assert_eq!(
+            reloaded
+                .backup_for_chat("chat/../1")
+                .unwrap()
+                .restored_to
+                .as_deref(),
+            Some("s2")
+        );
+        assert_eq!(reloaded.harness_session_for_chat("c", "s"), None);
+        let now = Utc::now();
+        reloaded.upsert_run(CloudRun {
+            id: "r1".into(),
+            chat_id: "c".into(),
+            seat_id: "s".into(),
+            command: None,
+            status: zeron_proto::CloudRunStatus::Done,
+            log_path: None,
+            remote_ref: None,
+            mirrored_bytes: 3,
+            remote_cursor: None,
+            entry_id: None,
+            error: None,
+            workspace: None,
+            harness_session: Some("sid".into()),
+            prompt: None,
+            started_at: now,
+            finished_at: Some(now),
+            updated_at: now,
+        });
+        assert_eq!(
+            reloaded.harness_session_for_chat("c", "s").as_deref(),
+            Some("sid")
+        );
+        assert_eq!(reloaded.harness_session_for_chat("c", "other"), None);
+    }
+
+    #[test]
+    fn unscheduled_automation_is_scheduled_not_fired() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CloudStore::load(dir.path());
+        store.save_automation(CloudAutomation {
+            id: "a".into(),
+            name: "n".into(),
+            prompt: "p".into(),
+            schedule: "hourly".into(),
+            seat_id: None,
+            space_id: None,
+            harness: None,
+            enabled: true,
+            last_run_at: None,
+            next_run_at: None,
+            last_status: None,
+            last_chat_id: None,
+        });
+        let now = at(0);
+        assert!(store.claim_due(now).is_empty());
+        assert_eq!(
+            store.automations()[0].next_run_at,
+            Some(now + chrono::Duration::hours(1))
+        );
+    }
+
+    #[test]
+    fn run_now_queues_known_automations_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CloudStore::load(dir.path());
+        assert!(store.request_run_now("nope").is_err());
+        store.save_automation(CloudAutomation {
+            id: "a".into(),
+            name: "n".into(),
+            prompt: "p".into(),
+            schedule: "daily".into(),
+            seat_id: None,
+            space_id: None,
+            harness: None,
+            enabled: false,
+            last_run_at: None,
+            next_run_at: None,
+            last_status: None,
+            last_chat_id: None,
+        });
+        store.request_run_now("a").unwrap();
+        store.request_run_now("a").unwrap();
+        let fired = store.take_run_now();
+        assert_eq!(fired.len(), 1, "duplicate requests collapse");
+        assert!(store.take_run_now().is_empty());
+        assert!(store.automations()[0].last_run_at.is_some());
+    }
+
+    /// Workspace persistence over a real ssh link: prepare (git init) →
+    /// write work → checkpoint → snapshot to this computer → wipe the seat
+    /// → ensure_chat_workspace restores it. Opt-in: point
+    /// `COSMOS_SSH_E2E_ALIAS` at an ssh alias whose host has git + tar.
+    #[tokio::test]
+    async fn repo_less_workspace_checkpoint_backup_restore_over_ssh() {
+        let Some(alias) = std::env::var_os("COSMOS_SSH_E2E_ALIAS") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = CloudStore::load(dir.path());
+        let base = format!("/tmp/cosmos-e2e-{}", crate::new_id());
+        let seat = SeatConfig {
+            id: "seat-e2e".into(),
+            kind: Some(CloudSeatKind::Railway),
+            label: "e2e".into(),
+            ssh_alias: Some(alias.to_string_lossy().into_owned()),
+            workspace_path: Some(base.clone()),
+            ..Default::default()
+        };
+        store.save_seat(seat.clone()).unwrap();
+        let http = reqwest::Client::new();
+        let ws = chat_workspace(&base, "chat-e2e-1");
+        // Fresh: prepared + git-initialised, nothing to restore.
+        assert!(
+            ensure_chat_workspace(&http, &store, &seat, "chat-e2e-1", &ws, true)
+                .await
+                .is_none()
+        );
+        let run = |cmd: String| {
+            let http = http.clone();
+            let store = store.clone();
+            let seat = seat.clone();
+            async move {
+                seat_exec(&http, &store, &seat, &cmd, Duration::from_secs(30))
+                    .await
+                    .unwrap()
+            }
+        };
+        run(format!(
+            "cd {} && echo 'print(1)' > app.py && mkdir -p node_modules && echo junk > node_modules/x",
+            shell_word(&ws)
+        ))
+        .await;
+        let commit = run(checkpoint_command(&ws, "build the app\nmore")).await;
+        assert!(!commit.stdout.trim().is_empty(), "{}", commit.stderr);
+        let log = run(format!("cd {} && git log --format=%s", shell_word(&ws))).await;
+        assert_eq!(log.stdout.trim(), "Cosmos checkpoint: build the app");
+        let tracked = run(format!("cd {} && git ls-files", shell_word(&ws))).await;
+        assert_eq!(tracked.stdout.trim(), "app.py", "build dirs stay out");
+        let backup = backup_chat_workspace(&http, &store, &seat, "chat-e2e-1", &ws)
+            .await
+            .unwrap();
+        assert!(backup.bytes > 0);
+        // The seat dies: its workspace is gone.
+        run(format!("rm -rf {}", shell_word(&base))).await;
+        let note = ensure_chat_workspace(&http, &store, &seat, "chat-e2e-1", &ws, true)
+            .await
+            .expect("restore note");
+        assert!(note.starts_with("Restored"), "{note}");
+        let back = run(format!(
+            "cd {} && cat app.py && git log --format=%s && ls node_modules 2>&1 | head -1",
+            shell_word(&ws)
+        ))
+        .await;
+        assert!(back.stdout.contains("print(1)"), "{}", back.stdout);
+        assert!(back.stdout.contains("Cosmos checkpoint: build the app"));
+        assert!(!back.stdout.contains("\nx\n"), "node_modules excluded");
+
+        // The desktop over the same link: the turn-start prep returns fast
+        // (bring-up is detached — the ssh session must not hang on it), then
+        // the pane's capture and an act round-trip.
+        let started = std::time::Instant::now();
+        let prep = format!(
+            "{{ {} ; }} ; {}",
+            crate::seat_desktop::bootstrap_command(),
+            chat_workspace_prepare(&ws, true)
+        );
+        let out = run(prep).await;
+        assert!(out.stdout.contains("__cosmos_desktop_ok"), "{}", out.stderr);
+        assert!(out.stdout.contains("__cosmos_ws_has"));
+        assert!(started.elapsed() < Duration::from_secs(20), "prep hung");
+        let ready = run(crate::seat_desktop::start_command()).await;
+        assert!(ready.stdout.contains("__status=ready"), "{}", ready.stderr);
+        let screen = linux_screen(&http, &store, &seat).await.unwrap();
+        assert_eq!(screen["width"], 1280, "{screen}");
+        let act = crate::seat_desktop::SeatAction::Type { text: "hi".into() }
+            .command()
+            .unwrap();
+        assert_eq!(run(act).await.code, 0);
+        run(format!("rm -rf {}", shell_word(&base))).await;
+    }
+
+    #[test]
     fn repo_prelude_keeps_the_token_out_of_the_remote() {
-        let prelude = repo_checkout_prelude("me/cosmos");
+        let prelude = repo_checkout_prelude("me/cosmos", None);
         assert!(prelude.contains("'https://github.com/me/cosmos.git'"));
         assert!(prelude.contains("$GITHUB_TOKEN"));
         assert!(!prelude.contains("x-access-token:$GITHUB_TOKEN@"));
+        assert!(!prelude.contains("--branch"));
+        let on_branch = repo_checkout_prelude("me/cosmos", Some("feat/x"));
+        assert!(on_branch.contains("clone --quiet --branch 'feat/x' "));
+    }
+
+    #[test]
+    fn repo_workspaces_split_by_branch() {
+        assert_eq!(repo_workspace("/app/", "me/cosmos", None), "/app/cosmos");
+        assert_eq!(
+            repo_workspace("/app", "me/cosmos", Some(" ")),
+            "/app/cosmos"
+        );
+        assert_eq!(
+            repo_workspace("/app", "me/cosmos", Some("feat/new ui")),
+            "/app/cosmos@feat-new-ui"
+        );
     }
 
     fn at(minute: u32) -> DateTime<Utc> {
@@ -3412,6 +4734,7 @@ mod tests {
             schedule: "hourly".into(),
             seat_id: None,
             space_id: None,
+            harness: None,
             enabled: true,
             last_run_at: None,
             next_run_at: Some(now - chrono::Duration::minutes(5)),
@@ -3535,18 +4858,23 @@ mod device_flow_tests {
 
 /// Captures the seat's X display when one is running, otherwise a live
 /// system snapshot — Railway, Boat and VPS seats are headless Linux boxes.
-const LINUX_SCREEN_SCRIPT: &str = r#"
+pub(crate) const LINUX_SCREEN_SCRIPT: &str = r#"
 d=""
+if [ -e /tmp/.X11-unix/X99 ]; then d=":99"; else
 for s in /tmp/.X11-unix/X*; do [ -e "$s" ] && d=":${s##*/X}" && break; done
+fi
+ds=$(cat "$HOME/.cosmos/desktop.status" 2>/dev/null)
 if [ -n "$d" ]; then
   f="/tmp/cosmos-screen-$$.png"
-  if command -v import >/dev/null 2>&1; then DISPLAY=$d import -window root "$f" >/dev/null 2>&1
+  if [ -x "$HOME/.cosmos/bin/cosmos-computer" ]; then DISPLAY=$d "$HOME/.cosmos/bin/cosmos-computer" screenshot "$f" >/dev/null 2>&1
+  elif command -v import >/dev/null 2>&1; then DISPLAY=$d import -window root "$f" >/dev/null 2>&1
   elif command -v scrot >/dev/null 2>&1; then DISPLAY=$d scrot -o "$f" >/dev/null 2>&1
   fi
-  if [ -s "$f" ]; then echo "__PNG__"; base64 "$f" | tr -d '\n'; echo; rm -f "$f"; exit 0; fi
+  if [ -s "$f" ]; then echo "__PNG__"; base64 "$f" | tr -d '\n'; echo; echo "__DISPLAY__ $d"; rm -f "$f"; exit 0; fi
   rm -f "$f"
 fi
 echo "__SYS__"
+echo "desktop=${ds}"
 [ -r /etc/os-release ] && . /etc/os-release
 echo "os=${PRETTY_NAME:-$(uname -s)}"
 echo "kernel=$(uname -r)"
@@ -3586,7 +4914,7 @@ pub async fn linux_screen(
     })
 }
 
-fn parse_linux_screen(stdout: &str) -> Option<serde_json::Value> {
+pub(crate) fn parse_linux_screen(stdout: &str) -> Option<serde_json::Value> {
     let mut lines = stdout.lines().skip_while(|l| {
         let l = l.trim();
         l != "__PNG__" && l != "__SYS__"
@@ -3594,7 +4922,26 @@ fn parse_linux_screen(stdout: &str) -> Option<serde_json::Value> {
     match lines.next()?.trim() {
         "__PNG__" => {
             let png = lines.next()?.trim();
-            (!png.is_empty()).then(|| serde_json::json!({ "pngBase64": png }))
+            if png.is_empty() {
+                return None;
+            }
+            // The first 32 base64 chars decode the PNG signature + IHDR —
+            // enough for the pixel size "Take control" maps clicks onto.
+            let size = {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(&png[..png.len().min(32)])
+                    .ok()
+                    .and_then(|head| crate::seat_desktop::png_size(&head))
+            };
+            let display =
+                lines.find_map(|l| l.trim().strip_prefix("__DISPLAY__ ").map(str::to_string));
+            Some(serde_json::json!({
+                "pngBase64": png,
+                "width": size.map(|s| s.0),
+                "height": size.map(|s| s.1),
+                "display": display,
+            }))
         }
         _ => {
             let mut system = serde_json::Map::new();

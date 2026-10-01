@@ -10,7 +10,7 @@
     "parent": {"type": ["string", "null"], "pattern": "^[0-9a-z]{26}$"},
     "ts": {"type": "string", "format": "date-time"},
     "session": {"type": "string", "pattern": "^[0-9a-z]{26}$"},
-    "harness": {"enum": ["zcli", "zdev", "zagy"]},
+    "harness": {"enum": ["cosmostui", "zcli", "zdev", "zagy"]},
     "kind": {
       "enum": [
         "session_start", "session_end", "checkout", "user", "assistant",

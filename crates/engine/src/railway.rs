@@ -217,12 +217,13 @@ fn ssh_failure(out: &crate::cloud::ExecOutcome) -> String {
 /// the host key on first connect. `command` runs on the trial VM itself —
 /// the box IS the ssh session's target.
 async fn railway_ssh(
+    host: &str,
     command: &str,
     timeout: Duration,
 ) -> Result<crate::cloud::ExecOutcome, String> {
     let output = tokio::time::timeout(
         timeout,
-        tokio::process::Command::new("ssh")
+        crate::cloud::ssh()
             .args([
                 "-o",
                 "BatchMode=yes",
@@ -232,14 +233,14 @@ async fn railway_ssh(
                 "StrictHostKeyChecking=accept-new",
                 // The trial VM serves an interactive TUI on a bare connect;
                 // a non-interactive command runs it directly on the box.
-                RAILWAY_HOST,
+                host,
                 command,
             ])
             .output(),
     )
     .await
     .map_err(|_| "ssh railway.new timed out — region may be saturated".to_string())?
-    .map_err(|e| format!("could not run ssh: {e}"))?;
+    .map_err(crate::cloud::ssh_spawn_error)?;
     Ok(crate::cloud::ExecOutcome {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -346,12 +347,16 @@ fn ssh_failure_result(out: &crate::cloud::ExecOutcome, trial: RailwayTrial) -> R
 /// repeat connect reattaches to the SAME VM (until it dies or is claimed).
 /// The manifest on stderr carries the deadline + claim link.
 pub async fn provision() -> Result<RailwayTrial, RailwayFailure> {
-    let out = railway_ssh("echo __cosmos_alive && uname -sm && pwd", PROVISION_TIMEOUT)
-        .await
-        .map_err(|detail| RailwayFailure {
-            detail,
-            trial: RailwayTrial::default(),
-        })?;
+    let out = railway_ssh(
+        RAILWAY_HOST,
+        "echo __cosmos_alive && uname -sm && pwd",
+        PROVISION_TIMEOUT,
+    )
+    .await
+    .map_err(|detail| RailwayFailure {
+        detail,
+        trial: RailwayTrial::default(),
+    })?;
     let mut trial = parse_manifest(&out.stdout, &out.stderr, true);
     if trial.claim_required {
         return Err(claim_required_failure(trial));
@@ -374,13 +379,16 @@ pub async fn provision() -> Result<RailwayTrial, RailwayFailure> {
 /// Cheap liveness + manifest refresh — the deadline can move when a box is
 /// claimed or reattached.
 pub async fn probe() -> Result<RailwayTrial, RailwayFailure> {
-    probe_with_existing_deadline(false).await
+    probe_with_existing_deadline(RAILWAY_HOST, false).await
 }
 
+/// `host` is the seat's ssh alias (`railway.new` unless the seat names a
+/// claimed box's own alias).
 pub async fn probe_with_existing_deadline(
+    host: &str,
     existing_deadline: bool,
 ) -> Result<RailwayTrial, RailwayFailure> {
-    let out = railway_ssh("echo __cosmos_alive", PROBE_TIMEOUT)
+    let out = railway_ssh(host, "echo __cosmos_alive", PROBE_TIMEOUT)
         .await
         .map_err(|detail| RailwayFailure {
             detail,
