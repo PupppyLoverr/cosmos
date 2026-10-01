@@ -1,5 +1,5 @@
 # Contract artifacts are compared byte-for-byte across harnesses
-# (zcli include_str!, zagy go:embed, zdev text import, conformance C1).
+# (cosmostui include_str!, zagy go:embed, zdev text import, conformance C1).
 # core.autocrlf=true would check them out as CRLF on Windows and silently
 # break that guarantee — pin LF on every checkout.
 contracts/tools.json  text eol=lf

@@ -346,7 +346,7 @@ impl Config {
     /// Two forms: a `[models]` alias from config.toml (`r9`), or a catalog
     /// reference `provider/model` (`anthropic/claude-opus-5-5`,
     /// `chatgpt/gpt-5.5`, `openrouter/qwen/qwen3.8-max`). Keys come from the
-    /// provider's env vars or the credential store (`zcli auth login`).
+    /// provider's env vars or the credential store (`cosmostui auth login`).
     pub fn provider_for(&self, alias: &str) -> Option<(ProviderCfg, String)> {
         if let Some(m) = self.models.get(alias) {
             let p = self.providers.get(&m.provider)?;
@@ -395,7 +395,9 @@ impl Config {
             crate::live::cached(pid).and_then(|ms| ms.into_iter().find(|m| m.id == mid))
         });
         let (api_key, account_id) = match def.kind.as_str() {
-            "chatgpt" => match crate::chatgpt::fresh() {
+            // stored token only — Agent::turn refreshes right before each
+            // request, so resolving a model never blocks on the network
+            "chatgpt" => match crate::chatgpt::load() {
                 Some(t) => (Some(t.access), Some(t.account_id)),
                 None => (None, None),
             },

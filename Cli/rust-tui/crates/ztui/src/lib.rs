@@ -1,4 +1,4 @@
-//! ztui — interactive terminal front-end for zcli.
+//! ztui — interactive terminal front-end for cosmostui.
 //!
 //! Two faces: an inline TUI in the Devin CLI style (history committed to
 //! native scrollback, a live composer region redrawn beneath it) driving the
@@ -6,6 +6,8 @@
 //! there's no terminal (piped stdin/stdout, tests).
 
 mod highlight;
+#[cfg(feature = "highlight")]
+mod highlight_ts;
 mod line;
 mod logo;
 mod markdown;
@@ -36,7 +38,7 @@ pub fn repl(opts: &RunOpts, cwd: &Path) -> Result<i32> {
     }
 }
 
-/// Building blocks `zcli-welcome` (the one-shot onboarding binary) paints
+/// Building blocks `cosmostui-welcome` (the one-shot onboarding binary) paints
 /// with — the same renderer, palette and matcher as the TUI.
 #[doc(hidden)]
 pub mod kit {

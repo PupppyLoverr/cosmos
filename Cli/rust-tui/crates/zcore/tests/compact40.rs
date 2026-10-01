@@ -5,7 +5,7 @@
 //! at a logged checkpoint (never turn by turn).
 
 use zcore::agent::Agent;
-use zcore::compact::{estimate_tokens, prefix_hash};
+use zcore::compact::estimate_tokens;
 use zproto::{Block, Message, RunOpts};
 
 struct Run {
@@ -35,11 +35,11 @@ fn run(home: &std::path::Path, line_chars: usize, window: Option<u64>) -> Run {
         std::fs::write(ws.join(format!("f{i}.txt")), body).unwrap();
     }
     let opts = RunOpts { model: Some("fixture".into()), cwd: Some(ws.to_string_lossy().into()), yolo: true, ..Default::default() };
-    let mut a = Agent::new(&opts, "cosmos", &ws).unwrap();
+    let mut a = Agent::new(&opts, "cosmostui", &ws).unwrap();
     if let Some(w) = window {
         a.context_window = w;
     }
-    let prefix0 = prefix_hash(&a.system, ztools::TOOLS_JSON);
+    let prefix0 = a.prefix_now();
     let mut sink = |_: &zproto::Event| {};
     let (mut naive_cum, mut view_cum, mut busts, mut max_view) = (0u64, 0u64, 0usize, 0u64);
     let mut inflation = 0u64; // tokens L1 moved to disk (naive replay keeps them)
@@ -98,13 +98,13 @@ fn run(home: &std::path::Path, line_chars: usize, window: Option<u64>) -> Run {
             }
         }
     }
-    let prefix_stable = prefix_hash(&a.system, ztools::TOOLS_JSON) == prefix0 && a.prefix_hash == prefix0;
+    let prefix_stable = a.prefix_now() == prefix0 && a.prefix_hash == prefix0;
     // resume from the log must rebuild exactly the view the model last saw
     let id = a.session.id.clone();
     let live = a.model_view();
     drop(a);
     let opts = RunOpts { model: Some("fixture".into()), cwd: Some(ws.to_string_lossy().into()), resume: Some(id), ..Default::default() };
-    let b = Agent::new(&opts, "cosmos", &ws).unwrap();
+    let b = Agent::new(&opts, "cosmostui", &ws).unwrap();
     let resumed = b.model_view();
     let resume_matches = live.len() == resumed.len() && live.iter().zip(&resumed).all(|(x, y)| same(x, y));
     Run { naive_final, view_final, naive_cum, view_cum, busts, checkpoints, max_view, prefix_stable, resume_matches }

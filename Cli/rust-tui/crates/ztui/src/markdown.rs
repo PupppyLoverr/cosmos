@@ -8,8 +8,8 @@
 //! tree-sitter against everything seen so far in the fence.
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui_core::style::{Modifier, Style};
+use ratatui_core::text::{Line, Span};
 
 use crate::highlight;
 use crate::theme::{self, CODE_INLINE, DIM, RULE};
@@ -242,7 +242,7 @@ fn render_line(line: &str, w: usize) -> Vec<Line<'static>> {
         let style = if level <= 2 {
             Style::new().add_modifier(Modifier::BOLD)
         } else {
-            Style::new().add_modifier(Modifier::BOLD).fg(ratatui::style::Color::Rgb(0xc8, 0xc8, 0xc8))
+            Style::new().add_modifier(Modifier::BOLD).fg(ratatui_core::style::Color::Rgb(0xc8, 0xc8, 0xc8))
         };
         return wrap::wrap(&inline(text, style), w, &[sp(M)], &[sp(M)]);
     }

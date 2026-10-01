@@ -164,3 +164,37 @@ fn unknown_tool_is_error() {
     let out = run(&mut c, "nonsense", &json!({}));
     assert!(out.starts_with("ERROR"), "{out}");
 }
+
+#[test]
+fn wire_tools_are_the_small_core() {
+    let names: Vec<String> = ztools::wire_tools(false).into_iter().map(|t| t.name).collect();
+    assert_eq!(names, ["read", "edit", "write", "bash", "grep", "glob", "tool_search", "mcp_call"]);
+    let plan: Vec<String> = ztools::wire_tools(true).into_iter().map(|t| t.name).collect();
+    assert!(plan.contains(&"submit_plan".to_string()));
+    // every contract tool is either on the wire or deferred — none lost
+    for t in ztools::tool_specs() {
+        assert!(ztools::CORE_TOOLS.contains(&t.name.as_str()) || ztools::DEFERRED_TOOLS.contains(&t.name.as_str()), "{}", t.name);
+    }
+    let bytes = serde_json::to_string(&ztools::wire_tools(false)).unwrap().len();
+    assert!(bytes / 4 < 800, "core tool schemas ~{} tokens", bytes / 4);
+}
+
+#[test]
+fn tool_search_finds_deferred_tools_and_self_calls_run() {
+    let (_dir, mut c) = ctx();
+    let out = run(&mut c, "tool_search", &serde_json::json!({"query": "memory"}));
+    assert!(out.contains("cosmos.memory_search") && out.contains("cosmos.memory_write"), "{out}");
+    assert!(out.contains("mcp_call"), "{out}");
+    let all = run(&mut c, "tool_search", &serde_json::json!({"query": ""}));
+    for t in ztools::DEFERRED_TOOLS {
+        assert!(all.contains(&format!("cosmos.{t} ")), "{t} missing from {all}");
+    }
+    // mcp_call to the built-in server runs the wrapped tool
+    let out = run(&mut c, "mcp_call", &serde_json::json!({"server": "cosmos", "tool": "ls", "arguments": {"path": "."}}));
+    assert!(!out.starts_with("ERROR"), "{out}");
+    assert_eq!(
+        ztools::unwrap_self_call("mcp_call", &serde_json::json!({"server": "cosmos", "tool": "task"})),
+        Some(("task".to_string(), serde_json::json!({})))
+    );
+    assert_eq!(ztools::unwrap_self_call("mcp_call", &serde_json::json!({"server": "github", "tool": "x"})), None);
+}

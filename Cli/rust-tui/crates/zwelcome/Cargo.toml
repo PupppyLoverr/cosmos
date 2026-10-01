@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
-# The one-shot first-run flow. Built as its own executable so zcli can delete
+# The one-shot first-run flow. Built as its own executable so cosmostui can delete
 # it once onboarding completes — none of this ships in the daily binary.
 [dependencies]
 anyhow = "1"
@@ -20,5 +20,5 @@ unicode-width = "0.2"
 tempfile = "3"
 
 [[bin]]
-name = "zcli-welcome"
+name = "cosmostui-welcome"
 path = "src/main.rs"

@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use zproto::{Block, Chunk, Event, Message, OutputMode, Role, RunOpts, Usage};
 use zproviders::{complete, ProviderCfg, ProviderKind, Request};
-use ztools::{is_readonly, tool_specs, ToolContext, PLAN_TOOLS};
+use ztools::{is_readonly, ToolContext, PLAN_TOOLS};
 
 use crate::compact::{self, CompactCfg, Trigger, ViewOp};
 use crate::config::Config;
@@ -122,70 +122,6 @@ impl Mode {
     }
 }
 
-fn meridian_bin() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("MERIDIAN_BIN") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for n in ["meridian.exe", "meridian"] {
-                let c = dir.join(n);
-                if c.is_file() {
-                    return Some(c);
-                }
-            }
-        }
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for d in std::env::split_paths(&path) {
-            for n in ["meridian.exe", "meridian"] {
-                let c = d.join(n);
-                if c.is_file() {
-                    return Some(c);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Layer-3 boot context via the bridge; falls back to the snippet alone.
-fn boot_context(workspace: &Path) -> (String, u64, Vec<String>) {
-    if let Some(bin) = meridian_bin() {
-        let mut cmd = std::process::Command::new(bin);
-        cmd.args(["boot", "--repo"]).arg(workspace);
-        if let Ok(v) = std::env::var("MERIDIAN_VAULT") {
-            cmd.env("MERIDIAN_VAULT", v);
-        }
-        if let Ok(out) = cmd.output() {
-            if out.status.success() {
-                if let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) {
-                    // the bridge's BootContext serializes the body as `text`
-                    let ctx = v["text"].as_str().unwrap_or("").to_string();
-                    let tokens = v["tokens"].as_u64().unwrap_or(0);
-                    let warnings = v["warnings"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|w| w.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    return (ctx, tokens, warnings);
-                }
-            }
-        }
-    }
-    (
-        crate::system_snippet(),
-        0,
-        vec!["meridian bridge not found; boot context is the contract snippet only".into()],
-    )
-}
-
 fn default_provider() -> ProviderCfg {
     ProviderCfg {
         kind: zproviders::ProviderKind::Fixture,
@@ -200,6 +136,11 @@ fn default_provider() -> ProviderCfg {
     }
 }
 
+/// The tools block exactly as serialized for the wire (prefix hashing).
+fn tools_json(tools: &[zproto::ToolSpec]) -> String {
+    serde_json::to_string(tools).unwrap_or_default()
+}
+
 fn load_prompt(value: &str) -> Result<String> {
     if let Some(path) = value.strip_prefix('@') {
         return Ok(std::fs::read_to_string(path)
@@ -209,7 +150,7 @@ fn load_prompt(value: &str) -> Result<String> {
 }
 
 impl Agent {
-    /// Create or resume an agent. `harness` is `zcli`/`zdev`/`zagy`.
+    /// Create or resume an agent. `harness` is `cosmostui`/`zdev`/`zagy`.
     pub fn new(opts: &RunOpts, harness: &str, cwd: &Path) -> Result<Agent> {
         let home = crate::cli_home();
         let cfg = Config::load(&home);
@@ -282,22 +223,15 @@ impl Agent {
         let mut session = session;
         session.harness = harness.into();
 
-        let (boot, boot_tokens, _warnings) = boot_context(&workspace);
-        let tools = tool_specs();
-        let mut system = if let Some(prompt) = &opts.system_prompt {
-            vec![load_prompt(prompt)?]
-        } else {
-            vec![boot]
+        // §4 layers: 1 snippet, 2 tools, 3 boot — fixed for the session
+        let boot = crate::boot::build(&workspace, &home);
+        let boot_tokens = boot.tokens;
+        let tools = ztools::wire_tools(mode == Mode::Plan);
+        let mut system = match &opts.system_prompt {
+            Some(prompt) => vec![load_prompt(prompt)?],
+            None => vec![crate::system_snippet()],
         };
-        if opts.system_prompt.is_none()
-            && !crate::system_snippet().is_empty()
-            && !system[0].contains("You are Cosmos")
-        {
-            system.insert(0, crate::system_snippet());
-        }
-        if let Some(p) = crate::project_instructions(&workspace) {
-            system.push(p);
-        }
+        system.push(boot.text);
         if !opts.add_dirs.is_empty() {
             system.push(format!(
                 "Additional tool roots granted for this run: {}",
@@ -310,7 +244,7 @@ impl Agent {
         let prices = provider.prices;
         let context_window = provider.context;
         let allowed = cfg.allowed_hosts();
-        let prefix = compact::prefix_hash(&system, ztools::TOOLS_JSON);
+        let prefix = compact::prefix_hash(&system, &tools_json(&tools));
         ctx.session_id = session.id.clone();
         restore_read_state(&mut ctx, &messages);
         let world = World::load(&home, &session.id);
@@ -409,6 +343,14 @@ impl Agent {
             .session
             .append("mode", json!({"from": from, "to": self.mode.name()}));
         emit(&ev);
+        // the tools block never changes mid-session (cache); tell the model
+        // about the mode in the conversation instead
+        if self.mode == Mode::Plan && !self.tools.iter().any(|t| t.name == "submit_plan") {
+            self.push_note(format!(
+                "[plan mode: read-only tools only. When the plan is ready, call mcp_call {{\"server\": \"{}\", \"tool\": \"submit_plan\", \"arguments\": {{\"plan\": \"…\"}}}}]",
+                ztools::SELF_SERVER
+            ));
+        }
     }
 
     pub fn compact_now(&mut self, focus: Option<&str>, emit: &mut dyn FnMut(&Event)) {
@@ -453,6 +395,30 @@ impl Agent {
             }
             Err(e) => e,
         }
+    }
+
+    /// Hash of layers 1–3 as they would be sent now.
+    pub fn prefix_now(&self) -> String {
+        compact::prefix_hash(&self.system, &tools_json(&self.tools))
+    }
+
+    /// Contract §4: the next request pays the whole prompt again (new model,
+    /// or a resumed session's own prefix). Log it with the estimated cost.
+    pub fn log_cache_break(&mut self, reason: &str, emit: &mut dyn FnMut(&Event)) {
+        let prefix_chars: usize =
+            self.system.iter().map(String::len).sum::<usize>() + tools_json(&self.tools).len();
+        let tokens = prefix_chars as u64 / 4 + compact::estimate_tokens(&self.model_view(), 0);
+        let price = if self.prices.cache_write > 0.0 {
+            self.prices.cache_write
+        } else {
+            self.prices.input
+        };
+        let usd = (price > 0.0).then(|| tokens as f64 * price / 1_000_000.0);
+        let ev = self.session.append(
+            "cache_break",
+            json!({"reason": reason, "tokens": tokens, "est_usd": usd}),
+        );
+        emit(&ev);
     }
 
     /// Exactly what the next request sends as the conversation (§9).
@@ -604,6 +570,12 @@ impl Agent {
         input: &Value,
         emit: &mut dyn FnMut(&Event),
     ) -> (String, bool) {
+        // a deferred tool called through the built-in server is that tool
+        let unwrapped = ztools::unwrap_self_call(name, input);
+        let (name, input) = match &unwrapped {
+            Some((n, i)) => (n.as_str(), i),
+            None => (name, input),
+        };
         let repaired = ztools::repair::repair(name, input);
         for r in &repaired.repairs {
             let ev = self.session.append(
@@ -1072,8 +1044,6 @@ impl Agent {
     fn child_ctx(&self, workspace: &Path) -> ToolContext {
         let mut c = ToolContext::new(workspace);
         c.sandbox_bin = self.ctx.sandbox_bin.clone();
-        c.meridian_bin = self.ctx.meridian_bin.clone();
-        c.meridian_vault = self.ctx.meridian_vault.clone();
         c.escalations = self.ctx.escalations.clone();
         c.net_allow = self.ctx.net_allow;
         c.sandbox_degraded = self.ctx.sandbox_degraded.clone();
@@ -1128,7 +1098,7 @@ impl Agent {
     /// still over, an L5 world summary. Every op is logged so resume replays
     /// the same view.
     fn maybe_compact(&mut self, emit: &mut dyn FnMut(&Event)) {
-        let prefix_now = compact::prefix_hash(&self.system, ztools::TOOLS_JSON);
+        let prefix_now = self.prefix_now();
         let warm = compact::cache_is_warm(
             self.last_model_at,
             &prefix_now,
@@ -1506,6 +1476,7 @@ pub fn run_headless(
         let mut denied_exit = false;
         let results = agent.exec_tools_batch(&calls, emit);
         for ((_id, name, input), (_n, text, is_error)) in calls.into_iter().zip(results) {
+            let (name, input) = ztools::unwrap_self_call(&name, &input).unwrap_or((name, input));
             if name == "submit_plan" && !is_error {
                 if agent.opts.approve_plan {
                     agent.mode = Mode::Agent;

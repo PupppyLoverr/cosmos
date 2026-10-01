@@ -12,12 +12,17 @@ const KINDS = new Set([
   "checkpoint", "verify", "self_improve", "job_start", "job_end",
   "doom_loop", "aside",
 ]);
-const HARNESSES = new Set(["zcli", "zdev", "zagy"]);
+const HARNESSES = new Set(["cosmostui", "zcli", "zdev", "zagy"]);
 const ULID = /^[0-9a-z]{26}$/;
 
 const arg = process.argv[2];
 const input = arg ? readFileSync(arg, "utf8") : readFileSync(0, "utf8");
-const lines = input.split(/\r?\n/).filter((l) => l.trim().length > 0);
+// Windows PowerShell 5.1 may prepend a UTF-8 BOM when it pipes text into a
+// native process (depends on the console code page) — it is never event data.
+const lines = input
+  .split(/\r?\n/)
+  .map((l) => l.replace(/^﻿/, ""))
+  .filter((l) => l.trim().length > 0);
 
 let bad = 0;
 const ids = new Set();

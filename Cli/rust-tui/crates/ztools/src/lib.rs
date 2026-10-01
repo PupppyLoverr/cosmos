@@ -5,9 +5,10 @@ pub mod ckpt;
 mod files;
 pub mod jobs;
 mod mcp;
-mod memory;
+pub mod memory;
 pub mod repair;
 mod shell;
+pub mod supermemory;
 pub mod verify;
 
 use std::collections::HashMap;
@@ -35,6 +36,49 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     serde_json::from_str(TOOLS_JSON).expect("contracts/tools.json parses")
 }
 
+/// Sent with every request — contract §4 layer 2. Small on purpose: every
+/// schema here is paid for (or cache-read) on every turn.
+pub const CORE_TOOLS: &[&str] = &["read", "edit", "write", "bash", "grep", "glob", "tool_search", "mcp_call"];
+
+/// Loaded on demand: `tool_search` returns their schemas as text, and the
+/// model calls them through `mcp_call {server: "cosmos", tool, arguments}`,
+/// so the tools block — and the prompt cache behind it — never changes.
+pub const DEFERRED_TOOLS: &[&str] = &[
+    "ls",
+    "memory_search",
+    "memory_write",
+    "task",
+    "context_remaining",
+    "new_context",
+    "request_escalation",
+    "submit_plan",
+];
+
+/// The MCP server name the harness answers for itself.
+pub const SELF_SERVER: &str = "cosmos";
+
+/// Tools on the wire. A session that starts in plan mode also carries
+/// `submit_plan` (kept for the whole session so the prefix never changes).
+pub fn wire_tools(plan: bool) -> Vec<ToolSpec> {
+    tool_specs()
+        .into_iter()
+        .filter(|t| CORE_TOOLS.contains(&t.name.as_str()) || (plan && t.name == "submit_plan"))
+        .collect()
+}
+
+/// `mcp_call {server:"cosmos", tool, arguments}` → the deferred call it wraps.
+pub fn unwrap_self_call(name: &str, input: &Value) -> Option<(String, Value)> {
+    if name != "mcp_call" || input["server"].as_str() != Some(SELF_SERVER) {
+        return None;
+    }
+    let tool = input["tool"].as_str()?.to_string();
+    let args = match &input["arguments"] {
+        Value::Null => serde_json::json!({}),
+        v => v.clone(),
+    };
+    Some((tool, args))
+}
+
 /// Per-session tool state.
 pub struct ToolContext {
     /// workspace root — all file tools are confined to it
@@ -43,10 +87,6 @@ pub struct ToolContext {
     pub allowed_roots: Vec<PathBuf>,
     /// sandbox executable (zsandbox.exe)
     pub sandbox_bin: Option<PathBuf>,
-    /// meridian binary for memory_* tools
-    pub meridian_bin: Option<PathBuf>,
-    /// meridian vault dir (MERIDIAN_VAULT)
-    pub meridian_vault: Option<PathBuf>,
     /// files read this session → sha256 at read time (write STALE guard)
     pub read_state: HashMap<String, String>,
     /// operator-granted escalations this session
@@ -90,8 +130,6 @@ impl ToolContext {
             workspace: ws,
             allowed_roots: Vec::new(),
             sandbox_bin: None,
-            meridian_bin: None,
-            meridian_vault: None,
             read_state: HashMap::new(),
             escalations: Vec::new(),
             net_allow: false,
@@ -217,6 +255,9 @@ pub fn is_readonly(name: &str) -> bool {
 /// Execute a tool by name. Permission decisions happen in zcore — this assumes
 /// the call was allowed.
 pub fn run(ctx: &mut ToolContext, name: &str, input: &Value) -> String {
+    if let Some((tool, args)) = unwrap_self_call(name, input) {
+        return run(ctx, &tool, &args);
+    }
     let r = match name {
         "read" => files::read(ctx, input),
         "edit" => files::edit(ctx, input),
@@ -225,8 +266,8 @@ pub fn run(ctx: &mut ToolContext, name: &str, input: &Value) -> String {
         "glob" => files::glob(ctx, input),
         "grep" => files::grep(ctx, input),
         "bash" => shell::bash(ctx, input),
-        "memory_search" => memory::search(ctx, input),
-        "memory_write" => memory::write(ctx, input),
+        "memory_search" => memory::search_tool(ctx, input),
+        "memory_write" => memory::write_tool(ctx, input),
         "tool_search" | "mcp_call" => mcp::run(ctx, name, input),
         "submit_plan" | "task" | "request_escalation" => Err(anyhow::anyhow!(
             "{name} is handled by the harness, not the tool layer"

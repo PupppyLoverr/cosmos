@@ -1,4 +1,4 @@
-//! `zcli auth …` and `zcli models …` — bring-your-own-key and ChatGPT sign-in
+//! `cosmostui auth …` and `cosmostui models …` — bring-your-own-key and ChatGPT sign-in
 //! from the command line (the TUI has the same flows under /connect, /login).
 
 use std::io::Write;
@@ -9,12 +9,12 @@ use zproto::exit;
 
 const USAGE: &str = "\
 usage:
-  zcli auth                          show connected providers
-  zcli auth login chatgpt            sign in with a ChatGPT Plus/Pro plan (browser)
-  zcli auth login devin              use the Devin subscription already signed in on this machine
-  zcli auth login <provider> [--key K]   store an API key (prompted, hidden)
-  zcli auth logout <provider|chatgpt>
-  zcli models [provider]             models you can use now (or one provider's list)";
+  cosmostui auth                              show connected providers
+  cosmostui auth login chatgpt                sign in with a ChatGPT Plus/Pro plan (browser)
+  cosmostui auth login devin                  use the Devin subscription already signed in on this machine
+  cosmostui auth login <provider> [--key K]   store an API key (prompted, hidden)
+  cosmostui auth logout <provider|chatgpt>
+  cosmostui models [provider]                 models you can use now (or one provider's list)";
 
 /// Read a line without echoing it (shows • per character).
 pub fn read_secret(prompt: &str) -> std::io::Result<String> {
@@ -65,7 +65,7 @@ fn status() -> i32 {
             t.email.map(|e| format!(" as {e}")).unwrap_or_default(),
             t.plan.map(|p| format!(" · {p} plan")).unwrap_or_default()
         ),
-        None => println!("  · chatgpt        not signed in — zcli auth login chatgpt"),
+        None => println!("  · chatgpt        not signed in — cosmostui auth login chatgpt"),
     }
     zcore::devin::invalidate();
     if zcore::devin::ready() {
@@ -80,7 +80,7 @@ fn status() -> i32 {
         }
     }
     let n = cfg.available_models().len();
-    println!("\n  {n} models available · zcli models · zcli auth login <provider>");
+    println!("\n  {n} models available · cosmostui models · cosmostui auth login <provider>");
     exit::DONE
 }
 
@@ -117,7 +117,7 @@ fn login(args: &[String]) -> i32 {
             match zcore::live::fetch(catalog::provider("devin").unwrap()) {
                 Ok(models) => {
                     let _ = zcore::live::store("devin", &models);
-                    println!("✓ Devin · {} · try: zcli --model devin/{}", zcore::devin::detail(), models.iter().find(|m| m.id == "swe-2-max").map(|m| m.id.as_str()).or_else(|| models.first().map(|m| m.id.as_str())).unwrap_or("swe-2-max"));
+                    println!("✓ Devin · {} · try: cosmostui --model devin/{}", zcore::devin::detail(), models.iter().find(|m| m.id == "swe-2-max").map(|m| m.id.as_str()).or_else(|| models.first().map(|m| m.id.as_str())).unwrap_or("swe-2-max"));
                     exit::DONE
                 }
                 Err(e) => {
@@ -153,7 +153,7 @@ fn login(args: &[String]) -> i32 {
             println!("✓ Saved {} key ({}) to the {}", id, creds::mask(key.trim()), src.label());
             if let Some(p) = catalog::provider(id) {
                 if let Some(m) = p.models.first() {
-                    println!("  try: zcli --model {}/{}", p.id, m.id);
+                    println!("  try: cosmostui --model {}/{}", p.id, m.id);
                 }
             }
             exit::DONE
@@ -219,9 +219,9 @@ pub fn models_cmd(args: &[String]) -> i32 {
         .collect();
     if list.is_empty() {
         if want == Some("devin") {
-            eprintln!("no Devin models yet — zcli auth login devin  (subscription models; Cosmos runs the tools)");
+            eprintln!("no Devin models yet — cosmostui auth login devin  (subscription models; Cosmos runs the tools)");
         } else {
-            eprintln!("no models yet — zcli auth login <provider>");
+            eprintln!("no models yet — cosmostui auth login <provider>");
         }
         return exit::USAGE;
     }

@@ -8,7 +8,7 @@ use zproto::{Block, Role};
 #[test]
 fn append_only_parent_chain() {
     let home = tempfile::tempdir().unwrap();
-    let mut s = Session::create(home.path(), "zcli").unwrap();
+    let mut s = Session::create(home.path(), "cosmostui").unwrap();
     let e1 = s.append("session_start", json!({"model": "fixture"}));
     let e2 = s.append("user", json!({"text": "ping"}));
     let e3 = s.append("assistant", json!({"text": "pong"}));
@@ -18,13 +18,13 @@ fn append_only_parent_chain() {
     let on_disk = read_events(&s.file).unwrap();
     assert_eq!(on_disk.len(), 3);
     assert_eq!(on_disk[0].v, 1);
-    assert_eq!(on_disk[0].harness, "zcli");
+    assert_eq!(on_disk[0].harness, "cosmostui");
 }
 
 #[test]
 fn resume_replays_messages() {
     let home = tempfile::tempdir().unwrap();
-    let mut s = Session::create(home.path(), "zcli").unwrap();
+    let mut s = Session::create(home.path(), "cosmostui").unwrap();
     s.append("session_start", json!({}));
     s.append("user", json!({"text": "ping"}));
     s.append(
@@ -52,7 +52,7 @@ fn resume_replays_messages() {
 #[test]
 fn checkout_rewinds_chain() {
     let home = tempfile::tempdir().unwrap();
-    let mut s = Session::create(home.path(), "zcli").unwrap();
+    let mut s = Session::create(home.path(), "cosmostui").unwrap();
     s.append("session_start", json!({}));
     let u1 = s.append("user", json!({"text": "first"}));
     s.append("assistant", json!({"text": "a1"}));
@@ -78,13 +78,13 @@ fn checkout_rewinds_chain() {
 #[test]
 fn cross_harness_visibility() {
     let home = tempfile::tempdir().unwrap();
-    let mut s = Session::create(home.path(), "zcli").unwrap();
+    let mut s = Session::create(home.path(), "cosmostui").unwrap();
     s.append("session_start", json!({"model": "fixture"}));
     s.append("user", json!({"text": "remember this"}));
     let id = s.id.clone();
     // zdev opens the same file — that's the handoff
     let s2 = Session::open(home.path(), &id).unwrap();
-    assert_eq!(s2.harness, "zcli"); // original harness recorded
+    assert_eq!(s2.harness, "cosmostui"); // original harness recorded
     let list = Session::list(home.path());
     assert_eq!(list.len(), 1);
     assert_eq!(list[0]["id"], json!(id));

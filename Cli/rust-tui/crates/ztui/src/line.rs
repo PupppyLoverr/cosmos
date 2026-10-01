@@ -72,9 +72,10 @@ fn prompt_line(prompt: &str) -> Option<String> {
 
 /// Interactive line-mode session loop. Returns the process exit code.
 pub fn repl(opts: &RunOpts, cwd: &Path) -> Result<i32> {
-    let mut agent = Agent::new(opts, "zcli", cwd)?;
+    let mut agent = Agent::new(opts, zcore::NAME, cwd)?;
     eprintln!(
-        "zcli · {} · mode {} · session {}",
+        "{} · {} · mode {} · session {}",
+        zcore::NAME,
         agent.model_alias,
         agent.mode.name(),
         &agent.session.id[..8]

@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::style::Color;
-use ratatui::text::Line;
+use ratatui_core::style::Color;
+use ratatui_core::text::Line;
 use serde_json::Value;
 use zcore::agent::Mode;
 use zproto::RunOpts;
@@ -36,7 +36,7 @@ use crate::view;
 use crate::voice::{self, Recorder};
 use crate::worker::{self, Cmd, Diff, Msg};
 
-pub(crate) const PLACEHOLDER: &str = "Ask zcli to build features, fix bugs, or work on your code";
+pub(crate) const PLACEHOLDER: &str = "Ask Cosmos to build features, fix bugs, or work on your code";
 
 /// Reasoning-effort choices in the model picker (index 0 = provider default).
 pub const EFFORTS: &[(&str, Option<&str>)] =
@@ -191,7 +191,7 @@ pub struct App {
     last_reply: String,
     /// operator name from onboarding — shown in the info line
     pub user: Option<String>,
-    /// `/onboarding` asked the loop to hand the terminal to zcli-welcome
+    /// `/onboarding` asked the loop to hand the terminal to cosmostui-welcome
     pub replay_onboard: bool,
     /// the dictation key is physically down (Windows reports releases), so
     /// its auto-repeat can't stop a recording it just started
@@ -539,7 +539,7 @@ impl App {
                 let to = ev.data["to"].as_str().unwrap_or("");
                 self.mode = Mode::parse(to);
                 let label = match self.mode {
-                    Mode::Plan => "Plan mode — zcli proposes before it changes anything",
+                    Mode::Plan => "Plan mode — Cosmos proposes before it changes anything",
                     Mode::Yolo => "Yolo mode — tools run without asking (sandbox stays on)",
                     Mode::AcceptEdits => "Accept-edits — writes auto-allow inside the workspace",
                     Mode::Agent => "Agent mode",
@@ -952,7 +952,7 @@ impl App {
             let note = note.trim();
             if !note.is_empty() {
                 let mut ctx = ztools::ToolContext::new(&self.cwd);
-                let r = ztools::run(&mut ctx, "memory_write", &serde_json::json!({"type": "preference", "text": note, "scope": "zcli"}));
+                let r = ztools::run(&mut ctx, "memory_write", &serde_json::json!({"type": "preference", "text": note, "scope": "global"}));
                 if r.to_lowercase().contains("error") {
                     self.error(format!("Memory: {r}"));
                 } else {
@@ -1049,7 +1049,7 @@ impl App {
             }
             "skillify" => {
                 let name = if args.is_empty() { "session" } else { args };
-                self.note(format!("skillify {name} — run after the turn, or use zcli skillify"));
+                self.note(format!("skillify {name} — run after the turn, or use /skillify after the turn"));
                 self.send_prompt(&format!("/skillify {name}"), format!("/skillify {name}"), cmd);
             }
             "refine" => {
@@ -1123,7 +1123,7 @@ impl App {
                     self.flash(format!("Copied the last reply ({} chars)", self.last_reply.chars().count()), theme::GREEN);
                 }
             }
-            "session" => self.note(format!("Session {} · resume with  zcli --resume {}", self.session, self.session)),
+            "session" => self.note(format!("Session {} · resume with  cosmostui --resume {}", self.session, self.session)),
             "clear" => self.clear_screen = true,
             "onboarding" => self.replay_onboard = true,
             "help" => self.popup = Some(Popup::Help),
@@ -1566,7 +1566,7 @@ fn copy_osc52(text: &str) {
 // ---- persistence --------------------------------------------------------------
 
 fn history_path() -> PathBuf {
-    zcore::cli_home().join("zcli_history.jsonl")
+    zcore::home_file("history.jsonl", "zcli_history.jsonl")
 }
 
 fn load_history() -> Vec<String> {
@@ -1591,10 +1591,10 @@ fn push_history(h: &mut Vec<String>, entry: &str) {
 }
 
 fn state_path() -> PathBuf {
-    zcore::cli_home().join("zcli_state.json")
+    zcore::home_file("state.json", "zcli_state.json")
 }
 
-/// The model picked last time — used when zcli starts without `--model`.
+/// The model picked last time — used when cosmostui starts without `--model`.
 fn saved_model() -> Option<String> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(state_path()).ok()?).ok()?;
     v["model"].as_str().map(str::to_string)
@@ -1612,7 +1612,7 @@ pub fn try_run(opts: &RunOpts, cwd: &Path) -> Result<Option<i32>> {
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         return Ok(None);
     }
-    // first launch: the one-shot `zcli-welcome` binary (galaxy intro → name
+    // first launch: the one-shot `cosmostui-welcome` binary (galaxy intro → name
     // → keys → how-to) runs before anything else so the keys and default
     // model it writes land in this session. It's deleted once it completes.
     if zcore::welcome::needed() {
@@ -1644,7 +1644,7 @@ pub fn try_run(opts: &RunOpts, cwd: &Path) -> Result<Option<i32>> {
         app.cwd = PathBuf::from(d);
     }
     app.user = zcore::welcome::user_name();
-    app.cont(crate::logo::banner("zcli", concat!("v", env!("CARGO_PKG_VERSION"))));
+    app.cont(crate::logo::banner("cosmos", concat!("v", env!("CARGO_PKG_VERSION"))));
 
     let r = run_loop(&mut screen, &mut app, &rx, &cmd, &interrupt);
     let bye = view::farewell(&app);
@@ -1714,7 +1714,7 @@ fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender
             if zcore::welcome::exe().is_none() {
                 app.note("onboarding has retired — /connect adds keys, /login signs in, /model picks a default");
             } else {
-                // hand the terminal to zcli-welcome, then take it back
+                // hand the terminal to cosmostui-welcome, then take it back
                 let out = std::mem::take(&mut app.out);
                 screen.draw(&out, Frame { lines: &[], cursor: None })?;
                 screen.leave(&[]);
@@ -1826,9 +1826,9 @@ mod tests {
     use std::sync::mpsc::channel;
 
     fn app() -> App {
-        std::env::set_var("COSMOS_CLI_HOME", std::env::temp_dir().join("zcli-tui-test"));
+        std::env::set_var("COSMOS_CLI_HOME", std::env::temp_dir().join("cosmos-tui-test"));
         std::env::set_var("COSMOS_CLI_KEYRING", "0");
-        let _ = std::fs::create_dir_all(std::env::temp_dir().join("zcli-tui-test"));
+        let _ = std::fs::create_dir_all(std::env::temp_dir().join("cosmos-tui-test"));
         let row = |alias: &str, provider: &str, id: &str, context: u64, effort_ok: bool| ModelRow {
             alias: alias.into(),
             provider: provider.into(),
@@ -1997,7 +1997,7 @@ mod tests {
         let mut a = app();
         let ev = |kind: &str, data: Value| zproto::Event {
             v: 1, id: "e".into(), parent: None, ts: String::new(), session: "s".into(),
-            harness: "zcli".into(), kind: kind.into(), data,
+            harness: "cosmostui".into(), kind: kind.into(), data,
         };
         a.on_msg(Msg::Event(ev("assistant", serde_json::json!({"text": "", "tool_calls": [{"id": "t1", "name": "bash", "input": {"command": "cargo test"}}]}))));
         assert_eq!(a.tools.len(), 1);
@@ -2035,7 +2035,7 @@ mod tests {
         let mut a = app();
         let (tx, rx) = channel();
         let flag = Arc::new(AtomicBool::new(false));
-        for c in "!echo zcli-shell-ok".chars() {
+        for c in "!echo cosmos-shell-ok".chars() {
             a.on_key(key(KeyCode::Char(c)), &tx, &flag);
         }
         a.on_key(key(KeyCode::Enter), &tx, &flag);
@@ -2047,12 +2047,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let rows: Vec<String> = a.out.iter().map(text).collect();
-        assert!(rows.iter().any(|r| r.contains("zcli-shell-ok")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("cosmos-shell-ok")), "{rows:?}");
         for c in "what happened?".chars() {
             a.on_key(key(KeyCode::Char(c)), &tx, &flag);
         }
         a.on_key(key(KeyCode::Enter), &tx, &flag);
         let sent: Vec<Cmd> = rx.try_iter().collect();
-        assert!(matches!(&sent[0], Cmd::Prompt(p) if p.contains("<shell-output") && p.contains("zcli-shell-ok") && p.ends_with("what happened?")));
+        assert!(matches!(&sent[0], Cmd::Prompt(p) if p.contains("<shell-output") && p.contains("cosmos-shell-ok") && p.ends_with("what happened?")));
     }
 }

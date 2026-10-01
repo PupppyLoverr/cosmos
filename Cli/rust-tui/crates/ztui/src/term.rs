@@ -24,8 +24,8 @@ use crossterm::terminal::{
     self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
 };
 use crossterm::{queue, QueueableCommand};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui_core::style::{Color, Modifier, Style};
+use ratatui_core::text::Line;
 use unicode_width::UnicodeWidthChar;
 
 pub struct Screen {
@@ -270,7 +270,7 @@ pub fn write_line(buf: &mut Vec<u8>, line: &Line<'_>, max: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::text::Span;
+    use ratatui_core::text::Span;
 
     #[test]
     fn clips_to_width() {

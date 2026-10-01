@@ -1,13 +1,13 @@
-//! zcli-welcome — the first-run flow, as its own full-screen executable.
+//! cosmostui-welcome — the first-run flow, as its own full-screen executable.
 //!
 //! It takes over the whole terminal (alternate screen). A soft bloom of sound
 //! plays while you fly into a spiral galaxy; the field dissolves and its dust
 //! rearranges into "welcome to cosmos"; then your name, your keys (BYOK or
 //! ChatGPT sign-in) with a live model list fetched from each provider you
 //! connect, and a one-screen how-to. When it's done the terminal is cleared
-//! so only zcli is left on screen.
+//! so only cosmostui is left on screen.
 //!
-//! zcli launches this on the first interactive start and deletes the
+//! cosmostui launches this on the first interactive start and deletes the
 //! executable once it exits successfully (see `zcore::welcome`), so none of
 //! the intro, synth or setup code stays behind in the binary you run daily.
 //! Exit codes: 0 done, 130 (`zcore::welcome::QUIT`) Ctrl+C.
@@ -28,7 +28,7 @@ use zcore::catalog::{ModelDef, ProviderDef};
 use ztui::kit::{self, width_of, ACCENT, ACCENT_BOLD, DIM, GHOST, GREEN, RED, RULE};
 
 const WHITE: Color = Color::Rgb(0xf4, 0xf4, 0xf4);
-const SUBTITLE: &str = concat!("zcli v", env!("CARGO_PKG_VERSION"), " · the cosmos coding agent");
+const SUBTITLE: &str = concat!("cosmostui v", env!("CARGO_PKG_VERSION"), " · the cosmos coding agent");
 const QUESTION: &str = "what should i call you?";
 const STEPS: [&str; 4] = ["name", "keys", "model", "start"];
 const SPIN: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -57,7 +57,7 @@ const PINNED: &[(&str, &str, &str)] = &[
 
 fn main() {
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-        eprintln!("zcli-welcome needs a terminal — run `zcli` in one");
+        eprintln!("cosmostui-welcome needs a terminal — run `cosmostui` in one");
         std::process::exit(2);
     }
     let code = match flow() {
@@ -75,7 +75,7 @@ fn main() {
 fn flow() -> Result<bool> {
     let mut tty = Tty::enter()?;
     let r = run(&mut tty);
-    // done → wipe the terminal so zcli starts on a clean screen;
+    // done → wipe the terminal so cosmostui starts on a clean screen;
     // quit or error → put the shell back exactly as it was
     tty.leave(matches!(r, Ok(true)));
     r
@@ -293,11 +293,11 @@ fn set_default_model(alias: &str) -> Result<()> {
     Ok(())
 }
 
-/// Make `alias` the model zcli opens with: config.toml's `default_model`,
+/// Make `alias` the model cosmostui opens with: config.toml's `default_model`,
 /// and the TUI's "last used" state, which would otherwise take precedence.
 fn remember_model(alias: &str) -> Result<()> {
     set_default_model(alias)?;
-    let state = zcore::cli_home().join("zcli_state.json");
+    let state = zcore::home_file("state.json", "zcli_state.json");
     let mut v: serde_json::Value = std::fs::read_to_string(&state)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -383,9 +383,9 @@ fn synth(rate: u32) -> Vec<f32> {
 static HUSH: AtomicBool = AtomicBool::new(false);
 
 /// Fire-and-forget playback on a thread; no output device → silence.
-/// `ZCLI_QUIET=1` mutes it.
+/// `COSMOS_QUIET=1` mutes it.
 fn play_galaxy() {
-    if std::env::var_os("ZCLI_QUIET").is_some() {
+    if zcore::env_var("QUIET").is_some() {
         return;
     }
     std::thread::spawn(|| {
@@ -810,7 +810,7 @@ struct Ob {
     chosen: HashMap<String, String>,
     /// providers connected in this run, in order — preferred for the default
     connected: Vec<String>,
-    /// the default zcli will open with: (alias, set in this run)
+    /// the default cosmostui will open with: (alias, set in this run)
     model: Option<(String, bool)>,
 
     status: Option<(String, Style, Instant)>,
@@ -1510,13 +1510,13 @@ impl Ob {
 
     fn draw_ready(&self, c: &mut Canvas) {
         const ROWS: &[(&str, &str)] = &[
-            ("type a task, enter", "zcli reads, edits and runs code with you"),
+            ("type a task, enter", "Cosmos reads, edits and runs code with you"),
             ("/", "commands — /model /connect /usage /context /help"),
             ("@path", "attach a file · !cmd runs a shell command"),
             ("ctrl+space", "dictate instead of typing"),
             ("shift+tab", "cycle plan → agent → yolo"),
             ("esc", "interrupt the agent · ctrl+c twice quits"),
-            ("zcli -p \"…\"", "headless runs for scripts and CI"),
+            ("cosmostui -p \"…\"", "headless runs for scripts and CI"),
         ];
         self.draw_sky(c);
         self.draw_header(c, 3);
@@ -1535,7 +1535,7 @@ impl Ob {
                 c.spans(x, y + 2, &[Span::styled("model  ", DIM), Span::styled(m.clone(), kit::bold(Style::new())), Span::styled("  · /model to switch", DIM)]);
             }
             None => {
-                c.text(x, y + 2, "no provider yet — /connect or /login inside zcli when you're ready", DIM);
+                c.text(x, y + 2, "no provider yet — /connect or /login inside Cosmos when you're ready", DIM);
             }
         }
         let keys: Vec<&str> = self.provs.iter().filter(|p| self.keyed.contains(&p.def.id)).map(|p| p.name.as_str()).collect();
@@ -1547,7 +1547,7 @@ impl Ob {
             c.text(x, yy, &format!("{k:<kw$}"), kit::fg(ACCENT));
             c.text(x + kw + 3, yy, d, DIM);
         }
-        c.spans(x, y + 6 + ROWS.len(), &[Span::styled("enter ", ACCENT_BOLD), Span::raw("launch zcli")]);
+        c.spans(x, y + 6 + ROWS.len(), &[Span::styled("enter ", ACCENT_BOLD), Span::raw("launch Cosmos")]);
         self.draw_footer(c, "enter launch · esc back to keys · this setup removes itself once you launch");
     }
 
@@ -1917,7 +1917,7 @@ mod tests {
     fn remember_model_sets_config_and_state() {
         let (_g, dir) = home();
         std::fs::write(dir.path().join("config.toml"), "[providers.r9]\nkind = \"openai\"\n").unwrap();
-        std::fs::write(dir.path().join("zcli_state.json"), r#"{"model":"r9","other":1}"#).unwrap();
+        std::fs::write(dir.path().join("state.json"), r#"{"model":"r9","other":1}"#).unwrap();
         remember_model("anthropic/claude-opus-5-5").unwrap();
         remember_model("openai/gpt-5.5").unwrap();
         let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
@@ -1925,7 +1925,7 @@ mod tests {
         let cfg = zcore::config::Config::load(dir.path());
         assert_eq!(cfg.default_model.as_deref(), Some("openai/gpt-5.5"));
         assert!(cfg.providers.contains_key("r9"), "table kept intact");
-        let state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("zcli_state.json")).unwrap()).unwrap();
+        let state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("state.json")).unwrap()).unwrap();
         assert_eq!(state["model"], "openai/gpt-5.5");
         assert_eq!(state["other"], 1, "other state kept");
     }
@@ -2062,7 +2062,7 @@ mod tests {
         assert!(ob.frame(0.016).0.plain().contains("✓ second ★"));
         let cfg = zcore::config::Config::load(dir.path());
         assert_eq!(cfg.default_model.as_deref(), Some("anthropic/second"));
-        // the live list is cached, so zcli's /model shows it too
+        // the live list is cached, so cosmostui's /model shows it too
         assert_eq!(zcore::live::cached("anthropic").unwrap().len(), 3);
         assert!(cfg.available_models().iter().any(|m| m.alias == "anthropic/anthropic-live-best"));
         ob.on_key(key(KeyCode::Esc));

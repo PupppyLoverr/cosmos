@@ -195,7 +195,7 @@ fn provider_errors_are_readable() {
     let msgs = vec![Message::text(Role::User, "hi")];
     let req = Request { system: vec![], tools: &[], messages: &msgs, session_id: "s", max_tokens: 16 };
     let err = complete(&cfg, &req, &mut |_| {}, &["127.0.0.1".into()]).unwrap_err().to_string();
-    assert!(err.contains("401") && err.contains("Incorrect API key") && err.contains("zcli auth login"), "{err}");
+    assert!(err.contains("401") && err.contains("Incorrect API key") && err.contains("cosmostui auth login"), "{err}");
 }
 
 #[test]

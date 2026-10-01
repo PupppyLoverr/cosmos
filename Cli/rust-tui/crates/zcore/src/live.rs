@@ -203,7 +203,7 @@ fn chatgpt() -> Result<Vec<Raw>> {
         &[
             ("authorization", format!("Bearer {}", t.access)),
             ("chatgpt-account-id", t.account_id.clone()),
-            ("originator", "zcli".into()),
+            ("originator", crate::NAME.into()),
         ],
     )?;
     let items = v["models"].as_array().or(v["data"].as_array()).cloned().unwrap_or_default();

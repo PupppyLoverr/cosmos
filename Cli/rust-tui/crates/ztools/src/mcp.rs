@@ -56,7 +56,7 @@ fn with_server(
     let mut m = Mcp::spawn(&cfg.command, &cfg.args, &cfg.env)?;
     let _ = m.rpc(
         "initialize",
-        json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"zcli","version":"0.1.0"}}),
+        json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"cosmostui","version":"0.1.0"}}),
     );
     // notifications/initialized — one-way
     if let Some(stdin) = m.child.stdin.as_mut() {
@@ -71,14 +71,30 @@ fn with_server(
     r
 }
 
-pub fn run(ctx: &mut ToolContext, name: &str, input: &Value) -> Result<String> {
-    if ctx.mcp_servers.is_empty() {
-        bail!("no MCP servers configured")
+/// Deferred harness tools whose name or description matches `q` (all of
+/// them for an empty query), as `cosmos.<name> — <description>` + schema.
+fn self_tools(q: &str) -> String {
+    let mut out = String::new();
+    for t in crate::tool_specs() {
+        if !crate::DEFERRED_TOOLS.contains(&t.name.as_str()) {
+            continue;
+        }
+        let hit = q.is_empty()
+            || q.split_whitespace().any(|w| t.name.to_lowercase().contains(w) || t.description.to_lowercase().contains(w));
+        if hit {
+            out.push_str(&format!("{}.{} — {}
+{}
+", crate::SELF_SERVER, t.name, t.description, t.input_schema));
+        }
     }
+    out
+}
+
+pub fn run(ctx: &mut ToolContext, name: &str, input: &Value) -> Result<String> {
     match name {
         "tool_search" => {
             let q = input["query"].as_str().unwrap_or("").to_lowercase();
-            let mut hits = String::new();
+            let mut hits = self_tools(&q);
             for server in ctx.mcp_servers.keys().cloned().collect::<Vec<_>>() {
                 if let Ok(res) = with_server(ctx, &server, |m| m.rpc("tools/list", json!({}))) {
                     if let Some(tools) = res["tools"].as_array() {
@@ -99,12 +115,16 @@ pub fn run(ctx: &mut ToolContext, name: &str, input: &Value) -> Result<String> {
                 }
             }
             Ok(if hits.is_empty() {
-                "no MCP tools matched".into()
+                format!("no tools matched {q:?} — try a broader word, or an empty query to list all")
             } else {
-                hits
+                format!("{hits}
+call any of these with mcp_call {{\"server\": \"<server>\", \"tool\": \"<name>\", \"arguments\": {{…}}}}")
             })
         }
         "mcp_call" => {
+            if ctx.mcp_servers.is_empty() {
+                bail!("no MCP servers configured (the built-in server is \"{}\")", crate::SELF_SERVER)
+            }
             let server = input["server"].as_str().unwrap_or("");
             let tool = input["tool"].as_str().unwrap_or("");
             let args = input["arguments"].clone();

@@ -55,14 +55,52 @@ pub fn load_file() -> CredFile {
 }
 
 pub fn save_file(f: &CredFile) -> Result<()> {
+    forget();
     let p = path();
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d)?;
     }
     let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(f)?)?;
+    write_private(&tmp, &serde_json::to_vec_pretty(f)?)?;
     std::fs::rename(&tmp, &p).context("writing credentials.json")?;
     Ok(())
+}
+
+/// Write a secrets file readable only by the owner (0600 on Unix; on
+/// Windows the file inherits the per-user profile ACL).
+pub fn write_private(p: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p)?;
+        f.write_all(bytes)?;
+        // an existing file keeps its old mode — tighten it
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(p, bytes)?;
+        Ok(())
+    }
+}
+
+/// Stored-key lookups hit the OS credential store and re-read the file, and
+/// the model list asks for ~30 providers at startup — remember the answers
+/// for the life of the process. Any write clears it.
+static MEMO: std::sync::Mutex<Option<BTreeMap<String, Option<(String, Source)>>>> = std::sync::Mutex::new(None);
+
+/// Memo key: the same id can hold different keys under different homes.
+fn memo_key(id: &str) -> String {
+    format!("{}\u{0}{id}", crate::cli_home().display())
+}
+
+fn forget() {
+    if let Ok(mut m) = MEMO.lock() {
+        *m = None;
+    }
 }
 
 fn keyring_enabled() -> bool {
@@ -98,6 +136,19 @@ fn keyring_delete(_id: &str) {}
 
 /// A stored (not environment) key for `id`.
 pub fn stored_key(id: &str) -> Option<(String, Source)> {
+    if let Ok(m) = MEMO.lock() {
+        if let Some(hit) = m.as_ref().and_then(|m| m.get(&memo_key(id))) {
+            return hit.clone();
+        }
+    }
+    let found = lookup_stored(id);
+    if let Ok(mut m) = MEMO.lock() {
+        m.get_or_insert_with(BTreeMap::new).insert(memo_key(id), found.clone());
+    }
+    found
+}
+
+fn lookup_stored(id: &str) -> Option<(String, Source)> {
     if keyring_enabled() {
         if let Some(k) = keyring_get(id) {
             return Some((k, Source::Keychain));
@@ -122,6 +173,7 @@ pub fn key_for(id: &str, env: &[String]) -> Option<(String, Source)> {
 pub fn store_key(id: &str, key: &str) -> Result<Source> {
     let key = key.trim();
     anyhow::ensure!(!key.is_empty(), "empty key");
+    forget();
     if keyring_enabled() && keyring_set(id, key) {
         // don't leave a stale copy in the file
         let mut f = load_file();
@@ -138,6 +190,7 @@ pub fn store_key(id: &str, key: &str) -> Result<Source> {
 
 /// Forget a stored key (environment variables are left alone).
 pub fn delete_key(id: &str) -> Result<()> {
+    forget();
     if keyring_enabled() {
         keyring_delete(id);
     }

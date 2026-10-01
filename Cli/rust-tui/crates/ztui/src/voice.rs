@@ -7,7 +7,7 @@
 //! cancels. The text lands in the composer for review; nothing is sent on
 //! its own.
 //!
-//! Transcription, first available wins (override with `ZCLI_STT`):
+//! Transcription, first available wins (override with `COSMOS_STT`):
 //!   chatgpt  — your ChatGPT Plus/Pro sign-in (the ChatGPT apps' dictation)
 //!   openai   — `gpt-4o-mini-transcribe` (falls back to `whisper-1`)
 //!   groq     — `whisper-large-v3-turbo`
@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+#[cfg(feature = "voice")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 const RATE: u32 = 16_000;
@@ -45,7 +46,7 @@ impl Backend {
 
 /// Pick a transcription backend from what's configured.
 pub fn pick_backend() -> Option<Backend> {
-    let want = std::env::var("ZCLI_STT").unwrap_or_default().to_lowercase();
+    let want = zcore::env_var("STT").unwrap_or_default().to_lowercase();
     let key = |id: &str| {
         let env = zcore::catalog::provider(id).map(|p| p.env.clone()).unwrap_or_default();
         zcore::creds::key_for(id, &env).map(|(k, _)| k)
@@ -157,7 +158,15 @@ impl Recorder {
     }
 }
 
+/// Built without the `voice` feature: no microphone code is linked.
+#[cfg(not(feature = "voice"))]
+fn capture(_stop: &AtomicBool, _cancel: &AtomicBool, _level: Arc<AtomicU32>, ready: &std::sync::mpsc::Sender<Result<()>>) -> Result<Vec<i16>> {
+    let _ = ready.send(Err(anyhow::anyhow!("this cosmostui build has no microphone support (rebuild with --features voice)")));
+    bail!("this cosmostui build has no microphone support (rebuild with --features voice)")
+}
+
 /// Record until `stop`; returns 16 kHz mono i16 PCM.
+#[cfg(feature = "voice")]
 fn capture(stop: &AtomicBool, cancel: &AtomicBool, level: Arc<AtomicU32>, ready: &std::sync::mpsc::Sender<Result<()>>) -> Result<Vec<i16>> {
     let host = cpal::default_host();
     let dev = match host.default_input_device() {
@@ -301,7 +310,7 @@ fn transcribe(b: &Backend, wav: &[u8]) -> Result<String> {
     let allowed = zcore::config::Config::load(&zcore::cli_home()).allowed_hosts();
     let text = match b {
         Backend::ChatGpt => {
-            let t = zcore::chatgpt::fresh().context("not signed in to ChatGPT — /login, or set ZCLI_STT")?;
+            let t = zcore::chatgpt::fresh().context("not signed in to ChatGPT — /login, or set COSMOS_STT")?;
             zproviders::transcribe_chatgpt("https://chatgpt.com/backend-api", &t.access, &t.account_id, wav, &allowed)?
         }
         Backend::OpenAI { key } => zproviders::transcribe("https://api.openai.com/v1", key, "gpt-4o-mini-transcribe", wav, &allowed)
@@ -318,7 +327,7 @@ fn transcribe(b: &Backend, wav: &[u8]) -> Result<String> {
 
 /// Offline recognition with the Windows speech engine via PowerShell.
 fn windows_speech(wav: &[u8]) -> Result<String> {
-    let path = std::env::temp_dir().join(format!("zcli-dictation-{}.wav", std::process::id()));
+    let path = std::env::temp_dir().join(format!("cosmos-dictation-{}.wav", std::process::id()));
     std::fs::write(&path, wav)?;
     let script = format!(
         "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Speech; \
@@ -375,7 +384,7 @@ mod hardware {
     #[ignore]
     #[cfg(windows)]
     fn windows_speech_round_trip() {
-        let path = std::env::temp_dir().join("zcli-tts-check.wav");
+        let path = std::env::temp_dir().join("cosmos-tts-check.wav");
         let script = format!(
             "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
              $f = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono); \
@@ -394,7 +403,7 @@ mod hardware {
     #[ignore]
     fn chatgpt_transcribes_speech() {
         // needs a ChatGPT sign-in: speak with Windows TTS, transcribe via ChatGPT
-        let path = std::env::temp_dir().join("zcli-tts-chatgpt.wav");
+        let path = std::env::temp_dir().join("cosmos-tts-chatgpt.wav");
         let script = format!(
             "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
              $f = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono); \

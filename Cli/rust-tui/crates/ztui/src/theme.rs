@@ -3,7 +3,7 @@
 //! darker grey for rules, one cyan accent for selection, and a filled grey
 //! bar behind user turns.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui_core::style::{Color, Modifier, Style};
 
 /// Secondary text: hints, meta, descriptions.
 pub const DIM: Style = Style::new().fg(Color::Rgb(0x8a, 0x8a, 0x8a));

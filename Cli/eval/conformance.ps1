@@ -2,7 +2,7 @@
 # Run from repo root:  powershell -File eval\conformance.ps1
 $ErrorActionPreference = "Stop"
 $root   = Split-Path -Parent $PSScriptRoot
-$cli    = Join-Path $root "rust-tui\target\debug\zcli.exe"
+$cli    = Join-Path $root "rust-tui\target\debug\cosmostui.exe"
 $zdev   = Join-Path $root "zdev\dist\zdev.exe"
 $zagy   = Join-Path $root "go-ssh\zagy.exe"
 $merid  = Join-Path $root "meridian-bridge\target\debug\meridian.exe"
@@ -26,7 +26,7 @@ function RunHarness($h, $argv, [string]$cwd = $null) {
   try {
     if ($cwd) { Set-Location $cwd }
     switch ($h) {
-      "zcli" { & $cli @argv 2>$null }
+      "cosmostui" { & $cli @argv 2>$null }
       "zagy" { & $zagy @argv 2>$null }
       "zdev" { & $zdev @argv 2>$null }
     }
@@ -36,7 +36,7 @@ function EventsOf($lines) { @($lines | Where-Object { $_ -match '^\{' } | Conver
 
 # --- binaries exist ---
 Check "binaries built" {
-  Assert (Test-Path $cli)   "zcli.exe missing"
+  Assert (Test-Path $cli)   "cosmostui.exe missing"
   Assert (Test-Path $zagy)  "zagy.exe missing"
   Assert (Test-Path $merid) "meridian.exe missing"
   Assert (Test-Path $zdev)  "zdev.exe missing"
@@ -60,7 +60,7 @@ Check "tools dump byte-identical" {
 }
 
 # --- C2: fixture ping → pong, json-stream pure, events valid ---
-foreach ($h in @("zcli","zdev","zagy")) {
+foreach ($h in @("cosmostui","zdev","zagy")) {
   Check "$h fixture ping/json-stream" {
     $out = @(RunHarness $h @("-p","ping","--model","fixture","--output","json-stream"))
     Assert ($out.Count -gt 0) "$h produced no events"
@@ -82,33 +82,33 @@ Check "session list/export/branch/tree" {
   if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
   $homeDir = Join-Path $tmp "home"; New-Item -ItemType Directory -Force $homeDir | Out-Null
   $env:COSMOS_CLI_HOME = $homeDir
-  RunHarness "zcli" @("-p","ping","--model","fixture","--output","json") | Out-Null
-  $list = RunHarness "zcli" @("session","list")
+  RunHarness "cosmostui" @("-p","ping","--model","fixture","--output","json") | Out-Null
+  $list = RunHarness "cosmostui" @("session","list")
   Assert ($list -match "01") "session list empty"
   $id = ($list | Select-String -Pattern '01[0-9a-z]{24}').Matches[0].Value
-  $exp = @(RunHarness "zcli" @("session","export",$id,"--format","jsonl"))
+  $exp = @(RunHarness "cosmostui" @("session","export",$id,"--format","jsonl"))
   $exp | & $node (Join-Path $root "eval\validate-events.mjs") | Out-Null
   Assert ($LASTEXITCODE -eq 0) "exported events invalid"
-  $md = @(RunHarness "zcli" @("session","export",$id))
+  $md = @(RunHarness "cosmostui" @("session","export",$id))
   Assert ($md[0] -match "^#") "default export not markdown"
-  $tree = @(RunHarness "zcli" @("session","tree",$id))
+  $tree = @(RunHarness "cosmostui" @("session","tree",$id))
   Assert ($tree.Count -ge 1) "tree empty"
   $evs = @($exp | ConvertFrom-Json)
   $at = ($evs | Where-Object { $_.kind -eq "user" } | Select-Object -First 1).id
   Assert ($at) "no user event to branch at"
-  RunHarness "zcli" @("session","branch",$id,"--at",$at) | Out-Null
+  RunHarness "cosmostui" @("session","branch",$id,"--at",$at) | Out-Null
   Assert ($LASTEXITCODE -eq 0) "branch failed"
   Remove-Item Env:\COSMOS_CLI_HOME
 }
 
-# --- C4: cross-harness resume (zcli → zdev → zagy all append to one session) ---
+# --- C4: cross-harness resume (cosmos → zdev → zagy all append to one session) ---
 Check "cross-harness session resume" {
   $tmp = Join-Path $env:TEMP "cosmos-xharness"
   if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
   $homeDir = Join-Path $tmp "home"; New-Item -ItemType Directory -Force $homeDir | Out-Null
   $env:COSMOS_CLI_HOME = $homeDir
-  RunHarness "zcli" @("-p","ping","--model","fixture","--output","json") | Out-Null
-  $list = RunHarness "zcli" @("session","list")
+  RunHarness "cosmostui" @("-p","ping","--model","fixture","--output","json") | Out-Null
+  $list = RunHarness "cosmostui" @("session","list")
   $id = ($list | Select-String -Pattern '01[0-9a-z]{24}').Matches[0].Value
   $file = Join-Path $homeDir "sessions\$id.jsonl"
   $n1 = (Get-Content $file).Count
@@ -125,16 +125,21 @@ Check "cross-harness session resume" {
   Remove-Item Env:\COSMOS_CLI_HOME
 }
 
-# --- C5: memory roundtrip through meridian bridge ---
+# --- C5: memory roundtrip, shared with zagy through one vault ---
+# cosmostui keeps memory in-process; MERIDIAN_VAULT opts it into the vault the
+# meridian bridge (zagy, zdev) reads. A temp vault keeps the user's own clean.
 Check "memory add/search via bridge" {
   $env:COSMOS_CLI_HOME = Join-Path $env:TEMP "cosmos-memhome"
+  $env:MERIDIAN_VAULT = Join-Path $env:TEMP "cosmos-memvault"
+  Remove-Item -Recurse -Force $env:MERIDIAN_VAULT -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Force $env:COSMOS_CLI_HOME | Out-Null
-  RunHarness "zcli" @("memory","add","cosmos-conformance-marker-7f3e") | Out-Null
-  $res = RunHarness "zcli" @("memory","search","conformance-marker")
-  Assert ($res -match "conformance-marker") "zcli search missed: $res"
+  RunHarness "cosmostui" @("memory","add","cosmos-conformance-marker-7f3e") | Out-Null
+  $res = RunHarness "cosmostui" @("memory","search","conformance-marker")
+  Assert ($res -match "conformance-marker") "cosmostui search missed: $res"
   $res2 = RunHarness "zagy" @("memory","search","conformance-marker")
   Assert ($res2 -match "conformance-marker") "zagy search missed: $res2"
   Remove-Item Env:\COSMOS_CLI_HOME
+  Remove-Item Env:\MERIDIAN_VAULT
 }
 
 # --- C6: sandbox probes ---
@@ -151,10 +156,10 @@ Check "plan-mode deny + path escape deny" {
   if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
   New-Item -ItemType Directory -Force $tmp | Out-Null
   Set-Content (Join-Path $tmp "v.txt") "keep"
-  $o1 = RunHarness "zcli" @("-p",'tool:write {\"path\":\"v.txt\",\"content\":\"x\"}',"--mode","plan","--cwd",$tmp,"--output","json-stream","--model","fixture")
+  $o1 = RunHarness "cosmostui" @("-p",'tool:write {\"path\":\"v.txt\",\"content\":\"x\"}',"--mode","plan","--cwd",$tmp,"--output","json-stream","--model","fixture")
   $r1 = @(EventsOf $o1 | Where-Object { $_.kind -eq "tool_result" })[0]
   Assert ($r1.data.content -match "denied|plan") "plan-mode write not denied: $($r1.data.content)"
-  $o2 = RunHarness "zcli" @("-p",'tool:read {\"path\":\"../secret.txt\"}',"--allow","read","--cwd",$tmp,"--output","json-stream","--model","fixture")
+  $o2 = RunHarness "cosmostui" @("-p",'tool:read {\"path\":\"../secret.txt\"}',"--allow","read","--cwd",$tmp,"--output","json-stream","--model","fixture")
   $r2 = @(EventsOf $o2 | Where-Object { $_.kind -eq "tool_result" })[0]
   Assert ($r2.data.content -match "escapes workspace") "escape not denied: $($r2.data.content)"
 }
@@ -164,9 +169,9 @@ Check "plan-mode deny + path escape deny" {
 # a live provider that isn't up).
 $env:COSMOS_CLI_HOME = Join-Path $env:TEMP "cosmos-acphome"
 New-Item -ItemType Directory -Force $env:COSMOS_CLI_HOME | Out-Null
-foreach ($h in @("zcli","zdev","zagy")) {
+foreach ($h in @("cosmostui","zdev","zagy")) {
   Check "$h acp handshake" {
-    $bin = if ($h -eq "zcli") { $cli } elseif ($h -eq "zagy") { $zagy } else { $zdev }
+    $bin = if ($h -eq "cosmostui") { $cli } elseif ($h -eq "zagy") { $zagy } else { $zdev }
     $o = & $node (Join-Path $root "eval\acp-smoke.mjs") $bin 2>$null
     Assert ($LASTEXITCODE -eq 0) "$h acp failed: $o"
     Assert ($o -match "OK acp") "unexpected: $o"
@@ -183,7 +188,7 @@ Check "task worktree create+cleanup" {
   git init -q; git config user.email t@t; git config user.name t
   git commit -qm init --allow-empty
   $env:COSMOS_CLI_HOME = Join-Path $tmp "home"; New-Item -ItemType Directory -Force $env:COSMOS_CLI_HOME | Out-Null
-  $o = RunHarness "zcli" @("-p",'tool:task {\"prompt\":\"ping\",\"worktree\":true}',"--allow","task,read","--cwd",$tmp,"--output","json-stream","--model","fixture")
+  $o = RunHarness "cosmostui" @("-p",'tool:task {\"prompt\":\"ping\",\"worktree\":true}',"--allow","task,read","--cwd",$tmp,"--output","json-stream","--model","fixture")
   $r = @(EventsOf $o | Where-Object { $_.kind -eq "tool_result" })[0]
   Assert ($r.data.content -match "worktree branch: cosmos-task-") "no branch in result: $($r.data.content)"
   $wt = git worktree list --porcelain | Select-String "worktree"
@@ -199,10 +204,10 @@ Check "headless /compact writes world.md" {
   if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
   New-Item -ItemType Directory -Force $tmp | Out-Null
   $env:COSMOS_CLI_HOME = Join-Path $tmp "home"; New-Item -ItemType Directory -Force $env:COSMOS_CLI_HOME | Out-Null
-  RunHarness "zcli" @("-p","ship the login form","--model","fixture","--output","json") | Out-Null
-  $list = RunHarness "zcli" @("session","list")
+  RunHarness "cosmostui" @("-p","ship the login form","--model","fixture","--output","json") | Out-Null
+  $list = RunHarness "cosmostui" @("session","list")
   $id = ($list | Select-String -Pattern '01[0-9a-z]{24}').Matches[0].Value
-  RunHarness "zcli" @("-p","/compact","--model","fixture","--resume",$id) | Out-Null
+  RunHarness "cosmostui" @("-p","/compact","--model","fixture","--resume",$id) | Out-Null
   Assert (Test-Path (Join-Path $env:COSMOS_CLI_HOME "world\$id.md")) "world.md missing after /compact"
   $md = Get-Content (Join-Path $env:COSMOS_CLI_HOME "world\$id.md") -Raw
   Assert ($md -match "ship the login form") "goal missing from world.md"
@@ -214,7 +219,7 @@ Check "Read alias repairs to read" {
   if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
   New-Item -ItemType Directory -Force $tmp | Out-Null
   Set-Content (Join-Path $tmp "a.txt") "hello"
-  $o = RunHarness "zcli" @("-p",'tool:Read {\"path\":\"a.txt\"}',"--allow","read","--cwd",$tmp,"--output","json-stream","--model","fixture")
+  $o = RunHarness "cosmostui" @("-p",'tool:Read {\"path\":\"a.txt\"}',"--allow","read","--cwd",$tmp,"--output","json-stream","--model","fixture")
   $rep = @(EventsOf $o | Where-Object { $_.kind -eq "tool_repair" })
   Assert ($rep.Count -ge 1) "no tool_repair"
   $r = @(EventsOf $o | Where-Object { $_.kind -eq "tool_result" })[0]
@@ -227,13 +232,13 @@ Check "checkpoint /undo restores file" {
   New-Item -ItemType Directory -Force $tmp | Out-Null
   Set-Content (Join-Path $tmp "v.txt") "keep-me"
   $env:COSMOS_CLI_HOME = Join-Path $tmp "home"; New-Item -ItemType Directory -Force $env:COSMOS_CLI_HOME | Out-Null
-  RunHarness "zcli" @("-p",'tool:read {\"path\":\"v.txt\"}',"--allow","read,write","--cwd",$tmp,"--output","json-stream","--model","fixture") | Out-Null
-  $list = RunHarness "zcli" @("session","list")
+  RunHarness "cosmostui" @("-p",'tool:read {\"path\":\"v.txt\"}',"--allow","read,write","--cwd",$tmp,"--output","json-stream","--model","fixture") | Out-Null
+  $list = RunHarness "cosmostui" @("session","list")
   $id = ($list | Select-String -Pattern '01[0-9a-z]{24}').Matches[0].Value
-  RunHarness "zcli" @("-p",'tool:write {\"path\":\"v.txt\",\"content\":\"clobber\"}',"--allow","read,write","--cwd",$tmp,"--output","json-stream","--model","fixture","--resume",$id) | Out-Null
+  RunHarness "cosmostui" @("-p",'tool:write {\"path\":\"v.txt\",\"content\":\"clobber\"}',"--allow","read,write","--cwd",$tmp,"--output","json-stream","--model","fixture","--resume",$id) | Out-Null
   $clobber = Get-Content (Join-Path $tmp "v.txt") -Raw
   Assert ($clobber -match "clobber") "write did not clobber: $clobber"
-  RunHarness "zcli" @("-p","/undo","--model","fixture","--resume",$id) | Out-Null
+  RunHarness "cosmostui" @("-p","/undo","--model","fixture","--resume",$id) | Out-Null
   $body = Get-Content (Join-Path $tmp "v.txt") -Raw
   Assert ($body -match "keep-me") "undo did not restore: $body"
   Remove-Item Env:\COSMOS_CLI_HOME
@@ -244,7 +249,7 @@ Check "self_improve draft skill after fixture done" {
   if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
   New-Item -ItemType Directory -Force $tmp | Out-Null
   $env:COSMOS_CLI_HOME = Join-Path $tmp "home"; New-Item -ItemType Directory -Force $env:COSMOS_CLI_HOME | Out-Null
-  $o = RunHarness "zcli" @("-p","ping","--model","fixture","--output","json-stream","--self-improve")
+  $o = RunHarness "cosmostui" @("-p","ping","--model","fixture","--output","json-stream","--self-improve")
   $ev = @(EventsOf $o | Where-Object { $_.kind -eq "self_improve" })
   Assert ($ev.Count -ge 1 -or (Test-Path (Join-Path $env:COSMOS_CLI_HOME "skills"))) "no self_improve draft"
   Remove-Item Env:\COSMOS_CLI_HOME
@@ -255,7 +260,7 @@ Check "tool call terminates in 1 turn" {
   if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
   New-Item -ItemType Directory -Force $tmp | Out-Null
   Set-Content (Join-Path $tmp "a.txt") "hello"
-  $o = RunHarness "zcli" @("-p",'tool:read {\"path\":\"a.txt\"}',"--allow","read","--cwd",$tmp,"--output","json-stream","--model","fixture")
+  $o = RunHarness "cosmostui" @("-p",'tool:read {\"path\":\"a.txt\"}',"--allow","read","--cwd",$tmp,"--output","json-stream","--model","fixture")
   $calls = @(EventsOf $o | Where-Object { $_.kind -eq "tool_result" }).Count
   Assert ($calls -eq 1) "expected 1 tool_result, got $calls"
 }

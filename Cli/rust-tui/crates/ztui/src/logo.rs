@@ -1,4 +1,4 @@
-//! The zcli mark: a small black-and-white Milky Way drawn in braille.
+//! The cosmos mark: a small black-and-white Milky Way drawn in braille.
 //!
 //! A tilted two-arm logarithmic spiral with a bright core and a sprinkle of
 //! field stars is sampled on a 2×4-per-cell dot grid, then each cell is
@@ -7,8 +7,8 @@
 
 use std::sync::OnceLock;
 
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui_core::style::{Color, Modifier, Style};
+use ratatui_core::text::{Line, Span};
 
 pub const COLS: usize = 12;
 pub const ROWS: usize = 4;
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn print_galaxy() {
         // run with --nocapture to eyeball it
-        for l in banner("zcli", "v0.1.0") {
+        for l in banner("cosmos", "v0.1.0") {
             let s: String = l.spans.iter().map(|s| s.content.to_string()).collect();
             println!("{s}");
         }

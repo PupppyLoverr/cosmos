@@ -2,8 +2,8 @@
 //! (the first row gets one prefix, continuation rows another) so bullets,
 //! quotes and tool output wrap under their text instead of the margin.
 
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
+use ratatui_core::style::Style;
+use ratatui_core::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
 pub fn cw(c: char) -> usize {

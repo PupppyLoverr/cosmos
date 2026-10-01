@@ -1,6 +1,6 @@
 # CONTRACT.md — Cosmos CLI family wire contract
 
-Version 0. All three harnesses — `zcli` (Rust), `zdev` (TypeScript/bun), `zagy` (Go) — conform to
+Version 0. All three harnesses — `cosmostui` (Rust; formerly `zcli`), `zdev` (TypeScript/bun), `zagy` (Go) — conform to
 this document byte-for-byte on every surface it names. Where a behavior is not listed, the
 harness is free to choose; where it is listed, deviating is a bug.
 
@@ -41,8 +41,12 @@ MCP configuration is read from `~/.cosmos-cli/mcp.json` when present, using the
 
 ## 2. Tools
 
-The model sees exactly these tools; their JSON schemas are byte-identical across harnesses
-(`tools dump` output must match byte-for-byte).
+These are the only tools; their JSON schemas are byte-identical across harnesses (`tools dump`
+output must match byte-for-byte). A harness may send a core subset on the wire and serve the
+rest as *deferred* tools: `tool_search` returns their schemas as tool-result text and the model
+calls them through `mcp_call {server: "cosmos", tool, arguments}`; permissions apply to the
+inner tool. cosmostui sends `read edit write bash grep glob tool_search mcp_call` (plus
+`submit_plan` for a session that starts in plan mode) and defers the rest.
 
 File tools:
 
@@ -66,13 +70,17 @@ File tools:
 
 Harness tools:
 
-- `memory_search {query, k=5, scope?}`, `memory_write {type, text, scope}` — via the bridge.
+- `memory_search {query, k=5, scope?}`, `memory_write {type, text, scope}` — markdown bullets
+  in the Meridian vault format, BM25-searched (cosmostui keeps them in-process under
+  `COSMOS_CLI_HOME/memory`, or `$MERIDIAN_VAULT/memory` when that is set; with
+  `SUPERMEMORY_API_KEY` set it also mirrors to Supermemory, falling back to local results).
 - `context_remaining {}` — JSON `{tokens_in, tokens_budget, percent, cache_warm}`.
 - `new_context {}` — force L5 compact and reseed from `world.md`.
 - `task {prompt, write:false, worktree:false}` — subagents (§10).
 - `request_escalation {capability: "network"|"write_outside_workspace"|"unsandboxed", reason}`.
 - `submit_plan {plan}` — only in plan mode.
-- `tool_search {query}`, `mcp_call {server, tool, arguments}` — only when MCP is configured.
+- `tool_search {query}`, `mcp_call {server, tool, arguments}` — deferred harness tools (server
+  `cosmos`) plus any configured MCP servers.
 
 Every tool result is capped at 30,000 characters and ends with an explicit truncation notice
 when capped. Nothing else ships in v0.
@@ -92,9 +100,12 @@ when capped. Nothing else ships in v0.
 
 ## 4. Cache-stable prompt layout
 
-Fixed order: (1) contract system snippet, (2) tool schemas, (3) bridge boot context,
-(4) conversation. Layers 1–3 never change mid-session. MCP tools never enter the tool list;
-`tool_search` returns schemas as tool-result text and the model calls `mcp_call`.
+Fixed order: (1) contract system snippet, (2) tool schemas, (3) boot context, (4) conversation.
+Layers 1–3 never change mid-session — not on a mode change either (mode is announced in the
+conversation). MCP and deferred tools never enter the tool list; `tool_search` returns schemas as
+tool-result text and the model calls `mcp_call`. Boot context lists skills as `name — description`
+(bodies are read with `read`), deferred tools by name, a short repo map, repo instructions and a
+bounded set of the operator's remembered preferences/corrections, within 2,000 tokens.
 
 Cache-breaking operations — model switch, MCP server add/remove, skill install, contract or
 AGENTS.md change — happen only on explicit operator command, log `cache_break` with a reason,
@@ -126,7 +137,7 @@ Never change firewall, Defender, or system policy.
 Sessions are append-only JSONL at `COSMOS_CLI_HOME\sessions\<session_id>.jsonl`:
 
 ```json
-{"v":1,"id":"<ulid>","parent":"<ulid|null>","ts":"<rfc3339>","session":"<ulid>","harness":"zcli|zdev|zagy","kind":"...","data":{...}}
+{"v":1,"id":"<ulid>","parent":"<ulid|null>","ts":"<rfc3339>","session":"<ulid>","harness":"cosmostui|zdev|zagy","kind":"...","data":{...}}
 ```
 
 Kinds: `session_start` (model, mode, sandbox, boot_tokens), `session_end`, `checkout`,
@@ -171,13 +182,20 @@ Compact only when: (a) projected next-turn input > 0.80 × context window, or (b
 cache is presumed cold (idle longer than the provider TTL — Anthropic default 300 s, others
 600 s) AND context > 0.50 × window. Never compact while the cache is warm and context < 80%.
 Compaction replaces conversation only — layers 1–3 are untouched. Logs
-`compaction {before_tokens, after_tokens, reason}`. Five layers, cheapest first: L1 persist
-large tool results under `cache/tool/<sha>.txt` + middle-out preview; L2 snip after 48
-messages (keep 3 head + 40 newest); L3 microcompact older `tool_result`s when the cache is
-warm; L4 collapse consecutive `read`s for the *next* request only (conversation JSONL is
-untouched); L5 write `COSMOS_CLI_HOME/world/<session>.md` and keep a tail. Cache-warm =
-last model call < 4 minutes AND prefix hash unchanged. `/compact focus: …` forces L5.
-Thrash (context refills immediately) logs `compact_thrash` and aborts further auto-L5.
+`compaction {before_tokens, after_tokens, reason}`. Five layers, cheapest first: L1 when a result
+is produced, anything over 8,000 chars (24,000 for `read`) is persisted under
+`cache/tool/<sha>.txt` and replaced, in the log and the model view alike, by a 2,000-char
+middle-out preview with `log_path` and `omitted_chars`; L2 snip after 48 messages (keep 3 head +
+40 newest); L3 stub tool results older than 6 turns as `{tool, ok, path, sha}`; L4 stub a `read`
+superseded by a later read of the same path and range; L5 one summary call (goal, decisions,
+files, failing commands, next step) → `COSMOS_CLI_HOME/world/<session>.md`, keeping the newest
+~20,000 tokens verbatim. L2–L5 are **sticky**: each is decided once at a checkpoint, logged as
+`snip`/`compact`/`compaction` with a `view` op, and replayed identically on every later request and
+on resume, so between checkpoints each request extends the previous one and the cache keeps
+hitting. The raw JSONL is never rewritten. Cache-warm = last model call within the provider TTL
+(Anthropic 300 s, others 600 s) AND prefix hash unchanged. `/compact focus: …` forces L5.
+Thrash (still over the threshold on the turn right after an L5) logs `compact_thrash` and
+stops auto-L5 until the operator runs `/compact`.
 
 ## 10. Subagents
 
@@ -227,4 +245,4 @@ rejects any host not on the allowlist; a test proves the rejection.
 - `task.write` defaults `worktree` to true. Subagent returns ≤4000 chars; parent never
   ingests child tool traces.
 - Read-only tools may run in parallel (cap 8). Writes, bash, mcp, and `task` stay serial.
-- GPUI: `zgpui` is a typed ACP client crate. Daily `zcli` does not link GPUI.
+- GPUI: `zgpui` is a typed ACP client crate. Daily `cosmostui` does not link GPUI.

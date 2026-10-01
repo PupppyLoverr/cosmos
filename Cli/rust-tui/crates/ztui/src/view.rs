@@ -6,7 +6,7 @@
 //! ❯ Hello what can you do   ← user turn: full-width grey bar
 //!  I can help with …        ← reply, one-column margin, • bullets
 //! ────────────────────────  ← rule
-//! ❯ Ask zcli to build …     ← composer
+//! ❯ Ask Cosmos to build …     ← composer
 //! ────────────────────────  ← rule
 //! r9 Medium          ? for shortcuts   ← status line
 //!   /model …  Interactively choose …   ← menus open *below* the status line
@@ -14,8 +14,8 @@
 
 use std::collections::HashMap;
 
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui_core::style::{Modifier, Style};
+use ratatui_core::text::{Line, Span};
 use serde_json::Value;
 use zcore::agent::Mode;
 
@@ -394,7 +394,7 @@ pub fn farewell(app: &App) -> Vec<Line<'static>> {
     if app.session.is_empty() {
         return Vec::new();
     }
-    vec![Line::default(), Line::from(vec![dim(" Resume this session with  "), sp(format!("zcli --resume {}", app.session))]), Line::default()]
+    vec![Line::default(), Line::from(vec![dim(" Resume this session with  "), sp(format!("cosmostui --resume {}", app.session))]), Line::default()]
 }
 
 /// The sign-in URL, shown in case the browser didn't open.
@@ -703,7 +703,7 @@ fn model_picker(app: &App, filter: &[char], sel: usize, effort: usize, w: usize)
             } else {
                 " · no quota consumed"
             };
-            vec![sp("  "), Span::styled(" FREE ", Style::new().fg(ratatui::style::Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)), dim(what)]
+            vec![sp("  "), Span::styled(" FREE ", Style::new().fg(ratatui_core::style::Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)), dim(what)]
         } else {
             vec![sp("  "), sp(format!("${:.2} in · ${:.2} out", m.price.input, m.price.output)), dim(" per 1M tokens")]
         };
@@ -810,7 +810,7 @@ fn perm_prompt(p: &Perm, w: usize) -> Vec<Line<'static>> {
     let opts = [
         "Yes".to_string(),
         format!("Yes, and don't ask again for {label} this session"),
-        "No, tell zcli what to do instead".to_string(),
+        "No, tell Cosmos what to do instead".to_string(),
     ];
     for (i, o) in opts.iter().enumerate() {
         let on = i == p.sel;
@@ -1067,8 +1067,8 @@ mod tests {
     fn dump_screens() {
         let _env = crate::env_lock();
         use crate::tui::ModelRow;
-        std::env::set_var("COSMOS_CLI_HOME", std::env::temp_dir().join("zcli-view-test"));
-        let _ = std::fs::create_dir_all(std::env::temp_dir().join("zcli-view-test"));
+        std::env::set_var("COSMOS_CLI_HOME", std::env::temp_dir().join("cosmos-view-test"));
+        let _ = std::fs::create_dir_all(std::env::temp_dir().join("cosmos-view-test"));
         let w = 96;
         let free = zproto::Prices::default();
         let paid = zproto::Prices { input: 3.0, cache_read: 0.3, cache_write: 3.75, output: 15.0 };
@@ -1091,7 +1091,7 @@ mod tests {
         app.session = "01k5zq8m3v".into();
         app.effort = 2;
 
-        let mut scroll: Vec<Line<'static>> = crate::logo::banner("zcli", "v0.1.0");
+        let mut scroll: Vec<Line<'static>> = crate::logo::banner("cosmos", "v0.1.0");
         scroll.push(Line::default());
         scroll.push(info_line(&app));
         scroll.push(Line::default());

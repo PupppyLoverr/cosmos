@@ -1,4 +1,4 @@
-//! ACP mode (`zcli acp`): newline-delimited JSON-RPC over stdio.
+//! ACP mode (`cosmostui acp`): newline-delimited JSON-RPC over stdio.
 //! Contract §11: initialize, session/new, session/prompt, session/update
 //! notifications, session/request_permission (auto-deny headless),
 //! session/cancel.
@@ -80,7 +80,7 @@ pub fn run() -> i32 {
                 &id,
                 json!({
                     "protocolVersion": 1,
-                    "agentInfo": {"name": "zcli", "version": env!("CARGO_PKG_VERSION")},
+                    "agentInfo": {"name": zcore::NAME, "version": env!("CARGO_PKG_VERSION")},
                     "agentCapabilities": {"loadSession": false,
                         "promptCapabilities": {"embeddedContext": true}}
                 }),
@@ -91,7 +91,7 @@ pub fn run() -> i32 {
                     .map(PathBuf::from)
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 let opts = RunOpts::default();
-                match Agent::new(&opts, "zcli", &cwd) {
+                match Agent::new(&opts, zcore::NAME, &cwd) {
                     Ok(agent) => {
                         let sid = agent.session.id.clone();
                         cwds.insert(sid.clone(), cwd);

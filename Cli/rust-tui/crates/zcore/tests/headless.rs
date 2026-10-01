@@ -18,7 +18,7 @@ fn unreachable_provider_exits_4_with_error_event() {
     .unwrap();
     let opts = RunOpts { prompt: Some("ping".into()), ..Default::default() };
     let mut kinds = Vec::new();
-    let code = zcore::agent::run_headless(&opts, "cosmos", home.path(), &mut |e: &zproto::Event| {
+    let code = zcore::agent::run_headless(&opts, "cosmostui", home.path(), &mut |e: &zproto::Event| {
         kinds.push((e.kind.clone(), e.data.clone()))
     })
     .unwrap();

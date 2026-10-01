@@ -321,7 +321,7 @@ fn worker(
     rx: Receiver<Cmd>,
     tx: Sender<Msg>,
 ) {
-    let mut agent = match Agent::new(&opts, "zcli", &cwd) {
+    let mut agent = match Agent::new(&opts, zcore::NAME, &cwd) {
         Ok(a) => a,
         Err(e) => {
             send(&tx, Msg::Err(format!("agent init failed: {e:#}")));
@@ -388,7 +388,7 @@ fn worker(
                 o.prompt = None;
                 o.mode = Some(agent.mode.name().to_string());
                 o.yolo = agent.mode == Mode::Yolo;
-                match Agent::new(&o, "zcli", &cwd) {
+                match Agent::new(&o, zcore::NAME, &cwd) {
                     Ok(mut a) => {
                         install_asker(&mut a, &tx, &always);
                         install_delta(&mut a, &tx);
@@ -398,8 +398,14 @@ fn worker(
                             json!({"model": a.model_alias, "mode": a.mode.name(),
                                    "resume": o.resume, "switch": true}),
                         );
+                        let from = agent.model_alias.clone();
                         agent = a;
                         emit(&ev);
+                        let ev = agent
+                            .session
+                            .append("model_switch", json!({"from": from, "to": agent.model_alias}));
+                        emit(&ev);
+                        agent.log_cache_break("model_switch", &mut emit);
                         send(&tx, ready(&agent));
                         send(&tx, Msg::Note(format!("model → {alias}")));
                     }
@@ -410,7 +416,7 @@ fn worker(
                 let mut o = agent.opts.clone();
                 o.resume = Some(id.clone());
                 o.prompt = None;
-                match Agent::new(&o, "zcli", &cwd) {
+                match Agent::new(&o, zcore::NAME, &cwd) {
                     Ok(mut a) => {
                         install_asker(&mut a, &tx, &always);
                         install_delta(&mut a, &tx);
@@ -419,6 +425,7 @@ fn worker(
                             "session_start",
                             json!({"model": a.model_alias, "mode": a.mode.name(), "resume": id}),
                         );
+                        a.log_cache_break("resume", &mut emit);
                         let history: Vec<(bool, String)> = a
                             .messages
                             .iter()

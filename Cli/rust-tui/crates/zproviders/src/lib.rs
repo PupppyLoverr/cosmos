@@ -157,7 +157,7 @@ fn http_error(status: u16, body: &str) -> anyhow::Error {
         })
         .unwrap_or_else(|| body.chars().take(400).collect());
     let hint = match status {
-        401 | 403 => " — check the API key (zcli auth login <provider>)",
+        401 | 403 => " — check the API key (cosmostui auth login <provider>)",
         404 => " — unknown model or endpoint for this provider",
         429 => " — rate limited or out of quota",
         _ => "",
@@ -869,7 +869,7 @@ fn responses_complete(
     if chatgpt {
         call = call
             .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "zcli")
+            .header("originator", "cosmostui")
             .header("session_id", req.session_id);
         if let Some(a) = &cfg.account_id {
             call = call.header("chatgpt-account-id", a);
@@ -951,7 +951,7 @@ fn responses_complete(
 pub fn transcribe(base_url: &str, key: &str, model: &str, wav: &[u8], allowed: &[String]) -> Result<String> {
     let url = format!("{}/audio/transcriptions", base_url.trim_end_matches('/'));
     host_allowed(&url, allowed)?;
-    let boundary = format!("zcli{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let boundary = format!("cosmos{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     let mut body: Vec<u8> = Vec::with_capacity(wav.len() + 512);
     let field = |b: &mut Vec<u8>, name: &str, value: &str| {
         b.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
@@ -986,7 +986,7 @@ pub fn transcribe(base_url: &str, key: &str, model: &str, wav: &[u8], allowed: &
 pub fn transcribe_chatgpt(base_url: &str, access: &str, account_id: &str, wav: &[u8], allowed: &[String]) -> Result<String> {
     let url = format!("{}/transcribe", base_url.trim_end_matches('/'));
     host_allowed(&url, allowed)?;
-    let boundary = format!("zcli{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let boundary = format!("cosmos{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     let mut body: Vec<u8> = Vec::with_capacity(wav.len() + 256);
     body.extend_from_slice(
         format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"dictation.wav\"\r\nContent-Type: audio/wav\r\n\r\n").as_bytes(),
@@ -996,7 +996,7 @@ pub fn transcribe_chatgpt(base_url: &str, access: &str, account_id: &str, wav: &
     let mut req = ureq::post(&url)
         .header("authorization", &format!("Bearer {access}"))
         .header("content-type", &format!("multipart/form-data; boundary={boundary}"))
-        .header("originator", "zcli");
+        .header("originator", "cosmostui");
     if !account_id.is_empty() {
         req = req.header("chatgpt-account-id", account_id);
     }

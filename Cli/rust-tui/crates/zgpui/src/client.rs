@@ -1,4 +1,4 @@
-//! Spawn `zcli acp`, speak JSON-RPC, yield typed events.
+//! Spawn `cosmostui acp`, speak JSON-RPC, yield typed events.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -16,8 +16,8 @@ pub struct AcpClient {
 }
 
 impl AcpClient {
-    pub fn spawn(zcli: PathBuf) -> std::io::Result<Self> {
-        let mut child = Command::new(zcli)
+    pub fn spawn(cosmos: PathBuf) -> std::io::Result<Self> {
+        let mut child = Command::new(cosmos)
             .arg("acp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
