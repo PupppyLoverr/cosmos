@@ -359,6 +359,7 @@ impl EngineCore {
         ));
         // Cloud/GitHub agent mode: `cloudSeat` chats dispatch to the seat.
         let cloud = cloud::CloudStore::load(data_dir);
+        cloud::set_ssh_key_dir(data_dir);
         sessions.set_cloud(cloud.clone());
         let scheduler = cloud::Scheduler::new(
             cloud.clone(),

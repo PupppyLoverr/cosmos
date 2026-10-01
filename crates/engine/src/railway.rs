@@ -223,7 +223,7 @@ async fn railway_ssh(
 ) -> Result<crate::cloud::ExecOutcome, String> {
     let output = tokio::time::timeout(
         timeout,
-        tokio::process::Command::new("ssh")
+        crate::cloud::ssh()
             .args([
                 "-o",
                 "BatchMode=yes",
@@ -240,7 +240,7 @@ async fn railway_ssh(
     )
     .await
     .map_err(|_| "ssh railway.new timed out — region may be saturated".to_string())?
-    .map_err(|e| format!("could not run ssh: {e}"))?;
+    .map_err(crate::cloud::ssh_spawn_error)?;
     Ok(crate::cloud::ExecOutcome {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),

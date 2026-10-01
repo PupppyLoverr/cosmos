@@ -8312,29 +8312,7 @@ impl Shell {
                         cx: &mut Context<Self>| {
             let seat_data = seat.clone();
             let selected = picked.as_deref() == Some(seat.config.id.as_str());
-            let ready = crate::cloud::CloudView::seat_ready(seat);
-            let status = match seat.config.kind {
-                Some(zeron_proto::CloudSeatKind::Railway) if seat.config.expired() => {
-                    Some("trial ended")
-                }
-                Some(zeron_proto::CloudSeatKind::Ssh)
-                    if seat
-                        .config
-                        .last_probe
-                        .as_ref()
-                        .is_some_and(|probe| !probe.online) =>
-                {
-                    Some("offline")
-                }
-                Some(zeron_proto::CloudSeatKind::GitHub)
-                    if seat.config.repo.is_none() || !seat.has_github_pat =>
-                {
-                    Some("needs token")
-                }
-                Some(zeron_proto::CloudSeatKind::Box) if !seat.has_box_token => Some("needs token"),
-                _ if !ready => Some("needs credentials"),
-                _ => None,
-            };
+            let status = crate::cloud::seat_status_note(seat);
             let mut row = popover::menu_row(
                 theme,
                 selected,
@@ -8398,6 +8376,14 @@ impl Shell {
                         state.cloud_mode = true;
                     });
                     this.close_cloud_seat_menu(cx);
+                    // A trial seat that isn't live (it never connected, or
+                    // its hour is up) re-asks Railway — the honest "retry".
+                    if crate::cloud::stalled_trial(&seat_data) {
+                        this.state
+                            .update(cx, |state, _| state.cloud_trial_failure = None);
+                        this.composer
+                            .update(cx, |composer, cx| composer.start_railway_trial(cx));
+                    }
                     cx.notify();
                 }))
         };
@@ -8493,25 +8479,7 @@ impl Shell {
     fn render_cloud_seat_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let seat = self.state.read(cx).active_cloud_seat().cloned();
         let trial_failed = self.state.read(cx).cloud_trial_failure.is_some();
-        let label: SharedString = match seat.as_ref() {
-            Some(seat) if seat.config.kind == Some(zeron_proto::CloudSeatKind::GitHub) => {
-                format!("GitHub — {}", seat.config.label).into()
-            }
-            Some(seat) if seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway) => {
-                match seat.config.expires_at {
-                    None if trial_failed => "Railway trial — unavailable".into(),
-                    None => "Railway trial — starting…".into(),
-                    Some(_) if seat.config.expired() => "Railway trial — ended".into(),
-                    Some(at) => format!(
-                        "Railway trial — {}m",
-                        at.signed_duration_since(Utc::now()).num_minutes().max(0)
-                    )
-                    .into(),
-                }
-            }
-            Some(seat) => format!("Cloud — {}", seat.config.label).into(),
-            None => "Choose a seat…".into(),
-        };
+        let label: SharedString = crate::cloud::seat_chip_label(seat.as_ref(), trial_failed).into();
         let open = self.cloud_seat_menu.is_open();
         let trigger = div()
             .id("sidebar-cloud-seat")

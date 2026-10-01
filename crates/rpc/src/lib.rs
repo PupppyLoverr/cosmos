@@ -335,6 +335,9 @@ pub mod methods {
     /// `{seatId?, query?}` → `{repos: [RepoHit], orgs: [String]}` — the
     /// GitHub-agent repo picker; resolves the seat's PAT or the shared one.
     pub const CLOUD_GITHUB_REPOS: &str = "CloudGitHubRepos";
+    /// `{repo, seatId?}` → `{branches: [String], defaultBranch, truncated}` —
+    /// the cloud composer's branch picker for the picked repo.
+    pub const CLOUD_GITHUB_BRANCHES: &str = "CloudGitHubBranches";
     /// `{pat}` → `{ok}` — verify + store the shared GitHub PAT (repo scope)
     /// that the picker and every PAT-less GitHub seat fall back to.
     pub const CLOUD_GITHUB_SAVE: &str = "CloudGitHubSave";

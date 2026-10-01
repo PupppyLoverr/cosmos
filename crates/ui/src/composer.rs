@@ -5915,10 +5915,22 @@ impl Composer {
         );
         let cloud_settings = cx.subscribe(
             &pickers,
-            |_, _, _: &crate::pickers::OpenCloudComputer, cx| {
-                cx.emit(ComposerEvent::WorkspaceCommand(
-                    WorkspaceCommand::CloudComputer,
-                ));
+            |this: &mut Self, _, action: &crate::pickers::CloudChipAction, cx| match action {
+                crate::pickers::CloudChipAction::OpenSettings => {
+                    cx.emit(ComposerEvent::WorkspaceCommand(
+                        WorkspaceCommand::CloudComputer,
+                    ));
+                }
+                crate::pickers::CloudChipAction::StartTrial => {
+                    this.clear_failure(cx);
+                    this.start_railway_trial(cx);
+                }
+                crate::pickers::CloudChipAction::SeatPicked { restart_trial } => {
+                    this.clear_failure(cx);
+                    if *restart_trial {
+                        this.start_railway_trial(cx);
+                    }
+                }
             },
         );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
@@ -6038,10 +6050,22 @@ impl Composer {
         );
         let cloud_settings = cx.subscribe(
             &pickers,
-            |_, _, _: &crate::pickers::OpenCloudComputer, cx| {
-                cx.emit(ComposerEvent::WorkspaceCommand(
-                    WorkspaceCommand::CloudComputer,
-                ));
+            |this: &mut Self, _, action: &crate::pickers::CloudChipAction, cx| match action {
+                crate::pickers::CloudChipAction::OpenSettings => {
+                    cx.emit(ComposerEvent::WorkspaceCommand(
+                        WorkspaceCommand::CloudComputer,
+                    ));
+                }
+                crate::pickers::CloudChipAction::StartTrial => {
+                    this.clear_failure(cx);
+                    this.start_railway_trial(cx);
+                }
+                crate::pickers::CloudChipAction::SeatPicked { restart_trial } => {
+                    this.clear_failure(cx);
+                    if *restart_trial {
+                        this.start_railway_trial(cx);
+                    }
+                }
             },
         );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
@@ -6155,10 +6179,22 @@ impl Composer {
         );
         let cloud_settings = cx.subscribe(
             &pickers,
-            |_, _, _: &crate::pickers::OpenCloudComputer, cx| {
-                cx.emit(ComposerEvent::WorkspaceCommand(
-                    WorkspaceCommand::CloudComputer,
-                ));
+            |this: &mut Self, _, action: &crate::pickers::CloudChipAction, cx| match action {
+                crate::pickers::CloudChipAction::OpenSettings => {
+                    cx.emit(ComposerEvent::WorkspaceCommand(
+                        WorkspaceCommand::CloudComputer,
+                    ));
+                }
+                crate::pickers::CloudChipAction::StartTrial => {
+                    this.clear_failure(cx);
+                    this.start_railway_trial(cx);
+                }
+                crate::pickers::CloudChipAction::SeatPicked { restart_trial } => {
+                    this.clear_failure(cx);
+                    if *restart_trial {
+                        this.start_railway_trial(cx);
+                    }
+                }
             },
         );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
@@ -9519,10 +9555,22 @@ impl Composer {
     fn seat_binding(&self, chat_id: &str, cx: &App) -> Option<zeron_proto::CloudSeatBinding> {
         let state = self.state.read(cx);
         let seat = state.active_cloud_seat()?;
+        // A non-default branch pick gets its own checkout beside the
+        // default branch's (`<repo>@<branch>`).
+        let branch = state.cloud_repo_pick.as_ref().and_then(|pick| {
+            state
+                .cloud_branch_pick
+                .clone()
+                .filter(|b| !b.trim().is_empty() && *b != pick.default_branch)
+        });
         let (repo, workspace_path) = match &state.cloud_repo_pick {
             Some(pick) => (
                 Some(pick.full_name.clone()),
-                Some(crate::cloud::repo_workspace(&seat.config, &pick.full_name)),
+                Some(zeron_engine::cloud::repo_workspace(
+                    &seat.config.workspace(),
+                    &pick.full_name,
+                    branch.as_deref(),
+                )),
             ),
             None if seat.config.repo.is_some() => {
                 (seat.config.repo.clone(), seat.config.workspace_path.clone())
@@ -9541,6 +9589,7 @@ impl Composer {
             label: seat.config.label.clone(),
             repo,
             workspace_path,
+            branch,
             model_label: self
                 .cloud_view(cx)
                 .map(|view| view.cloud_model_label().to_string()),
@@ -9598,11 +9647,22 @@ impl Composer {
                         return;
                     }
                 };
-                let existing_seat_id = current_view
+                let existing_seat = current_view
                     .seats
                     .iter()
-                    .find(|seat| seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway))
-                    .map(|seat| seat.config.id.clone());
+                    .find(|seat| seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway));
+                let existing_seat_id = existing_seat.map(|seat| seat.config.id.clone());
+                // A seat that never came online (no ssh key the first time) or whose hour
+                // is up asks railway.new afresh — a working key gets a box, a truly
+                // expired one gets Railway's claim link.
+                let fresh = existing_seat.is_some_and(|seat| {
+                    seat.config.expired()
+                        || seat
+                            .config
+                            .last_probe
+                            .as_ref()
+                            .is_none_or(|probe| !probe.online)
+                });
                 let seat_id = existing_seat_id
                     .clone()
                     .unwrap_or_else(|| format!("seat-{}", uuid::Uuid::new_v4().simple()));
@@ -9647,7 +9707,7 @@ impl Composer {
                     .client()
                     .call(
                         zeron_rpc::methods::CLOUD_PROBE_SEAT,
-                        serde_json::json!({ "seatId": seat_id.clone() }),
+                        serde_json::json!({ "seatId": seat_id.clone(), "fresh": fresh }),
                     )
                     .await;
                 // Re-read the view so the picked row carries the stamped
@@ -9886,7 +9946,7 @@ impl Composer {
                 )
                 .into()
             } else if has_seats {
-                "Cloud mode is on — choose a seat in the sidebar (or switch to Agent).".into()
+                "Cloud mode is on — pick a seat from the cloud chip above the composer (or switch to Agent).".into()
             } else {
                 self.start_railway_trial(cx);
                 "Starting your free cloud computer (60-minute Railway trial) — send again once it's ready."
@@ -12008,27 +12068,31 @@ impl Render for Composer {
                         ),
                 )
         };
-        // Machine + project name a LOCAL destination; a cloud chat's target
-        // is the seat (sidebar) and its repo — hide them in Cloud mode.
-        let local_target = !self.state.read(cx).cloud_mode;
-        let new_thread_target_selectors =
-            (new_thread_chrome_opacity > 0.0 && local_target).then(|| {
-                self.pickers.update(cx, |pickers, cx| {
-                    pickers.render_new_thread_target_selectors(cx)
-                })
-            });
-        let new_thread_git_selectors = (new_thread_chrome_opacity > 0.0 && local_target)
+        // Same chips in both modes: machine + project + checkout/ref locally;
+        // in Cloud mode the machine chip is the seat, the project chip picks
+        // a GitHub repo, and the ref chip picks its branch.
+        let new_thread_target_selectors = (new_thread_chrome_opacity > 0.0).then(|| {
+            self.pickers.update(cx, |pickers, cx| {
+                pickers.render_new_thread_target_selectors(cx)
+            })
+        });
+        let new_thread_git_selectors = (new_thread_chrome_opacity > 0.0)
             .then(|| {
                 self.pickers.update(cx, |pickers, cx| {
                     pickers.render_new_thread_git_selectors(cx)
                 })
             })
             .flatten();
-        let has_new_thread_git_selectors = self
-            .state
-            .read(cx)
-            .selected_space_row()
-            .is_some_and(|space| space.git_detected);
+        let has_new_thread_git_selectors = {
+            let state = self.state.read(cx);
+            if state.cloud_mode {
+                state.cloud_repo_pick.is_some()
+            } else {
+                state
+                    .selected_space_row()
+                    .is_some_and(|space| space.git_detected)
+            }
+        };
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.

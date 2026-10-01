@@ -3214,7 +3214,7 @@ impl Shell {
             match row {
                 SpacesMenuRow::All | SpacesMenuRow::Repo(_) => {
                     self.state.update(cx, |state, cx| {
-                        state.cloud_repo_pick = match &row {
+                        let pick = match &row {
                             SpacesMenuRow::Repo(name) => match &state.cloud_repos {
                                 crate::popover::Loadable::Ready(repos) => {
                                     repos.iter().find(|r| &r.full_name == name).cloned()
@@ -3223,6 +3223,7 @@ impl Shell {
                             },
                             _ => None,
                         };
+                        state.set_cloud_repo_pick(pick);
                         cx.notify();
                     });
                     self.close_spaces_menu(cx);

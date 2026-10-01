@@ -72,6 +72,10 @@ pub struct CloudSeatBinding {
     /// the seat's configured default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
+    /// The repo branch the chat's checkout starts on (the composer's branch
+    /// pick). None = the repo's default branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Model label for the seat chip, e.g. the BYOK provider's default model
     /// or the seat CLI's own login ("seat CLI login").
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -692,23 +692,25 @@ impl SessionsEngine {
         // Boat runs ride the provider's integrated-agent `/prompt` surface —
         // no seat-local harness command needed. SSH/Railway exec the seat's
         // configured harness; Railway defaults to the preinstalled `claude`.
-        let command = seat
+        // The composer's harness + model pick runs on the seat — the same
+        // agents as on this computer, headless, with the user's logins
+        // staged. A run with no explicit pick (automations, older clients)
+        // keeps the seat's own configured command.
+        let is_boat_seat = matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box));
+        let configured = seat
             .harness_command
             .clone()
-            .filter(|c| !c.trim().is_empty())
-            .or_else(|| {
-                matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Railway))
-                    .then(|| "claude -p".to_string())
-            })
-            .or_else(|| {
-                matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box)).then(String::new)
-            })
-            .ok_or_else(|| {
-                EngineError::Other(
-                    "this seat has no harness command — set one in Settings → Cloud computer"
-                        .into(),
-                )
-            })?;
+            .filter(|c| !c.trim().is_empty());
+        let (command, install) = if is_boat_seat {
+            (String::new(), String::new())
+        } else if request.harness.is_some() || configured.is_none() {
+            let picked =
+                crate::cloud::seat_harness(harness_id, request.model.as_deref(), request.reasoning)
+                    .map_err(EngineError::Other)?;
+            (picked.command, picked.install)
+        } else {
+            (configured.unwrap_or_default(), String::new())
+        };
 
         let handle = self.doc_handle(chat_id)?;
         // Conversation continuity: harnesses with a resumable conversation
@@ -717,14 +719,19 @@ impl SessionsEngine {
         // otherwise — and on a chat's first turn on a new seat — the prior
         // turns ride the prompt as a compact recap.
         let session_id = crate::cloud::harness_session_id(chat_id);
-        let resuming = store.harness_session_for_chat(chat_id, &seat.id).is_some();
+        // A turn resumes only the SAME agent's conversation — switching from
+        // Claude Code to Codex mid-thread starts Codex fresh (with a recap).
+        let bin = crate::cloud::command_bin(&command);
+        let resuming = store
+            .harness_session_for_chat(chat_id, &seat.id)
+            .is_some_and(|tag| tag.starts_with(&format!("{bin}:")));
         let is_boat = matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box));
         let flags = (!is_boat)
             .then(|| crate::cloud::continuation_flags(&command, &session_id, resuming))
             .flatten();
         let session_tag = (!is_boat
             && crate::cloud::continuation_flags(&command, &session_id, true).is_some())
-        .then(|| session_id.clone());
+        .then(|| format!("{bin}:{session_id}"));
         let recap = if resuming && flags.is_some() {
             String::new()
         } else {
@@ -801,6 +808,7 @@ impl SessionsEngine {
                 prompt: request.prompt,
                 recap,
                 session_tag,
+                install,
             },
             handle.writer(),
             cancel_rx,
@@ -1788,6 +1796,8 @@ struct RemoteTurn {
     prompt: String,
     recap: String,
     session_tag: Option<String>,
+    /// Best-effort install of the harness CLI when the seat lacks it.
+    install: String,
 }
 
 /// A compact recap of the thread so far — the continuity fallback for
@@ -1947,6 +1957,51 @@ async fn prepare_remote_turn(
     {
         write_transcript_note(doc, &inner.device_id, &note);
     }
+    // SSH/Railway runs clone inside the harness command; a Boat box's
+    // integrated agent has no such prelude, so its repo checkout (on the
+    // picked branch) lands here, before the prompt.
+    if matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box))
+        && let Some(repo) = seat.repo.as_deref().filter(|r| !r.trim().is_empty())
+    {
+        let token = store
+            .github_pat(&seat.id)
+            .map(|pat| format!("GITHUB_TOKEN={} ", crate::cloud::shell_word(&pat)))
+            .unwrap_or_default();
+        let clone = crate::cloud::command_in_workspace(
+            &workspace,
+            &format!(
+                "{token}sh -c {}",
+                crate::cloud::shell_word(&crate::cloud::repo_checkout_prelude(
+                    repo,
+                    seat.branch.as_deref()
+                ))
+            ),
+        );
+        match crate::cloud::seat_exec(
+            http,
+            store,
+            seat,
+            &clone,
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        {
+            Ok(out) if out.code == 0 => {}
+            Ok(out) => write_transcript_note(
+                doc,
+                &inner.device_id,
+                &format!(
+                    "Couldn't check out {repo} on the box: {}",
+                    out.stderr.lines().last().unwrap_or("git clone failed")
+                ),
+            ),
+            Err(e) => write_transcript_note(
+                doc,
+                &inner.device_id,
+                &format!("Couldn't check out {repo} on the box: {e}"),
+            ),
+        }
+    }
     if !desktop_ok {
         tracing::warn!(seat = %seat.id, "seat desktop bootstrap failed");
     }
@@ -2035,8 +2090,8 @@ async fn drive_remote_run(
         Some(repo) => format!(
             "sh -c {}",
             crate::cloud::shell_word(&format!(
-                "{} && exec {user_cmd}",
-                crate::cloud::repo_checkout_prelude(repo)
+                "{} && exec env {user_cmd}",
+                crate::cloud::repo_checkout_prelude(repo, seat.branch.as_deref())
             ))
         ),
         None => user_cmd,
@@ -2046,8 +2101,24 @@ async fn drive_remote_run(
     } else {
         format!("env {env} {user_cmd}")
     };
-    // The seat's display + `cosmos-computer` ride the harness environment.
-    let remote_command = format!("{} {remote_command}", crate::seat_desktop::env_prefix());
+    // The seat's display + `cosmos-computer` ride the harness environment;
+    // a missing harness CLI installs first (best-effort, never fatal).
+    let remote_command = if turn.install.is_empty() {
+        format!("{} {remote_command}", crate::seat_desktop::env_prefix())
+    } else {
+        // When the install couldn't land the CLI, say exactly that instead
+        // of the shell's bare "command not found".
+        let bin = crate::cloud::command_bin(&command);
+        format!(
+            "{} export PATH=\"$HOME/.local/bin:$HOME/.cursor/bin:$HOME/.npm-global/bin:$PATH\" && {{ {} ; }} ; command -v {} >/dev/null 2>&1 || {{ echo {} >&2; exit 127; }} ; {remote_command}",
+            crate::seat_desktop::env_prefix(),
+            turn.install,
+            crate::cloud::shell_word(&bin),
+            crate::cloud::shell_word(&format!(
+                "`{bin}` isn't installed on this seat and the automatic install didn't work — install it on the seat, or pick another agent in the model picker."
+            )),
+        )
+    };
     let full = crate::cloud::command_in_workspace(&seat.workspace(), &remote_command);
 
     // The user's existing CLI logins ride to the seat — `~/.codex/auth.json`,
@@ -3142,7 +3213,16 @@ fn remote_agent_failure_message(status: i32, stdout: &str, stderr: &str) -> Stri
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    let lines = output.lines().collect::<Vec<_>>();
+    // ssh's own "Connection to … closed." (from `-tt`) is transport noise,
+    // never the reason a run failed.
+    let lines = output
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !(line.starts_with("Connection to ") && line.ends_with(" closed."))
+        })
+        .collect::<Vec<_>>();
     if !lines.is_empty() {
         return lines[lines.len().saturating_sub(20)..].join("\n");
     }
@@ -3205,6 +3285,22 @@ mod remote_agent_failure_tests {
         assert_eq!(
             remote_agent_failure_message(status, &stdout, &stderr),
             "Not logged in · Please run /login"
+        );
+    }
+
+    #[test]
+    fn ssh_transport_noise_never_reads_as_the_failure() {
+        assert_eq!(
+            remote_agent_failure_message(
+                127,
+                "`claude` isn't installed on this seat\r\n",
+                "Connection to 127.0.0.1 closed.\r\n"
+            ),
+            "`claude` isn't installed on this seat"
+        );
+        assert_eq!(
+            remote_agent_failure_message(255, "", "Connection to railway.new closed.\n"),
+            "seat run exited 255"
         );
     }
 

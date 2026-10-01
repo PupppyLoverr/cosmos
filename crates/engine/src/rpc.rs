@@ -3824,9 +3824,23 @@ impl RpcService for EngineRpc {
                 #[serde(rename_all = "camelCase")]
                 struct P {
                     seat_id: String,
+                    /// Ask the provider afresh: a Railway seat drops its
+                    /// stored deadline/claim so railway.new decides — a new
+                    /// box, or "claim it" for one that really expired. Never
+                    /// a retry loop: one explicit user action, one connect.
+                    #[serde(default)]
+                    fresh: bool,
                 }
                 let p: P = parse_params(params)?;
                 let cloud = self.cloud()?.clone();
+                if p.fresh {
+                    cloud.update_seat(&p.seat_id, |seat| {
+                        if seat.kind == Some(zeron_proto::CloudSeatKind::Railway) {
+                            seat.expires_at = None;
+                            seat.claim_url = None;
+                        }
+                    });
+                }
                 let seat = cloud
                     .seat(&p.seat_id)
                     .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
@@ -4212,11 +4226,13 @@ impl RpcService for EngineRpc {
                 // Repo chats check out under the new seat's workspace; a
                 // repo-less chat gets its own workspace there, which the
                 // chat's backup restores into on the next run.
+                let branch = previous.as_ref().and_then(|b| b.branch.clone());
                 let workspace_path = match &repo {
-                    Some(full_name) => {
-                        let name = full_name.rsplit('/').next().unwrap_or(full_name);
-                        format!("{}/{name}", seat.workspace().trim_end_matches('/'))
-                    }
+                    Some(full_name) => crate::cloud::repo_workspace(
+                        &seat.workspace(),
+                        full_name,
+                        branch.as_deref(),
+                    ),
                     None => crate::cloud::chat_workspace(&seat.workspace(), &p.chat_id),
                 };
                 let binding = zeron_proto::CloudSeatBinding {
@@ -4225,6 +4241,7 @@ impl RpcService for EngineRpc {
                     label: seat.label.clone(),
                     repo,
                     workspace_path: Some(workspace_path),
+                    branch,
                     model_label: previous.as_ref().and_then(|b| b.model_label.clone()),
                     expires_at: seat.expires_at,
                 };
@@ -4668,6 +4685,42 @@ impl RpcService for EngineRpc {
                     "login": login.ok().filter(|l| !l.is_empty()),
                 }))
             }
+            methods::CLOUD_GITHUB_BRANCHES => {
+                #[derive(Default, serde::Deserialize)]
+                #[serde(rename_all = "camelCase", default)]
+                struct BranchParams {
+                    repo: String,
+                    seat_id: Option<String>,
+                }
+                let p: BranchParams = parse_params(params)?;
+                let repo = p.repo.trim();
+                if repo.split('/').filter(|part| !part.is_empty()).count() != 2
+                    || repo.contains(char::is_whitespace)
+                {
+                    return Err(RpcError::BadParams("repo must be owner/name".into()));
+                }
+                let cloud = self.cloud()?.clone();
+                let pat = p
+                    .seat_id
+                    .as_deref()
+                    .and_then(|id| cloud.github_pat(id))
+                    .or_else(|| cloud.github_pat(crate::cloud::CloudStore::SHARED_GITHUB_KEY))
+                    .ok_or_else(|| {
+                        RpcError::Failed(
+                            "GitHub isn't connected — connect it in Settings → Cloud computer"
+                                .into(),
+                        )
+                    })?;
+                let page = crate::cloud::github(&self.http, &pat)
+                    .branches(repo)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({
+                    "branches": page.items,
+                    "defaultBranch": page.default_branch,
+                    "truncated": page.truncated,
+                }))
+            }
             methods::CLOUD_GITHUB_SAVE => {
                 #[derive(Default, serde::Deserialize)]
                 #[serde(rename_all = "camelCase", default)]
@@ -4751,7 +4804,8 @@ impl RpcService for EngineRpc {
                         // PTY on the seat's workspace container.
                         RpcReply::value(&serde_json::json!({
                             "command": format!(
-                                "ssh -tt {} docker exec -it {} sh -lc {}",
+                                "{} {} docker exec -it {} sh -lc {}",
+                                crate::cloud::ssh_terminal_prefix(),
                                 alias,
                                 seat.container_name(),
                                 crate::cloud::shell_word(&crate::cloud::command_in_workspace(
@@ -4771,8 +4825,9 @@ impl RpcService for EngineRpc {
                         }
                         RpcReply::value(&serde_json::json!({
                             "command": format!(
-                                "ssh -tt {} sh -lc {}",
-                                crate::railway::RAILWAY_HOST,
+                                "{} {} sh -lc {}",
+                                crate::cloud::ssh_terminal_prefix(),
+                                seat.ssh_alias.as_deref().unwrap_or(crate::railway::RAILWAY_HOST),
                                 crate::cloud::shell_word(&crate::cloud::command_in_workspace(
                                     &seat.workspace(),
                                     "exec bash",
@@ -4791,7 +4846,8 @@ impl RpcService for EngineRpc {
                         })?;
                         RpcReply::value(&serde_json::json!({
                             "command": format!(
-                                "ssh -tt {} sh -lc {}",
+                                "{} {} sh -lc {}",
+                                crate::cloud::ssh_terminal_prefix(),
                                 endpoint,
                                 crate::cloud::shell_word(&crate::cloud::command_in_workspace(
                                     &seat.workspace(),
