@@ -238,6 +238,7 @@ mod tests {
 
     #[test]
     fn boot_is_small_and_ordered() {
+        let _env = crate::env_lock();
         let repo = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let r = repo.path();
@@ -264,6 +265,7 @@ mod tests {
 
     #[test]
     fn huge_agents_md_is_truncated_with_warning() {
+        let _env = crate::env_lock();
         let repo = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("AGENTS.md"), "rule\n".repeat(5000)).unwrap();

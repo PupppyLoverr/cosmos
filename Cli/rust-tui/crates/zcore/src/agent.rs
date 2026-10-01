@@ -191,6 +191,7 @@ impl Agent {
             .collect();
         ctx.mcp_servers = cfg.mcp_servers();
         ctx.allowed_hosts = cfg.allowed_hosts();
+        ctx.allow_self_mutate = opts.allow_self_mutate;
         if !ctx.no_sandbox {
             ctx.sandbox_degraded = ztools::shell::last_sandbox(&home).flatten();
         }
@@ -390,17 +391,21 @@ impl Agent {
         }
     }
 
+    /// The events on this session's current branch.
+    pub fn branch_events(&self) -> Vec<Event> {
+        crate::session::read_events(&self.session.file)
+            .map(|all| match &self.session.leaf {
+                Some(leaf) => crate::session::chain_from(&all, leaf),
+                None => Vec::new(),
+            })
+            .unwrap_or_default()
+    }
+
+    /// `/skillify <name>` — an explicit operator command, so it runs even
+    /// when automatic self-improvement is off.
     pub fn skillify(&mut self, name: &str, emit: &mut dyn FnMut(&Event)) -> String {
-        if !self.improve.enabled && !self.opts.yolo {
-            return "self_improve disabled".into();
-        }
-        match improve::skillify(
-            &self.home,
-            name,
-            &self.world,
-            false,
-            self.improve.allow_self_mutate,
-        ) {
+        let events = self.branch_events();
+        match improve::skillify(&self.home, name, &self.world, &events, false) {
             Ok((p, detail)) => {
                 let ev = self
                     .session
@@ -945,12 +950,14 @@ impl Agent {
                         && self.improve.auto_writes < improve::AUTO_WRITE_CAP
                     {
                         self.improve.auto_writes += 1;
+                        // remembered for every later session in this repo
+                        let path = input["path"].as_str().unwrap_or("a file");
+                        let text = format!("{name} on {path} went STALE twice — read the file again right before editing it");
+                        let scope = improve::repo_scope(&self.ctx.workspace);
+                        let saved = ztools::memory::add(&self.home, "correction", &text, &scope, &format!("cosmostui/{}", self.session.id)).is_ok();
                         let ev = self.session.append(
                             "self_improve",
-                            improve::event_data(
-                                "correction",
-                                json!({"text": improve::correction_row(name, "re-read then edit")}),
-                            ),
+                            improve::event_data("correction", json!({"text": text, "saved": saved})),
                         );
                         emit(&ev);
                     }
@@ -1247,6 +1254,8 @@ impl Agent {
         c.home = self.ctx.home.clone();
         c.session_id = self.ctx.session_id.clone();
         c.sandbox_mode = self.ctx.sandbox_mode.clone();
+        c.allowed_hosts = self.ctx.allowed_hosts.clone();
+        c.allow_self_mutate = self.ctx.allow_self_mutate;
         c
     }
 
@@ -1640,15 +1649,11 @@ pub fn run_headless(
                     }
                 }
             }
-            if agent.improve.enabled && agent.improve.write_skills {
+            // headless runs write a draft skill only when asked (--self-improve)
+            if opts.self_improve == Some(true) && agent.improve.write_skills {
                 let draft = format!("draft-{}", &agent.session.id[..8.min(agent.session.id.len())]);
-                if let Ok((_, detail)) = improve::skillify(
-                    &agent.home,
-                    &draft,
-                    &agent.world,
-                    true,
-                    agent.improve.allow_self_mutate,
-                ) {
+                let events = agent.branch_events();
+                if let Ok((_, detail)) = improve::skillify(&agent.home, &draft, &agent.world, &events, true) {
                     let ev = agent
                         .session
                         .append("self_improve", improve::event_data("draft_skill", detail));

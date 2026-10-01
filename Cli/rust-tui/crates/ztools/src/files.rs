@@ -23,6 +23,46 @@ fn deny_write_path(ctx: &ToolContext, path: &std::path::Path) -> bool {
         || s.contains(".env.")
 }
 
+/// Contract §13: the agent may not rewrite its own binary, its contract or
+/// its own state (config, credentials, sandbox tier) without
+/// `--allow-self-mutate`. Skills and memory stay writable — that is how it
+/// learns. Returns what the path is when it is fenced.
+pub fn self_mutate_fence(ctx: &ToolContext, path: &std::path::Path) -> Option<String> {
+    if ctx.allow_self_mutate {
+        return None;
+    }
+    let norm = |p: &std::path::Path| crate::normalize(p).to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    let p = norm(path);
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            let ours = ["cosmostui", "cosmostui-welcome", "zsandbox", "zcli"]
+                .iter()
+                .any(|b| name == *b || name == format!("{b}.exe"));
+            if p == norm(&exe) || (ours && path.parent().map(norm) == Some(norm(dir))) {
+                return Some("the running harness binary".into());
+            }
+        }
+    }
+    let home = norm(&ctx.home);
+    if let Some(rel) = p.strip_prefix(&format!("{home}/")) {
+        let top = rel.split('/').next().unwrap_or("");
+        if !matches!(top, "skills" | "memory" | "logs" | "cache" | "worktrees" | "world" | "canary") {
+            return Some(format!("the harness's own state ({rel})"));
+        }
+    }
+    if p.ends_with("/contracts/tools.json") {
+        return Some("the canonical tool schemas".into());
+    }
+    if p.ends_with("/contract.md") {
+        let text = fs::read_to_string(path).unwrap_or_default();
+        if text.contains("<!-- BEGIN SYSTEM -->") {
+            return Some("the harness contract".into());
+        }
+    }
+    None
+}
+
 fn checkpoint(ctx: &ToolContext, path: &std::path::Path) {
     if ctx.session_id.is_empty() {
         return;
@@ -111,6 +151,9 @@ fn fresh_anchors(lines: &[&str], around: usize, n: usize) -> String {
 
 pub fn edit(ctx: &mut ToolContext, input: &Value) -> Result<String> {
     let path = resolve(ctx, input["path"].as_str().unwrap_or(""))?;
+    if let Some(what) = self_mutate_fence(ctx, &path) {
+        bail!("self-mutate fence: {} is {what} — the operator must rerun with --allow-self-mutate", path.display());
+    }
     if deny_write_path(ctx, &path) {
         bail!("sandbox deny: write to {} blocked", path.display());
     }
@@ -185,6 +228,9 @@ pub fn edit(ctx: &mut ToolContext, input: &Value) -> Result<String> {
 
 pub fn write(ctx: &mut ToolContext, input: &Value) -> Result<String> {
     let path = resolve(ctx, input["path"].as_str().unwrap_or(""))?;
+    if let Some(what) = self_mutate_fence(ctx, &path) {
+        bail!("self-mutate fence: {} is {what} — the operator must rerun with --allow-self-mutate", path.display());
+    }
     if deny_write_path(ctx, &path) {
         bail!("sandbox deny: write to {} blocked", path.display());
     }

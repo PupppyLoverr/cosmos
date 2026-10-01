@@ -13,6 +13,7 @@ use zcore::agent::{Agent, Mode};
 use zproto::{Block, Event, RunOpts};
 
 /// UI → worker.
+#[derive(Debug)]
 pub enum Cmd {
     Prompt(String),
     SetMode(Mode),
@@ -22,7 +23,19 @@ pub enum Cmd {
     Approve,
     /// continue a stored session (replaces the current agent)
     Resume(String),
+    /// harness-side commands that never reach the model
+    Local(LocalCmd),
     Quit,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocalCmd {
+    /// /compact [focus]
+    Compact(Option<String>),
+    /// /undo
+    Undo,
+    /// /skillify <name>
+    Skillify(String),
 }
 
 /// One row of a rendered file diff.
@@ -342,7 +355,7 @@ fn worker(
     send(&tx, ready(&agent));
     let start = agent.session.append(
         "session_start",
-        agent.start_data(json!({"resume": opts.resume})),
+        agent.start_data(json!({"resume": opts.resume, "cwd": agent.ctx.workspace})),
     );
     emit(&start);
 
@@ -360,6 +373,21 @@ fn worker(
             Cmd::Prompt(text) => {
                 interrupt.store(false, Ordering::Relaxed);
                 run_task(&mut agent, &text, &mut emit, &interrupt, &always, &tx);
+                send(&tx, Msg::TurnDone);
+            }
+            Cmd::Local(lc) => {
+                let note = match lc {
+                    LocalCmd::Compact(focus) => {
+                        let before = agent.context_report();
+                        agent.compact_now(focus.as_deref(), &mut emit);
+                        let after = agent.context_report();
+                        let pct = |r: &str| serde_json::from_str::<serde_json::Value>(r).ok().and_then(|v| v["percent"].as_u64()).unwrap_or(0);
+                        format!("compacted · context {}% → {}%", pct(&before), pct(&after))
+                    }
+                    LocalCmd::Undo => agent.undo_last(&mut emit),
+                    LocalCmd::Skillify(name) => agent.skillify(&name, &mut emit),
+                };
+                send(&tx, Msg::Note(note));
                 send(&tx, Msg::TurnDone);
             }
             Cmd::Approve => {

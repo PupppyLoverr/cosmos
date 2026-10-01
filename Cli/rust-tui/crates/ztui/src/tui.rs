@@ -34,7 +34,7 @@ use crate::term::{Frame, Screen};
 use crate::theme;
 use crate::view;
 use crate::voice::{self, Recorder};
-use crate::worker::{self, Cmd, Diff, Msg};
+use crate::worker::{self, Cmd, Diff, LocalCmd, Msg};
 
 pub(crate) const PLACEHOLDER: &str = "Ask Cosmos to build features, fix bugs, or work on your code";
 
@@ -1047,25 +1047,17 @@ impl App {
                     self.note("No plan is waiting for approval");
                 }
             }
+            // these run in the harness, never as a model turn (contract §7)
             "compact" => {
                 let focus = args.strip_prefix("focus:").or_else(|| args.strip_prefix("focus")).unwrap_or(args).trim();
-                let prompt = if focus.is_empty() {
-                    "/compact".to_string()
-                } else {
-                    format!("/compact focus: {focus}")
-                };
-                self.send_prompt(&prompt, prompt.clone(), cmd);
+                let _ = cmd.send(Cmd::Local(LocalCmd::Compact((!focus.is_empty()).then(|| focus.to_string()))));
             }
             "undo" => {
-                self.send_prompt("/undo", "/undo".into(), cmd);
+                let _ = cmd.send(Cmd::Local(LocalCmd::Undo));
             }
             "skillify" => {
                 let name = if args.is_empty() { "session" } else { args };
-                self.note(format!("skillify {name} — run after the turn, or use /skillify after the turn"));
-                self.send_prompt(&format!("/skillify {name}"), format!("/skillify {name}"), cmd);
-            }
-            "refine" => {
-                self.note("refine: use meridian refine.apply / refine.rollback");
+                let _ = cmd.send(Cmd::Local(LocalCmd::Skillify(name.to_string())));
             }
             "usage" | "cost" => {
                 let lines = view::usage(self);
@@ -1659,6 +1651,11 @@ pub fn try_run(opts: &RunOpts, cwd: &Path) -> Result<Option<i32>> {
     let r = run_loop(&mut screen, &mut app, &rx, &cmd, &interrupt);
     let bye = view::farewell(&app);
     screen.leave(&bye);
+    // contract §13: after a clean interactive session, learn from it in the
+    // background (skills + memory only; the operator can turn it off)
+    if matches!(r, Ok(0)) && !app.session.is_empty() && zcore::config::Config::load(&zcore::cli_home()).self_improve.enabled {
+        zcore::improve::spawn_review(&app.session);
+    }
     r.map(Some)
 }
 
@@ -2032,6 +2029,21 @@ mod tests {
         let rows: Vec<String> = a.out.iter().map(text).collect();
         assert!(rows.iter().any(|r| r.contains("devin:edit") && r.contains("Edit a.rs")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("wrote a.rs")), "{rows:?}");
+    }
+
+    #[test]
+    fn harness_commands_never_reach_the_model() {
+        let _env = crate::env_lock();
+        let mut a = app();
+        let (tx, rx) = channel();
+        a.run_slash("compact", "focus: the parser", &tx);
+        a.run_slash("undo", "", &tx);
+        a.run_slash("skillify", "release steps", &tx);
+        let sent: Vec<Cmd> = rx.try_iter().collect();
+        assert!(matches!(&sent[0], Cmd::Local(LocalCmd::Compact(Some(f))) if f == "the parser"), "{sent:?}");
+        assert!(matches!(&sent[1], Cmd::Local(LocalCmd::Undo)));
+        assert!(matches!(&sent[2], Cmd::Local(LocalCmd::Skillify(n)) if n == "release steps"));
+        assert!(!sent.iter().any(|c| matches!(c, Cmd::Prompt(_))), "no prompt sent to the model");
     }
 
     #[test]

@@ -10,6 +10,7 @@ serde_json = "1"
 zproto = { path = "../zproto" }
 zcore = { path = "../zcore" }
 ztools = { path = "../ztools" }
+zproviders = { path = "../zproviders" }
 ztui = { path = "../ztui", default-features = false }
 crossterm = "0.29.0"
 

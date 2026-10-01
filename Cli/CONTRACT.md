@@ -253,6 +253,14 @@ rejects any host not on the allowlist; a test proves the rejection.
   `CONTRACT.md`, or sandbox policy without `--allow-self-mutate` plus a worktree plus a
   green conformance gate. `/skillify <name>` writes `skills/<name>/SKILL.md`. `/refine`
   goes through Meridian `refine.propose|apply|rollback`.
+  cosmostui: after a clean interactive session it runs `cosmostui review --session <id>`
+  detached — deterministic extraction of the operator's standing instructions, plus (with a real
+  model) one call that may add at most five `preference|correction|playbook|decision` bullets and
+  one new skill (≤ 200 lines, never overwriting). An edit that goes STALE twice becomes a
+  `correction` bullet. Bullets are scoped `repo:<folder>` and come back in the next session's boot
+  context. `write`/`edit` fence the running binaries, the harness contract,
+  `contracts/tools.json` and `COSMOS_CLI_HOME` state other than skills/memory without
+  `--allow-self-mutate`. `/compact`, `/undo`, `/skillify` run in the harness, never as a turn.
 - `task.write` defaults `worktree` to true. Subagent returns ≤4000 chars; parent never
   ingests child tool traces.
 - Read-only tools may run in parallel (cap 8). Writes, bash, mcp, and `task` stay serial.

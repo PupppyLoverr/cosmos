@@ -52,6 +52,7 @@ flags:
 commands:
   cosmostui compact --session <id> [--focus …]
   cosmostui undo --session <id>
+  cosmostui review --session <id>  remember what a session taught (runs after the TUI)
   cosmostui checkpoint restore --last [--session <id>]
 ";
 
@@ -177,6 +178,7 @@ fn main() {
         Some("session") => session_cmd(&args[1..]),
         Some("compact") => compact_cmd(&args[1..]),
         Some("undo") => undo_cmd(&args[1..]),
+        Some("review") => review_cmd(&args[1..]),
         Some("checkpoint") => checkpoint_cmd(&args[1..]),
         Some("memory") => memory_cmd(&args[1..]),
         Some("auth") | Some("login") => auth_cmd::auth_cmd(if args[0] == "login" { &args[..] } else { &args[1..] }),
@@ -329,6 +331,75 @@ fn flag_val(args: &[String], name: &str) -> Option<String> {
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+/// The post-session self-improve pass (contract §13). The TUI starts it
+/// detached after a clean exit; it can also be run by hand.
+fn review_cmd(args: &[String]) -> i32 {
+    let Some(id) = flag_val(args, "--session") else {
+        eprintln!("usage: cosmostui review --session <id>");
+        return exit::USAGE;
+    };
+    let home = zcore::cli_home();
+    let file = home.join("sessions").join(format!("{id}.jsonl"));
+    let events = match zcore::session::read_events(&file) {
+        Ok(all) => zcore::session::chain(&all),
+        Err(e) => {
+            eprintln!("no session {id}: {e}");
+            return exit::FAILED;
+        }
+    };
+    let cfg = zcore::config::Config::load(&home);
+    let start = events.iter().find(|e| e.kind == "session_start");
+    let workspace = start
+        .and_then(|e| e.data["cwd"].as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    // the model the session used ("alias (id)" in session_start)
+    let alias = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == "session_start")
+        .and_then(|e| e.data["model"].as_str())
+        .map(|m| m.split(" (").next().unwrap_or(m).to_string());
+    let mut provider = alias.as_deref().and_then(|a| cfg.provider_for(a)).map(|(p, _)| p);
+    if let Some(p) = provider.as_mut().filter(|p| p.kind == zproviders::ProviderKind::ChatGpt) {
+        if let Some(t) = zcore::chatgpt::fresh() {
+            p.api_key = Some(t.access);
+            p.account_id = Some(t.account_id);
+        }
+    }
+    let allowed = cfg.allowed_hosts();
+    let r = match zcore::improve::review(&home, &workspace, &events, provider.as_ref().map(|p| (p, allowed.as_slice()))) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("review failed: {e:#}");
+            return exit::FAILED;
+        }
+    };
+    if let Ok(mut s) = Session::open(&home, &id) {
+        s.append(
+            "self_improve",
+            zcore::improve::event_data(
+                "review",
+                serde_json::json!({
+                    "memories": r.memories.iter().map(|(k, t)| serde_json::json!({"type": k, "text": t})).collect::<Vec<_>>(),
+                    "skill": r.skill.as_ref().map(|p| p.display().to_string()),
+                    "notes": r.notes,
+                }),
+            ),
+        );
+    }
+    for (k, t) in &r.memories {
+        println!("remembered [{k}] {t}");
+    }
+    if let Some(p) = &r.skill {
+        println!("new skill {}", p.display());
+    }
+    for n in &r.notes {
+        println!("note: {n}");
+    }
+    exit::DONE
 }
 
 fn compact_cmd(args: &[String]) -> i32 {

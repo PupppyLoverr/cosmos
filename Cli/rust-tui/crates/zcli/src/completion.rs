@@ -22,6 +22,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "completion", description: "generate shell completion", subcommands: SHELLS },
     CommandSpec { name: "compact", description: "compact a session", subcommands: &[] },
     CommandSpec { name: "undo", description: "undo the last checkpoint", subcommands: &[] },
+    CommandSpec { name: "review", description: "self-improve pass over a session", subcommands: &[] },
     CommandSpec { name: "checkpoint", description: "checkpoint operations", subcommands: &["restore"] },
     CommandSpec { name: "auth", description: "keys and sign-ins", subcommands: &["login", "logout"] },
     CommandSpec { name: "models", description: "list models", subcommands: &[] },

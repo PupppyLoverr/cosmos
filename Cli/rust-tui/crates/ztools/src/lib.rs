@@ -2,7 +2,7 @@
 //! bytes so `tools dump` is byte-identical across harnesses.
 
 pub mod ckpt;
-mod files;
+pub mod files;
 pub mod jobs;
 mod mcp;
 pub mod memory;
@@ -113,6 +113,8 @@ pub struct ToolContext {
     pub deny_write: Vec<String>,
     /// §12 outbound allowlist for tools that talk HTTP (the memory mirror)
     pub allowed_hosts: Vec<String>,
+    /// §13: may write the harness's own binary, contract and state
+    pub allow_self_mutate: bool,
 }
 
 #[derive(Clone)]
@@ -150,6 +152,7 @@ impl ToolContext {
                 "**/.env.*".into(),
             ],
             allowed_hosts: Vec::new(),
+            allow_self_mutate: false,
         }
     }
 }

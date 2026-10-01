@@ -45,7 +45,6 @@ const BUILTIN: &[(&str, &str, &str)] = &[
     ("compact", "[focus: …]", "Five-layer compact; optional focus steers the summary"),
     ("undo", "", "Restore the last file checkpoint"),
     ("skillify", "[name]", "Distill this session into a skill"),
-    ("refine", "<id|skill>", "Propose or apply a bounded skill/playbook edit"),
     ("yolo", "", "Switch to yolo mode"),
     ("session", "", "Show the session id and how to resume it"),
     ("clear", "", "Clear the screen"),
