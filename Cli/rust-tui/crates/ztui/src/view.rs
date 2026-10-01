@@ -740,15 +740,13 @@ fn connect_picker(filter: &[char], sel: usize, w: usize) -> (Vec<Line<'static>>,
                 ),
                 None => dim("sign in"),
             },
-            "devin" => match zcore::devin::peek() {
-                Some((true, d)) => Span::styled(format!("✓ {d}"), theme::fg(GREEN)),
-                Some((false, d)) => dim(d),
-                None => match zcore::live::cached("devin") {
-                    Some(m) if !m.is_empty() => Span::styled(format!("✓ cached · {} models", m.len()), theme::fg(GREEN)),
-                    _ if zcore::devin::signed_in() => dim("enter to connect"),
-                    _ => dim(if zcore::devin::executable().is_some() { "enter to connect" } else { "devin auth login" }),
-                },
-            },
+            "acp" => {
+                if zcore::acp_client::installed(&p.id) {
+                    Span::styled("✓ CLI installed", theme::fg(GREEN))
+                } else {
+                    dim("not installed")
+                }
+            }
             _ => match zcore::creds::key_for(&p.id, &p.env) {
                 Some((k, src)) => Span::styled(format!("✓ {} · {}", zcore::creds::mask(&k), src.label()), theme::fg(GREEN)),
                 None => dim(format!("{} models", p.models.len())),
@@ -767,7 +765,10 @@ fn connect_picker(filter: &[char], sel: usize, w: usize) -> (Vec<Line<'static>>,
     if let Some(p) = order.get(sel).map(|&i| &ps[i]) {
         let how = match p.kind.as_str() {
             "chatgpt" => "Opens your browser — use your ChatGPT Plus/Pro plan instead of an API key".to_string(),
-            "devin" => "Uses your Devin subscription models. Cosmos runs the tools — not Devin's agent.".to_string(),
+            "acp" => match zcore::acp_client::plugin(&p.id) {
+                Some(a) => format!("Runs {}'s own agent on your plan (ACP) · sign in once with `{}`", a.name, a.login.join(" ")),
+                None => String::new(),
+            },
             _ => format!("Paste a key, or set {} · {}", p.env.join(" / "), p.base_url),
         };
         out.push(Line::from(dim(format!("  {}", ellipsize(&how, w.saturating_sub(3))))));

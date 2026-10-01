@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+pub const HOST: &str = "api.supermemory.ai";
 const BASE: &str = "https://api.supermemory.ai";
 /// Every cosmos memory lives under one container tag.
 const TAG: &str = "cosmos";
@@ -39,8 +40,11 @@ pub fn add_body(kind: &str, text: &str, scope: &str) -> Value {
 }
 
 /// Mirror one bullet. Returns at once; the request runs on its own thread.
-pub fn add(kind: &str, text: &str, scope: &str) {
+pub fn add(kind: &str, text: &str, scope: &str, allowed: &[String]) {
     let Some(k) = key() else { return };
+    if zproviders::host_allowed(BASE, allowed).is_err() {
+        return;
+    }
     let body = add_body(kind, text, scope);
     std::thread::spawn(move || {
         let _ = agent()
@@ -52,8 +56,9 @@ pub fn add(kind: &str, text: &str, scope: &str) {
 
 /// Remote hits as `{id, text, type, scope, score, source:"supermemory"}`.
 /// `None` when disabled or the call fails.
-pub fn search(query: &str, k: usize) -> Option<Vec<Value>> {
+pub fn search(query: &str, k: usize, allowed: &[String]) -> Option<Vec<Value>> {
     let key = key()?;
+    zproviders::host_allowed(BASE, allowed).ok()?;
     let mut resp = agent()
         .post(&format!("{BASE}/v4/search"))
         .header("authorization", &format!("Bearer {key}"))
@@ -95,7 +100,10 @@ mod tests {
     fn off_without_key_and_shapes_requests() {
         std::env::remove_var("SUPERMEMORY_API_KEY");
         assert!(!enabled());
-        assert!(search("anything", 3).is_none(), "no key → no request");
+        assert!(search("anything", 3, &[HOST.to_string()]).is_none(), "no key → no request");
+        std::env::set_var("SUPERMEMORY_API_KEY", "test-not-a-key");
+        assert!(search("anything", 3, &[]).is_none(), "host not on the allowlist → no request");
+        std::env::remove_var("SUPERMEMORY_API_KEY");
         let b = add_body("preference", "tabs over spaces", "repo:x");
         assert_eq!(b["containerTag"], "cosmos");
         assert_eq!(b["metadata"]["scope"], "repo:x");

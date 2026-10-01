@@ -14,7 +14,7 @@ zproviders = { path = "../zproviders" }
 ztools = { path = "../ztools" }
 zsandbox = { path = "../zsandbox" }
 ureq = { version = "3", features = ["json"] }
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
 base64 = "0.22"
 sha2 = "0.10"
 getrandom = "0.3"
@@ -25,6 +25,12 @@ keyring = { version = "3.6", features = ["windows-native"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6", features = ["apple-native"] }
+
+[features]
+# The pre-ACP Devin path: talks to Codeium's private chat API with the Devin
+# CLI's stored key while presenting itself as that CLI. Not in the public
+# build — Devin is reached through `devin acp` (acp_client.rs) instead.
+devin-direct = ["dep:flate2"]
 
 [dev-dependencies]
 tempfile = "3"

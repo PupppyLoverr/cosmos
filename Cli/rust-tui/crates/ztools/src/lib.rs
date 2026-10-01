@@ -111,6 +111,8 @@ pub struct ToolContext {
     pub current_tool_id: String,
     /// deny-write globs even inside workspace (default ~/.ssh, .env)
     pub deny_write: Vec<String>,
+    /// §12 outbound allowlist for tools that talk HTTP (the memory mirror)
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -147,6 +149,7 @@ impl ToolContext {
                 "**/.env".into(),
                 "**/.env.*".into(),
             ],
+            allowed_hosts: Vec::new(),
         }
     }
 }

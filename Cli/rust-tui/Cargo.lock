@@ -3602,6 +3602,7 @@ dependencies = [
  "tempfile",
  "ureq",
  "zproto",
+ "zproviders",
  "zsandbox",
 ]
 

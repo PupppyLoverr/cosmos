@@ -279,7 +279,7 @@ pub fn search_tool(ctx: &mut ToolContext, input: &Value) -> Result<String> {
         .into_iter()
         .map(|(score, e)| json!({"id": e.id, "text": e.text, "type": e.kind, "scope": e.scope, "date": e.date, "score": (score * 1000.0).round() / 1000.0}))
         .collect();
-    if let Some(remote) = crate::supermemory::search(q, k) {
+    if let Some(remote) = crate::supermemory::search(q, k, &ctx.allowed_hosts) {
         let have: std::collections::HashSet<String> = results.iter().filter_map(|r| r["text"].as_str().map(str::to_lowercase)).collect();
         results.extend(remote.into_iter().filter(|r| r["text"].as_str().is_some_and(|t| !have.contains(&t.to_lowercase()))));
         results.truncate(k);
@@ -295,7 +295,7 @@ pub fn write_tool(ctx: &mut ToolContext, input: &Value) -> Result<String> {
     let scope = input["scope"].as_str().filter(|s| !s.is_empty()).unwrap_or("global");
     let src = format!("cosmostui/{}", ctx.session_id);
     let id = add(&ctx.home, kind, text, scope, &src)?;
-    crate::supermemory::add(kind, text, scope);
+    crate::supermemory::add(kind, text, scope, &ctx.allowed_hosts);
     Ok(serde_json::to_string(&json!({"id": id}))?)
 }
 

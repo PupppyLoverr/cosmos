@@ -506,7 +506,7 @@ pub fn known_ready() -> bool {
             return c.ready;
         }
     }
-    signed_in() || crate::live::cached("devin").is_some_and(|m| !m.is_empty())
+    signed_in() || crate::live::cached("devin-direct").is_some_and(|m| !m.is_empty())
 }
 
 pub fn ready() -> bool {

@@ -37,7 +37,9 @@ const SPIN: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', 
 /// where to get a key. The rest keep catalog order and show their env var.
 const PINNED: &[(&str, &str, &str)] = &[
     ("chatgpt", "use your Plus / Pro plan — no API key", ""),
-    ("devin", "your Devin subscription — Cosmos runs the tools", ""),
+    ("devin", "your Devin plan — Devin's own agent, via its CLI", ""),
+    ("cursor", "your Cursor plan — Cursor's agent, via its CLI", ""),
+    ("codex", "your ChatGPT plan through the Codex agent", ""),
     ("openrouter", "one key, 300+ models from every lab", "https://openrouter.ai/keys"),
     ("router9", "your local 9Router — routes the subscriptions you have", "http://localhost:20128 → API keys"),
     ("anthropic", "Claude", "https://console.anthropic.com/settings/keys"),
@@ -893,7 +895,7 @@ impl Ob {
             .filter(|p| {
                 match p.def.kind.as_str() {
                     "chatgpt" => zcore::chatgpt::load().is_some(),
-                    "devin" => zcore::devin::known_ready(),
+                    "acp" => zcore::acp_client::installed(&p.def.id),
                     _ => zcore::creds::key_for(&p.def.id, &p.def.env).is_some(),
                 }
             })
@@ -1255,10 +1257,7 @@ impl Ob {
             } else if self.keyed.contains(&p.def.id) {
                 match (p.def.kind.as_str(), &self.oauth_email) {
                     ("chatgpt", Some(e)) => format!("✓ {e}"),
-                    ("devin", _) => match zcore::devin::peek() {
-                        Some((true, d)) => format!("✓ {d}"),
-                        _ => "✓ connected".into(),
-                    },
+                    ("acp", _) => "✓ CLI installed".into(),
                     _ => "✓ connected".into(),
                 }
             } else {
@@ -1600,15 +1599,18 @@ impl Ob {
         }
     }
 
-    fn connect_devin(&mut self, i: usize) {
-        zcore::devin::invalidate();
-        if zcore::devin::ready() {
-            self.connected.push("devin".into());
+    /// A subscription agent (Cursor, Devin, Codex): its CLI must be on PATH;
+    /// it signs in with its own command and runs on the operator's plan.
+    fn connect_acp(&mut self, i: usize) {
+        let id = self.provs[i].def.id.clone();
+        let Some(p) = zcore::acp_client::plugin(&id) else { return };
+        if zcore::acp_client::installed(&id) {
+            self.connected.push(id.clone());
             self.refresh_keyed();
-            self.flash(format!("✓ Devin · {}", zcore::devin::detail()), true);
+            self.flash(format!("✓ {} found — if it asks you to sign in, run `{}`", p.name, p.login.join(" ")), true);
             self.open_models(i);
         } else {
-            self.flash(zcore::devin::hint(), false);
+            self.flash(format!("{} isn't installed — {}", p.name, p.install), false);
         }
     }
 
@@ -1744,8 +1746,8 @@ impl Ob {
                                 self.open_models(i);
                             } else if self.provs[i].def.kind == "chatgpt" {
                                 self.start_oauth();
-                            } else if self.provs[i].def.kind == "devin" {
-                                self.connect_devin(i);
+                            } else if self.provs[i].def.kind == "acp" {
+                                self.connect_acp(i);
                             } else {
                                 self.key_buf.clear();
                                 self.phase = Phase::KeyEntry(i);
@@ -2016,10 +2018,12 @@ mod tests {
         assert_eq!(p[0].def.id, "chatgpt");
         assert_eq!(p[0].name, "ChatGPT");
         assert_eq!(p[1].def.id, "devin");
-        assert_eq!(p[2].def.id, "openrouter");
-        assert_eq!(p[2].key_url, "https://openrouter.ai/keys");
-        assert_eq!(p[3].def.id, "router9");
-        assert_eq!(p[3].name, "9Router");
+        assert_eq!(p[2].def.id, "cursor");
+        assert_eq!(p[3].def.id, "codex");
+        assert_eq!(p[4].def.id, "openrouter");
+        assert_eq!(p[4].key_url, "https://openrouter.ai/keys");
+        assert_eq!(p[5].def.id, "router9");
+        assert_eq!(p[5].name, "9Router");
     }
 
     #[test]

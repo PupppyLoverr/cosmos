@@ -2,6 +2,7 @@
 //! the agent loop, compaction. zdev (Python) and zagy (Go) implement the same
 //! semantics from CONTRACT.md — this crate is the Rust reference.
 
+pub mod acp_client;
 pub mod agent;
 pub mod boot;
 pub mod catalog;
@@ -9,6 +10,7 @@ pub mod chatgpt;
 pub mod compact;
 pub mod config;
 pub mod creds;
+#[cfg(feature = "devin-direct")]
 pub mod devin;
 pub mod hooks;
 pub mod improve;

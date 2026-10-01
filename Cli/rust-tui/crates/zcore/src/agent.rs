@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -23,11 +25,11 @@ fn dispatch_complete(
     sink: &mut dyn FnMut(Chunk),
     allowed: &[String],
 ) -> Result<()> {
+    #[cfg(feature = "devin-direct")]
     if cfg.kind == ProviderKind::Devin {
-        crate::devin::complete(cfg, req, sink)
-    } else {
-        complete(cfg, req, sink, allowed)
+        return crate::devin::complete(cfg, req, sink);
     }
+    complete(cfg, req, sink, allowed)
 }
 
 pub struct Agent {
@@ -73,6 +75,12 @@ pub struct Agent {
     pub compact_focus: Option<String>,
     pub doom: Vec<u64>,
     pub stale_hits: u32,
+    /// Set by the UI to interrupt a running turn (ACP turns poll it).
+    pub interrupt: Option<Arc<AtomicBool>>,
+    /// The vendor agent process for an ACP provider, started on first use.
+    acp: Option<crate::acp_client::AcpSession>,
+    /// `messages[..acp_sent]` have already been given to the vendor agent.
+    acp_sent: usize,
     pub home: PathBuf,
     cfg: Config,
 }
@@ -182,6 +190,7 @@ impl Agent {
             .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
             .collect();
         ctx.mcp_servers = cfg.mcp_servers();
+        ctx.allowed_hosts = cfg.allowed_hosts();
         ctx.large_read_lines = cfg.bridge.large_read_lines;
         ctx.no_sandbox = opts.no_sandbox;
         ctx.escalations = opts.allow_escalation.clone();
@@ -305,6 +314,9 @@ impl Agent {
             compact_focus: None,
             doom: Vec::new(),
             stale_hits: 0,
+            interrupt: None,
+            acp: None,
+            acp_sent: 0,
             home,
             cfg,
         })
@@ -421,6 +433,134 @@ impl Agent {
         emit(&ev);
     }
 
+    /// One turn on a subscription agent over ACP: the user text not yet sent
+    /// goes to the vendor's agent, which works until it stops. Its replies
+    /// stream to the UI; its tool activity is logged as `tool_call` events
+    /// (`source: "acp"` — never replayed as our own tool turns); permission
+    /// requests go to the operator. Always ends the turn.
+    fn acp_turn(&mut self, emit: &mut dyn FnMut(&Event)) -> Result<bool> {
+        let plugin = crate::acp_client::id_of(&self.provider.base_url)
+            .context("ACP provider without an acp:// address")?
+            .to_string();
+        let from = self.acp_sent.min(self.messages.len());
+        let fresh: Vec<String> = self.messages[from..]
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                Block::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        if fresh.is_empty() {
+            return Ok(true);
+        }
+        let mut prompt = fresh.join("\n\n");
+        let mut session = match self.acp.take() {
+            Some(s) => s,
+            None => {
+                let s = crate::acp_client::AcpSession::start(&plugin, &self.ctx.workspace, &self.provider.model)?;
+                if let Some(note) = &s.model_note {
+                    if let Some(f) = self.on_delta.as_mut() {
+                        f(&format!("[{note}]\n"));
+                    }
+                }
+                // a resumed session or a model switch: the vendor never saw
+                // what came before, so it gets a short recap
+                let recap = acp_recap(&self.messages[..from]);
+                if !recap.is_empty() {
+                    prompt = format!("[Earlier in this session]\n{recap}\n\n[Now]\n{prompt}");
+                }
+                s
+            }
+        };
+        self.acp_sent = self.messages.len();
+
+        let mut text = String::new();
+        let mut tools: Vec<(String, String, String, Value, String, String)> = Vec::new();
+        let mode = self.mode;
+        let allow: Vec<String> = self.opts.allow.iter().chain(self.cfg.permissions.allow.iter()).cloned().collect();
+        let interrupt = self.interrupt.clone();
+        let result = {
+            let delta = &mut self.on_delta;
+            let asker = &mut self.asker;
+            let log = &mut self.session;
+            let mut on = |u: crate::acp_client::Update| match u {
+                crate::acp_client::Update::Text(t) => {
+                    if let Some(f) = delta.as_mut() {
+                        f(&t);
+                    }
+                    text.push_str(&t);
+                }
+                crate::acp_client::Update::Tool { id, kind, title, status, input, output } => {
+                    match tools.iter_mut().find(|t| t.0 == id) {
+                        Some(t) => {
+                            if !kind.is_empty() {
+                                t.1 = kind;
+                            }
+                            if !title.is_empty() {
+                                t.2 = title;
+                            }
+                            if !input.is_null() {
+                                t.3 = input;
+                            }
+                            if !status.is_empty() {
+                                t.4 = status;
+                            }
+                            if !output.is_empty() {
+                                t.5 = output;
+                            }
+                        }
+                        None => tools.push((id, kind, title, input, status, output)),
+                    }
+                }
+            };
+            let mut decide = |title: &str, params: &Value| -> bool {
+                let kind = params["toolCall"]["kind"].as_str().unwrap_or("");
+                let label = format!("{plugin}: {title}");
+                log.append("permission_request", json!({"tool": label, "kind": kind, "source": "acp"}));
+                let granted = mode == Mode::Yolo
+                    || allow.iter().any(|a| a == "acp" || a == &plugin || (!kind.is_empty() && a == kind))
+                    || asker.as_mut().map(|f| f(&label)).unwrap_or(false);
+                log.append("permission_decision", json!({"tool": label, "granted": granted, "source": "acp"}));
+                granted
+            };
+            session.prompt(&prompt, &mut on, &mut decide, interrupt.as_deref())
+        };
+        for (id, kind, title, input, status, output) in tools {
+            let out: String = output.chars().take(2000).collect();
+            let ev = self.session.append(
+                "tool_call",
+                json!({"id": id, "name": format!("{plugin}:{}", if kind.is_empty() { "tool" } else { &kind }),
+                       "title": title, "input": input, "status": status, "output": out, "source": "acp"}),
+            );
+            emit(&ev);
+        }
+        let stop = match result {
+            Ok(stop) => {
+                self.acp = Some(session);
+                stop
+            }
+            // the agent process is gone or broken — start fresh next turn
+            Err(e) => return Err(e),
+        };
+        self.last_model_at = Some(Instant::now());
+        let ev = self.session.append("assistant", json!({"text": text, "tool_calls": [], "stop_reason": stop}));
+        emit(&ev);
+        let uev = self.session.append(
+            "usage",
+            json!({"input": 0, "cache_read": 0, "cache_write": 0, "output": 0,
+                   "usd": null, "cum_usd": self.cum_usd, "model": self.model_alias,
+                   "billing": "subscription", "plugin": plugin}),
+        );
+        emit(&uev);
+        if !text.is_empty() {
+            self.messages.push(Message::text(Role::Assistant, text));
+        }
+        eprintln!("turn · {plugin} subscription · stop {stop}");
+        Ok(true)
+    }
+
     /// Exactly what the next request sends as the conversation (§9).
     pub fn model_view(&self) -> Vec<Message> {
         compact::project(&self.messages, &self.view_ops)
@@ -453,6 +593,9 @@ impl Agent {
     /// §9 compaction check, then one provider turn. Returns true when the
     /// model produced no tool calls (turn ends).
     pub fn turn(&mut self, emit: &mut dyn FnMut(&Event)) -> Result<bool> {
+        if self.provider.kind == ProviderKind::Acp {
+            return self.acp_turn(emit);
+        }
         self.maybe_compact(emit);
         self.drain_jobs(emit);
         // subscription tokens are short-lived — renew before they lapse
@@ -1193,7 +1336,7 @@ impl Agent {
     fn summarize(&mut self, focus: Option<&str>) -> String {
         let view = self.model_view();
         let fallback = || compact::summarize_deterministic(&view, focus);
-        if matches!(self.provider.kind, ProviderKind::Fixture | ProviderKind::Devin) {
+        if matches!(self.provider.kind, ProviderKind::Fixture | ProviderKind::Devin | ProviderKind::Acp) {
             return fallback();
         }
         let mut msgs = view.clone();
@@ -1296,6 +1439,28 @@ fn restore_read_state(ctx: &mut ToolContext, messages: &[Message]) {
             }
         }
     }
+}
+
+/// Plain-text recap of earlier turns for an agent that wasn't there,
+/// newest last, capped at ~12k chars.
+fn acp_recap(messages: &[Message]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for m in messages {
+        for b in &m.content {
+            if let Block::Text { text } = b {
+                let who = if m.role == Role::Assistant { "assistant" } else { "user" };
+                lines.push(format!("{who}: {}", text.trim()));
+            }
+        }
+    }
+    let mut out = String::new();
+    for l in lines.iter().rev() {
+        if out.len() + l.len() > 12_000 {
+            break;
+        }
+        out = if out.is_empty() { l.clone() } else { format!("{l}\n{out}") };
+    }
+    out
 }
 
 enum Permission {

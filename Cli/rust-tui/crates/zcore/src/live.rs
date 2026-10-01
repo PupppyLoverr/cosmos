@@ -36,7 +36,9 @@ struct Raw {
 pub fn fetch(def: &ProviderDef) -> Result<Vec<ModelDef>> {
     let raw = match def.kind.as_str() {
         "chatgpt" => chatgpt()?,
+        #[cfg(feature = "devin-direct")]
         "devin" => devin()?,
+        "acp" => bail!("{} picks its own models — use {}/default", def.name, def.id),
         "anthropic" => anthropic(def)?,
         "google" => google(def)?,
         _ => openai(def)?,
@@ -55,6 +57,9 @@ fn key(def: &ProviderDef) -> Result<String> {
 }
 
 fn get_json(url: &str, headers: &[(&str, String)]) -> Result<Value> {
+    // §12: same allowlist as every provider call
+    let allowed = crate::config::Config::load(&crate::cli_home()).allowed_hosts();
+    zproviders::host_allowed(url, &allowed)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
         .http_status_as_error(false)
@@ -180,6 +185,7 @@ fn google(def: &ProviderDef) -> Result<Vec<Raw>> {
 }
 
 /// Devin subscription — `GetCliModelConfigs` over the signed-in plan.
+#[cfg(feature = "devin-direct")]
 fn devin() -> Result<Vec<Raw>> {
     let models = crate::devin::models()?;
     Ok(models
@@ -382,7 +388,7 @@ mod tests {
 
     #[test]
     fn merge_keeps_subscription_ids() {
-        let d = crate::catalog::provider("devin").unwrap().clone();
+        let d = crate::catalog::provider("chatgpt").unwrap().clone();
         let m = merge(
             &d,
             vec![Raw { id: "foo-clip-bar".into(), name: Some("Clip".into()), ..Raw::default() }],

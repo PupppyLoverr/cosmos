@@ -332,6 +332,7 @@ fn worker(
     let always = Arc::new(Mutex::new(Vec::new()));
     install_asker(&mut agent, &tx, &always);
     install_delta(&mut agent, &tx);
+    agent.interrupt = Some(interrupt.clone());
     let mut effort: Option<String> = None;
 
     let tx2 = tx.clone();
@@ -392,6 +393,7 @@ fn worker(
                     Ok(mut a) => {
                         install_asker(&mut a, &tx, &always);
                         install_delta(&mut a, &tx);
+                        a.interrupt = Some(interrupt.clone());
                         a.provider.effort = effort.clone();
                         let ev = a.session.append(
                             "session_start",
@@ -420,6 +422,7 @@ fn worker(
                     Ok(mut a) => {
                         install_asker(&mut a, &tx, &always);
                         install_delta(&mut a, &tx);
+                        a.interrupt = Some(interrupt.clone());
                         a.provider.effort = effort.clone();
                         let ev = a.session.append(
                             "session_start",

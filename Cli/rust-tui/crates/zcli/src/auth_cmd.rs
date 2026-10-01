@@ -11,7 +11,7 @@ const USAGE: &str = "\
 usage:
   cosmostui auth                              show connected providers
   cosmostui auth login chatgpt                sign in with a ChatGPT Plus/Pro plan (browser)
-  cosmostui auth login devin                  use the Devin subscription already signed in on this machine
+  cosmostui auth login cursor|devin|codex     sign in through that vendor's own CLI (runs on your plan)
   cosmostui auth login <provider> [--key K]   store an API key (prompted, hidden)
   cosmostui auth logout <provider|chatgpt>
   cosmostui models [provider]                 models you can use now (or one provider's list)";
@@ -67,11 +67,9 @@ fn status() -> i32 {
         ),
         None => println!("  · chatgpt        not signed in — cosmostui auth login chatgpt"),
     }
-    zcore::devin::invalidate();
-    if zcore::devin::ready() {
-        println!("  ✓ {:<14} {}", "devin", zcore::devin::detail());
-    } else {
-        println!("  · {:<14} {}", "devin", zcore::devin::detail());
+    for p in zcore::acp_client::PLUGINS {
+        let mark = if zcore::acp_client::installed(p.id) { "✓" } else { "·" };
+        println!("  {mark} {:<14} {}", p.id, zcore::acp_client::status(p.id));
     }
     for p in catalog::providers().iter().filter(|p| !p.is_subscription() && !p.env.is_empty()) {
         match creds::key_for(&p.id, &p.env) {
@@ -111,23 +109,21 @@ fn login(args: &[String]) -> i32 {
             }
         };
     }
-    if id == "devin" {
-        zcore::devin::invalidate();
-        return if zcore::devin::ready() {
-            match zcore::live::fetch(catalog::provider("devin").unwrap()) {
-                Ok(models) => {
-                    let _ = zcore::live::store("devin", &models);
-                    println!("✓ Devin · {} · try: cosmostui --model devin/{}", zcore::devin::detail(), models.iter().find(|m| m.id == "swe-2-max").map(|m| m.id.as_str()).or_else(|| models.first().map(|m| m.id.as_str())).unwrap_or("swe-2-max"));
-                    exit::DONE
-                }
-                Err(e) => {
-                    eprintln!("✗ {e:#}");
-                    exit::FAILED
-                }
+    if let Some(p) = zcore::acp_client::plugin(id) {
+        // the vendor's own sign-in; Cosmos never sees the credentials
+        if !zcore::acp_client::installed(p.id) {
+            eprintln!("✗ {} isn't installed — {}", p.name, p.install);
+            return exit::PROVIDER;
+        }
+        return match zcore::acp_client::login(p.id) {
+            Ok(()) => {
+                println!("✓ {} is signed in through its CLI · try: cosmostui --model {}/default", p.name, p.id);
+                exit::DONE
             }
-        } else {
-            eprintln!("✗ {}", zcore::devin::hint());
-            exit::FAILED
+            Err(e) => {
+                eprintln!("✗ {e:#}");
+                exit::PROVIDER
+            }
         };
     }
     let known = catalog::provider(id).is_some() || Config::load(&zcore::cli_home()).providers.contains_key(id.as_str());
@@ -218,8 +214,8 @@ pub fn models_cmd(args: &[String]) -> i32 {
         .filter(|m| want.is_none_or(|id| m.provider == id))
         .collect();
     if list.is_empty() {
-        if want == Some("devin") {
-            eprintln!("no Devin models yet — cosmostui auth login devin  (subscription models; Cosmos runs the tools)");
+        if let Some(p) = want.and_then(zcore::acp_client::plugin) {
+            eprintln!("{} isn't installed — {}", p.name, p.install);
         } else {
             eprintln!("no models yet — cosmostui auth login <provider>");
         }

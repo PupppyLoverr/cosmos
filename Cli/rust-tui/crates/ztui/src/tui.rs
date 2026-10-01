@@ -478,10 +478,14 @@ impl App {
                 }
                 if let Some(calls) = ev.data["tool_calls"].as_array() {
                     for c in calls {
+                        let name = c["name"].as_str().unwrap_or("tool");
+                        // a deferred tool through the built-in server shows as itself
+                        let (name, input) = ztools::unwrap_self_call(name, &c["input"])
+                            .unwrap_or_else(|| (name.to_string(), c["input"].clone()));
                         self.tools.push(PendingTool {
                             id: c["id"].as_str().unwrap_or("").to_string(),
-                            name: c["name"].as_str().unwrap_or("tool").to_string(),
-                            input: c["input"].clone(),
+                            name,
+                            input,
                         });
                     }
                 }
@@ -502,6 +506,14 @@ impl App {
                     let lines = view::tool_block(&name, &input, Some(content), err, diff.as_ref(), w, false);
                     self.block(lines);
                 }
+            }
+            // a subscription agent's own tool (ACP) — shown, never replayed
+            "tool_call" if ev.data["source"] == "acp" => {
+                let name = ev.data["name"].as_str().unwrap_or("tool");
+                let status = ev.data["status"].as_str().unwrap_or("");
+                let input = serde_json::json!({"title": ev.data["title"]});
+                let out = ev.data["output"].as_str().unwrap_or("");
+                self.block(view::tool_block(name, &input, Some(out), status == "failed", None, w, false));
             }
             "plan" => {
                 self.plan_pending = true;
@@ -1140,15 +1152,16 @@ impl App {
         }
     }
 
-    /// Begin /connect for a provider: ChatGPT and Devin sign in, others ask for a key.
+    /// Begin /connect for a provider: ChatGPT signs in, subscription agents
+    /// (Cursor, Devin, Codex) use their own CLI, others ask for a key.
     fn connect(&mut self, id: &str) {
         self.popup = None;
         if id == "chatgpt" {
             self.start_login();
             return;
         }
-        if id == "devin" {
-            self.connect_devin();
+        if zcore::acp_client::plugin(id).is_some() {
+            self.connect_acp(id);
             return;
         }
         match zcore::catalog::provider(id) {
@@ -1162,25 +1175,22 @@ impl App {
         }
     }
 
-    fn connect_devin(&mut self) {
-        zcore::devin::invalidate();
-        if !zcore::devin::ready() {
-            self.error(zcore::devin::hint());
+    /// A subscription agent needs only its CLI on PATH and its own sign-in;
+    /// it runs on the operator's plan, never on a key Cosmos holds.
+    fn connect_acp(&mut self, id: &str) {
+        let Some(p) = zcore::acp_client::plugin(id) else { return };
+        if !zcore::acp_client::installed(id) {
+            self.error(format!("{} isn't installed — {}", p.name, p.install));
             return;
         }
-        let Some(def) = zcore::catalog::provider("devin") else {
-            self.error("Devin is missing from the catalog");
-            return;
-        };
-        match zcore::live::fetch(def) {
-            Ok(models) => {
-                let _ = zcore::live::store("devin", &models);
-                self.reload_models();
-                self.note(format!("Devin · {} · {} models", zcore::devin::detail(), models.len()));
-                self.open_model_picker_for("devin");
-            }
-            Err(e) => self.error(format!("{e:#}")),
-        }
+        self.reload_models();
+        self.note(format!(
+            "{} found — it runs on your {} plan. Not signed in yet? Run `{}` in a terminal (or `cosmostui auth login {id}`).",
+            p.name,
+            p.name,
+            p.login.join(" ")
+        ));
+        self.open_model_picker_for(id);
     }
 
     fn open_model_picker(&mut self) {
@@ -2007,6 +2017,21 @@ mod tests {
         let rows: Vec<String> = a.out.iter().map(text).collect();
         assert!(rows.iter().any(|r| r.contains("Bash") && r.contains("cargo test")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("ok. 3 passed")));
+
+        // a deferred tool via the built-in server renders as itself
+        a.on_msg(Msg::Event(ev("assistant", serde_json::json!({"text": "", "tool_calls": [{"id": "t2", "name": "mcp_call",
+            "input": {"server": "cosmos", "tool": "memory_search", "arguments": {"query": "tabs"}}}]}))));
+        assert_eq!(a.tools[0].name, "memory_search");
+        a.on_msg(Msg::Event(ev("tool_result", serde_json::json!({"tool_use_id": "t2", "name": "memory_search", "content": "{\"results\":[]}", "is_error": false}))));
+        let rows: Vec<String> = a.out.iter().map(text).collect();
+        assert!(rows.iter().any(|r| r.contains("Recall") && r.contains("tabs")), "{rows:?}");
+
+        // a subscription agent's tool shows up from its tool_call event
+        a.on_msg(Msg::Event(ev("tool_call", serde_json::json!({"id": "x", "name": "devin:edit", "title": "Edit a.rs",
+            "status": "completed", "output": "wrote a.rs", "source": "acp"}))));
+        let rows: Vec<String> = a.out.iter().map(text).collect();
+        assert!(rows.iter().any(|r| r.contains("devin:edit") && r.contains("Edit a.rs")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("wrote a.rs")), "{rows:?}");
     }
 
     #[test]

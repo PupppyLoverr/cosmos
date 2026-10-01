@@ -24,8 +24,10 @@ pub enum ProviderKind {
     Anthropic,
     Google,
     Fixture,
-    /// Devin subscription models — handled by zcore::devin over GetChatMessage.
+    /// Devin subscription models — zcore::devin over GetChatMessage (`devin-direct` builds only).
     Devin,
+    /// A vendor agent (Cursor, Devin, Codex) over the Agent Client Protocol — zcore::acp_client.
+    Acp,
 }
 
 impl ProviderKind {
@@ -38,6 +40,7 @@ impl ProviderKind {
             "google" => Some(Self::Google),
             "fixture" => Some(Self::Fixture),
             "devin" => Some(Self::Devin),
+            "acp" => Some(Self::Acp),
             _ => None,
         }
     }
@@ -827,6 +830,10 @@ fn responses_complete(
     allowed: &[String],
 ) -> Result<()> {
     let chatgpt = cfg.kind == ProviderKind::ChatGpt;
+    if cfg.model.trim().is_empty() {
+        // the ChatGPT backend answers a model-less request with a bare 400
+        bail!("no model id — pick one as {}/<model>", if chatgpt { "chatgpt" } else { "provider" });
+    }
     let base = cfg.base_url.trim_end_matches('/');
     let url = if chatgpt {
         format!("{base}/codex/responses")
@@ -1028,6 +1035,7 @@ pub fn complete(
         ProviderKind::Responses | ProviderKind::ChatGpt => responses_complete(cfg, req, sink, allowed),
         ProviderKind::Anthropic => anthropic_complete(cfg, req, sink, allowed),
         ProviderKind::Google => google_complete(cfg, req, sink, allowed),
-        ProviderKind::Devin => bail!("Devin turns run through the local `devin` CLI (zcore::devin)"),
+        ProviderKind::Devin => bail!("Devin-direct turns run in zcore::devin"),
+        ProviderKind::Acp => bail!("ACP plugin turns run in zcore::acp_client"),
     }
 }

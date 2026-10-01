@@ -396,6 +396,7 @@ fn memory_cmd(args: &[String]) -> i32 {
     let ws = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut ctx = ztools::ToolContext::new(&ws);
     ctx.home = zcore::cli_home();
+    ctx.allowed_hosts = zcore::config::Config::load(&ctx.home).allowed_hosts();
     let (tool, input) = match args.first().map(String::as_str) {
         Some("search") => {
             let q = args.get(1..).map(|a| a.join(" ")).unwrap_or_default();

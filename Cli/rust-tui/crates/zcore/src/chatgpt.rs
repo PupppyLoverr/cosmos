@@ -120,7 +120,9 @@ fn tokens_from(v: &Value, prev_refresh: Option<&str>) -> Result<Tokens> {
 
 fn token_request(form: &[(&str, &str)]) -> Result<Value> {
     let body = form.iter().map(|(k, v)| format!("{k}={}", enc(v))).collect::<Vec<_>>().join("&");
-    let mut resp = ureq::post(&format!("{ISSUER}/oauth/token"))
+    let url = format!("{ISSUER}/oauth/token");
+    zproviders::host_allowed(&url, &crate::config::Config::load(&crate::cli_home()).allowed_hosts())?;
+    let mut resp = ureq::post(&url)
         .header("content-type", "application/x-www-form-urlencoded")
         .config()
         .http_status_as_error(false)
@@ -301,8 +303,11 @@ mod tests {
     #[test]
     fn pkce_challenge_is_s256_of_verifier() {
         let p = pkce();
-        assert!(p.verifier.len() >= 43);
+        // RFC 7636 §4.1: 43–128 chars from the unreserved set
+        assert!((43..=128).contains(&p.verifier.len()), "{}", p.verifier.len());
+        assert!(p.verifier.chars().all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)), "{}", p.verifier);
         assert_eq!(p.challenge, URL_SAFE_NO_PAD.encode(Sha256::digest(p.verifier.as_bytes())));
+        assert_ne!(pkce().verifier, p.verifier, "fresh verifier per sign-in");
     }
 
     #[test]

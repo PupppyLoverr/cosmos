@@ -330,3 +330,12 @@ fn fixture_reports_usage_once() {
     assert_eq!(dones, 1);
     assert!(usage.input > 0 && usage.output > 0);
 }
+
+#[test]
+fn chatgpt_requires_a_model_id() {
+    let cfg = ProviderCfg { kind: ProviderKind::ChatGpt, base_url: "http://127.0.0.1:9/backend-api".into(), model: String::new(), api_key: Some("tok".into()), ..Default::default() };
+    let msgs = vec![Message::text(Role::User, "hi")];
+    let req = Request { system: vec![], tools: &[], messages: &msgs, session_id: "s", max_tokens: 16 };
+    let err = complete(&cfg, &req, &mut |_| {}, &["127.0.0.1".into()]).unwrap_err().to_string();
+    assert!(err.contains("chatgpt/<model>"), "{err}");
+}

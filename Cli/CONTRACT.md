@@ -223,6 +223,11 @@ removal happens on `session_end` only if the worktree is clean. Parallel tasks b
   at session start.
 - ACP: `<bin> acp` serves `initialize`, `session/new`, `session/prompt`, `session/update`
   (notifications), `session/request_permission`, `session/cancel` over stdio JSON-RPC.
+  cosmostui is also an ACP *client*: provider kind `acp` (`cursor` → `agent acp`, `devin` →
+  `devin acp`, `codex` → `codex-acp`) runs the vendor's installed, signed-in agent on the
+  operator's own plan. Its replies stream as `assistant`; its tool activity is logged as
+  `tool_call {source: "acp"}` (never replayed as tool turns); its permission requests follow
+  §3 (headless: denied unless `--allow acp|<plugin>|<kind>`); a missing binary is exit 4.
 
 ## 12. Privacy
 

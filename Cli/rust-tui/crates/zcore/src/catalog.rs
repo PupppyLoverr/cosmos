@@ -45,9 +45,10 @@ pub struct ProviderDef {
 }
 
 impl ProviderDef {
-    /// Signs in with an account rather than an API key (ChatGPT Plus/Pro or Devin).
+    /// Signs in with an account rather than an API key (ChatGPT Plus/Pro, or
+    /// a vendor CLI driven over ACP).
     pub fn is_subscription(&self) -> bool {
-        matches!(self.kind.as_str(), "chatgpt" | "devin")
+        matches!(self.kind.as_str(), "chatgpt" | "devin" | "acp")
     }
 
     pub fn model(&self, id: &str) -> Option<&ModelDef> {
@@ -126,7 +127,32 @@ fn router9() -> ProviderDef {
     }
 }
 
-/// Devin subscription — models from the signed-in plan; Cosmos runs the tools.
+/// Subscription agents driven over ACP — the vendor's own CLI, sign-in and
+/// agent. One "default" model each: the plan decides (a model id typed by
+/// hand is requested with `session/set_model`).
+fn acp_plugins() -> Vec<ProviderDef> {
+    crate::acp_client::PLUGINS
+        .iter()
+        .map(|p| ProviderDef {
+            id: p.id.into(),
+            name: format!("{} (subscription)", p.name),
+            kind: "acp".into(),
+            base_url: crate::acp_client::url(p.id),
+            env: Vec::new(),
+            models: vec![ModelDef {
+                id: "default".into(),
+                name: format!("{} — your plan's default model", p.name),
+                context: 200_000,
+                output: 32_000,
+                reasoning: true,
+                price: [0.0; 4],
+            }],
+        })
+        .collect()
+}
+
+/// The pre-ACP Devin path (`devin-direct` feature).
+#[cfg(feature = "devin-direct")]
 fn devin() -> ProviderDef {
     let m = |id: &str, name: &str, context: u64| ModelDef {
         id: id.into(),
@@ -137,8 +163,8 @@ fn devin() -> ProviderDef {
         price: [0.0; 4],
     };
     ProviderDef {
-        id: "devin".into(),
-        name: "Devin (subscription)".into(),
+        id: "devin-direct".into(),
+        name: "Devin (direct, unofficial)".into(),
         kind: "devin".into(),
         base_url: "https://server.codeium.com".into(),
         env: Vec::new(),
@@ -180,7 +206,11 @@ pub fn providers() -> &'static [ProviderDef] {
     P.get_or_init(|| {
         let file: CatalogFile = serde_json::from_str(include_str!("../catalog/catalog.json"))
             .expect("catalog.json is generated and checked in");
-        let mut v = vec![chatgpt(), devin(), router9()];
+        let mut v = vec![chatgpt()];
+        v.extend(acp_plugins());
+        #[cfg(feature = "devin-direct")]
+        v.push(devin());
+        v.push(router9());
         v.extend(file.providers);
         v.extend(local());
         v
@@ -204,17 +234,22 @@ mod tests {
 
     #[test]
     fn catalog_loads_with_requested_providers() {
-        for id in ["chatgpt", "devin", "router9", "openai", "anthropic", "google", "meta", "llama", "xiaomi", "alibaba", "bailing", "xai", "deepseek", "moonshotai", "zai", "minimax", "mistral", "groq", "openrouter", "ollama"] {
+        for id in ["chatgpt", "devin", "cursor", "codex", "router9", "openai", "anthropic", "google", "meta", "llama", "xiaomi", "alibaba", "bailing", "xai", "deepseek", "moonshotai", "zai", "minimax", "mistral", "groq", "openrouter", "ollama"] {
             assert!(provider(id).is_some(), "{id} missing from catalog");
         }
         let xiaomi = provider("xiaomi").unwrap();
         assert!(!xiaomi.models.is_empty());
         assert_eq!(xiaomi.kind, "openai");
         assert!(provider("chatgpt").unwrap().is_subscription());
-        assert!(provider("devin").unwrap().is_subscription());
-        assert_eq!(provider("devin").unwrap().kind, "devin");
-        assert_eq!(provider("devin").unwrap().base_url, "https://server.codeium.com");
-        assert_eq!(provider("devin").unwrap().models[0].id, "swe-2-max");
+        for id in ["devin", "cursor", "codex"] {
+            let p = provider(id).unwrap();
+            assert!(p.is_subscription());
+            assert_eq!(p.kind, "acp");
+            assert_eq!(p.base_url, format!("acp://{id}"));
+            assert_eq!(p.models[0].id, "default");
+        }
+        #[cfg(not(feature = "devin-direct"))]
+        assert!(provider("devin-direct").is_none(), "the unofficial Devin path is opt-in");
     }
 
     #[test]
