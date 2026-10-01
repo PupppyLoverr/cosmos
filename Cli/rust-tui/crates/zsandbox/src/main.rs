@@ -61,12 +61,7 @@ fn main() -> ExitCode {
     if argv.is_empty() {
         usage();
     }
-    match exec(&ExecOpts {
-        workspace,
-        net,
-        timeout,
-        argv,
-    }) {
+    match exec(&ExecOpts::new(workspace, net, timeout, argv)) {
         Ok(r) => {
             let mut so = std::io::stdout().lock();
             let mut se = std::io::stderr().lock();

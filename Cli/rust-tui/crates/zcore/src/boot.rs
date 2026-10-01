@@ -200,6 +200,7 @@ pub fn build(repo: &Path, home: &Path) -> Boot {
     if !mem.is_empty() {
         parts.push(format!("## Operator memory\n{}", mem.trim_end()));
     }
+    parts.push(format!("## Shell\n`bash` runs {} in the workspace.", ztools::shell::shell_name()));
     parts.push(format!(
         "## More tools\n{} — find with tool_search, call with mcp_call {{\"server\": \"{}\", \"tool\", \"arguments\"}}.",
         ztools::DEFERRED_TOOLS.join(", "),

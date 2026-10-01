@@ -191,6 +191,9 @@ impl Agent {
             .collect();
         ctx.mcp_servers = cfg.mcp_servers();
         ctx.allowed_hosts = cfg.allowed_hosts();
+        if !ctx.no_sandbox {
+            ctx.sandbox_degraded = ztools::shell::last_sandbox(&home).flatten();
+        }
         ctx.large_read_lines = cfg.bridge.large_read_lines;
         ctx.no_sandbox = opts.no_sandbox;
         ctx.escalations = opts.allow_escalation.clone();
@@ -559,6 +562,40 @@ impl Agent {
         }
         eprintln!("turn · {plugin} subscription · stop {stop}");
         Ok(true)
+    }
+
+    /// Contract §5 `session_start` fields: "off", the platform sandbox, or
+    /// "degraded" with the reason last observed on this machine.
+    pub fn sandbox_status(&self) -> Value {
+        if self.ctx.no_sandbox {
+            return json!({"sandbox": "off"});
+        }
+        let kind = if cfg!(windows) {
+            "appcontainer"
+        } else if cfg!(target_os = "macos") {
+            "seatbelt"
+        } else {
+            "bwrap"
+        };
+        match (&self.ctx.sandbox_degraded, ztools::shell::last_sandbox(&self.home)) {
+            (Some(r), _) => json!({"sandbox": "degraded", "sandbox_reason": r}),
+            // the first bash call on this machine runs the tier check
+            (None, None) if cfg!(windows) => json!({"sandbox": kind, "sandbox_checked": false}),
+            _ => json!({"sandbox": kind}),
+        }
+    }
+
+    /// `session_start` data with the fields every front end logs.
+    pub fn start_data(&self, extra: Value) -> Value {
+        let mut d = json!({"model": self.model_alias, "mode": self.mode.name(), "boot_tokens": self.boot_tokens});
+        for v in [self.sandbox_status(), extra] {
+            if let Value::Object(m) = v {
+                for (k, x) in m {
+                    d[k] = x;
+                }
+            }
+        }
+        d
     }
 
     /// Exactly what the next request sends as the conversation (§9).
@@ -934,6 +971,18 @@ impl Agent {
                             }
                         }
                     }
+                    if name == "bash" && input["wait"] == "now" {
+                        if let Ok(v) = serde_json::from_str::<Value>(&out) {
+                            if !v["task_id"].is_null() {
+                                let ev = self.session.append(
+                                    "job_start",
+                                    json!({"task_id": v["task_id"], "pid": v["pid"], "log_path": v["log_path"],
+                                           "command": input["command"]}),
+                                );
+                                emit(&ev);
+                            }
+                        }
+                    }
                     if name == "bash" {
                         if let Some(c) = input["command"].as_str() {
                             if c.contains("test") {
@@ -955,7 +1004,9 @@ impl Agent {
                 json!({
                     "task_id": j.task_id,
                     "exit_code": j.exit_code,
+                    "note": ztools::jobs::exit_note(Some(j.exit_code), ""),
                     "log_path": j.log_path.display().to_string(),
+                    "degraded": j.degraded,
                 }),
             );
             emit(&ev);
@@ -1076,7 +1127,7 @@ impl Agent {
         );
         emit(&ev);
         child.append("session_start", json!({"model": self.model_alias, "mode": "agent",
-                                           "sandbox": "appcontainer", "boot_tokens": self.boot_tokens,
+                                           "sandbox": self.sandbox_status()["sandbox"], "boot_tokens": self.boot_tokens,
                                            "parent_session": self.session.id}));
         // Worktree subagents run their tools against the worktree root.
         let mut child_ctx = self.worktrees.last().map(|(p, _)| self.child_ctx(p));
@@ -1487,20 +1538,8 @@ pub fn run_headless(
         None => bail!("run_headless needs a prompt"),
     };
     let mut agent = Agent::new(opts, harness, cwd)?;
-    let sandbox_state = if agent.ctx.no_sandbox {
-        "off"
-    } else {
-        "appcontainer"
-    };
-    let ev = agent.session.append(
-        "session_start",
-        json!({
-            "model": agent.model_alias, "mode": agent.mode.name(),
-            "sandbox": sandbox_state, "boot_tokens": agent.boot_tokens,
-            "resume": opts.resume,
-            "cwd": agent.ctx.workspace,
-        }),
-    );
+    let start = agent.start_data(json!({"resume": opts.resume, "cwd": agent.ctx.workspace}));
+    let ev = agent.session.append("session_start", start);
     emit(&ev);
     crate::hooks::run(
         &agent.cfg,

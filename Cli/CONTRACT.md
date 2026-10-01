@@ -128,6 +128,12 @@ grant the AppContainer SID read/write on the workspace and read/execute on toolc
 wrap the process in a Job object with `KILL_ON_JOB_CLOSE`, a memory cap and a process cap.
 If AppContainer setup fails, fall back to a restricted token at low integrity inside the Job
 object and report `sandbox:"degraded", reason` in `session_start` and every `bash` result.
+cosmostui picks the tier once per machine with a canary run in a scratch folder (the shell must
+print, write a file, and list the PATH folders under the user profile): AppContainer, else the
+low-integrity restricted token, else Job limits only — the last two always reported as degraded,
+with what failed and that the network is not blocked. Cached in `COSMOS_CLI_HOME/sandbox_tier.json`;
+`COSMOS_SANDBOX_TIER=appcontainer|restricted|job` pins it. Background jobs (`wait=now`) run
+through the same tier, streaming output to their log.
 Linux: Landlock + seccomp or bubblewrap (Codex lineage). Escalation only via
 `request_escalation`; never silent; denied in headless unless `--allow-escalation network`.
 Never change firewall, Defender, or system policy.

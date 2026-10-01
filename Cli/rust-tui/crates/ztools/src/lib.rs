@@ -7,7 +7,7 @@ pub mod jobs;
 mod mcp;
 pub mod memory;
 pub mod repair;
-mod shell;
+pub mod shell;
 pub mod supermemory;
 pub mod verify;
 

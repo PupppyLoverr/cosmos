@@ -342,12 +342,7 @@ fn worker(
     send(&tx, ready(&agent));
     let start = agent.session.append(
         "session_start",
-        json!({
-            "model": agent.model_alias, "mode": agent.mode.name(),
-            "sandbox": if agent.ctx.no_sandbox {"off"} else {"appcontainer"},
-            "boot_tokens": agent.boot_tokens,
-            "resume": opts.resume,
-        }),
+        agent.start_data(json!({"resume": opts.resume})),
     );
     emit(&start);
 
