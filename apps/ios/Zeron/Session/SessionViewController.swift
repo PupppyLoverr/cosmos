@@ -33,6 +33,10 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = Palette.background
+        engine.setCompact(enabled: TranscriptSettings.compact)
+        compactObserver = NotificationCenter.default.addObserver(forName: TranscriptSettings.didChange, object: nil, queue: .main) { [weak self] _ in
+            self?.engine.setCompact(enabled: TranscriptSettings.compact)
+        }
         // The app can be killed in the background: the draft goes to disk first.
         backgroundObserver = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
             self?.saveDraft()
@@ -163,9 +167,11 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
 
     private var hasAppeared = false
     private var backgroundObserver: NSObjectProtocol?
+    private var compactObserver: NSObjectProtocol?
 
     deinit {
         if let backgroundObserver { NotificationCenter.default.removeObserver(backgroundObserver) }
+        if let compactObserver { NotificationCenter.default.removeObserver(compactObserver) }
     }
 
     /// Swap the tab accessory *inside* the push/pop animation so it travels

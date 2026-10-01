@@ -170,6 +170,7 @@ struct EntryState {
 /// Builds rows incrementally across snapshots.
 #[derive(Default)]
 pub(crate) struct RowBuilder {
+    pub compact: bool,
     parts: HashMap<String, PartState>,
     /// Reasoning parts' parse + prepared detail, keyed `{entry}#{part}`.
     pub(crate) thoughts: HashMap<String, ThoughtState>,
@@ -294,7 +295,7 @@ impl RowBuilder {
 
     /// Context outside the entry that changes its rows (gaps only).
     fn entry_sig(&self, _entry: &SessionMessageEntry, first: bool, prev: Option<MessageRole>) -> u64 {
-        (first as u64) | ((prev.map_or(0, |r| r as u64 + 1)) << 1)
+        (first as u64) | ((prev.map_or(0, |r| r as u64 + 1)) << 1) | ((self.compact as u64) << 8)
     }
 
     fn entry_rows(
@@ -336,6 +337,9 @@ impl RowBuilder {
             return rows;
         }
         let streaming = entry.status == Some(MessageStatus::Streaming);
+        if self.compact && entry.role == MessageRole::Assistant {
+            return self.compact_entry_rows(ctx, entry, first, prev, streaming, live_parts);
+        }
         let mut tools: Vec<&MessagePart> = Vec::new();
         let mut group_ix = 0usize;
         let flush_tools = |this: &mut Self, ctx: &mut Ctx, rows: &mut Vec<Placed>, tools: &mut Vec<&MessagePart>, group_ix: &mut usize, tail: bool| {
@@ -346,7 +350,7 @@ impl RowBuilder {
             *group_ix += 1;
             let gap = gap_for(rows, false);
             let agents = tools.iter().any(|p| matches!(p, MessagePart::Tool { call, .. } if call.is_subagent_spawn()));
-            let row = this.tool_row(ctx, &entry.id, &id, tools, streaming && tail, agents);
+            let row = this.tool_row(ctx, &entry.id, &id, tools, streaming && tail, agents, false, None);
             rows.push(Placed { core: Arc::new(row), gap });
             tools.clear();
         };
@@ -424,6 +428,108 @@ impl RowBuilder {
             }
         }
         flush_tools(self, ctx, &mut rows, &mut tools, &mut group_ix, true);
+        rows
+    }
+
+    fn compact_entry_rows(&mut self, ctx: &mut Ctx, entry: &SessionMessageEntry, first: bool, prev: Option<MessageRole>, streaming: bool, live_parts: &mut HashSet<String>) -> Vec<Placed> {
+        let gap_for = |rows: &Vec<Placed>, heading: bool| {
+            if rows.is_empty() {
+                if first {
+                    Gap::First
+                } else if prev == Some(MessageRole::User) || prev.is_none() {
+                    Gap::Reply
+                } else {
+                    Gap::Block
+                }
+            } else if heading {
+                Gap::Heading
+            } else {
+                Gap::Block
+            }
+        };
+        let reply_start = if streaming {
+            None
+        } else {
+            entry.parts.iter().rposition(|part| matches!(part, MessagePart::Text { text, .. } if !text.trim().is_empty())).map(|mut start| {
+                while start > 0 && matches!(&entry.parts[start - 1], MessagePart::Text { text, .. } if !text.trim().is_empty()) {
+                    start -= 1;
+                }
+                start
+            })
+        };
+        let is_work = |index: usize, part: &MessagePart| match part {
+            MessagePart::Tool { .. } => true,
+            MessagePart::Reasoning { text, .. } | MessagePart::Text { text, .. } => !text.trim().is_empty() && reply_start.is_none_or(|start| index < start),
+            _ => false,
+        };
+        let work_parts: Vec<&MessagePart> = entry.parts.iter().enumerate().filter_map(|(index, part)| is_work(index, part).then_some(part)).collect();
+        let first_work = entry.parts.iter().enumerate().find_map(|(index, part)| is_work(index, part).then_some(index));
+        let mut rows = Vec::new();
+        let mut inserted_work = false;
+
+        for (pi, part) in entry.parts.iter().enumerate() {
+            if is_work(pi, part) {
+                if !inserted_work && Some(pi) == first_work {
+                    let gap = gap_for(&rows, false);
+                    let work_id = format!("{}#work", entry.id);
+                    let group = self.tool_row(ctx, &entry.id, &work_id, &work_parts, streaming, false, true, entry.duration_ms);
+                    rows.push(Placed { core: Arc::new(group), gap });
+                    inserted_work = true;
+                }
+                if matches!(part, MessagePart::Reasoning { .. } | MessagePart::Text { .. }) {
+                    live_parts.insert(format!("{}#{}", entry.id, part.id()));
+                }
+                continue;
+            }
+
+            match part {
+                MessagePart::Text { id, text } => {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    let pkey = format!("{}#{}", entry.id, id);
+                    live_parts.insert(pkey.clone());
+                    let part_streaming = streaming && pi + 1 == entry.parts.len();
+                    let blocks = self.text_blocks(ctx, &pkey, text, part_streaming);
+                    for (bi, (_, core)) in blocks.iter().enumerate() {
+                        let heading = matches!(core.content, Content::Block(PBlock::Heading(_)));
+                        let gap = gap_for(&rows, heading && bi > 0);
+                        rows.push(Placed { core: core.clone(), gap });
+                    }
+                }
+                MessagePart::Image { id, path, .. } => {
+                    let gap = gap_for(&rows, false);
+                    let core = Arc::new(RowCore {
+                        key: row_key(&format!("{}#{}", entry.id, id)),
+                        version: next_version(),
+                        kind: RowKind::Image,
+                        entry_id: Arc::from(entry.id.as_str()),
+                        content: Content::Image { reference: path.clone() },
+                        copy_text: String::new(),
+                    });
+                    rows.push(Placed { core, gap });
+                }
+                MessagePart::Input { id, questions, resolved, .. } => {
+                    let text = if *resolved {
+                        "Answered a question".to_owned()
+                    } else {
+                        questions.first().map_or("Awaiting your answer…".to_owned(), |q| q.question.clone())
+                    };
+                    let gap = gap_for(&rows, false);
+                    rows.push(Placed { core: Arc::new(chip_row(ctx, &entry.id, id, "questionmark.bubble", ColorRole::Accent, &text)), gap });
+                }
+                MessagePart::Error { id, message } => {
+                    let gap = gap_for(&rows, false);
+                    rows.push(Placed { core: Arc::new(chip_row(ctx, &entry.id, id, "exclamationmark.triangle", ColorRole::Danger, message)), gap });
+                }
+                MessagePart::Fork { id, source_title, .. } => {
+                    let gap = gap_for(&rows, false);
+                    let text = format!("Forked from {source_title}");
+                    rows.push(Placed { core: Arc::new(chip_row(ctx, &entry.id, id, "arrow.triangle.branch", ColorRole::TextTertiary, &text)), gap });
+                }
+                _ => {}
+            }
+        }
         rows
     }
 

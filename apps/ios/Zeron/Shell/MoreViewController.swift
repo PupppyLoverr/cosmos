@@ -144,6 +144,10 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
     }
 
     private func toggled(_ id: String, _ on: Bool) {
+        if id == "transcript:compact" {
+            TranscriptSettings.compact = on
+            return reload()
+        }
         let push = PushNotifications.shared
         if id == "notify:enabled" {
             guard on else {
@@ -192,6 +196,10 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
             Row(id: "appearance:0", title: "System", symbol: "circle.lefthalf.filled", accessory: .check(style == 0)),
             Row(id: "appearance:1", title: "Light", symbol: "sun.max", accessory: .check(style == 1)),
             Row(id: "appearance:2", title: "Dark", symbol: "moon", accessory: .check(style == 2)),
+        ])
+        s.appendSections(["Transcript"])
+        s.appendItems([
+            Row(id: "transcript:compact", title: "Compact mode", subtitle: "Fold thinking and tool calls into one step so only replies show", symbol: "rectangle.compress.vertical", accessory: .toggle(TranscriptSettings.compact)),
         ])
         s.appendSections(["Wallpaper"])
         var wall = [Row(id: "wallpaper:choose", title: WallpaperStore.isSet ? "Change Wallpaper…" : "Choose Wallpaper…", subtitle: WallpaperStore.isSet ? WallpaperStore.name : "Shown behind new chats and the sessions list", symbol: "photo")]

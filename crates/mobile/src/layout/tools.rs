@@ -748,7 +748,7 @@ impl RowBuilder {
     }
 
     /// One group of consecutive tool / thought parts (`{msg}#g{n}`).
-    pub(crate) fn tool_row(&mut self, ctx: &mut Ctx, entry_id: &str, id: &str, parts: &[&MessagePart], live: bool, agents: bool) -> RowCore {
+    pub(crate) fn tool_row(&mut self, ctx: &mut Ctx, entry_id: &str, id: &str, parts: &[&MessagePart], live: bool, agents: bool, compact: bool, duration_ms: Option<i64>) -> RowCore {
         let key = row_key(id);
         let calls: Vec<(ToolCall, bool)> = parts
             .iter()
@@ -758,14 +758,18 @@ impl RowBuilder {
             })
             .collect();
         let thoughts = parts.iter().filter(|p| matches!(p, MessagePart::Reasoning { .. })).count();
-        let expanded = agents
-            || if self.expanded.contains(&key) {
-                true
-            } else if self.collapsed.contains(&key) {
-                false
-            } else {
-                live // Auto-open while it's the live tail, like desktop.
-            };
+        let expanded = if compact {
+            self.expanded.contains(&key)
+        } else {
+            agents
+                || if self.expanded.contains(&key) {
+                    true
+                } else if self.collapsed.contains(&key) {
+                    false
+                } else {
+                    live // Auto-open while it's the live tail, like desktop.
+                }
+        };
         let size = 12.0 * T;
         let st = Styles {
             label: ctx.typo.style(Family::Sans, Weight::Regular, false, size),
@@ -776,7 +780,12 @@ impl RowBuilder {
             out_lh: ctx.typo.px(OUT_LH * T),
         };
         let medium = ctx.typo.style(Family::Sans, Weight::Medium, false, size);
-        let summary = prepare_plain(ctx, &group_summary(thoughts, &calls), st.label, st.lh, ColorRole::TextSecondary, WhiteSpace::Pre);
+        let summary_text = if compact && !live {
+            duration_ms.filter(|ms| *ms > 0).map(|ms| worked_for_label((ms / 1000).max(1)))
+        } else {
+            None
+        };
+        let summary = prepare_plain(ctx, summary_text.as_deref().unwrap_or(&group_summary(thoughts, &calls)), st.label, st.lh, ColorRole::TextSecondary, WhiteSpace::Pre);
         let mut lines = Vec::new();
         if expanded {
             let last = parts.len().saturating_sub(1);
@@ -850,6 +859,29 @@ impl RowBuilder {
                             body,
                         });
                     }
+                    MessagePart::Text { text, .. } if compact => {
+                        let tail = live && i == last;
+                        let open = self.detail_open.get(&dkey).copied().unwrap_or(tail);
+                        let first_line = text.lines().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
+                        let label: String = first_line.chars().take(80).collect();
+                        let label = if first_line.chars().count() > 80 { format!("{label}…") } else { label };
+                        let body = if open && !text.trim().is_empty() {
+                            vec![DetailBlock::Thought(self.thought_body(ctx, &st, &format!("{entry_id}#{}", part.id()), text, tail))]
+                        } else {
+                            Vec::new()
+                        };
+                        lines.push(ToolLine {
+                            icon: "tool-chat-round-line".into(),
+                            label: prepare_plain(ctx, &label, st.label, st.lh, ColorRole::TextSecondary, WhiteSpace::Pre),
+                            detail: None,
+                            badge: None,
+                            failed: false,
+                            running: false,
+                            key: dkey,
+                            open,
+                            body,
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -862,6 +894,14 @@ impl RowBuilder {
             content: Content::Tools(ToolGroup { summary, lines, expanded, live, agents }),
             copy_text: String::new(),
         }
+    }
+}
+
+fn worked_for_label(secs: i64) -> String {
+    if secs >= 60 {
+        format!("Worked for {}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("Worked for {secs}s")
     }
 }
 

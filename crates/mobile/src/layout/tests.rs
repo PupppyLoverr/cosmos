@@ -561,3 +561,107 @@ fn links_get_hit_regions() {
         assert!(!links.is_empty(), "no link hits for {md:?}");
     }
 }
+
+fn compact_entry(streaming: bool) -> Arc<zeron_doc::schema::SessionMessageEntry> {
+    use zeron_doc::parts::{MessagePart, MessageStatus};
+    use zeron_doc::schema::{MessageRole, SessionMessageEntry};
+    let tool = |id: &str, command: &str| MessagePart::Tool {
+        id: id.into(),
+        call: zeron_proto::ToolCall::Exec { command: command.into() },
+        is_error: false,
+        resolved: true,
+        output: None,
+        diff: None,
+        output_ref: None,
+        output_bytes: None,
+        diff_ref: None,
+        diff_stats: None,
+        subagent_ref: None,
+        subagent_status: None,
+        subagent_tail: None,
+    };
+    Arc::new(SessionMessageEntry {
+        id: "compact".into(),
+        role: MessageRole::Assistant,
+        parts: vec![
+            MessagePart::Reasoning { id: "r0".into(), text: "planning the work".into() },
+            tool("t0", "ls"),
+            MessagePart::Text { id: "n0".into(), text: "Checking the directory".into() },
+            tool("t1", "pwd"),
+            MessagePart::Text { id: "reply".into(), text: "Here is the reply.".into() },
+        ],
+        created_at: 0,
+        device_id: String::new(),
+        status: Some(if streaming { MessageStatus::Streaming } else { MessageStatus::Complete }),
+        continuation_of: None,
+        duration_ms: (!streaming).then_some(12_000),
+    })
+}
+
+#[test]
+fn compact_entry_folds_work_and_keeps_only_the_trailing_reply_visible() {
+    let mut w = worker(390.0);
+    w.builder.compact = true;
+    w.input = TranscriptInput { entries: vec![compact_entry(false)], ..Default::default() };
+    let frame = w.pass();
+    assert_eq!(frame.row_count(), 2);
+    assert_eq!(frame.placement(0).unwrap().kind, RowKind::Tools);
+    assert_eq!(frame.placement(1).unwrap().kind, RowKind::Markdown);
+    let group = frame.display(0).unwrap();
+    assert!(group.text.starts_with("Worked for 12s"), "{}", group.text);
+    assert!(!group.text.contains("Checking the directory"));
+    assert!(!frame.display(1).unwrap().text.contains("Checking the directory"));
+    assert!(frame.display(1).unwrap().text.contains("Here is the reply."));
+}
+
+#[test]
+fn compact_streaming_entry_keeps_all_text_in_its_collapsed_group() {
+    let mut w = worker(390.0);
+    w.builder.compact = true;
+    w.input = TranscriptInput { entries: vec![compact_entry(true)], ..Default::default() };
+    let frame = w.pass();
+    assert_eq!(frame.row_count(), 1);
+    assert_eq!(frame.placement(0).unwrap().kind, RowKind::Tools);
+    let group = frame.display(0).unwrap();
+    assert!(!group.text.contains("Here is the reply."));
+    assert!(!group.text.contains("Checking the directory"));
+}
+
+#[test]
+fn compact_toggle_off_rebuilds_the_same_rows_as_a_fresh_builder() {
+    let input = TranscriptInput { entries: vec![compact_entry(false)], ..Default::default() };
+    let mut toggled = worker(390.0);
+    toggled.builder.compact = true;
+    toggled.input = input.clone();
+    toggled.pass();
+    toggled.builder.compact = false;
+    let after_toggle = toggled.pass();
+
+    let mut fresh = worker(390.0);
+    fresh.input = input;
+    let expected = fresh.pass();
+    assert_eq!(after_toggle.row_count(), expected.row_count());
+    for index in 0..expected.row_count() {
+        assert_eq!(after_toggle.placement(index).unwrap().kind, expected.placement(index).unwrap().kind);
+        assert_eq!(after_toggle.display(index).unwrap().text, expected.display(index).unwrap().text);
+    }
+}
+
+#[test]
+fn expanding_compact_work_group_shows_tool_thought_and_narration_lines() {
+    let mut w = worker(390.0);
+    w.builder.compact = true;
+    w.input = TranscriptInput { entries: vec![compact_entry(false)], ..Default::default() };
+    let folded = w.pass();
+    let key = folded.placement(0).unwrap().key;
+    w.builder.expanded.insert(key);
+    w.builder.invalidate(key);
+    let expanded = w.pass();
+    let group = expanded.display(0).unwrap();
+    assert!(group.text.contains("Thought process"), "{}", group.text);
+    assert!(group.text.contains("Checking the directory"), "{}", group.text);
+    assert!(group.text.contains("ls"), "{}", group.text);
+    assert!(group.text.contains("pwd"), "{}", group.text);
+    assert!(!group.text.contains("Here is the reply."));
+    assert!(group.height > folded.display(0).unwrap().height);
+}

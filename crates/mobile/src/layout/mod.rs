@@ -328,6 +328,7 @@ pub struct DebugEntry {
 
 enum Msg {
     Input(TranscriptInput),
+    Compact(bool),
     Viewport { width: f32, scale: f32 },
     Toggle(u64),
     ToggleDetail { row: u64, detail: u64, open: bool },
@@ -400,6 +401,10 @@ impl TranscriptView {
             width,
             scale: text_scale,
         });
+    }
+
+    pub fn set_compact(&self, enabled: bool) {
+        self.send(Msg::Compact(enabled));
     }
 
     /// Expand/collapse a disclosure (tool group, long user message).
@@ -523,6 +528,12 @@ impl Worker {
                     Msg::Input(input) => {
                         self.input = input;
                         dirty = true;
+                    }
+                    Msg::Compact(compact) => {
+                        if self.builder.compact != compact {
+                            self.builder.compact = compact;
+                            dirty = true;
+                        }
                     }
                     Msg::Viewport { width, scale } => {
                         if (scale - self.typo.scale).abs() > f32::EPSILON {

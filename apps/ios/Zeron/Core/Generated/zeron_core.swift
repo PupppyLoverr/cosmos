@@ -3333,6 +3333,8 @@ public protocol TranscriptViewProtocol: AnyObject, Sendable {
      */
     func frame()  -> LayoutFrame
     
+    func setCompact(enabled: Bool) 
+    
     /**
      * Feed markdown fixtures directly (demo screens, benchmarks, tests).
      */
@@ -3450,6 +3452,15 @@ open func frame() -> LayoutFrame  {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
+}
+    
+open func setCompact(enabled: Bool)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_transcriptview_set_compact(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(enabled),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -13506,6 +13517,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_transcriptview_frame() != 19133) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_transcriptview_set_compact() != 4995) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_transcriptview_set_debug_entries() != 54762) {
