@@ -11,7 +11,7 @@ use zproto::{Block, Chunk, Event, Message, OutputMode, Role, RunOpts, Usage};
 use zproviders::{complete, ProviderCfg, ProviderKind, Request};
 use ztools::{is_readonly, tool_specs, ToolContext, PLAN_TOOLS};
 
-use crate::compact::{self, CompactCfg};
+use crate::compact::{self, CompactCfg, Trigger, ViewOp};
 use crate::config::Config;
 use crate::improve::{self, SelfImproveCfg};
 use crate::session::Session;
@@ -59,8 +59,12 @@ pub struct Agent {
     pub world: World,
     pub last_model_at: Option<Instant>,
     pub prefix_hash: String,
-    pub last_l5_before: Option<u64>,
-    pub last_l5_after: Option<u64>,
+    /// Sticky compaction ops — the model sees `project(messages, view_ops)`.
+    pub view_ops: Vec<ViewOp>,
+    /// L5 ran at the previous check — a refill right after is thrash.
+    pub l5_last: bool,
+    /// set by thrash; only an operator `/compact` runs L5 again
+    pub auto_l5_off: bool,
     pub improve: SelfImproveCfg,
     pub compact_cfg: CompactCfg,
     pub sandbox_mode: String,
@@ -159,7 +163,8 @@ fn boot_context(workspace: &Path) -> (String, u64, Vec<String>) {
         if let Ok(out) = cmd.output() {
             if out.status.success() {
                 if let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) {
-                    let ctx = v["context"].as_str().unwrap_or("").to_string();
+                    // the bridge's BootContext serializes the body as `text`
+                    let ctx = v["text"].as_str().unwrap_or("").to_string();
                     let tokens = v["tokens"].as_u64().unwrap_or(0);
                     let warnings = v["warnings"]
                         .as_array()
@@ -260,12 +265,17 @@ impl Agent {
             Some(id) => Some(id.to_owned()),
             None => None,
         };
-        let (session, messages) = if let Some(id) = resume_id {
-            let s = Session::open(&home, &id)?;
-            let msgs = Session::replay(&home, &id)?;
-            (s, msgs)
+        // `--resume <id>@<event>` resumes from any event, compaction nodes included
+        let (session, messages, view_ops) = if let Some(id) = resume_id {
+            let (id, at) = match id.split_once('@') {
+                Some((i, a)) => (i.to_string(), Some(a.to_string())),
+                None => (id, None),
+            };
+            let s = Session::open_at(&home, &id, at.as_deref())?;
+            let (msgs, ops) = Session::replay_view(&home, &id, s.leaf.as_deref())?;
+            (s, msgs, ops)
         } else {
-            (Session::create(&home, harness)?, Vec::new())
+            (Session::create(&home, harness)?, Vec::new(), Vec::new())
         };
         // resumed sessions keep their own harness name in history; new events
         // carry ours — that IS the handoff mechanism (shared home).
@@ -334,8 +344,9 @@ impl Agent {
             world,
             last_model_at: None,
             prefix_hash: prefix,
-            last_l5_before: None,
-            last_l5_after: None,
+            view_ops,
+            l5_last: false,
+            auto_l5_off: false,
             improve: {
                 let mut i = SelfImproveCfg {
                     enabled: cfg.self_improve.enabled,
@@ -444,8 +455,17 @@ impl Agent {
         }
     }
 
+    /// Exactly what the next request sends as the conversation (§9).
+    pub fn model_view(&self) -> Vec<Message> {
+        compact::project(&self.messages, &self.view_ops)
+    }
+
+    fn cache_ttl(&self) -> u64 {
+        compact::cache_ttl_secs(&self.compact_cfg, self.provider.kind == ProviderKind::Anthropic)
+    }
+
     pub fn context_report(&self) -> String {
-        let tokens = compact::estimate_tokens(&self.messages, self.boot_tokens);
+        let tokens = compact::estimate_tokens(&self.model_view(), self.boot_tokens);
         let pct = if self.context_window == 0 {
             0
         } else {
@@ -456,7 +476,7 @@ impl Agent {
             &self.prefix_hash,
             &self.prefix_hash,
             Instant::now(),
-            self.compact_cfg.cache_warm_secs,
+            self.cache_ttl(),
         );
         format!(
             "{{\"tokens_in\":{tokens},\"tokens_budget\":{},\"percent\":{pct},\"cache_warm\":{warm}}}",
@@ -479,7 +499,7 @@ impl Agent {
         let mut text = String::new();
         let mut calls: Vec<Block> = Vec::new();
         let mut usage = Usage::default();
-        let projected = compact::layer4_collapse(&self.messages);
+        let projected = self.model_view();
         let req = Request {
             system: self.system.clone(),
             tools: &self.tools,
@@ -503,7 +523,8 @@ impl Agent {
                     calls.push(Block::ToolUse { id, name, input })
                 }
                 Chunk::Done(u) => {
-                    // providers may emit several Done chunks (input est, then output)
+                    // providers emit one merged Done per call; summing keeps
+                    // any multi-call provider (Devin) correct too
                     usage.input += u.input;
                     usage.cache_read += u.cache_read;
                     usage.cache_write += u.cache_write;
@@ -548,11 +569,14 @@ impl Agent {
             blocks.push(Block::Text { text });
         }
         blocks.extend(calls.iter().cloned());
-        self.messages.push(Message {
-            role: Role::Assistant,
-            content: blocks,
-        });
-        let tokens = compact::estimate_tokens(&self.messages, self.boot_tokens);
+        // an empty reply is logged but not replayed — keep memory == replay
+        if !blocks.is_empty() {
+            self.messages.push(Message {
+                role: Role::Assistant,
+                content: blocks,
+            });
+        }
+        let tokens = compact::estimate_tokens(&self.model_view(), self.boot_tokens);
         let pct = if self.context_window == 0 {
             0
         } else {
@@ -620,6 +644,11 @@ impl Agent {
             );
             emit(&ev);
             let msg = "doom_loop: same tool+args fired 3 times with no file change — stop and ask";
+            // log it so a resumed session replays the same conversation
+            self.session.append(
+                "tool_result",
+                json!({"tool_use_id":id,"name":name,"content":msg,"is_error":true}),
+            );
             self.messages.push(Message {
                 role: Role::User,
                 content: vec![Block::ToolResult {
@@ -681,6 +710,8 @@ impl Agent {
             }
             Permission::Allow => self.dispatch(name, input, emit),
         };
+        // §9 L1: big results go to disk once; log and model keep the preview
+        let text = compact::budget_result(&self.home, name, text);
         let ev = self.session.append(
             "tool_result",
             json!({"tool_use_id":id,"name":name,"content":text,"is_error":is_error}),
@@ -864,6 +895,7 @@ impl Agent {
                 for (k, v) in state {
                     self.ctx.read_state.insert(k, v);
                 }
+                let text = compact::budget_result(&self.home, &name, text);
                 self.session
                     .append("tool_call", json!({"id":id,"name":name,"input":input}));
                 let err = text.starts_with("ERROR");
@@ -1070,6 +1102,14 @@ impl Agent {
         self.messages.push(Message::text(Role::User, text));
     }
 
+    /// A harness-authored user message. Logged (`synthetic`) so a resumed
+    /// session replays exactly the conversation the model saw.
+    pub fn push_note(&mut self, text: String) {
+        self.session
+            .append("user", json!({"text": text, "synthetic": true}));
+        self.messages.push(Message::text(Role::User, text));
+    }
+
     /// `/approve` — pin the pending plan as the next user message and switch
     /// to agent mode (contract §3).
     pub fn approve_plan(&mut self, emit: &mut dyn FnMut(&Event)) {
@@ -1079,57 +1119,149 @@ impl Agent {
                 .session
                 .append("mode", json!({"from": "plan", "to": "agent"}));
             emit(&ev);
-            self.messages.push(Message::text(
-                Role::User,
-                format!("[approved plan]\n{plan}"),
-            ));
+            self.push_note(format!("[approved plan]\n{plan}"));
         }
     }
 
-    /// Five-layer compact before every model call.
+    /// §9 checkpoint before every model call. Does nothing on a warm cache
+    /// under the hot threshold; otherwise decides sticky L2–L4 ops and, if
+    /// still over, an L5 world summary. Every op is logged so resume replays
+    /// the same view.
     fn maybe_compact(&mut self, emit: &mut dyn FnMut(&Event)) {
-        let now = Instant::now();
         let prefix_now = compact::prefix_hash(&self.system, ztools::TOOLS_JSON);
         let warm = compact::cache_is_warm(
             self.last_model_at,
             &prefix_now,
             &self.prefix_hash,
-            now,
-            self.compact_cfg.cache_warm_secs,
+            Instant::now(),
+            self.cache_ttl(),
         );
-        crate::hooks::run(
-            &self.cfg,
-            "pre_compact",
-            "",
-            &json!({}),
-            &self.session.id.clone(),
-        );
-        let force = self.force_compact;
-        let focus = self.compact_focus.clone();
-        let outcome = compact::compact(
-            &mut self.messages,
-            &self.home,
-            &self.session.id,
-            &self.compact_cfg,
-            self.context_window,
-            self.boot_tokens,
-            warm,
-            force,
-            focus.as_deref(),
-            self.last_l5_before,
-            self.last_l5_after,
-        );
-        if outcome.world_md.is_some() {
-            self.last_l5_before = Some(outcome.tokens_before);
-            self.last_l5_after = Some(outcome.tokens_after);
-            if let Some(md) = &outcome.world_md {
-                self.world.apply_compact_md(md);
-                self.world.save(&self.home, &self.session.id);
-            }
+        let view = self.model_view();
+        let tokens = compact::estimate_tokens(&view, self.boot_tokens);
+        let why = if self.force_compact {
+            Some(Trigger::Operator)
+        } else {
+            compact::trigger(
+                tokens,
+                self.context_window,
+                self.compact_cfg.reserved_output_tokens,
+                warm,
+                self.compact_cfg.trigger_ratio,
+            )
+        };
+        let l5_last = std::mem::replace(&mut self.l5_last, false);
+        let Some(why) = why else {
+            return;
+        };
+        crate::hooks::run(&self.cfg, "pre_compact", "", &json!({}), &self.session.id.clone());
+        // thrash: L5 just ran and the context is already over the line again
+        if why == Trigger::Hot && l5_last && !self.auto_l5_off {
+            self.auto_l5_off = true;
+            let ev = self.session.append(
+                "compact_thrash",
+                json!({"tokens": tokens, "window": self.context_window,
+                       "note": "auto-compact off until /compact"}),
+            );
+            emit(&ev);
         }
-        for ev in outcome.events {
-            let e = self.session.append(&ev.kind, ev.data);
-            emit(&e);
+        if why == Trigger::Operator {
+            self.auto_l5_off = false;
+        }
+        let cp = compact::checkpoint(
+            &self.messages,
+            &self.view_ops,
+            self.boot_tokens,
+            self.context_window,
+            &self.compact_cfg,
+            why,
+        );
+        for op in cp.ops {
+            let data = match &op {
+                ViewOp::Snip { dropped, .. } => json!({"view": op, "dropped": dropped}),
+                ViewOp::Stub { layer, stubs } => json!({"view": op, "layer": layer, "count": stubs.len()}),
+                ViewOp::World { .. } => json!({"view": op}),
+            };
+            let ev = self.session.append(op.kind(), data);
+            emit(&ev);
+            self.view_ops.push(op);
+        }
+        if !cp.needs_world || (self.auto_l5_off && why != Trigger::Operator) {
+            return;
+        }
+        let focus = self.compact_focus.clone();
+        let md = self.summarize(focus.as_deref());
+        let dest = self.home.join("world").join(format!("{}.md", self.session.id));
+        if let Some(p) = dest.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        let _ = std::fs::write(&dest, &md);
+        self.world.apply_compact_md(&md);
+        self.world.save(&self.home, &self.session.id);
+        let op = compact::plan_world(&self.messages, &self.view_ops, md);
+        let mut ops = self.view_ops.clone();
+        ops.push(op.clone());
+        let after = compact::estimate_tokens(&compact::project(&self.messages, &ops), self.boot_tokens);
+        let ev = self.session.append(
+            "compaction",
+            json!({
+                "view": op,
+                "before_tokens": cp.tokens_before,
+                "after_tokens": after,
+                "reason": match why { Trigger::Operator => "operator", Trigger::Hot => "auto", Trigger::Cold => "cold_cache" },
+                "focus": focus,
+            }),
+        );
+        emit(&ev);
+        self.view_ops.push(op);
+        self.l5_last = why != Trigger::Operator;
+    }
+
+    /// L5 summary. One model call over the *current* prefix and view (so it
+    /// reads from the prompt cache) plus the template as the final user turn.
+    /// Fixture provider, a tool call instead of text, or any error → the
+    /// deterministic extractor.
+    fn summarize(&mut self, focus: Option<&str>) -> String {
+        let view = self.model_view();
+        let fallback = || compact::summarize_deterministic(&view, focus);
+        if matches!(self.provider.kind, ProviderKind::Fixture | ProviderKind::Devin) {
+            return fallback();
+        }
+        let mut msgs = view.clone();
+        let ask = match focus {
+            Some(f) => format!("{}\nFocus on: {f}", compact::SUMMARY_PROMPT),
+            None => compact::SUMMARY_PROMPT.to_string(),
+        };
+        msgs.push(Message::text(Role::User, ask));
+        let req = Request {
+            system: self.system.clone(),
+            tools: &self.tools,
+            messages: &msgs,
+            session_id: &self.session.id,
+            max_tokens: 1500,
+        };
+        let mut text = String::new();
+        let mut usage = Usage::default();
+        let ok = dispatch_complete(
+            &self.provider,
+            &req,
+            &mut |c| match c {
+                Chunk::Text(t) => text.push_str(&t),
+                Chunk::Done(u) => usage = u,
+                _ => {}
+            },
+            &self.allowed,
+        )
+        .is_ok();
+        if let Some(c) = self.prices.cost(&usage) {
+            self.cum_usd += c;
+        }
+        if !ok || !text.contains("goal:") {
+            return fallback();
+        }
+        let text = text.trim().to_string();
+        match focus {
+            Some(f) if !text.contains("focus:") => text.replacen("# World\n", &format!("# World\nfocus: {f}\n"), 1),
+            _ => text,
         }
     }
 }
@@ -1285,7 +1417,23 @@ pub fn run_headless(
                 return Ok(zproto::exit::BUDGET);
             }
         }
-        let done = agent.turn(emit)?;
+        // turn() only fails on the provider/network path — contract §7 exit 4
+        let done = match agent.turn(emit) {
+            Ok(d) => d,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                eprintln!("{msg}");
+                let ev = agent
+                    .session
+                    .append("error", json!({"kind": "provider", "message": msg}));
+                emit(&ev);
+                let ev = agent
+                    .session
+                    .append("session_end", json!({"reason":"provider_error"}));
+                emit(&ev);
+                return Ok(zproto::exit::PROVIDER);
+            }
+        };
         if done {
             if let Some(gate) = &opts.autonomous_gate {
                 if opts.autonomous || opts.autonomous_gate.is_some() {
@@ -1308,17 +1456,11 @@ pub fn run_headless(
                                 String::from_utf8_lossy(&o.stdout),
                                 String::from_utf8_lossy(&o.stderr)
                             );
-                            agent.messages.push(Message::text(
-                                Role::User,
-                                format!("[autonomous-gate failed]\n{body}"),
-                            ));
+                            agent.push_note(format!("[autonomous-gate failed]\n{body}"));
                             continue;
                         }
                         Err(e) => {
-                            agent.messages.push(Message::text(
-                                Role::User,
-                                format!("[autonomous-gate error] {e}"),
-                            ));
+                            agent.push_note(format!("[autonomous-gate error] {e}"));
                             continue;
                         }
                     }
@@ -1367,9 +1509,9 @@ pub fn run_headless(
             if name == "submit_plan" && !is_error {
                 if agent.opts.approve_plan {
                     agent.mode = Mode::Agent;
-                    agent.messages.push(Message::text(
-                        Role::User,
-                        format!("[approved plan]\n{}", input["plan"].as_str().unwrap_or("")),
+                    agent.push_note(format!(
+                        "[approved plan]\n{}",
+                        input["plan"].as_str().unwrap_or("")
                     ));
                 } else {
                     let ev = agent

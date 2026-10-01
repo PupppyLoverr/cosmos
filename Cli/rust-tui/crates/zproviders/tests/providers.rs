@@ -211,3 +211,122 @@ fn chatgpt_dictation_round_trip() {
     assert!(req.contains("name=\"file\"; filename=\"dictation.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFFfake\r\n--"), "{req}");
     assert!(req.trim_end().ends_with("--"), "closing boundary");
 }
+
+#[test]
+fn allowlist_rejects_example_com() {
+    let allowed = vec!["api.anthropic.com".to_string(), "127.0.0.1".to_string()];
+    assert!(host_allowed("https://example.com/v1/messages", &allowed).is_err());
+    let cfg = ProviderCfg { kind: ProviderKind::OpenAI, base_url: "https://example.com/v1".into(), model: "m".into(), ..Default::default() };
+    let msgs = vec![Message::text(Role::User, "hi")];
+    let req = Request { system: vec![], tools: &[], messages: &msgs, session_id: "s", max_tokens: 16 };
+    let err = complete(&cfg, &req, &mut |_| {}, &allowed).unwrap_err().to_string();
+    assert!(err.contains("not on the allowlist"), "{err}");
+}
+
+fn body_of(raw: &str) -> serde_json::Value {
+    serde_json::from_str(&raw[raw.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+}
+
+/// Collect every chunk kind; usage must arrive exactly once.
+fn run(cfg: &ProviderCfg, req: &Request) -> (String, Vec<(String, String, serde_json::Value)>, zproto::Usage, usize) {
+    let (mut text, mut calls, mut usage, mut dones) = (String::new(), Vec::new(), zproto::Usage::default(), 0);
+    complete(cfg, req, &mut |c| match c {
+        Chunk::Text(t) => text.push_str(&t),
+        Chunk::ToolUse { id, name, input } => calls.push((id, name, input)),
+        Chunk::Done(u) => {
+            usage = u;
+            dones += 1;
+        }
+        Chunk::Err(e) => panic!("{e}"),
+    }, &["127.0.0.1".into()]).unwrap();
+    (text, calls, usage, dones)
+}
+
+#[test]
+fn openai_stream_round_trip() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"po\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ng\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a.rs\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":9,\"prompt_tokens_details\":{\"cached_tokens\":800}}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (port, h) = mock_sse("", sse);
+    let cfg = ProviderCfg { kind: ProviderKind::OpenAI, base_url: format!("http://127.0.0.1:{port}/v1"), model: "m".into(), api_key: Some("k".into()), ..Default::default() };
+    let msgs = vec![Message::text(Role::User, "ping")];
+    let req = Request { system: vec!["sys".into()], tools: &[], messages: &msgs, session_id: "sess-1", max_tokens: 64 };
+    let (text, calls, usage, dones) = run(&cfg, &req);
+    let body = body_of(&h.join().unwrap());
+    assert_eq!(text, "pong");
+    assert_eq!(calls, vec![("c1".to_string(), "read".to_string(), json!({"path": "a.rs"}))]);
+    assert_eq!((usage.input, usage.cache_read, usage.output, dones), (200, 800, 9, 1));
+    assert_eq!(body["prompt_cache_key"], "sess-1");
+    assert_eq!(body["stream"], true);
+    assert!(body.get("tools").is_none(), "empty tools omitted");
+}
+
+#[test]
+fn anthropic_stream_merges_usage_and_marks_cache() {
+    let sse = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":3000,\"cache_creation_input_tokens\":50,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"pong\"}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu1\",\"name\":\"grep\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\\\"x\\\"}\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":3000,\"cache_creation_input_tokens\":50,\"output_tokens\":42}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let (port, h) = mock_sse("", sse);
+    let cfg = ProviderCfg { kind: ProviderKind::Anthropic, base_url: format!("http://127.0.0.1:{port}"), model: "m".into(), api_key: Some("k".into()), ..Default::default() };
+    let msgs = vec![
+        Message::text(Role::User, "first"),
+        Message::text(Role::Assistant, "ok"),
+        Message::text(Role::User, "ping"),
+    ];
+    let tools = vec![zproto::ToolSpec { name: "grep".into(), description: "g".into(), input_schema: json!({"type":"object"}) }];
+    let req = Request { system: vec!["snippet".into(), "".into(), "boot".into()], tools: &tools, messages: &msgs, session_id: "s", max_tokens: 64 };
+    let (text, calls, usage, dones) = run(&cfg, &req);
+    let body = body_of(&h.join().unwrap());
+    assert_eq!(text, "pong");
+    assert_eq!(calls, vec![("tu1".to_string(), "grep".to_string(), json!({"pattern": "x"}))]);
+    // max per field, never summed across message_start + message_delta
+    assert_eq!((usage.input, usage.cache_read, usage.cache_write, usage.output, dones), (12, 3000, 50, 42, 1));
+    let sys = body["system"].as_array().unwrap();
+    assert_eq!(sys.len(), 2, "empty system layer dropped");
+    assert_eq!(sys[1]["cache_control"]["type"], "ephemeral");
+    assert!(sys[0].get("cache_control").is_none());
+    assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+    let m = body["messages"].as_array().unwrap();
+    assert_eq!(m[2]["content"][0]["cache_control"]["type"], "ephemeral", "last user turn breakpoint");
+    assert!(m[0]["content"][0].get("cache_control").is_none());
+}
+
+#[test]
+fn google_stream_keeps_latest_usage() {
+    let sse = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"po\"}]}}],\"usageMetadata\":{\"promptTokenCount\":500,\"cachedContentTokenCount\":400,\"candidatesTokenCount\":1}}\n\n",
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ng\"}]}}],\"usageMetadata\":{\"promptTokenCount\":500,\"cachedContentTokenCount\":400,\"candidatesTokenCount\":2}}\n\n",
+    );
+    let (port, h) = mock_sse("", sse);
+    let cfg = ProviderCfg { kind: ProviderKind::Google, base_url: format!("http://127.0.0.1:{port}"), model: "gem".into(), api_key: Some("k".into()), ..Default::default() };
+    let msgs = vec![Message::text(Role::User, "ping")];
+    let req = Request { system: vec!["sys".into()], tools: &[], messages: &msgs, session_id: "s", max_tokens: 64 };
+    let (text, _calls, usage, dones) = run(&cfg, &req);
+    let raw = h.join().unwrap();
+    assert!(raw.starts_with("POST /v1beta/models/gem:streamGenerateContent?alt=sse "), "{raw}");
+    let body = body_of(&raw);
+    assert_eq!(text, "pong");
+    assert_eq!((usage.input, usage.cache_read, usage.output, dones), (100, 400, 2, 1));
+    assert!(body.get("tools").is_none(), "no empty functionDeclarations");
+    assert_eq!(body["generationConfig"]["maxOutputTokens"], 64);
+}
+
+#[test]
+fn fixture_reports_usage_once() {
+    let msgs = vec![Message::text(Role::User, "ping")];
+    let req = Request { system: vec!["sys".into()], tools: &[], messages: &msgs, session_id: "s", max_tokens: 16 };
+    let (_, _, usage, dones) = run(&fixture(), &req);
+    assert_eq!(dones, 1);
+    assert!(usage.input > 0 && usage.output > 0);
+}

@@ -123,8 +123,9 @@ fn default_keep_tail() -> usize {
 fn default_ratio() -> f64 {
     0.80
 }
+/// 0 = provider default TTL (Anthropic 300 s, others 600 s).
 fn default_warm() -> u64 {
-    240
+    0
 }
 
 #[derive(Debug, Deserialize)]
@@ -492,7 +493,6 @@ impl Config {
         crate::compact::CompactCfg {
             large_read_lines: self.bridge.large_read_lines,
             reserved_output_tokens: self.compact.reserved_output_tokens,
-            keep_tail: self.compact.keep_tail,
             cache_warm_secs: self.compact.cache_warm_secs,
             trigger_ratio: self.compact.trigger_ratio,
         }

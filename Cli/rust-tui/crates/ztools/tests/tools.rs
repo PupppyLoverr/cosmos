@@ -144,6 +144,9 @@ fn result_cap() {
     let capped = cap_result(big);
     assert!(capped.len() < RESULT_CAP + 200);
     assert!(capped.contains("[truncated:"));
+    // multi-byte text straddling the cap must not panic
+    let wide = "é".repeat(RESULT_CAP);
+    assert!(cap_result(wide).contains("[truncated:"));
 }
 
 #[test]

@@ -129,10 +129,14 @@ pub fn cap_result(s: String) -> String {
     if s.len() <= RESULT_CAP {
         s
     } else {
-        let keep = RESULT_CAP;
+        // back off to a char boundary — slicing mid-UTF-8 would panic
+        let mut keep = RESULT_CAP.min(s.len());
+        while !s.is_char_boundary(keep) {
+            keep -= 1;
+        }
         format!(
             "{}\n[truncated: {} bytes > {} cap]",
-            &s[..keep.min(s.len())],
+            &s[..keep],
             s.len(),
             RESULT_CAP
         )
