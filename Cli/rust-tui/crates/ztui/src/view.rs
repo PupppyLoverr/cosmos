@@ -507,6 +507,14 @@ fn status_line(app: &App, w: usize) -> Line<'static> {
         Mode::Agent => {}
     }
     let first = app.input.first().copied();
+    // contract §8 ledger once a turn has run, unless a hint matters more
+    let quiet = app.popup.is_none() && app.key_entry.is_none() && !app.busy && !app.plan_pending && !matches!(first, Some('!') | Some('#'));
+    if quiet && app.usage.turns > 0 {
+        let lw: usize = left.iter().map(|s| width_of(&s.content)).sum();
+        let (full, short) = ledger(app);
+        let pick = if lw + width_of(&full) + 2 <= w { full } else { short };
+        return split_row(left, vec![dim(pick)], w);
+    }
     let hint = if matches!(app.popup, Some(Popup::Slash { .. } | Popup::Files { .. })) {
         "tab next · shift+tab prev · ↵ accept · esc close".to_string()
     } else if app.key_entry.is_some() {
@@ -525,6 +533,33 @@ fn status_line(app: &App, w: usize) -> Line<'static> {
         "shift+↵ newline · @ to mention a file".to_string()
     };
     split_row(left, vec![dim(hint)], w)
+}
+
+/// `turn 3 · in 1.2k · cache_r 18k · cache_w 0 · out 312 · $0.0041 · Σ $0.0213 · ctx 41%`
+/// and a short form for narrow terminals. Unknown prices print `$?`, never
+/// a guess; subscription turns print `plan`.
+pub fn ledger(app: &App) -> (String, String) {
+    let u = &app.usage;
+    let window = app.models.iter().find(|m| m.alias == app.alias).map(|m| m.context).unwrap_or(128_000).max(1);
+    let pct = (u.last_prompt as f64 / window as f64 * 100.0).round().min(100.0) as u64;
+    let money = |v: Option<f64>| match v {
+        Some(c) => format!("${c:.4}"),
+        None if u.plan => "plan".to_string(),
+        None => "$?".to_string(),
+    };
+    let [i, cr, cw, o] = u.last;
+    let full = format!(
+        "turn {} · in {} · cache_r {} · cache_w {} · out {} · {} · Σ {} · ctx {pct}%",
+        u.turns,
+        kfmt(i),
+        kfmt(cr),
+        kfmt(cw),
+        kfmt(o),
+        money(u.last_usd),
+        money(u.cum_usd)
+    );
+    let short = format!("Σ {} · ctx {pct}%", money(u.cum_usd));
+    (full, short)
 }
 
 fn menu_row(on: bool, label: String, col: usize, desc: String, w: usize) -> Line<'static> {

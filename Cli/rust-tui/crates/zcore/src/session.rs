@@ -50,7 +50,9 @@ impl Session {
         }
         let events = read_events(&file)?;
         let leaf = match at {
-            Some(a) => match events.iter().find(|e| e.id == a || e.id.starts_with(a)) {
+            // a full id, or a unique suffix as `tree` prints it (ULID prefixes
+            // are timestamps and repeat within a millisecond)
+            Some(a) => match events.iter().find(|e| e.id == a || (a.len() >= 6 && e.id.ends_with(a))) {
                 Some(e) => Some(e.id.clone()),
                 None => bail!("session {id} has no event {a}"),
             },
@@ -291,4 +293,53 @@ pub fn events_to_messages(events: &[Event]) -> Vec<Message> {
 /// Sticky compaction ops logged along a chain, in order.
 pub fn events_to_ops(events: &[Event]) -> Vec<ViewOp> {
     events.iter().filter_map(|e| ViewOp::from_event(&e.kind, &e.data)).collect()
+}
+
+/// One line describing an event for `tree`.
+fn tree_label(e: &Event) -> String {
+    let short = |s: &str| -> String {
+        let one = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one.chars().count() > 60 {
+            format!("{}…", one.chars().take(60).collect::<String>())
+        } else {
+            one
+        }
+    };
+    let what = match e.kind.as_str() {
+        "user" | "assistant" => short(e.data["text"].as_str().unwrap_or("")),
+        "tool_call" => short(&format!("{} {}", e.data["name"].as_str().unwrap_or(""), e.data["input"]["path"].as_str().or(e.data["input"]["command"].as_str()).unwrap_or(""))),
+        "tool_result" => short(e.data["content"].as_str().unwrap_or("").lines().next().unwrap_or("")),
+        "compaction" => format!("{} → {} tokens", e.data["before_tokens"], e.data["after_tokens"]),
+        "checkout" => format!("branch from {}", e.data["at"].as_str().map(|a| &a[a.len().saturating_sub(8)..]).unwrap_or("")),
+        _ => String::new(),
+    };
+    let id = &e.id[e.id.len().saturating_sub(8)..];
+    format!("{id} {}{}", e.kind, if what.is_empty() { String::new() } else { format!("  {what}") })
+}
+
+/// The session as a tree: a straight run of events stays at one depth and
+/// only a branch point (a `checkout` that rewinds) indents. Ids are the last
+/// eight characters — enough for `--resume <session>@<id>`.
+pub fn tree(events: &[Event]) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut kids: HashMap<Option<&str>, Vec<&Event>> = HashMap::new();
+    let known: std::collections::HashSet<&str> = events.iter().map(|e| e.id.as_str()).collect();
+    for e in events {
+        // a parent outside this file is treated as a root
+        let p = e.parent.as_deref().filter(|p| known.contains(p));
+        kids.entry(p).or_default().push(e);
+    }
+    let mut out = Vec::new();
+    // iterative walk: (node, indent)
+    let mut stack: Vec<(&Event, usize)> = kids.get(&None).map(|r| r.iter().rev().map(|e| (*e, 0)).collect()).unwrap_or_default();
+    while let Some((e, depth)) = stack.pop() {
+        out.push(format!("{}{}", "  ".repeat(depth), tree_label(e)));
+        if let Some(children) = kids.get(&Some(e.id.as_str())) {
+            let d = if children.len() > 1 { depth + 1 } else { depth };
+            for c in children.iter().rev() {
+                stack.push((*c, d));
+            }
+        }
+    }
+    out
 }

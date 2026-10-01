@@ -53,6 +53,12 @@ pub struct UsageInfo {
     pub turns: u64,
     pub cum_usd: Option<f64>,
     pub model_usd: HashMap<String, f64>,
+    /// the last turn alone: input, cache read, cache write, output
+    pub last: [u64; 4],
+    /// the last turn's price; None = unknown (or a subscription plan)
+    pub last_usd: Option<f64>,
+    /// the last turn ran on a subscription (no per-token price)
+    pub plan: bool,
 }
 
 /// A `/model` picker row: a config.toml alias or a catalog `provider/model`.
@@ -527,6 +533,9 @@ impl App {
                 u.cache_write += g("cache_write");
                 u.output += g("output");
                 u.last_prompt = g("input") + g("cache_read") + g("cache_write");
+                u.last = [g("input"), g("cache_read"), g("cache_write"), g("output")];
+                u.last_usd = ev.data["usd"].as_f64();
+                u.plan = ev.data["billing"] == "subscription";
                 u.turns += 1;
                 if ev.data["usd"].is_number() {
                     u.cum_usd = ev.data["cum_usd"].as_f64();
@@ -2029,6 +2038,30 @@ mod tests {
         let rows: Vec<String> = a.out.iter().map(text).collect();
         assert!(rows.iter().any(|r| r.contains("devin:edit") && r.contains("Edit a.rs")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("wrote a.rs")), "{rows:?}");
+    }
+
+    #[test]
+    fn status_line_shows_the_cost_ledger() {
+        let _env = crate::env_lock();
+        let mut a = app();
+        let ev = |data: Value| zproto::Event {
+            v: 1, id: "e".into(), parent: None, ts: String::new(), session: "s".into(),
+            harness: "cosmostui".into(), kind: "usage".into(), data,
+        };
+        a.on_msg(Msg::Event(ev(serde_json::json!({"input": 1204, "cache_read": 18400, "cache_write": 0, "output": 312, "usd": 0.0041, "cum_usd": 0.0213}))));
+        // narrow terminals get the short form
+        let (lines, _) = view::live(&a);
+        assert!(lines.iter().map(text).any(|r| r.contains("Σ $0.0213 · ctx") && !r.contains("turn 1")));
+        a.width = 160;
+        let (lines, _) = view::live(&a);
+        let rows: Vec<String> = lines.iter().map(text).collect();
+        let status = rows.iter().find(|r| r.contains("ctx")).unwrap_or_else(|| panic!("{rows:?}"));
+        assert!(status.contains("turn 1 · in 1.2k · cache_r 18k · cache_w 0 · out 312 · $0.0041 · Σ $0.0213 · ctx"), "{status}");
+        // a subscription turn has no per-token price: "plan", never a guess
+        a.on_msg(Msg::Event(ev(serde_json::json!({"input": 0, "cache_read": 0, "cache_write": 0, "output": 0, "usd": null, "billing": "subscription"}))));
+        let (lines, _) = view::live(&a);
+        let rows: Vec<String> = lines.iter().map(text).collect();
+        assert!(rows.iter().any(|r| r.contains("turn 2") && r.contains("· plan ·")), "{rows:?}");
     }
 
     #[test]
