@@ -130,7 +130,7 @@ impl DevicesPage {
     fn open_pair(&mut self, cx: &mut Context<Self>) {
         if self.state.read(cx).auth_user().is_none() {
             self.error = Some(
-                "Log in (Woozlit) first — phone pairing rides the account relay.".into(),
+                "Sign in first — phone pairing rides the account relay.".into(),
             );
             cx.notify();
             return;
@@ -328,7 +328,7 @@ impl DevicesPage {
                                 .child(SharedString::from(if signed_in {
                                     "Scan the QR with the Cosmos app — your phone can steer this desktop from anywhere, not just this network."
                                 } else {
-                                    "Log in (Woozlit) to pair a phone for remote control from anywhere."
+                                    "Sign in to pair a phone for remote control from anywhere."
                                 })),
                         ),
                 )
@@ -336,11 +336,6 @@ impl DevicesPage {
                     widgets::ghost_action(theme)
                         .id("pair-phone-open")
                         .opacity(if signed_in { 0.7 } else { 0.35 })
-                        .hover(|s| {
-                            s.opacity(1.0)
-                                .bg(crate::theme::ink(0.06))
-                                .text_color(theme.text)
-                        })
                         .on_click(cx.listener(|this, _, _, cx| this.open_pair(cx)))
                         .child(SharedString::from("Show code")),
                 ),
@@ -381,11 +376,7 @@ impl DevicesPage {
                         widgets::ghost_action(theme)
                             .id(("phone-revoke", ix))
                             .opacity(0.7)
-                            .hover(|s| {
-                                s.opacity(1.0)
-                                    .bg(theme.danger.opacity(0.12))
-                                    .text_color(theme.danger)
-                            })
+                            .text_color(theme.danger.opacity(0.85))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.revoke_phone(revoke_id.clone(), cx);
                             }))

@@ -28,6 +28,10 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// Command execution caps at 600s per Boat's API contract.
 const EXEC_CAP: Duration = Duration::from_secs(600);
 
+fn command_http_timeout(requested: Duration) -> Duration {
+    requested.min(EXEC_CAP) + Duration::from_secs(5)
+}
+
 pub struct Boat<'a> {
     http: &'a reqwest::Client,
     token: &'a str,
@@ -160,12 +164,17 @@ impl<'a> Boat<'a> {
         self.read::<serde_json::Value>(resp).await
     }
 
-    async fn post<B: Serialize>(&self, path: &str, body: &B) -> Result<serde_json::Value, String> {
+    async fn post<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
         let resp = self
             .http
             .post(self.url(path))
             .bearer_auth(self.token)
-            .timeout(EXEC_CAP.min(TIMEOUT).max(TIMEOUT))
+            .timeout(timeout)
             .json(body)
             .send()
             .await
@@ -191,11 +200,18 @@ impl<'a> Boat<'a> {
             .or_else(|| v.get("items"))
             .and_then(|s| s.as_array())
             .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                "boat: unexpected response from /sandboxes: missing sandboxes".to_string()
+            })?;
         Ok(items
             .into_iter()
-            .filter_map(|s| serde_json::from_value(s).ok())
-            .collect())
+            .enumerate()
+            .map(|(ix, s)| {
+                serde_json::from_value(s).map_err(|e| {
+                    format!("boat: unexpected response from /sandboxes: invalid item {ix}: {e}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub async fn sandbox(&self, id: &str) -> Result<BoatSandbox, String> {
@@ -220,7 +236,9 @@ impl<'a> Boat<'a> {
             .map_err(|e| format!("boat unreachable: {e}"))?;
         let v = self.read::<serde_json::Value>(resp).await?;
         let sandbox = v.get("sandbox").cloned().unwrap_or(v);
-        serde_json::from_value(sandbox).map_err(|e| format!("boat sandbox shape: {e}"))
+        serde_json::from_value(sandbox).map_err(|e| {
+            format!("boat: unexpected response from /sandboxes: missing or invalid sandbox: {e}")
+        })
     }
 
     /// Poll until usable/dead — provisioning is seconds; cap at 3 minutes.
@@ -242,15 +260,23 @@ impl<'a> Boat<'a> {
 
     /// `POST /sandboxes/{id}/stop` — snapshot & archive: billing off.
     pub async fn stop(&self, id: &str) -> Result<(), String> {
-        self.post(&format!("/sandboxes/{id}/stop"), &serde_json::json!({}))
-            .await?;
+        self.post(
+            &format!("/sandboxes/{id}/stop"),
+            &serde_json::json!({}),
+            TIMEOUT,
+        )
+        .await?;
         Ok(())
     }
 
     /// `POST /sandboxes/{id}/resume` — wake a sleeping box.
     pub async fn resume(&self, id: &str) -> Result<BoatSandbox, String> {
-        self.post(&format!("/sandboxes/{id}/resume"), &serde_json::json!({}))
-            .await?;
+        self.post(
+            &format!("/sandboxes/{id}/resume"),
+            &serde_json::json!({}),
+            TIMEOUT,
+        )
+        .await?;
         self.wait_ready(id).await
     }
 
@@ -287,6 +313,7 @@ impl<'a> Boat<'a> {
                     "cwd": cwd,
                     "timeoutSeconds": secs,
                 }),
+                command_http_timeout(timeout),
             )
             .await?;
         serde_json::from_value(v).map_err(|e| format!("boat command shape: {e}"))
@@ -307,12 +334,17 @@ impl<'a> Boat<'a> {
                     "cwd": cwd,
                     "detached": true,
                 }),
+                TIMEOUT,
             )
             .await?;
-        serde_json::from_value::<BoatCommandResult>(v)
-            .ok()
-            .and_then(|r| r.process_id)
-            .ok_or_else(|| "boat returned no process id".into())
+        let result: BoatCommandResult = serde_json::from_value(v).map_err(|e| {
+            format!(
+                "boat: unexpected response from /sandboxes/{id}/commands: missing processId: {e}"
+            )
+        })?;
+        result.process_id.ok_or_else(|| {
+            format!("boat: unexpected response from /sandboxes/{id}/commands: missing processId")
+        })
     }
 
     /// `GET /sandboxes/{id}/commands/{pid}` — detached status + logs.
@@ -342,11 +374,13 @@ impl<'a> Boat<'a> {
         let v = self
             .get(&format!("/sandboxes/{id}/files?path={}", urlencoding(path)))
             .await?;
-        Ok(v.get("content")
+        v.get("content")
             .or_else(|| v.get("data"))
             .and_then(|c| c.as_str())
-            .unwrap_or_default()
-            .to_string())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                format!("boat: unexpected response from /sandboxes/{id}/files: missing content")
+            })
     }
 
     /// `POST /sandboxes/{id}/prompt` — the integrated-agent surface: runs a
@@ -367,6 +401,7 @@ impl<'a> Boat<'a> {
                 "model": model,
                 "new": true,
             }),
+            TIMEOUT,
         )
         .await
     }
@@ -391,6 +426,7 @@ impl<'a> Boat<'a> {
         self.post(
             &format!("/sandboxes/{id}/steer"),
             &serde_json::json!({ "prompt": prompt }),
+            TIMEOUT,
         )
         .await?;
         Ok(())
@@ -402,6 +438,7 @@ impl<'a> Boat<'a> {
         self.post(
             &format!("/sandboxes/{id}/interrupt"),
             &serde_json::json!({}),
+            TIMEOUT,
         )
         .await?;
         Ok(())
@@ -412,7 +449,11 @@ impl<'a> Boat<'a> {
     /// persisted.
     pub async fn desktop(&self, id: &str) -> Result<String, String> {
         let v = self
-            .post(&format!("/sandboxes/{id}/desktop"), &serde_json::json!({}))
+            .post(
+                &format!("/sandboxes/{id}/desktop"),
+                &serde_json::json!({}),
+                TIMEOUT,
+            )
             .await?;
         v.get("desktopUrl")
             .or_else(|| v.get("url"))
@@ -427,6 +468,7 @@ impl<'a> Boat<'a> {
         self.post(
             &format!("/sandboxes/{id}/sshkey"),
             &serde_json::json!({ "publicKey": public_key }),
+            TIMEOUT,
         )
         .await?;
         Ok(())
@@ -445,4 +487,21 @@ fn urlencoding(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_timeout_is_capped_and_has_network_grace() {
+        assert_eq!(
+            command_http_timeout(Duration::from_secs(20)),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            command_http_timeout(Duration::from_secs(900)),
+            Duration::from_secs(605)
+        );
+    }
 }

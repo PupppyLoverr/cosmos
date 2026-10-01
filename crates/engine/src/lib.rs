@@ -37,6 +37,7 @@ pub mod registry;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
+pub mod seat_desktop;
 pub mod sessions;
 pub mod sister_apps;
 pub mod source_control;
@@ -358,6 +359,7 @@ impl EngineCore {
         ));
         // Cloud/GitHub agent mode: `cloudSeat` chats dispatch to the seat.
         let cloud = cloud::CloudStore::load(data_dir);
+        cloud::set_ssh_key_dir(data_dir);
         sessions.set_cloud(cloud.clone());
         let scheduler = cloud::Scheduler::new(
             cloud.clone(),
@@ -366,6 +368,9 @@ impl EngineCore {
             device_id.clone(),
         );
         scheduler.start();
+        // Runs that kept going on a seat while the app was closed pick up
+        // where their transcript stopped.
+        sessions.resume_cloud_runs();
         let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
         // Turn starts snapshot the checkout tree — the "Latest turn" diff base.
         let turn_diff = diff_sync.clone();

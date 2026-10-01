@@ -914,6 +914,21 @@ impl WorkspaceHost {
 
     /// [`create_chat`](Self::create_chat) recording the creating chat
     /// (`parentChatId`) — the Zeron MCP's orchestration link.
+    /// Move a chat's cloud binding to another seat — the next run
+    /// dispatches there (restoring the chat's workspace backup first).
+    pub fn rebind_chat_seat(
+        &self,
+        chat_id: &str,
+        cloud_seat: &zeron_proto::CloudSeatBinding,
+    ) -> Result<(), EngineError> {
+        let moved = self.mutate(|doc| doc.set_chat_cloud_seat(chat_id, cloud_seat))?;
+        if moved {
+            Ok(())
+        } else {
+            Err(EngineError::Other(format!("no such chat: {chat_id}")))
+        }
+    }
+
     pub fn create_chat_with_parent(
         &self,
         chat_id: &str,
@@ -925,6 +940,9 @@ impl WorkspaceHost {
         cloud_seat: Option<zeron_proto::CloudSeatBinding>,
     ) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
+            if let Some(cloud_seat) = cloud_seat.as_ref() {
+                self.mutate(|doc| doc.set_chat_cloud_seat_if_unset(chat_id, cloud_seat))?;
+            }
             return Ok(()); // idempotent: optimistic client retries never duplicate
         }
         let space = match space_id {

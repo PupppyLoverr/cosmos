@@ -209,6 +209,11 @@ pub fn run_app(config: UiConfig) {
             ui_settings.git_history_author_display,
             cx,
         );
+        motion::init(
+            ui_settings.reduce_motion,
+            ui_settings.pause_animations_in_background,
+            cx,
+        );
         composer::init(cx, ui_settings.composer_send_behavior);
         appshots::set_enabled(ui_settings.appshots_enabled);
         terminal::panel::init(cx);
@@ -216,7 +221,11 @@ pub fn run_app(config: UiConfig) {
         cx.register_url_scheme("zeron").detach();
         cx.register_url_scheme("cosmos").detach();
 
-        let state = cx.new(|_| state::AppState::new());
+        let state = cx.new(|_| {
+            let mut state = state::AppState::new();
+            state.cloud_mode = ui_settings.cloud_mode;
+            state
+        });
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {

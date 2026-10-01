@@ -22,7 +22,8 @@ use gpui::{
 
 use zeron_engine::registry::{HarnessDescriptor, TitleSettings};
 use zeron_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, Space,
+    ChatConfig, CloudSeatKind, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef,
+    SandboxLevel, Space,
 };
 use zeron_rpc::methods;
 
@@ -476,6 +477,19 @@ pub enum PickerKind {
 pub(crate) struct ReturnComposerFocus;
 
 impl gpui::EventEmitter<ReturnComposerFocus> for Pickers {}
+
+/// Cloud-mode chip actions the composer carries out: open Settings → Cloud
+/// computer, or start (or restart) the free Railway trial seat.
+pub(crate) enum CloudChipAction {
+    OpenSettings,
+    StartTrial,
+    /// A seat was picked from the chip; a stalled trial seat restarts.
+    SeatPicked {
+        restart_trial: bool,
+    },
+}
+
+impl gpui::EventEmitter<CloudChipAction> for Pickers {}
 
 /// A model picked while bound to thread naming (see [`Pickers::new_for_titles`]);
 /// the owner persists it with `SetTitleSettings`.
@@ -952,10 +966,9 @@ impl Pickers {
     fn effective_model_id<'a>(&'a self, cx: &'a App) -> Option<&'a str> {
         if let Some(title) = &self.title {
             // Only the saved agent's tab shows a selected row.
-            return title
-                .model
-                .as_deref()
-                .filter(|_| title.harness.is_some() && title.harness == self.effective_harness(cx));
+            return title.model.as_deref().filter(|_| {
+                title.harness.is_some() && title.harness == self.effective_harness(cx)
+            });
         }
         if let Some(id) = self.config.model.as_deref() {
             return Some(id);
@@ -1205,7 +1218,11 @@ impl Pickers {
         }
         // The keyboard-nav highlight starts ON the selected row — row 0
         // otherwise reads as a second active row (user report).
+        let cloud = self.cloud_mode(cx) && kind != PickerKind::HarnessModel;
         self.active = match kind {
+            PickerKind::Device if cloud => self.selected_cloud_seat_index(cx),
+            PickerKind::Space if cloud => self.selected_cloud_repo_index(cx),
+            PickerKind::Branch if cloud => self.selected_cloud_branch_index(cx),
             PickerKind::Checkout => match self.config.checkout {
                 CheckoutKind::Local => 0,
                 CheckoutKind::NewWorktree => 1,
@@ -1230,21 +1247,42 @@ impl Pickers {
                 self.switch_error = None; // stale mid-session failures don't linger
                 let handle = self.search.read(cx).focus_handle(cx);
                 self.search.update(cx, |input, cx| {
-                    input.set_placeholder("Search refs…", cx);
+                    input.set_placeholder(
+                        if cloud {
+                            "Search branches…"
+                        } else {
+                            "Search refs…"
+                        },
+                        cx,
+                    );
                 });
                 window.focus(&handle, cx);
             }
             PickerKind::Space => {
                 let handle = self.search.read(cx).focus_handle(cx);
                 self.search.update(cx, |input, cx| {
-                    input.set_placeholder("Search projects…", cx);
+                    input.set_placeholder(
+                        if cloud {
+                            "Search repositories…"
+                        } else {
+                            "Search projects…"
+                        },
+                        cx,
+                    );
                 });
                 window.focus(&handle, cx);
             }
             PickerKind::Device => {
                 let handle = self.search.read(cx).focus_handle(cx);
                 self.search.update(cx, |input, cx| {
-                    input.set_placeholder("Search devices…", cx);
+                    input.set_placeholder(
+                        if cloud {
+                            "Search seats…"
+                        } else {
+                            "Search devices…"
+                        },
+                        cx,
+                    );
                 });
                 window.focus(&handle, cx);
             }
@@ -1258,6 +1296,12 @@ impl Pickers {
             _ => window.focus(&self.focus, cx),
         }
         match kind {
+            // Cloud rows live on GitHub / the engine's seat list: every open
+            // revalidates (branches force; seats and repos are shared,
+            // staleness-gated state).
+            PickerKind::Device | PickerKind::Space | PickerKind::Branch if cloud => {
+                self.load_cloud_rows(kind, kind == PickerKind::Branch, cx)
+            }
             // Force: the checkout state moves under us (a send mints a
             // worktree+branch, terminals switch refs) — every open
             // revalidates, keeping stale rows visible until fresh ones land.
@@ -2492,6 +2536,13 @@ impl Pickers {
     }
 
     fn on_search_submit(&mut self, cx: &mut Context<Self>) {
+        if self.cloud_mode(cx)
+            && let Some(kind @ (PickerKind::Device | PickerKind::Space | PickerKind::Branch)) =
+                self.open_kind()
+        {
+            self.submit_cloud_row(kind, cx);
+            return;
+        }
         if self.open_kind() == Some(PickerKind::Branch)
             && let Some(row) = self.filtered_ref_rows(cx).into_iter().nth(self.active)
         {
@@ -2584,7 +2635,13 @@ impl Pickers {
             }
             MenuKey::Up | MenuKey::Down => {
                 let delta = if key == MenuKey::Up { -1 } else { 1 };
+                let cloud = self.cloud_mode(cx);
                 let count = match self.open_kind() {
+                    Some(kind @ (PickerKind::Device | PickerKind::Space | PickerKind::Branch))
+                        if cloud =>
+                    {
+                        self.cloud_row_count(kind, cx)
+                    }
                     Some(PickerKind::Branch) => self.filtered_ref_rows(cx).len().min(MAX_REF_ROWS),
                     Some(PickerKind::Checkout) => 2,
                     // Continue from model rows into the pinned settings triggers.
@@ -2723,7 +2780,7 @@ impl Pickers {
         // Ghost pill (zeron composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
         // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
         // hover/open wash — no border, no caret; the actions row stays quiet.
-        div()
+        let trigger = div()
             .relative()
             .child(self.measure_trigger(kind, cx))
             .id(id)
@@ -2774,8 +2831,12 @@ impl Pickers {
                 cx.listener(move |this, _, _, _| {
                     this.open.note_trigger_press_matching(|open| *open == kind)
                 }),
-            )
-            .on_click(cx.listener(move |this, _, window, cx| this.toggle(kind, window, cx)))
+            );
+        // Cloud mode uses the same picker: the picked agent + model run
+        // headless on the seat with this computer's logins.
+        let trigger =
+            trigger.on_click(cx.listener(move |this, _, window, cx| this.toggle(kind, window, cx)));
+        trigger
             .when(icon_loading, |el| {
                 el.child(div().flex_none().child(crate::loaders::mini_glyph_spinner(
                     "picker-chip-loader",
@@ -2909,6 +2970,9 @@ impl Pickers {
     /// New-session destination controls. Machine and project form the
     /// original chip-only cluster floating above the composer's trailing edge.
     pub fn render_new_thread_target_selectors(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.cloud_mode(cx) {
+            return self.render_cloud_target_selectors(cx);
+        }
         let theme = Theme::of(cx).clone();
         let closing = (self.open.closing_since(), self.menu_geometry().below);
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
@@ -2988,6 +3052,9 @@ impl Pickers {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if self.cloud_mode(cx) {
+            return self.render_cloud_git_selectors(cx);
+        }
         let git = self
             .state
             .read(cx)
@@ -3081,6 +3148,49 @@ impl Pickers {
         };
 
         if let Some(chat) = &session {
+            // A cloud repo chat: where its checkout lives + the branch it
+            // started on, read-only like a local session's labels.
+            if let Some(binding) = chat.cloud_seat.as_ref() {
+                let repo = binding.repo.clone()?;
+                let branch = binding
+                    .branch
+                    .clone()
+                    .or_else(|| match &self.state.read(cx).cloud_repos {
+                        Loadable::Ready(repos) => repos
+                            .iter()
+                            .find(|r| r.full_name == repo)
+                            .map(|r| r.default_branch.clone())
+                            .filter(|b| !b.is_empty()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "Default branch".to_string());
+                return Some(
+                    row()
+                        .pr_0()
+                        .child(Self::footer_label(
+                            crate::icons::FOLDER_WITH_FILES,
+                            SharedString::from("Seat checkout"),
+                            &theme,
+                        ))
+                        .child(Self::footer_label(
+                            crate::icons::GIT_BRANCH,
+                            SharedString::from(branch),
+                            &theme,
+                        ))
+                        .child(div().flex_1().min_w_0())
+                        .when_some(change_request, |el, summary| {
+                            el.child(div().flex_none().child(
+                                crate::change_requests::pull_request_badge(
+                                    "composer-pull-request".into(),
+                                    summary,
+                                    crate::change_requests::ChangeRequestBadgeSurface::Composer,
+                                    &theme,
+                                ),
+                            ))
+                        })
+                        .into_any_element(),
+                );
+            }
             // Sessions never move: read-only checkout-kind + ref labels,
             // LEFT-aligned, only when the session's project has git. The
             // target (project @ device) lives in the titlebar now.
@@ -3141,7 +3251,11 @@ impl Pickers {
         }
 
         // New-session draft: checkout + ref only, LEFT-aligned (device +
-        // project live in the row above the pill now).
+        // project live in the row above the pill now). Cloud drafts carry
+        // their branch chip in the floating git row instead.
+        if self.cloud_mode(cx) {
+            return None;
+        }
         let git = space.as_ref().is_some_and(|s| s.git_detected);
         if !git {
             return None;
@@ -3323,6 +3437,9 @@ impl Pickers {
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.element_hover))
                     .on_click(cx.listener(move |this, _, _, cx| match kind {
+                        PickerKind::Space | PickerKind::Branch if this.cloud_mode(cx) => {
+                            this.load_cloud_rows(kind, true, cx)
+                        }
                         PickerKind::Branch | PickerKind::Checkout => this.ensure_refs(true, cx),
                         PickerKind::HarnessModel => {
                             this.harnesses = Loadable::Idle;
@@ -4903,6 +5020,757 @@ fn attach_overlay_end(
     chip
 }
 
+/// A seat-menu action row under the seats (keyboard-reachable after them).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloudSeatAction {
+    StartTrial,
+    Settings,
+}
+
+// ---- Cloud mode: the same destination chips, pointed at the cloud ----
+//
+// The device chip names the cloud seat (switchable here), the project chip
+// lists the connected GitHub account's repos, and the git row below picks
+// the repo's branch the seat checks out — the local composer's exact shape.
+impl Pickers {
+    fn cloud_mode(&self, cx: &App) -> bool {
+        self.state.read(cx).cloud_mode
+    }
+
+    fn search_query(&self, cx: &App) -> String {
+        self.search.read(cx).text().to_string()
+    }
+
+    /// Configured seats matching the search, in the view's order.
+    fn cloud_seat_rows(&self, cx: &App) -> Vec<crate::cloud::SeatRow> {
+        let seats = self.state.read(cx).cloud_seats().to_vec();
+        let names: Vec<String> = seats.iter().map(|s| s.config.label.clone()).collect();
+        popover::filter_indices(&self.search_query(cx), &names)
+            .into_iter()
+            .map(|ix| seats[ix].clone())
+            .collect()
+    }
+
+    /// The action rows under the seats: the free trial while no Railway
+    /// seat exists yet, then Settings.
+    fn cloud_seat_actions(&self, cx: &App) -> Vec<CloudSeatAction> {
+        let has_trial = self
+            .state
+            .read(cx)
+            .cloud_seats()
+            .iter()
+            .any(|s| s.config.kind == Some(CloudSeatKind::Railway));
+        let mut actions = Vec::new();
+        if !has_trial {
+            actions.push(CloudSeatAction::StartTrial);
+        }
+        actions.push(CloudSeatAction::Settings);
+        actions
+    }
+
+    fn selected_cloud_seat_index(&self, cx: &App) -> usize {
+        let picked = self
+            .state
+            .read(cx)
+            .cloud_seat_pick
+            .as_ref()
+            .map(|s| s.config.id.clone());
+        self.cloud_seat_rows(cx)
+            .iter()
+            .position(|s| Some(&s.config.id) == picked.as_ref())
+            .unwrap_or(0)
+    }
+
+    /// Pick a seat; a stalled trial seat re-asks Railway (the composer runs
+    /// the restart so its single-flight guard holds).
+    fn pick_cloud_seat(&mut self, seat: crate::cloud::SeatRow, cx: &mut Context<Self>) {
+        let restart = crate::cloud::stalled_trial(&seat);
+        self.state.update(cx, |state, cx| {
+            state.cloud_seat_pick = Some(seat);
+            if restart {
+                state.cloud_trial_failure = None;
+            }
+            cx.notify();
+        });
+        cx.emit(CloudChipAction::SeatPicked {
+            restart_trial: restart,
+        });
+        self.close(cx);
+    }
+
+    fn activate_cloud_seat_action(&mut self, action: CloudSeatAction, cx: &mut Context<Self>) {
+        self.close(cx);
+        match action {
+            CloudSeatAction::StartTrial => {
+                self.state
+                    .update(cx, |state, _| state.cloud_trial_failure = None);
+                cx.emit(CloudChipAction::StartTrial);
+            }
+            CloudSeatAction::Settings => cx.emit(CloudChipAction::OpenSettings),
+        }
+    }
+
+    /// The connected account's repos matching the search.
+    fn cloud_repo_rows(&self, cx: &App) -> Vec<zeron_engine::cloud::RepoHit> {
+        let Loadable::Ready(repos) = &self.state.read(cx).cloud_repos else {
+            return Vec::new();
+        };
+        let names: Vec<String> = repos.iter().map(|r| r.full_name.clone()).collect();
+        popover::filter_indices(&self.search_query(cx), &names)
+            .into_iter()
+            .map(|ix| repos[ix].clone())
+            .collect()
+    }
+
+    /// The picked repo's row; the "No repository" row (after the list) when
+    /// none is picked.
+    fn selected_cloud_repo_index(&self, cx: &App) -> usize {
+        let rows = self.cloud_repo_rows(cx);
+        match self.state.read(cx).cloud_repo_pick.as_ref() {
+            Some(pick) => rows
+                .iter()
+                .position(|r| r.full_name == pick.full_name)
+                .unwrap_or(NO_ACTIVE_ROW),
+            None => rows.len(),
+        }
+    }
+
+    fn pick_cloud_repo(
+        &mut self,
+        pick: Option<zeron_engine::cloud::RepoHit>,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.update(cx, |state, cx| {
+            if let Some(repo) = pick.as_ref() {
+                state.refresh_cloud_branches(&repo.full_name, false, cx);
+            }
+            state.set_cloud_repo_pick(pick);
+            cx.notify();
+        });
+        self.close(cx);
+    }
+
+    /// The picked repo's branches (default first) matching the search.
+    fn cloud_branch_rows(&self, cx: &App) -> Vec<String> {
+        let state = self.state.read(cx);
+        let Some(repo) = state.cloud_repo_pick.as_ref() else {
+            return Vec::new();
+        };
+        let Some(Loadable::Ready(branches)) = state.cloud_branches.get(&repo.full_name) else {
+            return Vec::new();
+        };
+        popover::filter_indices(&self.search_query(cx), &branches.items)
+            .into_iter()
+            .map(|ix| branches.items[ix].clone())
+            .collect()
+    }
+
+    fn selected_cloud_branch_index(&self, cx: &App) -> usize {
+        let current = self.state.read(cx).cloud_branch();
+        self.cloud_branch_rows(cx)
+            .iter()
+            .position(|b| Some(b) == current.as_ref())
+            .unwrap_or(0)
+            .min(MAX_REF_ROWS.saturating_sub(1))
+    }
+
+    fn pick_cloud_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            let default = state
+                .cloud_repo_pick
+                .as_ref()
+                .map(|r| r.default_branch.clone())
+                .unwrap_or_default();
+            state.cloud_branch_pick = (branch != default).then_some(branch);
+            cx.notify();
+        });
+        self.close(cx);
+    }
+
+    /// Row count for keyboard navigation in a cloud-mode popover.
+    fn cloud_row_count(&self, kind: PickerKind, cx: &App) -> usize {
+        match kind {
+            PickerKind::Device => {
+                self.cloud_seat_rows(cx).len() + self.cloud_seat_actions(cx).len()
+            }
+            PickerKind::Space => self.cloud_repo_rows(cx).len() + 1,
+            PickerKind::Branch => self.cloud_branch_rows(cx).len().min(MAX_REF_ROWS),
+            PickerKind::Checkout | PickerKind::HarnessModel => 0,
+        }
+    }
+
+    /// Enter on the highlighted row of a cloud-mode popover.
+    fn submit_cloud_row(&mut self, kind: PickerKind, cx: &mut Context<Self>) {
+        let active = self.active;
+        match kind {
+            PickerKind::Device => {
+                let seats = self.cloud_seat_rows(cx);
+                if let Some(seat) = seats.get(active).cloned() {
+                    self.pick_cloud_seat(seat, cx);
+                } else if let Some(action) = active
+                    .checked_sub(seats.len())
+                    .and_then(|ix| self.cloud_seat_actions(cx).get(ix).copied())
+                {
+                    self.activate_cloud_seat_action(action, cx);
+                }
+            }
+            PickerKind::Space => {
+                let rows = self.cloud_repo_rows(cx);
+                if let Some(repo) = rows.get(active).cloned() {
+                    self.pick_cloud_repo(Some(repo), cx);
+                } else if active == rows.len() {
+                    self.pick_cloud_repo(None, cx);
+                }
+            }
+            PickerKind::Branch => {
+                if let Some(branch) = self.cloud_branch_rows(cx).into_iter().nth(active) {
+                    self.pick_cloud_branch(branch, cx);
+                }
+            }
+            PickerKind::Checkout | PickerKind::HarnessModel => {}
+        }
+    }
+
+    /// A cloud popover's load (re)starts on open: seats and repos are shared
+    /// state, branches belong to the picked repo.
+    fn load_cloud_rows(&mut self, kind: PickerKind, force: bool, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| match kind {
+            PickerKind::Device => state.refresh_cloud(Some(std::time::Duration::from_secs(10)), cx),
+            PickerKind::Space => {
+                if force {
+                    state.cloud_repos = Loadable::Idle;
+                }
+                state.refresh_cloud_repos(cx);
+            }
+            PickerKind::Branch => {
+                if let Some(repo) = state.cloud_repo_pick.as_ref().map(|r| r.full_name.clone()) {
+                    state.refresh_cloud_branches(&repo, force, cx);
+                }
+            }
+            PickerKind::Checkout | PickerKind::HarnessModel => {}
+        });
+    }
+
+    /// One muted text line inside a popover body (empty states).
+    fn popover_note(theme: &Theme, text: impl Into<SharedString>) -> AnyElement {
+        div()
+            .p(px(Theme::SPACE_SM))
+            .text_size(crate::typography::ui_rems(12.0))
+            .text_color(theme.text_faint)
+            .child(text.into())
+            .into_any_element()
+    }
+
+    /// The hairline between a popover's list and its action rows.
+    fn popover_rule(theme: &Theme) -> gpui::Div {
+        div()
+            .my(px(2.0))
+            .mx(px(-popover::CARD_INSET))
+            .h(px(1.0))
+            .flex_none()
+            .bg(theme.border.opacity(0.6))
+    }
+
+    /// A popover action row: leading glyph, label, optional muted detail.
+    #[allow(clippy::too_many_arguments)]
+    fn popover_action_row(
+        theme: &Theme,
+        id: &'static str,
+        selected: bool,
+        highlighted: bool,
+        glyph: &'static str,
+        tint: gpui::Hsla,
+        label: &'static str,
+        detail: Option<&'static str>,
+    ) -> gpui::Stateful<gpui::Div> {
+        popover::menu_row_nav(theme, selected, highlighted, id.to_string())
+            .id(id)
+            .child(
+                crate::icons::icon(glyph)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(tint),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .when_some(detail, |el, detail| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(crate::typography::ui_rems(10.0))
+                        .text_color(theme.text_muted)
+                        .child(detail),
+                )
+            })
+    }
+
+    /// The seat popover: search + one row per configured seat (live dot,
+    /// name, its one-word problem), then the free trial and Settings.
+    fn render_cloud_seat_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).for_popup();
+        let rows = self.cloud_seat_rows(cx);
+        let actions = self.cloud_seat_actions(cx);
+        let picked = self
+            .state
+            .read(cx)
+            .cloud_seat_pick
+            .as_ref()
+            .map(|s| s.config.id.clone());
+        let active = self.active;
+        let seat_count = rows.len();
+        let scrollbar = popover::rail(self, "cloud-seat-scrollbar", &theme, cx);
+        let body: AnyElement = if rows.is_empty() {
+            Self::popover_note(
+                &theme,
+                if self.search_query(cx).is_empty() {
+                    "No cloud seats yet."
+                } else {
+                    "No seats match."
+                },
+            )
+        } else {
+            popover::menu_scroll_host("cloud-seat-list-host")
+                .on_hover(cx.listener(Self::on_menu_list_hover))
+                .child(popover::faded_menu_list(
+                    &self.menu_scroll,
+                    popover::menu_scroll_list("cloud-seat-list", &self.menu_scroll)
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .max_h(px(self.list_budget(120.0)))
+                        .children(rows.into_iter().enumerate().map(|(ix, seat)| {
+                            let is_selected = picked.as_deref() == Some(seat.config.id.as_str());
+                            let note = crate::cloud::seat_status_note(&seat);
+                            let label: SharedString = seat.config.label.clone().into();
+                            let probe = seat.config.last_probe.clone();
+                            popover::menu_row_nav(
+                                &theme,
+                                is_selected,
+                                ix == active,
+                                format!("cloud-seat-row-{ix}"),
+                            )
+                            .id(("cloud-seat-row", ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.pick_cloud_seat(seat.clone(), cx);
+                            }))
+                            .child(crate::cloud::status_dot(&theme, probe.as_ref()))
+                            .child(div().flex_1().min_w_0().truncate().child(label))
+                            .when_some(note, |el, note| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(crate::typography::ui_rems(10.0))
+                                        .text_color(theme.warning.opacity(0.9))
+                                        .child(note),
+                                )
+                            })
+                        })),
+                ))
+                .children(scrollbar)
+                .into_any_element()
+        };
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(self.search_box(&theme))
+            .child(body)
+            .child(Self::popover_rule(&theme));
+        for (offset, action) in actions.into_iter().enumerate() {
+            let highlighted = active == seat_count + offset;
+            let row = match action {
+                CloudSeatAction::StartTrial => Self::popover_action_row(
+                    &theme,
+                    "cloud-seat-trial",
+                    false,
+                    highlighted,
+                    crate::icons::CLOUD,
+                    theme.accent,
+                    "Start free trial",
+                    Some("60 min"),
+                ),
+                CloudSeatAction::Settings => Self::popover_action_row(
+                    &theme,
+                    "cloud-seat-settings",
+                    false,
+                    highlighted,
+                    crate::icons::SETTINGS_MINIMALISTIC,
+                    theme.text_muted,
+                    "Configure seats…",
+                    None,
+                ),
+            };
+            card = card.child(row.on_click(cx.listener(move |this, _, _, cx| {
+                this.activate_cloud_seat_action(action, cx);
+            })));
+        }
+        card.into_any_element()
+    }
+
+    /// The repo popover: search + the connected account's repos, then "No
+    /// repository" (a private scratch workspace on the seat) and the GitHub
+    /// access row.
+    fn render_cloud_repo_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).for_popup();
+        let rows = self.cloud_repo_rows(cx);
+        let (picked, repos_state) = {
+            let state = self.state.read(cx);
+            (
+                state.cloud_repo_pick.as_ref().map(|r| r.full_name.clone()),
+                match &state.cloud_repos {
+                    Loadable::Idle | Loadable::Loading => Loadable::Loading,
+                    Loadable::Error(e) => Loadable::Error(e.clone()),
+                    Loadable::Ready(_) => Loadable::Ready(()),
+                },
+            )
+        };
+        let active = self.active;
+        let none_index = rows.len();
+        let scrollbar = popover::rail(self, "cloud-repo-scrollbar", &theme, cx);
+        let connected = !matches!(repos_state, Loadable::Error(_));
+        let body: AnyElement = match repos_state {
+            Loadable::Loading | Loadable::Idle => {
+                popover::skeleton_rows("cloud-repo-skeleton", &theme, 4, cx.entity_id(), cx)
+            }
+            Loadable::Error(message) => {
+                self.retry_row("cloud-repo-retry", &message, PickerKind::Space, &theme, cx)
+            }
+            Loadable::Ready(()) if rows.is_empty() => Self::popover_note(
+                &theme,
+                if self.search_query(cx).is_empty() {
+                    "No repositories yet."
+                } else {
+                    "No repositories match."
+                },
+            ),
+            Loadable::Ready(()) => popover::menu_scroll_host("cloud-repo-list-host")
+                .on_hover(cx.listener(Self::on_menu_list_hover))
+                .child(popover::faded_menu_list(
+                    &self.menu_scroll,
+                    popover::menu_scroll_list("cloud-repo-list", &self.menu_scroll)
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .max_h(px(self.list_budget(152.0)))
+                        .children(rows.into_iter().enumerate().map(|(ix, repo)| {
+                            let is_selected = picked.as_deref() == Some(repo.full_name.as_str());
+                            let label: SharedString = repo.full_name.clone().into();
+                            let private = repo.private;
+                            popover::menu_row_nav(
+                                &theme,
+                                is_selected,
+                                ix == active,
+                                format!("cloud-repo-row-{ix}"),
+                            )
+                            .id(("cloud-repo-row", ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.pick_cloud_repo(Some(repo.clone()), cx);
+                            }))
+                            .child(div().flex_1().min_w_0().truncate().child(label))
+                            .when(private, |el| {
+                                el.child(
+                                    crate::icons::icon(crate::icons::LOCK)
+                                        .size(px(11.0))
+                                        .flex_none()
+                                        .text_color(theme.text_muted),
+                                )
+                            })
+                        })),
+                ))
+                .children(scrollbar)
+                .into_any_element(),
+        };
+        let github = if connected {
+            Self::popover_action_row(
+                &theme,
+                "cloud-repo-github",
+                false,
+                false,
+                crate::icons::PLUS,
+                theme.text_muted,
+                "Add repositories on GitHub…",
+                None,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.dismiss(cx);
+                cx.open_url(zeron_engine::cloud::COSMOS_GITHUB_INSTALL_URL);
+            }))
+        } else {
+            Self::popover_action_row(
+                &theme,
+                "cloud-repo-github",
+                false,
+                false,
+                crate::icons::LINK,
+                theme.accent,
+                "Connect GitHub…",
+                None,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.dismiss(cx);
+                cx.emit(CloudChipAction::OpenSettings);
+            }))
+        };
+        let no_repo = Self::popover_action_row(
+            &theme,
+            "cloud-repo-none",
+            picked.is_none(),
+            active == none_index,
+            crate::icons::CLOSE,
+            theme.text_muted,
+            "Don't use a repository",
+            None,
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.pick_cloud_repo(None, cx)));
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(self.search_box(&theme))
+            .child(body)
+            .child(Self::popover_rule(&theme))
+            .child(github)
+            .child(no_repo)
+            .into_any_element()
+    }
+
+    /// The branch popover for the picked repo: its branches (default first,
+    /// tagged), loaded from GitHub on open.
+    fn render_cloud_branch_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).for_popup();
+        let (repo, branches_state, current) = {
+            let state = self.state.read(cx);
+            let repo = state.cloud_repo_pick.clone();
+            let branches = repo
+                .as_ref()
+                .and_then(|r| state.cloud_branches.get(&r.full_name))
+                .cloned()
+                .unwrap_or(Loadable::Loading);
+            (repo, branches, state.cloud_branch())
+        };
+        let Some(repo) = repo else {
+            return Self::popover_note(&theme, "No repository selected");
+        };
+        let rows = self.cloud_branch_rows(cx);
+        let total = rows.len();
+        let shown = total.min(MAX_REF_ROWS);
+        let active = self.active;
+        let scrollbar = popover::rail(self, "cloud-branch-scrollbar", &theme, cx);
+        let (default_branch, truncated) = match &branches_state {
+            Loadable::Ready(b) => (b.default_branch.clone(), b.truncated),
+            _ => (repo.default_branch.clone(), false),
+        };
+        let body: AnyElement = match branches_state {
+            Loadable::Loading | Loadable::Idle => {
+                popover::skeleton_rows("cloud-branch-skeleton", &theme, 4, cx.entity_id(), cx)
+            }
+            Loadable::Error(message) => self.retry_row(
+                "cloud-branch-retry",
+                &message,
+                PickerKind::Branch,
+                &theme,
+                cx,
+            ),
+            Loadable::Ready(_) if rows.is_empty() => {
+                Self::popover_note(&theme, "No branches match.")
+            }
+            Loadable::Ready(_) => popover::menu_scroll_host("cloud-branch-list-host")
+                .on_hover(cx.listener(Self::on_menu_list_hover))
+                .child(popover::faded_menu_list(
+                    &self.menu_scroll,
+                    popover::menu_scroll_list("cloud-branch-list", &self.menu_scroll)
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .max_h(px(self.list_budget(96.0)))
+                        .children(rows.into_iter().take(MAX_REF_ROWS).enumerate().map(
+                            |(ix, branch)| {
+                                let is_selected = current.as_deref() == Some(branch.as_str());
+                                let is_default = branch == default_branch;
+                                let label: SharedString = branch.clone().into();
+                                popover::menu_row_nav(
+                                    &theme,
+                                    is_selected,
+                                    ix == active,
+                                    format!("cloud-branch-row-{ix}"),
+                                )
+                                .id(("cloud-branch-row", ix))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pick_cloud_branch(branch.clone(), cx);
+                                }))
+                                .child(div().flex_1().min_w_0().truncate().child(label))
+                                .when(is_default, |el| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(crate::typography::ui_rems(10.0))
+                                            .text_color(theme.text_muted)
+                                            .child("default"),
+                                    )
+                                })
+                            },
+                        )),
+                ))
+                .children(scrollbar)
+                .into_any_element(),
+        };
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .child(self.search_box(&theme))
+            .child(body);
+        if total > shown || truncated {
+            card = card.child(
+                popover::menu_section().child(
+                    div()
+                        .px(px(Theme::SPACE_SM))
+                        .py(px(4.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(if truncated {
+                            "Showing the first 500 branches — search to narrow".to_string()
+                        } else {
+                            format!("Showing {shown} of {total} branches")
+                        })),
+                ),
+            );
+        }
+        card.into_any_element()
+    }
+
+    /// Cloud mode's device + project chips: the seat and the repo.
+    fn render_cloud_target_selectors(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let closing = (self.open.closing_since(), self.menu_geometry().below);
+        let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
+            Some(PickerKind::Space) => {
+                let content = self.render_cloud_repo_popover(cx);
+                Some((PickerKind::Space, self.popover_frame(300.0, content, cx)))
+            }
+            Some(PickerKind::Device) => {
+                let content = self.render_cloud_seat_popover(cx);
+                Some((PickerKind::Device, self.popover_frame(260.0, content, cx)))
+            }
+            _ => None,
+        };
+        let (seat_label, seat_warn, repo_label) = {
+            let state = self.state.read(cx);
+            let seat = state.active_cloud_seat();
+            let failed = state.cloud_trial_failure.is_some();
+            // Amber only for a real problem (a failed start, a dead or
+            // offline seat) — never for "not checked yet".
+            let warn = failed
+                || seat.is_some_and(|s| {
+                    crate::cloud::seat_status_note(s).is_some()
+                        || s.config.last_probe.as_ref().is_some_and(|p| !p.online)
+                });
+            let repo: SharedString = state
+                .cloud_repo_pick
+                .as_ref()
+                .map(|r| {
+                    r.full_name
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&r.full_name)
+                        .to_string()
+                })
+                .unwrap_or_else(|| "No repository".to_string())
+                .into();
+            (
+                SharedString::from(crate::cloud::seat_chip_label(seat, failed)),
+                warn,
+                repo,
+            )
+        };
+        let device_chip = self
+            .footer_chip(
+                PickerKind::Device,
+                "picker-device",
+                crate::icons::CLOUD,
+                seat_label,
+                &theme,
+                cx,
+            )
+            .when(seat_warn, |el| el.text_color(theme.warning.opacity(0.8)));
+        let project_chip = self.footer_chip(
+            PickerKind::Space,
+            "picker-project",
+            crate::icons::FOLDER,
+            repo_label,
+            &theme,
+            cx,
+        );
+        div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .child(attach_overlay_end(
+                device_chip,
+                &mut overlay,
+                PickerKind::Device,
+                "device-popover",
+                closing,
+            ))
+            .child(attach_overlay_end(
+                project_chip,
+                &mut overlay,
+                PickerKind::Space,
+                "project-popover",
+                closing,
+            ))
+            .into_any_element()
+    }
+
+    /// Cloud mode's git row: where the checkout lives + the branch it starts
+    /// on. Only with a repo picked (a repo-less chat has no git to pick).
+    fn render_cloud_git_selectors(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let repo = self.state.read(cx).cloud_repo_pick.clone()?;
+        self.state.update(cx, |state, cx| {
+            state.refresh_cloud_branches(&repo.full_name, false, cx)
+        });
+        let theme = Theme::of(cx).clone();
+        let closing = (self.open.closing_since(), self.menu_geometry().below);
+        let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
+            Some(PickerKind::Branch) => {
+                let content = self.render_cloud_branch_popover(cx);
+                Some((PickerKind::Branch, self.popover_frame(300.0, content, cx)))
+            }
+            _ => None,
+        };
+        let branch: SharedString = self
+            .state
+            .read(cx)
+            .cloud_branch()
+            .unwrap_or_else(|| "Default branch".to_string())
+            .into();
+        let branch_chip = self.footer_chip(
+            PickerKind::Branch,
+            "picker-branch",
+            crate::icons::GIT_BRANCH,
+            branch,
+            &theme,
+            cx,
+        );
+        Some(
+            workspace_footer_row()
+                .child(Self::footer_label(
+                    crate::icons::FOLDER_WITH_FILES,
+                    SharedString::from("Seat checkout"),
+                    &theme,
+                ))
+                .child(attach_overlay_below(
+                    branch_chip,
+                    &mut overlay,
+                    PickerKind::Branch,
+                    "branch-popover",
+                    closing,
+                ))
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for Pickers {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
@@ -4963,10 +5831,12 @@ impl Render for Pickers {
         self.prefetch_models(false, cx);
         // A popover opened data-side (ZERON_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
-        if matches!(
-            self.open_kind(),
-            Some(PickerKind::Branch) | Some(PickerKind::Checkout)
-        ) && matches!(self.refs, Loadable::Idle)
+        if !self.cloud_mode(cx)
+            && matches!(
+                self.open_kind(),
+                Some(PickerKind::Branch) | Some(PickerKind::Checkout)
+            )
+            && matches!(self.refs, Loadable::Idle)
         {
             self.ensure_refs(false, cx);
         }
@@ -5076,18 +5946,19 @@ impl Render for Pickers {
                 traits_active.then(|| theme.text.opacity(0.85)),
             )
         });
-        let fast = self.title.is_none() && self.selected_model(cx).is_some_and(|model| {
-            model.options.iter().any(|option| {
-                option.id == "serviceTier"
-                    && self
-                        .resolved(cx)
-                        .model_options
-                        .get(&option.id)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&option.default_choice)
-                        == "fast"
-            })
-        });
+        let fast = self.title.is_none()
+            && self.selected_model(cx).is_some_and(|model| {
+                model.options.iter().any(|option| {
+                    option.id == "serviceTier"
+                        && self
+                            .resolved(cx)
+                            .model_options
+                            .get(&option.id)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&option.default_choice)
+                            == "fast"
+                })
+            });
         let model_chip = self
             .trigger_chip(
                 PickerKind::HarnessModel,
@@ -5874,6 +6745,90 @@ mod tests {
             assert_eq!(pickers.space_target(cx).as_deref(), Some("remote"));
             assert_eq!(pickers.selected_space_index(cx), 0); // empty device
             assert!(pickers.target_generation >= 2);
+        });
+    }
+
+    #[gpui::test]
+    fn cloud_chips_pick_seat_repo_and_branch_by_keyboard(cx: &mut gpui::TestAppContext) {
+        let seat = |id: &str, label: &str| crate::cloud::SeatRow {
+            config: zeron_engine::cloud::SeatConfig {
+                id: id.into(),
+                label: label.into(),
+                kind: Some(CloudSeatKind::Box),
+                ..Default::default()
+            },
+            has_box_token: true,
+            ..Default::default()
+        };
+        let repo = |name: &str, default: &str| zeron_engine::cloud::RepoHit {
+            full_name: name.into(),
+            default_branch: default.into(),
+            ..Default::default()
+        };
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.cloud_mode = true;
+            state.cloud = Loadable::Ready(crate::cloud::CloudView {
+                seats: vec![seat("a", "Alpha box"), seat("b", "Beta box")],
+                ..Default::default()
+            });
+            state.cloud_repos =
+                Loadable::Ready(vec![repo("me/app", "main"), repo("me/site", "trunk")]);
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        pickers.update(cx, |pickers, cx| {
+            // Seats first, then "Start free trial" (no Railway seat) and
+            // Settings.
+            assert_eq!(pickers.cloud_row_count(PickerKind::Device, cx), 4);
+            pickers.open.open(PickerKind::Device);
+            pickers.active = 1;
+            pickers.on_search_submit(cx);
+        });
+        cx.run_until_parked();
+        pickers.update(cx, |pickers, cx| {
+            let state = pickers.state.read(cx);
+            assert_eq!(
+                state.cloud_seat_pick.as_ref().map(|s| s.config.id.as_str()),
+                Some("b")
+            );
+            assert_eq!(pickers.selected_cloud_seat_index(cx), 1);
+            // No repo yet: the "Don't use a repository" row is current.
+            assert_eq!(pickers.selected_cloud_repo_index(cx), 2);
+            pickers.open.open(PickerKind::Space);
+            pickers.active = 1;
+            pickers.on_search_submit(cx);
+        });
+        cx.run_until_parked();
+        state.update(cx, |state, _| {
+            assert_eq!(
+                state.cloud_repo_pick.as_ref().map(|r| r.full_name.as_str()),
+                Some("me/site")
+            );
+            // The repo's default branch until one is picked.
+            assert_eq!(state.cloud_branch().as_deref(), Some("trunk"));
+            state.cloud_branches.insert(
+                "me/site".into(),
+                Loadable::Ready(crate::state::CloudBranches {
+                    items: vec!["trunk".into(), "feat/x".into()],
+                    default_branch: "trunk".into(),
+                    truncated: false,
+                }),
+            );
+        });
+        pickers.update(cx, |pickers, cx| {
+            assert_eq!(pickers.cloud_row_count(PickerKind::Branch, cx), 2);
+            pickers.open.open(PickerKind::Branch);
+            pickers.active = 1;
+            pickers.on_search_submit(cx);
+        });
+        cx.run_until_parked();
+        state.update(cx, |state, _| {
+            assert_eq!(state.cloud_branch().as_deref(), Some("feat/x"));
+            // Another repo drops the branch pick.
+            state.set_cloud_repo_pick(Some(repo("me/app", "main")));
+            assert_eq!(state.cloud_branch().as_deref(), Some("main"));
+            assert!(state.cloud_branch_pick.is_none());
         });
     }
 

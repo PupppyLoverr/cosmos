@@ -15,3 +15,6 @@ build/
 edge/dist/
 # Machine-specific linker config (absolute toolchain paths differ per box).
 /.cargo/
+.agents
+.claude
+CLAUDE.md

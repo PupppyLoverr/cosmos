@@ -286,6 +286,260 @@ impl SessionsEngine {
         let _ = self.inner.cloud.set(store);
     }
 
+    /// After a restart, pick up the cloud runs the ledger still calls live.
+    /// Detached seat runs and Boat runs kept working while Cosmos was closed
+    /// — their output resumes mirroring into the chat from where it stopped.
+    /// A run that streamed over this app's own ssh link died with the app;
+    /// it is marked stopped, with one honest line in the transcript.
+    pub fn resume_cloud_runs(&self) {
+        let Some(store) = self.inner.cloud.get().cloned() else {
+            return;
+        };
+        let live: Vec<zeron_proto::CloudRun> = store
+            .runs()
+            .into_iter()
+            .filter(|run| {
+                matches!(
+                    run.status,
+                    zeron_proto::CloudRunStatus::Working | zeron_proto::CloudRunStatus::Queued
+                )
+            })
+            .collect();
+        if live.is_empty() {
+            return;
+        }
+        let sessions = self.clone();
+        tokio::spawn(async move {
+            // Chat docs live in the workspace host, which attaches after the
+            // engine core is assembled.
+            for _ in 0..120 {
+                if sessions.inner.workspace().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            for run in live {
+                if lock(&sessions.inner.runs).contains_key(&run.chat_id) {
+                    continue;
+                }
+                sessions.reattach_cloud_run(&store, run);
+            }
+        });
+    }
+
+    fn reattach_cloud_run(&self, store: &crate::cloud::CloudStore, run: zeron_proto::CloudRun) {
+        let chat_id = run.chat_id.clone();
+        let mark = |status: zeron_proto::CloudRunStatus, error: &str| {
+            store.update_run(&run.id, |r| {
+                r.status = status;
+                r.error = Some(error.to_string());
+                r.finished_at = Some(Utc::now());
+            });
+        };
+        let binding = self
+            .inner
+            .workspace()
+            .and_then(|ws| ws.chat(&chat_id).ok().flatten())
+            .and_then(|chat| chat.cloud_seat);
+        let seat = binding
+            .as_ref()
+            .and_then(|binding| store.seat_for(binding))
+            .or_else(|| {
+                store
+                    .seat(&run.seat_id)
+                    .map(|seat| seat.scoped(run.workspace.as_deref(), None))
+            });
+        let Some(seat) = seat else {
+            mark(
+                zeron_proto::CloudRunStatus::Error,
+                "this run's cloud seat is no longer configured",
+            );
+            return;
+        };
+        let Ok(handle) = self.doc_handle(&chat_id) else {
+            mark(
+                zeron_proto::CloudRunStatus::Error,
+                "this run's chat is no longer available",
+            );
+            return;
+        };
+        let doc = handle.writer();
+        let box_id = run
+            .remote_ref
+            .as_deref()
+            .and_then(|r| r.strip_prefix("boat:"))
+            .map(str::to_string);
+        if box_id.is_none() && run.log_path.is_none() {
+            let message = "Cosmos closed while this run was streaming from the seat, and the run ended with it. Send the message again to continue.";
+            write_transcript_note(&doc, &self.inner.device_id, message);
+            mark(zeron_proto::CloudRunStatus::Stopped, message);
+            return;
+        }
+        if seat.expired() {
+            let message = "This trial seat's hour ended while Cosmos was closed.";
+            write_transcript_note(&doc, &self.inner.device_id, message);
+            mark(zeron_proto::CloudRunStatus::Error, message);
+            return;
+        }
+
+        // A live handle, so Stop and the status row work as for a fresh run.
+        let (steer_tx, _steer_rx) = mpsc::channel::<SteerMessage>(1);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (engine_tx, _engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let interrupt_token = CancellationToken::new();
+        let workspace = seat.workspace();
+        lock(&self.inner.runs).insert(
+            chat_id.clone(),
+            RunHandle {
+                run_id: run.id.clone(),
+                steerable: false,
+                runtime_config: RuntimeConfig {
+                    harness_id: HarnessId::ClaudeCode,
+                    model: None,
+                    reasoning: None,
+                    model_options: serde_json::Map::new(),
+                    cwd: workspace,
+                    sandbox: zeron_proto::SandboxLevel::DangerFullAccess,
+                    auto_approve: true,
+                    worktree: None,
+                },
+                steer_tx,
+                interrupt_token: interrupt_token.clone(),
+                cancel: cancel_tx,
+                engine_tx,
+                pending_inputs: Arc::new(Mutex::new(HashMap::new())),
+                routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            },
+        );
+        self.set_status(&chat_id, SessionStatus::Working, true);
+        write_transcript_note(
+            &doc,
+            &self.inner.device_id,
+            "Reconnected — this run kept going on the cloud seat while Cosmos was closed.",
+        );
+
+        let inner = self.inner.clone();
+        let store = store.clone();
+        tokio::spawn(async move {
+            let http = reqwest::Client::new();
+            let command = run.command.clone().unwrap_or_default();
+            let credential_paths: Vec<&'static str> =
+                crate::cloud::harness_credentials(if box_id.is_some() {
+                    seat.harness_command.as_deref().unwrap_or("claude")
+                } else {
+                    &command
+                })
+                .into_iter()
+                .map(|(_, remote)| remote)
+                .collect();
+            let session_id = crate::cloud::harness_session_id(&chat_id);
+            let turn = RemoteTurn {
+                prompt: run.prompt.clone().unwrap_or_default(),
+                recap: String::new(),
+                session_tag: (box_id.is_none()
+                    && crate::cloud::continuation_flags(&command, &session_id, true).is_some())
+                .then(|| format!("{}:{session_id}", crate::cloud::command_bin(&command))),
+                install: String::new(),
+            };
+            let persist_seat = match box_id {
+                Some(box_id) => {
+                    let Some(token) = store.box_token(&seat.id) else {
+                        write_remote_error(
+                            &doc,
+                            &inner.device_id,
+                            "this Boat seat has no token — set one in Settings → Cloud computer",
+                        );
+                        inner.set_status(&chat_id, SessionStatus::Errored, false);
+                        store.update_run(&run.id, |r| {
+                            r.status = zeron_proto::CloudRunStatus::Error;
+                            r.finished_at = Some(Utc::now());
+                        });
+                        lock(&inner.runs).remove(&chat_id);
+                        return;
+                    };
+                    let api = crate::boat::boat(&http, &token, seat.box_endpoint.as_deref());
+                    let outcome = mirror_boat_events(
+                        &inner,
+                        &store,
+                        &api,
+                        &box_id,
+                        &run.id,
+                        &doc,
+                        &cancel_rx,
+                        &interrupt_token,
+                        run.remote_cursor.clone(),
+                        run.entry_id.as_deref(),
+                    )
+                    .await;
+                    let (status, run_status, error) = match outcome {
+                        BoatOutcome::Done => {
+                            (SessionStatus::Idle, zeron_proto::CloudRunStatus::Done, None)
+                        }
+                        BoatOutcome::Stopped => (
+                            SessionStatus::Idle,
+                            zeron_proto::CloudRunStatus::Stopped,
+                            None,
+                        ),
+                        BoatOutcome::Failed(message) => {
+                            write_remote_error(&doc, &inner.device_id, &message);
+                            (
+                                SessionStatus::Errored,
+                                zeron_proto::CloudRunStatus::Error,
+                                Some(message),
+                            )
+                        }
+                    };
+                    inner.set_status(&chat_id, status, false);
+                    store.update_run(&run.id, |r| {
+                        r.status = run_status;
+                        r.error = error;
+                        r.finished_at = Some(Utc::now());
+                    });
+                    lock(&inner.runs).remove(&chat_id);
+                    let mut live = seat.clone();
+                    live.box_id = Some(box_id);
+                    live
+                }
+                None => {
+                    let log_path = run.log_path.clone().unwrap_or_default();
+                    tail_remote_log(
+                        &inner,
+                        &http,
+                        &store,
+                        &chat_id,
+                        &run.id,
+                        &seat,
+                        &log_path,
+                        &doc,
+                        &mut cancel_rx,
+                        run.entry_id.as_deref(),
+                        &command,
+                    )
+                    .await;
+                    seat.clone()
+                }
+            };
+            crate::cloud::cleanup_staged_credentials(
+                &http,
+                &store,
+                &persist_seat,
+                &credential_paths,
+            )
+            .await;
+            persist_remote_turn(
+                &inner,
+                &store,
+                &http,
+                &persist_seat,
+                &chat_id,
+                &run.id,
+                &turn,
+                &doc,
+            )
+            .await;
+        });
+    }
+
     fn note_turn_start(&self, chat_id: &str, cwd: &str) {
         if let Some(listener) = self.inner.turn_listener.get() {
             listener(chat_id, cwd);
@@ -692,25 +946,56 @@ impl SessionsEngine {
         // Boat runs ride the provider's integrated-agent `/prompt` surface —
         // no seat-local harness command needed. SSH/Railway exec the seat's
         // configured harness; Railway defaults to the preinstalled `claude`.
-        let command = seat
+        // The composer's harness + model pick runs on the seat — the same
+        // agents as on this computer, headless, with the user's logins
+        // staged. A run with no explicit pick (automations, older clients)
+        // keeps the seat's own configured command.
+        let is_boat_seat = matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box));
+        let configured = seat
             .harness_command
             .clone()
-            .filter(|c| !c.trim().is_empty())
-            .or_else(|| {
-                matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Railway))
-                    .then(|| "claude -p".to_string())
-            })
-            .or_else(|| {
-                matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box)).then(|| String::new())
-            })
-            .ok_or_else(|| {
-                EngineError::Other(
-                    "this seat has no harness command — set one in Settings → Cloud computer"
-                        .into(),
-                )
-            })?;
+            .filter(|c| !c.trim().is_empty());
+        let (command, install) = if is_boat_seat {
+            (String::new(), String::new())
+        } else if request.harness.is_some() || configured.is_none() {
+            let picked =
+                crate::cloud::seat_harness(harness_id, request.model.as_deref(), request.reasoning)
+                    .map_err(EngineError::Other)?;
+            (picked.command, picked.install)
+        } else {
+            (configured.unwrap_or_default(), String::new())
+        };
 
         let handle = self.doc_handle(chat_id)?;
+        // Conversation continuity: harnesses with a resumable conversation
+        // (Claude Code's session id, OpenCode/Codex "continue last") pick
+        // the thread back up natively once a turn on this seat completed;
+        // otherwise — and on a chat's first turn on a new seat — the prior
+        // turns ride the prompt as a compact recap.
+        let session_id = crate::cloud::harness_session_id(chat_id);
+        // A turn resumes only the SAME agent's conversation — switching from
+        // Claude Code to Codex mid-thread starts Codex fresh (with a recap).
+        let bin = crate::cloud::command_bin(&command);
+        let resuming = store
+            .harness_session_for_chat(chat_id, &seat.id)
+            .is_some_and(|tag| tag.starts_with(&format!("{bin}:")));
+        let is_boat = matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box));
+        let flags = (!is_boat)
+            .then(|| crate::cloud::continuation_flags(&command, &session_id, resuming))
+            .flatten();
+        let session_tag = (!is_boat
+            && crate::cloud::continuation_flags(&command, &session_id, true).is_some())
+        .then(|| format!("{bin}:{session_id}"));
+        let recap = if resuming && flags.is_some() {
+            String::new()
+        } else {
+            prior_turns_recap(&handle.doc().read_entries().unwrap_or_default())
+        };
+        let command = if is_boat {
+            command
+        } else {
+            crate::cloud::with_continuation(&command, flags.as_deref())
+        };
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
 
@@ -749,7 +1034,17 @@ impl SessionsEngine {
             log_path: None,
             remote_ref: None,
             mirrored_bytes: 0,
+            remote_cursor: None,
+            entry_id: None,
             error: None,
+            workspace: Some(seat.workspace()),
+            harness_session: None,
+            prompt: request
+                .prompt
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(|l| l.chars().take(140).collect()),
             started_at: Utc::now(),
             finished_at: None,
             updated_at: Utc::now(),
@@ -765,7 +1060,12 @@ impl SessionsEngine {
             run_id.clone(),
             seat,
             command,
-            request.prompt,
+            RemoteTurn {
+                prompt: request.prompt,
+                recap,
+                session_tag,
+                install,
+            },
             handle.writer(),
             cancel_rx,
             interrupt_token,
@@ -845,6 +1145,11 @@ impl SessionsEngine {
         }
         self.inner.note_message(chat_id, prompt);
         Ok(SteerOutcome::Accepted)
+    }
+
+    /// Whether a run (local or seat) is live for this chat.
+    pub fn is_running(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs).contains_key(chat_id)
     }
 
     /// Interrupt the live run, if any. The run settles with a synthetic
@@ -1416,6 +1721,17 @@ pub(crate) fn subagent_doc_id(chat_id: &str, tool_use_id: &str) -> String {
     format!("{chat_id}--sub--{hex}")
 }
 
+/// Test-only instrumentation: how often `drive_run`'s coalesced commit branch
+/// fires. The sink-dirty regression test proves the branch ticks once per
+/// commit window instead of spinning on a deadline left in the past.
+/// Thread-local so parallel tests' runs can't bleed into the count: the
+/// test's current-thread runtime runs its spawned `drive_run` on its own
+/// thread.
+#[cfg(test)]
+thread_local! {
+    static FLUSH_TICKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A live subagent transcript sink: its own doc (opened by id — the room
 /// `chat2/{docId}/ws` dials automatically, so viewers sync it like a chat),
 /// one streaming assistant entry folded from the tagged events. The held
@@ -1433,7 +1749,14 @@ struct SubagentSink {
 
 impl SubagentSink {
     fn flush(&mut self, device_id: &str) {
-        if !self.dirty || self.folded.is_empty() {
+        if !self.dirty {
+            return;
+        }
+        // An empty fold still counts as flushed: leaving dirty set would hold
+        // the run loop's coalesced-commit guard open on a deadline already in
+        // the past, spinning it until the subagent emits real content.
+        self.dirty = false;
+        if self.folded.is_empty() {
             return;
         }
         let rendered = render_parts(&self.folded);
@@ -1464,7 +1787,6 @@ impl SubagentSink {
             // errors the chat.
             tracing::warn!(doc = %self.doc_id, error = %err, "subagent sink flush failed");
         }
-        self.dirty = false;
     }
 
     /// A parent→subagent steer ([`AgentEvent::UserMessage`], tagged): close
@@ -1723,6 +2045,231 @@ fn cursor_unstarted_history(
 /// the run survives this app closing and the driver tails the log while
 /// connected, backfilling on reopen.
 #[allow(clippy::too_many_arguments)]
+/// What one seat turn carries beyond the command: the user's words, a recap
+/// of earlier turns when the harness can't resume natively, and the session
+/// tag to stamp on the ledger once the turn produced output.
+struct RemoteTurn {
+    prompt: String,
+    recap: String,
+    session_tag: Option<String>,
+    /// Best-effort install of the harness CLI when the seat lacks it.
+    install: String,
+}
+
+/// A compact recap of the thread so far — the continuity fallback for
+/// harnesses without a resumable session, and for a chat's first turn on a
+/// seat it moved to. Bounded: the last few text turns, clipped.
+fn prior_turns_recap(entries: &[SessionMessageEntry]) -> String {
+    const MAX_TURNS: usize = 8;
+    const MAX_PER_TURN: usize = 700;
+    const MAX_TOTAL: usize = 4_000;
+    let mut turns: Vec<String> = Vec::new();
+    for entry in entries.iter().rev() {
+        let who = match entry.role {
+            zeron_doc::MessageRole::User => "User",
+            zeron_doc::MessageRole::Assistant => "Assistant",
+            _ => continue,
+        };
+        let text: String = entry
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text { text, .. } => Some(text.trim()),
+                _ => None,
+            })
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            continue;
+        }
+        let clipped: String = if text.chars().count() > MAX_PER_TURN {
+            let head: String = text.chars().take(MAX_PER_TURN).collect();
+            format!("{head}…")
+        } else {
+            text
+        };
+        turns.push(format!("{who}: {clipped}"));
+        if turns.len() >= MAX_TURNS || turns.iter().map(String::len).sum::<usize>() > MAX_TOTAL {
+            break;
+        }
+    }
+    if turns.is_empty() {
+        return String::new();
+    }
+    turns.reverse();
+    format!(
+        "<previous-turns>\nEarlier in this thread (most recent last):\n{}\n</previous-turns>\n\n",
+        turns.join("\n\n")
+    )
+}
+
+/// After a seat turn ends: checkpoint a repo-less workspace with a local git
+/// commit, then pull a snapshot of the chat's workspace down to this
+/// computer — so the work survives the seat (a trial's hour ending, a box
+/// destroyed) and restores onto whichever seat the chat runs on next.
+#[allow(clippy::too_many_arguments)]
+async fn persist_remote_turn(
+    inner: &Arc<Inner>,
+    store: &crate::cloud::CloudStore,
+    http: &reqwest::Client,
+    seat: &crate::cloud::SeatConfig,
+    chat_id: &str,
+    run_id: &str,
+    turn: &RemoteTurn,
+    doc: &crate::doc_host::DocWriter,
+) {
+    let run = store.runs().into_iter().find(|r| r.id == run_id);
+    let produced = run.as_ref().is_some_and(|r| {
+        r.mirrored_bytes > 0 || matches!(r.status, zeron_proto::CloudRunStatus::Done)
+    });
+    if produced && let Some(tag) = turn.session_tag.clone() {
+        store.update_run(run_id, |run| run.harness_session = Some(tag));
+    }
+    // Repo chats keep their record in git (commits, pushed branches, PRs —
+    // plus the trial-expiry sweep and "Back up now"); per-turn snapshots are
+    // for repo-less workspaces, whose only other copy is the seat itself.
+    if seat.expired() || seat.repo.is_some() {
+        return;
+    }
+    let workspace = seat.workspace();
+    {
+        match crate::cloud::seat_exec(
+            http,
+            store,
+            seat,
+            &crate::cloud::checkpoint_command(&workspace, &turn.prompt),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        {
+            Ok(out) if out.code == 0 && !out.stdout.trim().is_empty() => {
+                tracing::debug!(chat = %chat_id, commit = %out.stdout.trim(), "seat checkpoint");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(chat = %chat_id, error = %e, "seat checkpoint failed"),
+        }
+    }
+    match crate::cloud::backup_chat_workspace(http, store, seat, chat_id, &workspace).await {
+        Ok(backup) => {
+            tracing::info!(chat = %chat_id, bytes = backup.bytes, "chat workspace backed up");
+        }
+        Err(e) => {
+            tracing::warn!(chat = %chat_id, error = %e, "chat workspace backup failed");
+            // Say so in the transcript: a repo-less workspace has no other
+            // home, so a failed save is worth one honest line.
+            if produced {
+                write_transcript_note(
+                    doc,
+                    &inner.device_id,
+                    &format!("Couldn't back up this workspace to your computer this turn: {e}"),
+                );
+            }
+        }
+    }
+}
+
+/// Before a seat turn: the chat's workspace exists (restored from this
+/// computer's backup when the seat came up empty) and the seat's desktop +
+/// `cosmos-computer` are staged. Returns the prompt the harness receives.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_remote_turn(
+    inner: &Arc<Inner>,
+    store: &crate::cloud::CloudStore,
+    http: &reqwest::Client,
+    seat: &crate::cloud::SeatConfig,
+    chat_id: &str,
+    turn: &RemoteTurn,
+    doc: &crate::doc_host::DocWriter,
+) -> String {
+    let workspace = seat.workspace();
+    // One round-trip: stage the desktop tooling (detached bring-up), then
+    // create/inspect the chat's workspace.
+    let prep = format!(
+        "{{ {} ; }} ; {}",
+        crate::seat_desktop::bootstrap_command(),
+        crate::cloud::chat_workspace_prepare(&workspace, seat.repo.is_none())
+    );
+    let (desktop_ok, empty) =
+        match crate::cloud::seat_exec(http, store, seat, &prep, std::time::Duration::from_secs(45))
+            .await
+        {
+            Ok(out) => (
+                out.stdout.contains("__cosmos_desktop_ok"),
+                out.stdout.contains("__cosmos_ws_empty"),
+            ),
+            Err(e) => {
+                write_transcript_note(
+                    doc,
+                    &inner.device_id,
+                    &format!("Couldn't prepare the workspace on the seat: {e}"),
+                );
+                (false, false)
+            }
+        };
+    if let Some(note) =
+        crate::cloud::restore_chat_workspace_if_empty(http, store, seat, chat_id, &workspace, empty)
+            .await
+    {
+        write_transcript_note(doc, &inner.device_id, &note);
+    }
+    // SSH/Railway runs clone inside the harness command; a Boat box's
+    // integrated agent has no such prelude, so its repo checkout (on the
+    // picked branch) lands here, before the prompt.
+    if matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Box))
+        && let Some(repo) = seat.repo.as_deref().filter(|r| !r.trim().is_empty())
+    {
+        let token = store
+            .github_pat(&seat.id)
+            .map(|pat| format!("GITHUB_TOKEN={} ", crate::cloud::shell_word(&pat)))
+            .unwrap_or_default();
+        let clone = crate::cloud::command_in_workspace(
+            &workspace,
+            &format!(
+                "{token}sh -c {}",
+                crate::cloud::shell_word(&crate::cloud::repo_checkout_prelude(
+                    repo,
+                    seat.branch.as_deref()
+                ))
+            ),
+        );
+        match crate::cloud::seat_exec(
+            http,
+            store,
+            seat,
+            &clone,
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        {
+            Ok(out) if out.code == 0 => {}
+            Ok(out) => write_transcript_note(
+                doc,
+                &inner.device_id,
+                &format!(
+                    "Couldn't check out {repo} on the box: {}",
+                    out.stderr.lines().last().unwrap_or("git clone failed")
+                ),
+            ),
+            Err(e) => write_transcript_note(
+                doc,
+                &inner.device_id,
+                &format!("Couldn't check out {repo} on the box: {e}"),
+            ),
+        }
+    }
+    if !desktop_ok {
+        tracing::warn!(seat = %seat.id, "seat desktop bootstrap failed");
+    }
+    let brief = if desktop_ok {
+        crate::seat_desktop::agent_brief(&workspace, seat.repo.as_deref())
+    } else {
+        String::new()
+    };
+    format!("{brief}{}{}", turn.recap, turn.prompt)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn drive_remote_run(
     inner: Arc<Inner>,
     store: crate::cloud::CloudStore,
@@ -1730,7 +2277,7 @@ async fn drive_remote_run(
     run_id: String,
     seat: crate::cloud::SeatConfig,
     command: String,
-    prompt: String,
+    turn: RemoteTurn,
     doc: crate::doc_host::DocWriter,
     mut cancel_rx: watch::Receiver<bool>,
     interrupt_token: CancellationToken,
@@ -1764,7 +2311,7 @@ async fn drive_remote_run(
             chat_id,
             run_id,
             seat,
-            prompt,
+            turn,
             doc,
             cancel_rx,
             interrupt_token,
@@ -1772,6 +2319,8 @@ async fn drive_remote_run(
         .await;
         return;
     }
+
+    let prompt = prepare_remote_turn(&inner, &store, &http, &seat, &chat_id, &turn, &doc).await;
 
     let env = store
         .cloud_env()
@@ -1793,25 +2342,63 @@ async fn drive_remote_run(
     } else {
         format!("{command} {prompt_word}")
     };
-    let full = format!(
-        "cd {} && {}{}{}",
-        crate::cloud::shell_word(&seat.workspace()),
-        if env.is_empty() {
-            String::new()
-        } else {
-            format!("env {env} ")
-        },
-        user_cmd,
-        ""
-    );
+    let user_cmd = match seat.repo.as_deref().filter(|r| !r.trim().is_empty()) {
+        Some(repo) => format!(
+            "sh -c {}",
+            crate::cloud::shell_word(&format!(
+                "{} && exec env {user_cmd}",
+                crate::cloud::repo_checkout_prelude(repo, seat.branch.as_deref())
+            ))
+        ),
+        None => user_cmd,
+    };
+    let remote_command = if env.is_empty() {
+        user_cmd
+    } else {
+        format!("env {env} {user_cmd}")
+    };
+    // The seat's display + `cosmos-computer` ride the harness environment;
+    // a missing harness CLI installs first (best-effort, never fatal).
+    let remote_command = if turn.install.is_empty() {
+        format!("{} {remote_command}", crate::seat_desktop::env_prefix())
+    } else {
+        // When the install couldn't land the CLI, say exactly that instead
+        // of the shell's bare "command not found".
+        let bin = crate::cloud::command_bin(&command);
+        format!(
+            "{} export PATH=\"$HOME/.local/bin:$HOME/.cursor/bin:$HOME/.npm-global/bin:$PATH\" && {{ {} ; }} ; command -v {} >/dev/null 2>&1 || {{ echo {} >&2; exit 127; }} ; {remote_command}",
+            crate::seat_desktop::env_prefix(),
+            turn.install,
+            crate::cloud::shell_word(&bin),
+            crate::cloud::shell_word(&format!(
+                "`{bin}` isn't installed on this seat and the automatic install didn't work — install it on the seat, or pick another agent in the model picker."
+            )),
+        )
+    };
+    let full = crate::cloud::command_in_workspace(&seat.workspace(), &remote_command);
 
     // The user's existing CLI logins ride to the seat — `~/.codex/auth.json`,
     // opencode/grok/pi/hermes stores — staged per run so the harness auths
     // on the box and keeps working after the laptop closes. A staging miss
     // only warns; BYOK env keys may still cover the harness.
-    for (local, remote) in crate::cloud::harness_credentials(&command) {
+    let staged_remotes = crate::cloud::harness_credentials(&command)
+        .into_iter()
+        .map(|(local, remote)| (local, remote))
+        .collect::<Vec<_>>();
+    for (local, remote) in &staged_remotes {
         if let Err(e) = crate::cloud::stage_credential(&http, &store, &seat, &local, remote).await {
             tracing::warn!(seat = %seat.id, file = %local.display(), error = %e, "credential staging failed");
+            write_transcript_note(
+                &doc,
+                &inner.device_id,
+                &format!(
+                    "Couldn't stage {} login on the seat: {e}",
+                    local
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("harness")
+                ),
+            );
         }
     }
 
@@ -1820,13 +2407,13 @@ async fn drive_remote_run(
         // process belongs to the seat's init tree, so closing this app (or
         // dropping the ssh link) never kills the run — the ledger row lets a
         // later session reattach.
-        let log_path = format!("~/.cosmos/runs/{run_id}.log");
-        let pid_path = format!("~/.cosmos/runs/{run_id}.pid");
+        let log_path = format!("$HOME/.cosmos/runs/{run_id}.log");
+        let detached_command = format!(
+            "{full}; code=$?; printf '%s\\n' \"$code\" > \"$HOME/.cosmos/runs/{run_id}.exit\"; exit \"$code\""
+        );
         let launch = format!(
-            "mkdir -p ~/.cosmos/runs && nohup sh -c {} > {} 2>&1 & pid=$!; echo $pid > {}; echo $pid",
-            crate::cloud::shell_word(&full),
-            crate::cloud::shell_word(&log_path),
-            crate::cloud::shell_word(&pid_path),
+            "mkdir -p \"$HOME/.cosmos/runs\" && {{ nohup sh -c {} > \"$HOME/.cosmos/runs/{run_id}.log\" 2>&1 & pid=$!; printf '%s\\n' \"$pid\" > \"$HOME/.cosmos/runs/{run_id}.pid\"; printf '%s\\n' \"$pid\"; }}",
+            crate::cloud::shell_word(&detached_command),
         );
         match crate::cloud::seat_exec(
             &http,
@@ -1853,8 +2440,22 @@ async fn drive_remote_run(
                     &log_path,
                     &doc,
                     &mut cancel_rx,
+                    None,
+                    &command,
                 )
                 .await;
+                crate::cloud::cleanup_staged_credentials(
+                    &http,
+                    &store,
+                    &seat,
+                    &staged_remotes
+                        .iter()
+                        .map(|(_, path)| *path)
+                        .collect::<Vec<_>>(),
+                )
+                .await;
+                persist_remote_turn(&inner, &store, &http, &seat, &chat_id, &run_id, &turn, &doc)
+                    .await;
             }
             Ok(out) => {
                 let message = out
@@ -1881,13 +2482,23 @@ async fn drive_remote_run(
                     zeron_proto::CloudRunStatus::Error,
                     Some(e),
                 );
+                crate::cloud::cleanup_staged_credentials(
+                    &http,
+                    &store,
+                    &seat,
+                    &staged_remotes
+                        .iter()
+                        .map(|(_, path)| *path)
+                        .collect::<Vec<_>>(),
+                )
+                .await;
             }
         }
         return;
     }
 
     let stream = crate::cloud::seat_exec_stream(&seat, &full).await;
-    let mut stream = match stream {
+    let stream = match stream {
         Ok(s) => s,
         Err(e) => {
             write_remote_error(&doc, &inner.device_id, &e);
@@ -1898,21 +2509,53 @@ async fn drive_remote_run(
                 zeron_proto::CloudRunStatus::Error,
                 Some(e),
             );
+            crate::cloud::cleanup_staged_credentials(
+                &http,
+                &store,
+                &seat,
+                &staged_remotes
+                    .iter()
+                    .map(|(_, path)| *path)
+                    .collect::<Vec<_>>(),
+            )
+            .await;
             return;
         }
     };
 
     let entry_id = new_id();
-    let mut segment =
-        zeron_doc::SegmentWriter::begin(&doc, &entry_id, &inner.device_id, now_ms()).ok();
+    let mut segment: Option<zeron_doc::SegmentWriter> = None;
     let mut text = String::new();
+    let mut render = StreamJsonRenderer::for_command(&command);
     let mut buf = [0u8; 8192];
+    let mut err_buf = [0u8; 4096];
+    let mut stderr_tail = Vec::new();
+    let mut stdout_open = true;
+    let mut stderr_open = true;
     let mut interrupted = false;
+    let mut expired = false;
+    let mut child = stream.child;
+    let mut stdout = stream.stdout;
+    let mut stderr = stream.stderr;
+    let deadline = seat.expires_at.map(|deadline| {
+        let seconds = (deadline - Utc::now()).num_seconds().max(0) as u64;
+        tokio::time::Instant::now() + std::time::Duration::from_secs(seconds)
+    });
     loop {
         tokio::select! {
+            _ = async {
+                match deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                expired = true;
+                let _ = child.kill().await;
+                break;
+            }
             _ = cancel_rx.changed() => {
                 interrupted = true;
-                let _ = stream.child.kill().await;
+                let _ = child.kill().await;
                 // Best-effort remote kill so a hung harness can't linger —
                 // seat_exec routes to docker-exec (SSH) or direct ssh
                 // (Railway); the run-id marker matches the detached cmdline.
@@ -1929,38 +2572,70 @@ async fn drive_remote_run(
             }
             _ = interrupt_token.cancelled() => {
                 interrupted = true;
-                let _ = stream.child.kill().await;
+                let _ = child.kill().await;
                 break;
             }
-            read = stream.stdout.read(&mut buf) => {
+            read = stdout.read(&mut buf), if stdout_open => {
                 match read {
-                    Ok(0) => break,
+                    Ok(0) => stdout_open = false,
                     Ok(n) => {
-                        text.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        match render.as_mut() {
+                            Some(render) => text.push_str(&render.push(&buf[..n])),
+                            None => text.push_str(&String::from_utf8_lossy(&buf[..n])),
+                        }
+                        if segment.is_none() && !text.trim().is_empty() {
+                            segment = zeron_doc::SegmentWriter::begin(
+                                &doc,
+                                &entry_id,
+                                &inner.device_id,
+                                now_ms(),
+                            )
+                            .ok();
+                        }
                         if let Some(segment) = segment.as_mut() {
                             let _ = segment.sync(&[MessagePart::Text {
                                 id: "t0".into(),
-                                text: text.clone(),
+                                text: preserve_line_breaks(&text),
                             }]);
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => stdout_open = false,
+                }
+            }
+            read = stderr.read(&mut err_buf), if stderr_open => {
+                match read {
+                    Ok(0) => stderr_open = false,
+                    Ok(n) => {
+                        stderr_tail.extend_from_slice(&err_buf[..n]);
+                        if stderr_tail.len() > 65_536 {
+                            let excess = stderr_tail.len() - 65_536;
+                            stderr_tail.drain(..excess);
+                        }
+                    }
+                    Err(_) => stderr_open = false,
                 }
             }
         }
+        if !stdout_open && !stderr_open {
+            break;
+        }
     }
-    let status = stream
-        .child
+    if let Some(render) = render.as_mut() {
+        text.push_str(&render.finish());
+    }
+    let status = child
         .wait()
         .await
         .map(|s| s.code().unwrap_or(-1))
         .unwrap_or(-1);
-    if interrupted {
+    if expired {
+        terminal_cloud_run(&inner, &store, &chat_id, &run_id, &mut segment, &text);
+    } else if interrupted {
         if let Some(segment) = segment {
             let _ = segment.finish(
                 &[MessagePart::Text {
                     id: "t0".into(),
-                    text,
+                    text: preserve_line_breaks(&text),
                 }],
                 zeron_doc::MessageStatus::Aborted,
             );
@@ -1972,12 +2647,13 @@ async fn drive_remote_run(
             zeron_proto::CloudRunStatus::Stopped,
             None,
         );
-    } else if status == 0 {
+    } else if !remote_agent_failed(status, &text) {
+        store.update_run(&run_id, |run| run.mirrored_bytes = text.len() as u64);
         if let Some(segment) = segment {
             let _ = segment.finish(
                 &[MessagePart::Text {
                     id: "t0".into(),
-                    text,
+                    text: preserve_line_breaks(&text),
                 }],
                 zeron_doc::MessageStatus::Complete,
             );
@@ -1989,35 +2665,19 @@ async fn drive_remote_run(
             zeron_proto::CloudRunStatus::Done,
             None,
         );
-        // A finished Railway run is the moment work exists worth keeping —
-        // snapshot now so an expired-trial restore works even if the app
-        // never lives to see the T-10m sweep.
-        if seat.kind == Some(zeron_proto::CloudSeatKind::Railway) {
-            let store = store.clone();
-            let seat = seat.clone();
-            tokio::spawn(async move {
-                match crate::cloud::snapshot_workspace(&store, &seat).await {
-                    Ok(path) => store.update_seat(&seat.id, |s| {
-                        s.backup_path = Some(path.to_string_lossy().into_owned());
-                        s.backup_at = Some(Utc::now());
-                    }),
-                    Err(e) => {
-                        tracing::warn!(seat = %seat.id, error = %e, "post-run snapshot failed")
-                    }
-                }
-            });
-        }
     } else {
-        let message = format!("seat run exited {status}");
+        let stderr_text = String::from_utf8_lossy(&stderr_tail);
+        let message = remote_agent_failure_message(status, &text, &stderr_text);
         if let Some(segment) = segment {
             let _ = segment.finish(
                 &[MessagePart::Text {
                     id: "t0".into(),
-                    text,
+                    text: preserve_line_breaks(&text),
                 }],
                 zeron_doc::MessageStatus::Aborted,
             );
         }
+        write_remote_error(&doc, &inner.device_id, &message);
         finish(
             &inner,
             &store,
@@ -2026,12 +2686,26 @@ async fn drive_remote_run(
             Some(message),
         );
     }
+    crate::cloud::cleanup_staged_credentials(
+        &http,
+        &store,
+        &seat,
+        &staged_remotes
+            .iter()
+            .map(|(_, path)| *path)
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    if !expired {
+        persist_remote_turn(&inner, &store, &http, &seat, &chat_id, &run_id, &turn, &doc).await;
+    }
 }
 
 /// Boat seats run the provider's integrated agent: provision (or wake) the
 /// sandbox, POST `/prompt`, then mirror `/events` into the transcript. The
 /// agent process lives on the box — closing this app doesn't kill the run,
 /// so `keeps_running` is honest, not the desktop-lifetime warning.
+#[allow(clippy::too_many_arguments)]
 async fn drive_boat_run(
     inner: Arc<Inner>,
     store: crate::cloud::CloudStore,
@@ -2039,8 +2713,46 @@ async fn drive_boat_run(
     chat_id: String,
     run_id: String,
     seat: crate::cloud::SeatConfig,
-    prompt: String,
+    turn: RemoteTurn,
     doc: crate::doc_host::DocWriter,
+    cancel_rx: watch::Receiver<bool>,
+    interrupt_token: CancellationToken,
+) {
+    drive_boat_turn(
+        inner.clone(),
+        store.clone(),
+        http.clone(),
+        chat_id.clone(),
+        run_id.clone(),
+        seat.clone(),
+        &turn,
+        &doc,
+        cancel_rx,
+        interrupt_token,
+    )
+    .await;
+    // The box id may have been minted this turn — re-read it, keeping the
+    // chat's workspace/repo scope.
+    let Some(live) = store
+        .seat(&seat.id)
+        .map(|s| s.scoped(seat.workspace_path.as_deref(), seat.repo.as_deref()))
+        .filter(|s| s.box_id.is_some())
+    else {
+        return;
+    };
+    persist_remote_turn(&inner, &store, &http, &live, &chat_id, &run_id, &turn, &doc).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_boat_turn(
+    inner: Arc<Inner>,
+    store: crate::cloud::CloudStore,
+    http: reqwest::Client,
+    chat_id: String,
+    run_id: String,
+    seat: crate::cloud::SeatConfig,
+    turn: &RemoteTurn,
+    doc: &crate::doc_host::DocWriter,
     cancel_rx: watch::Receiver<bool>,
     interrupt_token: CancellationToken,
 ) {
@@ -2102,7 +2814,29 @@ async fn drive_boat_run(
                         id
                     }
                     Err(e) => {
-                        fail(format!("Boat box never came ready: {e}"));
+                        let mut destroyed = false;
+                        let mut destroy_error = String::new();
+                        for attempt in 0..3 {
+                            match api.destroy(&s.id).await {
+                                Ok(()) => {
+                                    destroyed = true;
+                                    break;
+                                }
+                                Err(error) => {
+                                    destroy_error = error;
+                                    if attempt < 2 {
+                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                    }
+                                }
+                            }
+                        }
+                        if destroyed {
+                            fail(format!("created but not ready; destroyed ({e})"));
+                        } else {
+                            fail(format!(
+                                "created but not ready; destroy failed: {destroy_error} (readiness: {e})"
+                            ));
+                        }
                         return;
                     }
                 },
@@ -2144,8 +2878,24 @@ async fn drive_boat_run(
                 use base64::Engine as _;
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 let ws = crate::cloud::shell_word(&seat.workspace());
-                let staged = "/tmp/cosmos-restore.tgz.b64";
-                if let Err(e) = api.write_file(&box_id, staged, b64.as_bytes()).await {
+                let staged = format!("/tmp/cosmos-restore-{run_id}.tgz.b64");
+                let _ = api
+                    .exec(
+                        &box_id,
+                        "rm -f /tmp/cosmos-restore-*.tgz.b64",
+                        None,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await;
+                if let Err(e) = api.write_file(&box_id, &staged, b64.as_bytes()).await {
+                    let _ = api
+                        .exec(
+                            &box_id,
+                            &format!("rm -f {staged}"),
+                            None,
+                            std::time::Duration::from_secs(30),
+                        )
+                        .await;
                     note(format!(
                         "Couldn't upload the Railway backup to this box ({e}) — starting fresh."
                     ));
@@ -2154,7 +2904,7 @@ async fn drive_boat_run(
                         .exec(
                             &box_id,
                             &format!(
-                                "mkdir -p {ws} && base64 -d {staged} | tar xzf - -C {ws} && rm -f {staged}"
+                                "trap 'rm -f {staged}' EXIT; mkdir -p {ws} && base64 -d {staged} | tar xzf - -C {ws}"
                             ),
                             None,
                             std::time::Duration::from_secs(300),
@@ -2183,46 +2933,162 @@ async fn drive_boat_run(
         }
     }
 
+    let staged_remotes =
+        crate::cloud::harness_credentials(seat.harness_command.as_deref().unwrap_or("claude"))
+            .into_iter()
+            .collect::<Vec<_>>();
+    for (local, remote) in &staged_remotes {
+        if let Err(e) = crate::cloud::stage_credential(&http, &store, &seat, local, remote).await {
+            tracing::warn!(seat = %seat.id, file = %local.display(), error = %e, "credential staging failed");
+            write_transcript_note(
+                &doc,
+                &inner.device_id,
+                &format!(
+                    "Couldn't stage {} login on the seat: {e}",
+                    local
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("harness")
+                ),
+            );
+        }
+    }
+    let cleanup = || async {
+        crate::cloud::cleanup_staged_credentials(
+            &http,
+            &store,
+            &seat,
+            &staged_remotes
+                .iter()
+                .map(|(_, path)| *path)
+                .collect::<Vec<_>>(),
+        )
+        .await;
+    };
+
     // Kick the integrated agent. The prompt response carries the
     // conversation handle; events stream the transcript we mirror.
+    let live_seat = {
+        let mut live = seat.clone();
+        live.box_id = Some(box_id.clone());
+        live
+    };
+    let prompt = prepare_remote_turn(&inner, &store, &http, &live_seat, &chat_id, turn, doc).await;
     if let Err(e) = api.prompt(&box_id, "claude", &prompt, None).await {
+        cleanup().await;
         fail(format!("Boat couldn't start the agent: {e}"));
         return;
     }
 
-    let entry_id = new_id();
-    let mut segment =
-        zeron_doc::SegmentWriter::begin(&doc, &entry_id, &inner.device_id, now_ms()).ok();
-    let mut text = String::new();
-    let mut cursor: Option<String> = None;
+    let outcome = mirror_boat_events(
+        &inner,
+        &store,
+        &api,
+        &box_id,
+        &run_id,
+        doc,
+        &cancel_rx,
+        &interrupt_token,
+        None,
+        None,
+    )
+    .await;
+    cleanup().await;
+    match outcome {
+        BoatOutcome::Done => finish(SessionStatus::Idle, zeron_proto::CloudRunStatus::Done, None),
+        BoatOutcome::Stopped => finish(
+            SessionStatus::Idle,
+            zeron_proto::CloudRunStatus::Stopped,
+            None,
+        ),
+        BoatOutcome::Failed(message) => fail(message),
+    }
+}
+
+/// How a mirrored Boat turn ended.
+enum BoatOutcome {
+    Done,
+    Stopped,
+    Failed(String),
+}
+
+/// Mirror a Boat box's integrated-agent `/events` into the chat until the
+/// turn finishes, errors, stalls, or is cancelled. The cursor is recorded on
+/// the run after every page, so a reopened app resumes from it.
+#[allow(clippy::too_many_arguments)]
+async fn mirror_boat_events(
+    inner: &Arc<Inner>,
+    store: &crate::cloud::CloudStore,
+    api: &crate::boat::Boat<'_>,
+    box_id: &str,
+    run_id: &str,
+    doc: &crate::doc_host::DocWriter,
+    cancel_rx: &watch::Receiver<bool>,
+    interrupt_token: &CancellationToken,
+    mut cursor: Option<String>,
+    // A reattach continues the run's own entry from the recorded cursor.
+    resume_entry: Option<&str>,
+) -> BoatOutcome {
+    let resumed = resume_entry.and_then(|id| {
+        doc.find_entry(id).map(|(index, written)| {
+            let text = written
+                .iter()
+                .find_map(|part| match part {
+                    MessagePart::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            (
+                id.to_string(),
+                zeron_doc::SegmentWriter::resume(doc, index, written),
+                text,
+            )
+        })
+    });
+    let (entry_id, mut segment, mut text) = match resumed {
+        Some((id, segment, text)) => (id, Some(segment), text),
+        None => {
+            let id = new_id();
+            let segment =
+                zeron_doc::SegmentWriter::begin(doc, &id, &inner.device_id, now_ms()).ok();
+            (id, segment, String::new())
+        }
+    };
+    store.update_run(run_id, |run| run.entry_id = Some(entry_id.clone()));
     let mut idle_ticks = 0u32;
+    let close = |segment: &mut Option<zeron_doc::SegmentWriter>,
+                 text: &str,
+                 status: zeron_doc::MessageStatus| {
+        if let Some(segment) = segment.take() {
+            let _ = segment.finish(
+                &[MessagePart::Text {
+                    id: "t0".into(),
+                    text: text.to_string(),
+                }],
+                status,
+            );
+        }
+    };
     loop {
         if *cancel_rx.borrow() || interrupt_token.is_cancelled() {
-            let _ = api.interrupt(&box_id).await;
-            if let Some(segment) = segment {
-                let _ = segment.finish(
-                    &[MessagePart::Text {
-                        id: "t0".into(),
-                        text: text.clone(),
-                    }],
-                    zeron_doc::MessageStatus::Aborted,
-                );
-            }
-            finish(
-                SessionStatus::Idle,
-                zeron_proto::CloudRunStatus::Stopped,
-                None,
-            );
-            return;
+            let _ = api.interrupt(box_id).await;
+            close(&mut segment, &text, zeron_doc::MessageStatus::Aborted);
+            return BoatOutcome::Stopped;
         }
-        match api.events(&box_id, cursor.as_deref()).await {
+        match api.events(box_id, cursor.as_deref()).await {
             Ok(v) => {
-                let items = v
+                let Some(items) = v
                     .get("events")
                     .or_else(|| v.get("items"))
                     .and_then(|e| e.as_array())
                     .cloned()
-                    .unwrap_or_default();
+                else {
+                    close(&mut segment, &text, zeron_doc::MessageStatus::Aborted);
+                    return BoatOutcome::Failed(
+                        "boat: unexpected response from /sandboxes/{id}/events: missing events"
+                            .into(),
+                    );
+                };
                 let mut grew = false;
                 let mut done = false;
                 for event in items {
@@ -2263,22 +3129,13 @@ async fn drive_boat_run(
                         }
                         "done" | "complete" | "finished" => done = true,
                         "error" => {
-                            let msg = data
+                            let message = data
                                 .get("message")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("the Boat agent errored")
                                 .to_string();
-                            if let Some(segment) = segment.take() {
-                                let _ = segment.finish(
-                                    &[MessagePart::Text {
-                                        id: "t0".into(),
-                                        text,
-                                    }],
-                                    zeron_doc::MessageStatus::Aborted,
-                                );
-                            }
-                            fail(msg);
-                            return;
+                            close(&mut segment, &text, zeron_doc::MessageStatus::Aborted);
+                            return BoatOutcome::Failed(message);
                         }
                         _ => {}
                     }
@@ -2290,6 +3147,10 @@ async fn drive_boat_run(
                 {
                     cursor = Some(next.to_string());
                 }
+                if cursor.is_some() {
+                    let at = cursor.clone();
+                    store.update_run(run_id, |run| run.remote_cursor = at);
+                }
                 if grew {
                     if let Some(segment) = segment.as_mut() {
                         let _ = segment.sync(&[MessagePart::Text {
@@ -2297,60 +3158,270 @@ async fn drive_boat_run(
                             text: text.clone(),
                         }]);
                     }
-                    store.update_run(&run_id, |run| run.mirrored_bytes = text.len() as u64);
+                    store.update_run(run_id, |run| run.mirrored_bytes = text.len() as u64);
                     idle_ticks = 0;
                 } else {
                     idle_ticks += 1;
                 }
                 if done {
-                    if let Some(segment) = segment.take() {
-                        let _ = segment.finish(
-                            &[MessagePart::Text {
-                                id: "t0".into(),
-                                text,
-                            }],
-                            zeron_doc::MessageStatus::Complete,
-                        );
-                    }
-                    finish(SessionStatus::Idle, zeron_proto::CloudRunStatus::Done, None);
-                    return;
+                    close(&mut segment, &text, zeron_doc::MessageStatus::Complete);
+                    return BoatOutcome::Done;
                 }
             }
             Err(e) => {
                 // A dead box mid-run is terminal; a transient network error
-                // is not — keep polling for ~2 min before giving up.
+                // is not — keep polling before giving up.
                 idle_ticks += 1;
-                if api
-                    .sandbox(&box_id)
-                    .await
-                    .map(|s| s.dead())
-                    .unwrap_or(false)
-                {
-                    fail(format!("the Boat box died mid-run: {e}"));
-                    return;
+                if api.sandbox(box_id).await.map(|s| s.dead()).unwrap_or(false) {
+                    close(&mut segment, &text, zeron_doc::MessageStatus::Aborted);
+                    return BoatOutcome::Failed(format!("the Boat box died mid-run: {e}"));
                 }
             }
         }
         // No events for ~10 min → the agent likely wedged; end honestly.
         if idle_ticks > 300 {
-            if let Some(segment) = segment.take() {
-                let _ = segment.finish(
-                    &[MessagePart::Text {
-                        id: "t0".into(),
-                        text,
-                    }],
-                    zeron_doc::MessageStatus::Aborted,
-                );
-            }
-            fail("no agent events for 10 minutes — the run likely stalled on the box".into());
-            return;
+            close(&mut segment, &text, zeron_doc::MessageStatus::Aborted);
+            return BoatOutcome::Failed(
+                "no agent events for 10 minutes — the run likely stalled on the box".into(),
+            );
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
 
+/// Renders Claude Code's `--output-format stream-json` events as transcript
+/// text while the run is still going: assistant prose as paragraphs, each
+/// tool call as one `›` line, the final result only when it adds something.
+/// Lines that aren't JSON (an install notice, a shell error) pass through.
+#[derive(Default)]
+struct StreamJsonRenderer {
+    partial: Vec<u8>,
+    last_text: String,
+    after_tool: bool,
+}
+
+impl StreamJsonRenderer {
+    fn for_command(command: &str) -> Option<Self> {
+        command
+            .contains("--output-format stream-json")
+            .then(Self::default)
+    }
+
+    /// Feed raw output; returns the text for every line it completes.
+    fn push(&mut self, chunk: &[u8]) -> String {
+        self.partial.extend_from_slice(chunk);
+        let mut out = String::new();
+        while let Some(at) = self.partial.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.partial.drain(..=at).collect();
+            out.push_str(&self.render_line(&String::from_utf8_lossy(&line)));
+        }
+        out
+    }
+
+    /// The stream ended: render a last unterminated line, if any.
+    fn finish(&mut self) -> String {
+        let line = std::mem::take(&mut self.partial);
+        self.render_line(&String::from_utf8_lossy(&line))
+    }
+
+    fn render_line(&mut self, line: &str) -> String {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.trim().is_empty() {
+            return String::new();
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            self.after_tool = false;
+            return format!("{line}\n");
+        };
+        let mut out = String::new();
+        match event.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                let blocks = event
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                for block in blocks {
+                    match block.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            let text = block
+                                .get("text")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or_default()
+                                .trim();
+                            if text.is_empty() {
+                                continue;
+                            }
+                            if self.after_tool {
+                                out.push('\n');
+                            }
+                            out.push_str(text);
+                            out.push_str("\n\n");
+                            self.last_text = text.to_string();
+                            self.after_tool = false;
+                        }
+                        Some("tool_use") => {
+                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                            let input = block.get("input").cloned().unwrap_or_default();
+                            out.push_str(&format!("› {}\n", tool_line(name, &input)));
+                            self.after_tool = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("result") => {
+                let result = event
+                    .get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or_default()
+                    .trim();
+                let is_error = event
+                    .get("is_error")
+                    .and_then(|e| e.as_bool())
+                    .unwrap_or(false);
+                if self.after_tool {
+                    out.push('\n');
+                }
+                if is_error {
+                    out.push_str(&format!(
+                        "⚠ {}\n",
+                        if result.is_empty() {
+                            "the agent stopped with an error"
+                        } else {
+                            result
+                        }
+                    ));
+                } else if !result.is_empty() && result != self.last_text {
+                    out.push_str(result);
+                    out.push('\n');
+                }
+                self.after_tool = false;
+            }
+            // system/init, tool results, rate-limit notices: not transcript.
+            _ => {}
+        }
+        out
+    }
+}
+
+/// One readable line for a tool call: what it touched, not its full input.
+fn tool_line(name: &str, input: &serde_json::Value) -> String {
+    let field = |key: &str| {
+        input
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let clip = |text: &str| {
+        let first = text.lines().next().unwrap_or_default();
+        let mut clipped: String = first.chars().take(120).collect();
+        if clipped.len() < first.len() || text.lines().nth(1).is_some() {
+            clipped.push('…');
+        }
+        clipped
+    };
+    let detail = match name {
+        "Bash" => field("command").map(|c| format!("`{}`", clip(c))),
+        "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => field("file_path")
+            .or_else(|| field("notebook_path"))
+            .map(str::to_string),
+        "Glob" | "Grep" => field("pattern").map(|p| format!("`{}`", clip(p))),
+        "WebFetch" => field("url").map(str::to_string),
+        "WebSearch" => field("query").map(str::to_string),
+        "Task" | "Agent" => field("description").map(str::to_string),
+        "TodoWrite" => Some("task list".to_string()),
+        _ => None,
+    };
+    match detail {
+        Some(detail) => format!("{name} {detail}"),
+        None => name.to_string(),
+    }
+}
+
+#[derive(Default)]
+struct AnsiStripper {
+    state: AnsiState,
+}
+
+#[derive(Default, Clone, Copy)]
+enum AnsiState {
+    #[default]
+    Text,
+    Escape,
+    Csi,
+    Osc,
+    OscEscape,
+}
+
+impl AnsiStripper {
+    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut text = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            match self.state {
+                AnsiState::Text if byte == 0x1b => self.state = AnsiState::Escape,
+                AnsiState::Text => text.push(byte),
+                AnsiState::Escape => {
+                    self.state = match byte {
+                        b'[' => AnsiState::Csi,
+                        b']' => AnsiState::Osc,
+                        _ => {
+                            text.extend_from_slice(&[0x1b, byte]);
+                            AnsiState::Text
+                        }
+                    };
+                }
+                AnsiState::Csi if (0x40..=0x7e).contains(&byte) => {
+                    self.state = AnsiState::Text;
+                }
+                AnsiState::Csi => {}
+                AnsiState::Osc if byte == 0x07 => self.state = AnsiState::Text,
+                AnsiState::Osc if byte == 0x1b => self.state = AnsiState::OscEscape,
+                AnsiState::Osc => {}
+                AnsiState::OscEscape if byte == b'\\' => self.state = AnsiState::Text,
+                AnsiState::OscEscape if byte == 0x07 => self.state = AnsiState::Text,
+                AnsiState::OscEscape if byte == 0x1b => {}
+                AnsiState::OscEscape => self.state = AnsiState::Osc,
+            }
+        }
+        text
+    }
+}
+
+fn parse_remote_tail_output(
+    run_id: &str,
+    stdout: &str,
+) -> Result<(Vec<u8>, bool, Option<i32>), String> {
+    use base64::Engine as _;
+
+    let begin = format!("__cosmos_tail_begin_{run_id}__\n");
+    let end = format!("\n__cosmos_tail_end_{run_id}__");
+    let (_, framed) = stdout
+        .split_once(&begin)
+        .ok_or_else(|| "remote log response has no start marker".to_string())?;
+    let (encoded, metadata) = framed
+        .split_once(&end)
+        .ok_or_else(|| "remote log response has no end marker".to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|err| format!("invalid remote log frame: {err}"))?;
+
+    let mut alive = false;
+    let mut remote_exit = None;
+    for line in metadata.lines() {
+        if let Some(flag) = line.strip_prefix("__alive_") {
+            alive = flag.trim() == "0";
+        } else if let Some(status) = line.strip_prefix("__exit_") {
+            remote_exit = status.trim().parse::<i32>().ok();
+        }
+    }
+    Ok((bytes, alive, remote_exit))
+}
+
 /// Tail a detached run's log on the seat, mirroring new bytes into the doc
 /// until the remote process exits (or the caller cancels).
+#[allow(clippy::too_many_arguments)]
 async fn tail_remote_log(
     inner: &Arc<Inner>,
     http: &reqwest::Client,
@@ -2361,19 +3432,37 @@ async fn tail_remote_log(
     log_path: &str,
     doc: &crate::doc_host::DocWriter,
     cancel_rx: &mut watch::Receiver<bool>,
+    // A reattach reopens the run's own transcript entry and rebuilds it from
+    // the start of the log — whatever reached the doc before the app closed
+    // is rewritten in place, so nothing is lost or repeated.
+    resume_entry: Option<&str>,
+    // The run's harness command — picks how its output renders.
+    command: &str,
 ) {
-    let entry_id = new_id();
-    let mut segment =
-        zeron_doc::SegmentWriter::begin(doc, &entry_id, &inner.device_id, now_ms()).ok();
+    let mut render = StreamJsonRenderer::for_command(command);
+    let (entry_id, mut segment) = match resume_entry.and_then(|id| {
+        doc.find_entry(id).map(|(index, written)| {
+            (
+                id.to_string(),
+                zeron_doc::SegmentWriter::resume(doc, index, written),
+            )
+        })
+    }) {
+        Some((id, segment)) => (id, Some(segment)),
+        None => (new_id(), None),
+    };
+    store.update_run(run_id, |run| run.entry_id = Some(entry_id.clone()));
     let mut mirrored: u64 = 0;
     let mut text = String::new();
+    let mut ansi = AnsiStripper::default();
+    let mut ssh_255_streak = 0u8;
     loop {
         if *cancel_rx.borrow() {
             let _ = segment.take().and_then(|s| {
                 s.finish(
                     &[MessagePart::Text {
                         id: "t0".into(),
-                        text: text.clone(),
+                        text: preserve_line_breaks(&text),
                     }],
                     zeron_doc::MessageStatus::Aborted,
                 )
@@ -2387,45 +3476,85 @@ async fn tail_remote_log(
             lock(&inner.runs).remove(chat_id);
             return;
         }
-        // `tail -c +N` streams from byte N; `kill -0` reports liveness.
+        // Base64 frames the log bytes separately from metadata so neither
+        // framing newlines nor line-ending normalization can move the cursor.
         let cmd = format!(
-            "tail -c +{} -- {} 2>/dev/null | head -c 262144; echo; kill -0 $(cat ~/.cosmos/runs/{run_id}.pid 2>/dev/null) 2>/dev/null; echo __alive_$?",
+            "printf '__cosmos_tail_begin_{run_id}__\\n'; tail -c +{} -- \"{log_path}\" 2>/dev/null | head -c 262144 | base64 | tr -d '\\n'; printf '\\n__cosmos_tail_end_{run_id}__\\n'; if [ -f \"$HOME/.cosmos/runs/{run_id}.exit\" ]; then printf '__exit_%s\\n' \"$(cat \"$HOME/.cosmos/runs/{run_id}.exit\")\"; else kill -0 \"$(cat \"$HOME/.cosmos/runs/{run_id}.pid\" 2>/dev/null)\" 2>/dev/null; echo __alive_$?; fi",
             mirrored + 1,
-            crate::cloud::shell_word(log_path),
         );
         match crate::cloud::seat_exec(http, store, seat, &cmd, std::time::Duration::from_secs(20))
             .await
         {
             Ok(out) => {
-                let mut alive = false;
-                let mut chunk = String::new();
-                for line in out.stdout.lines() {
-                    if let Some(flag) = line.strip_prefix("__alive_") {
-                        alive = flag.trim() == "0";
-                    } else {
-                        chunk.push_str(line);
-                        chunk.push('\n');
-                    }
+                if out.code == 255 {
+                    ssh_255_streak = ssh_255_streak.saturating_add(1);
+                } else {
+                    ssh_255_streak = 0;
                 }
+                if ssh_255_streak >= 3
+                    || out.stderr.contains("Permission denied")
+                    || out.stdout.contains("Permission denied")
+                {
+                    terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, &text);
+                    return;
+                }
+                let (chunk, alive, remote_exit) =
+                    match parse_remote_tail_output(run_id, &out.stdout) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            tracing::warn!(run_id, %error, "failed to parse remote log tail");
+                            (Vec::new(), false, None)
+                        }
+                    };
                 if !chunk.is_empty() {
-                    text.push_str(&chunk);
                     mirrored += chunk.len() as u64;
+                    let clean = ansi.push(&chunk);
+                    match render.as_mut() {
+                        Some(render) => text.push_str(&render.push(&clean)),
+                        None => text.push_str(&String::from_utf8_lossy(&clean)),
+                    }
+                    if segment.is_none() {
+                        segment = zeron_doc::SegmentWriter::begin(
+                            doc,
+                            &entry_id,
+                            &inner.device_id,
+                            now_ms(),
+                        )
+                        .ok();
+                    }
                     if let Some(segment) = segment.as_mut() {
                         let _ = segment.sync(&[MessagePart::Text {
                             id: "t0".into(),
-                            text: text.clone(),
+                            text: preserve_line_breaks(&text),
                         }]);
                     }
                     store.update_run(run_id, |run| run.mirrored_bytes = mirrored);
                 }
-                if out.code != 0 || !alive {
+                if out.code != 0 || remote_exit.is_some() || !alive {
+                    if let Some(render) = render.as_mut() {
+                        text.push_str(&render.finish());
+                    }
+                    let done =
+                        out.code == 0 && remote_exit == Some(0) && !remote_agent_failed(0, &text);
+                    let error = (!done).then(|| {
+                        let status = remote_exit.unwrap_or_else(|| out.code.max(1));
+                        let stderr = if remote_exit.is_none() && out.stderr.is_empty() {
+                            "remote agent ended without an exit status".to_string()
+                        } else {
+                            out.stderr.clone()
+                        };
+                        remote_agent_failure_message(status, &text, &stderr)
+                    });
+                    if let Some(message) = error.as_deref() {
+                        write_remote_error(doc, &inner.device_id, message);
+                    }
                     let _ = segment.take().and_then(|s| {
                         s.finish(
                             &[MessagePart::Text {
                                 id: "t0".into(),
-                                text: text.clone(),
+                                text: preserve_line_breaks(&text),
                             }],
-                            if out.code == 0 {
+                            if done {
                                 zeron_doc::MessageStatus::Complete
                             } else {
                                 zeron_doc::MessageStatus::Aborted
@@ -2433,7 +3562,6 @@ async fn tail_remote_log(
                         )
                         .ok()
                     });
-                    let done = out.code == 0;
                     inner.set_status(
                         chat_id,
                         if done {
@@ -2449,6 +3577,7 @@ async fn tail_remote_log(
                         } else {
                             zeron_proto::CloudRunStatus::Error
                         };
+                        run.error = error;
                         run.finished_at = Some(Utc::now());
                     });
                     lock(&inner.runs).remove(chat_id);
@@ -2456,6 +3585,14 @@ async fn tail_remote_log(
                 }
             }
             Err(e) => {
+                if e.contains("expired")
+                    || e.contains("Permission denied")
+                    || (matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Railway))
+                        && e.contains("Railway"))
+                {
+                    terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, &text);
+                    return;
+                }
                 tracing::warn!(seat = %seat.id, error = %e, "cloud run log tail failed");
             }
         }
@@ -2464,6 +3601,65 @@ async fn tail_remote_log(
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
         }
     }
+}
+
+const CLOUD_EXPIRY_MESSAGE: &str =
+    "Cloud seat expired — the run was cut off. Reprovision the seat to continue.";
+
+fn terminal_cloud_run(
+    inner: &Arc<Inner>,
+    store: &crate::cloud::CloudStore,
+    chat_id: &str,
+    run_id: &str,
+    segment: &mut Option<zeron_doc::SegmentWriter>,
+    text: &str,
+) {
+    let _ = segment.take().and_then(|s| {
+        s.finish(
+            &[MessagePart::Text {
+                id: "t0".into(),
+                text: text.to_string(),
+            }],
+            zeron_doc::MessageStatus::Aborted,
+        )
+        .ok()
+    });
+    inner.set_status(chat_id, SessionStatus::Errored, false);
+    store.update_run(run_id, |run| {
+        run.status = zeron_proto::CloudRunStatus::Error;
+        run.error = Some(CLOUD_EXPIRY_MESSAGE.to_string());
+        run.finished_at = Some(Utc::now());
+    });
+    lock(&inner.runs).remove(chat_id);
+}
+
+/// Seat harnesses print plain terminal text; in the transcript's markdown a
+/// single newline would fold lines into one paragraph. Hard-break them
+/// (outside code fences) so the output reads the way it printed.
+fn preserve_line_breaks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 16);
+    let mut in_fence = false;
+    let mut lines = text.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        let fence = line.trim_start().starts_with("```");
+        if fence {
+            in_fence = !in_fence;
+        }
+        out.push_str(line);
+        if let Some(next) = lines.peek() {
+            let hard = !in_fence
+                && !fence
+                && !line.trim().is_empty()
+                && !next.trim().is_empty()
+                && !line.ends_with("  ")
+                && !next.trim_start().starts_with("```");
+            if hard {
+                out.push_str("  ");
+            }
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// An honest error line in the transcript when a remote run can't even start.
@@ -2481,6 +3677,158 @@ fn write_remote_error(doc: &crate::doc_host::DocWriter, device_id: &str, message
         continuation_of: None,
         duration_ms: None,
     });
+}
+
+fn remote_agent_failed(status: i32, stdout: &str) -> bool {
+    status != 0 || stdout.trim().is_empty()
+}
+
+fn remote_agent_failure_message(status: i32, stdout: &str, stderr: &str) -> String {
+    let output = [stdout.trim_end(), stderr.trim_end()]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // ssh's own "Connection to … closed." (from `-tt`) is transport noise,
+    // never the reason a run failed.
+    let lines = output
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !(line.starts_with("Connection to ") && line.ends_with(" closed."))
+        })
+        .collect::<Vec<_>>();
+    if !lines.is_empty() {
+        return lines[lines.len().saturating_sub(20)..].join("\n");
+    }
+    if status == 0 {
+        "remote agent exited successfully without output".into()
+    } else {
+        format!("seat run exited {status}")
+    }
+}
+
+fn write_transcript_note(doc: &crate::doc_host::DocWriter, device_id: &str, message: &str) {
+    let _ = doc.push_message(&SessionMessageEntry {
+        id: new_id(),
+        role: zeron_doc::MessageRole::Assistant,
+        parts: vec![MessagePart::Text {
+            id: "t0".into(),
+            text: message.to_string(),
+        }],
+        created_at: now_ms(),
+        device_id: device_id.to_string(),
+        status: Some(zeron_doc::MessageStatus::Complete),
+        continuation_of: None,
+        duration_ms: None,
+    });
+}
+
+#[cfg(test)]
+mod line_break_tests {
+    use super::preserve_line_breaks;
+
+    #[test]
+    fn plain_lines_hard_break_but_fences_stay_verbatim() {
+        assert_eq!(preserve_line_breaks("a\nb\n\nc"), "a  \nb\n\nc");
+        assert_eq!(
+            preserve_line_breaks("x\n```\nl1\nl2\n```\ny"),
+            "x\n```\nl1\nl2\n```\ny"
+        );
+        assert_eq!(preserve_line_breaks("done"), "done");
+    }
+}
+
+#[cfg(test)]
+mod remote_agent_failure_tests {
+    use super::{StreamJsonRenderer, remote_agent_failed, remote_agent_failure_message};
+
+    #[test]
+    fn failed_stub_remote_surfaces_recent_stderr() {
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "printf '%s\\n' 'Not logged in · Please run /login' >&2; exit 1",
+            ])
+            .output()
+            .expect("run stub remote command");
+        let status = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(remote_agent_failed(status, &stdout));
+        assert_eq!(
+            remote_agent_failure_message(status, &stdout, &stderr),
+            "Not logged in · Please run /login"
+        );
+    }
+
+    #[test]
+    fn claude_stream_json_renders_progress_as_it_arrives() {
+        let mut render = StreamJsonRenderer::for_command(
+            "IS_SANDBOX=1 claude -p --output-format stream-json --verbose",
+        )
+        .expect("stream-json command renders");
+        assert!(StreamJsonRenderer::for_command("codex exec").is_none());
+        let lines = [
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I'll build the page."}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la\necho hi"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"total 0"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"/app/index.html","content":"<html>"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done — the page is live."}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Done — the page is live."}"#,
+        ];
+        let stream = lines.join("\n") + "\n";
+        // Split mid-line (and mid-character): output only lands per line.
+        let bytes = stream.as_bytes();
+        let cut = stream.find("page is").unwrap() + 2;
+        let mut out = render.push(&bytes[..cut]);
+        assert!(!out.contains("Done"));
+        out.push_str(&render.push(&bytes[cut..]));
+        out.push_str(&render.finish());
+        assert_eq!(
+            out,
+            "I'll build the page.\n\n› Bash `ls -la…`\n› Write /app/index.html\n\nDone — the page is live.\n\n"
+        );
+    }
+
+    #[test]
+    fn claude_stream_json_surfaces_errors_and_plain_lines() {
+        let mut render = StreamJsonRenderer::default();
+        let out = render.push(
+            b"`claude` isn't installed on this seat\n{\"type\":\"result\",\"is_error\":true,\"result\":\"Invalid API key \xc2\xb7 Please run /login\"}",
+        );
+        assert_eq!(out, "`claude` isn't installed on this seat\n");
+        assert_eq!(render.finish(), "⚠ Invalid API key · Please run /login\n");
+        assert_eq!(render.finish(), "");
+    }
+
+    #[test]
+    fn ssh_transport_noise_never_reads_as_the_failure() {
+        assert_eq!(
+            remote_agent_failure_message(
+                127,
+                "`claude` isn't installed on this seat\r\n",
+                "Connection to 127.0.0.1 closed.\r\n"
+            ),
+            "`claude` isn't installed on this seat"
+        );
+        assert_eq!(
+            remote_agent_failure_message(255, "", "Connection to railway.new closed.\n"),
+            "seat run exited 255"
+        );
+    }
+
+    #[test]
+    fn successful_remote_without_agent_output_is_a_failure() {
+        assert!(remote_agent_failed(0, " \n"));
+        assert_eq!(
+            remote_agent_failure_message(0, "", ""),
+            "remote agent exited successfully without output"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2615,7 +3963,20 @@ async fn drive_run(
     // routes into a live run) starts the next turn with zero respawn/resume
     // latency. `Some(when)` = idle since then; the 30-min reaper below ends
     // a session nobody comes back to (zeron SESSION_IDLE_MS).
-    const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+    // `ZERON_SESSION_IDLE_MS` overrides the window (tests).
+    let session_idle = std::env::var("ZERON_SESSION_IDLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(30 * 60));
+    // A live subagent stretches the window, but never unbounded: every
+    // driver's subagent terminal is a best-effort vendor signal (claude's
+    // untagged task_notification, grok's subagent_finished, codex thread
+    // closure), and one lost signal would otherwise pin the child — and this
+    // loop's registry heartbeat — until the chat is archived. A subagent
+    // silent this long (4h by default) is presumed lost; the reap stamps its
+    // chip failed.
+    let subagent_silence = session_idle * 8;
     let mut idle_since: Option<tokio::time::Instant> = None;
     let steerable = harness.supports_steering();
     // TURN-QUIESCE WATCHDOG (2026-08-12 stuck-Working incident): a harness
@@ -2680,6 +4041,10 @@ async fn drive_run(
     // Live subagent sinks, parent tool-use id → transcript doc state.
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();
+    // Last tagged subagent event. A background subagent outlives the turn that
+    // spawned it, and its traffic never un-parks the chat, so the idle reaper
+    // measures from here as well as from the park.
+    let mut last_subagent_activity: Option<tokio::time::Instant> = None;
 
     let mut final_completed_turn = None;
     let final_status = loop {
@@ -2711,10 +4076,22 @@ async fn drive_run(
                 // Idle reaper (zeron SESSION_IDLE_MS): a parked persistent session
                 // nobody returned to in 30 minutes releases its child. The turn
                 // was finalized at Done, so this end is clean — no aborted stamp.
+                // A live background subagent is somebody still using the child:
+                // the window counts from its last activity, and stretches to
+                // `subagent_silence` while its sink is open.
                 _ = tokio::time::sleep_until(
-                    idle_since.map(|at| at + SESSION_IDLE).unwrap_or_else(tokio::time::Instant::now)
+                    idle_since
+                        .map(|at| {
+                            at.max(last_subagent_activity.unwrap_or(at))
+                                + if subagents.is_empty() { session_idle } else { subagent_silence }
+                        })
+                        .unwrap_or_else(tokio::time::Instant::now)
                 ), if idle_since.is_some() => {
-                    tracing::info!(chat = %chat_id, "reaping idle persistent session");
+                    tracing::info!(
+                        chat = %chat_id,
+                        live_subagents = subagents.len(),
+                        "reaping idle persistent session"
+                    );
                     if let Some(token) = lock(&inner.runs)
                         .get(&chat_id)
                         .filter(|h| h.run_id == run_id)
@@ -2759,6 +4136,8 @@ async fn drive_run(
                     },
                 },
                 _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) => {
+                    #[cfg(test)]
+                    FLUSH_TICKS.with(|t| t.set(t.get() + 1));
                     // Coalesced STREAM_COMMIT_MS tick: one doc commit per window
                     // (parent + any dirty subagent docs).
                     if dirty {
@@ -2868,6 +4247,7 @@ async fn drive_run(
         } = &event
         {
             inner.publish(&chat_id, &event);
+            last_subagent_activity = Some(tokio::time::Instant::now());
             let is_steer = matches!(
                 sub_event.as_ref(),
                 AgentEvent::UserMessage { .. } | AgentEvent::Steered { .. }
@@ -2963,8 +4343,18 @@ async fn drive_run(
                     sink.push_user(&device_id, text);
                     continue;
                 }
+                let was_clean = !sink.dirty;
                 zeron_doc::fold_event_into_parts(&mut sink.folded, sub_event);
                 sink.dirty = true;
+                // A sink waking on its own must arm the same commit window
+                // the parent's dirty flag does — `flush_at` is otherwise only
+                // rescheduled on the parent's flip, so a past deadline would
+                // fire the commit branch on every event instead of once per
+                // STREAM_COMMIT_MS window.
+                if was_clean && !dirty && flush_at <= tokio::time::Instant::now() {
+                    flush_at = tokio::time::Instant::now()
+                        + std::time::Duration::from_millis(STREAM_COMMIT_MS);
+                }
                 if !chip_streaming && done {
                     // In-place chip refresh on lifecycle transitions only —
                     // content never rewrites the parent doc.
@@ -3480,6 +4870,59 @@ async fn drive_run(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn remote_tail_frame(run_id: &str, bytes: &[u8], metadata: &str) -> String {
+        use base64::Engine as _;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        format!(
+            "__cosmos_tail_begin_{run_id}__\n{encoded}\n__cosmos_tail_end_{run_id}__\n{metadata}\n"
+        )
+    }
+
+    #[test]
+    fn remote_log_ansi_stripper_removes_csi_and_osc_sequences() {
+        let mut stripper = AnsiStripper::default();
+        assert_eq!(
+            stripper.push(b"\x1b[0mWrite hello.txt\x1b]0;remote title\x07!"),
+            b"Write hello.txt!"
+        );
+    }
+
+    #[test]
+    fn remote_log_ansi_stripper_handles_sequences_split_across_chunks() {
+        let mut stripper = AnsiStripper::default();
+        assert_eq!(stripper.push(b"\x1b[0"), b"");
+        assert_eq!(stripper.push(b"mHello\x1b]0;title\x1b"), b"Hello");
+        assert_eq!(stripper.push(b"\\!"), b"!");
+    }
+
+    #[test]
+    fn remote_tail_offset_preserves_first_character_after_partial_poll() {
+        let run_id = "offset-test";
+        let first_chunk = b"\x1b[0mworking";
+        let first_stdout = remote_tail_frame(run_id, first_chunk, "__alive_0");
+        let (decoded, alive, exit) = parse_remote_tail_output(run_id, &first_stdout).unwrap();
+        assert_eq!(decoded, first_chunk);
+        assert!(alive);
+        assert_eq!(exit, None);
+
+        let old_reconstructed_offset = String::from_utf8_lossy(first_chunk)
+            .lines()
+            .map(|line| line.len() + 1)
+            .sum::<usize>();
+        let appended = b"Hello!";
+        let mut full_log = first_chunk.to_vec();
+        full_log.extend_from_slice(appended);
+        assert_eq!(&full_log[old_reconstructed_offset..], b"ello!");
+
+        let next_stdout = remote_tail_frame(run_id, &full_log[decoded.len()..], "__exit_0");
+        let (next, _, exit) = parse_remote_tail_output(run_id, &next_stdout).unwrap();
+        assert_eq!(next, appended);
+        assert_eq!(exit, Some(0));
+    }
+
     #[test]
     fn cursor_recovery_converts_rich_messages_before_json_encoding() {
         let doc = zeron_doc::SessionDoc::init("cursor-rich-recovery").unwrap();
@@ -3571,7 +5014,6 @@ mod tests {
         assert_eq!(doc.read_entries().unwrap().len(), 4);
     }
 
-    use super::{RuntimeConfig, subagent_doc_id};
     use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
 
     #[tokio::test]
@@ -3703,5 +5145,139 @@ mod tests {
             subagent_doc_id("chat", "a:b"),
             subagent_doc_id("chat", "a:c")
         );
+    }
+
+    #[tokio::test]
+    async fn subagent_sink_flush_clears_dirty_when_nothing_folded() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store,
+            crate::doc_host::DocHostConfig {
+                device_id: "dev-test".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open("chat-sub-flush--sub--t1").unwrap();
+        let mut sink = SubagentSink {
+            doc_id: "chat-sub-flush--sub--t1".into(),
+            doc: handle.writer(),
+            entry_id: "entry-1".into(),
+            started_at: 0,
+            entry_index: None,
+            written: Vec::new(),
+            folded: Vec::new(),
+            dirty: true,
+        };
+        // Nothing to write is still a completed flush — left set, the flag
+        // holds the run loop's commit guard open on a past deadline.
+        sink.flush("dev-test");
+        assert!(!sink.dirty);
+    }
+
+    /// Feed-by-hand harness: the test pushes wire events through a channel
+    /// and decides when the stream ends.
+    struct FeedHarness {
+        feed: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Harness for FeedHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Feed"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> zeron_proto::SteeringMode {
+            zeron_proto::SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[zeron_proto::ReasoningLevel] {
+            &[zeron_proto::ReasoningLevel::Medium]
+        }
+        async fn models(&self) -> Result<Vec<zeron_proto::Model>, zeron_harness::HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<AgentEvent, zeron_harness::HarnessError>>,
+            zeron_harness::HarnessError,
+        > {
+            let mut feed = self
+                .feed
+                .lock()
+                .unwrap()
+                .take()
+                .expect("FeedHarness serves one run per test");
+            Ok(futures::stream::poll_fn(move |cx| feed.poll_recv(cx).map(|e| e.map(Ok))).boxed())
+        }
+    }
+
+    // A tagged subagent event that folds to NO parts used to leave its sink
+    // dirty forever: the commit branch's guard stayed true on a deadline in
+    // the past and the run loop burned a core until real content arrived.
+    #[tokio::test]
+    async fn empty_subagent_events_commit_once_per_window_not_per_tick() {
+        use super::*;
+        FLUSH_TICKS.with(|t| t.set(0));
+        let (feed, rx) = mpsc::unbounded_channel();
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(FeedHarness {
+            feed: Mutex::new(Some(rx)),
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let core =
+            crate::EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+                .unwrap();
+        let chat = "chat-sink-spin";
+        core.sessions
+            .dispatch(chat, HarnessId::Mock, request(), None)
+            .await
+            .unwrap();
+        feed.send(AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock-1".into(),
+            tools: vec![],
+            cwd: "/tmp".into(),
+            session_id: "hs-1".into(),
+            assistant_message_id: "a1".into(),
+        })
+        .unwrap();
+        feed.send(AgentEvent::Subagent {
+            parent_tool_use_id: "tool-1".into(),
+            event: Box::new(AgentEvent::ReasoningDelta {
+                text: String::new(),
+            }),
+        })
+        .unwrap();
+        // Well past several commit windows with the stream still open: the
+        // loop must idle between commits, not spin on a past deadline.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let ticks = FLUSH_TICKS.with(|t| t.get());
+        assert!(
+            (1..=8).contains(&ticks),
+            "commit branch fired {ticks} times in 1s for one empty subagent event"
+        );
+        assert_eq!(
+            core.sessions.session_status(chat).map(|s| s.status),
+            Some(SessionStatus::Working),
+            "stream still open, turn still running"
+        );
+        feed.send(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+        })
+        .unwrap();
+        core.sessions.shutdown().await;
     }
 }

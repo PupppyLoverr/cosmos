@@ -57,13 +57,25 @@ pub struct CloudView {
     pub automations: Vec<CloudAutomation>,
     pub default_seat: Option<String>,
     pub runs: Vec<CloudRun>,
+    /// Per-chat workspace snapshots held on this computer.
+    pub backups: Vec<zeron_proto::WorkspaceBackup>,
+    /// Kanban tasks saved but not started.
+    pub drafts: Vec<zeron_proto::TaskDraft>,
     /// The shared GitHub PAT exists (the repo picker's token flag).
     pub has_github_pat: bool,
+    pub load_error: Option<String>,
 }
 
 impl CloudView {
     pub fn seat(&self, seat_id: &str) -> Option<&SeatRow> {
         self.seats.iter().find(|s| s.config.id == seat_id)
+    }
+
+    pub fn backup_for_chat(&self, chat_id: &str) -> Option<&zeron_proto::WorkspaceBackup> {
+        self.backups
+            .iter()
+            .filter(|b| b.chat_id == chat_id)
+            .max_by_key(|b| b.taken_at)
     }
 
     /// Latest ledger run for a chat (the ledger is append-most-recent-last).
@@ -82,16 +94,41 @@ impl CloudView {
     /// trial identity); Boat needs only a token — the box provisions lazily.
     pub fn seat_ready(seat: &SeatRow) -> bool {
         match seat.config.kind {
-            Some(CloudSeatKind::Ssh) => seat.config.ssh_alias.is_some(),
-            Some(CloudSeatKind::Railway) => !seat.config.expired(),
-            Some(CloudSeatKind::Box) => {
-                seat.has_box_token
-                    || seat.config.box_endpoint.is_some()
-                    || seat.config.box_id.is_some()
+            Some(CloudSeatKind::Ssh) => {
+                seat.config.ssh_alias.is_some()
+                    && seat
+                        .config
+                        .last_probe
+                        .as_ref()
+                        .map(|probe| probe.online)
+                        .unwrap_or(true)
             }
+            Some(CloudSeatKind::Railway) => !seat.config.expired(),
+            Some(CloudSeatKind::Box) => seat.has_box_token,
             Some(CloudSeatKind::GitHub) => seat.config.repo.is_some() && seat.has_github_pat,
             None => false,
         }
+    }
+
+    /// The seat new cloud chats should land on: the user's own persistent
+    /// computer first (Boat, then a VPS), a live Railway trial as the
+    /// on-ramp, a GitHub workspace last (it can't run a harness).
+    pub fn preferred_seat(seats: &[SeatRow]) -> Option<&SeatRow> {
+        let rank = |seat: &SeatRow| match seat.config.kind {
+            Some(CloudSeatKind::Box) => 0,
+            Some(CloudSeatKind::Ssh) => 1,
+            Some(CloudSeatKind::Railway) => 2,
+            Some(CloudSeatKind::GitHub) => 3,
+            None => 4,
+        };
+        seats
+            .iter()
+            .filter(|seat| Self::seat_ready(seat))
+            .min_by_key(|seat| rank(seat))
+    }
+
+    pub fn seat_runnable(seat: &SeatRow) -> bool {
+        Self::seat_ready(seat) && seat.config.kind != Some(CloudSeatKind::GitHub)
     }
 
     /// Model chip label for a seat-bound run: the cloud BYOK default model,
@@ -107,6 +144,133 @@ impl CloudView {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    fn seat(kind: CloudSeatKind) -> SeatRow {
+        SeatRow {
+            config: SeatConfig {
+                kind: Some(kind),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn seat_readiness_matches_credential_and_probe_requirements() {
+        let mut ssh = seat(CloudSeatKind::Ssh);
+        assert!(!CloudView::seat_ready(&ssh));
+        ssh.config.ssh_alias = Some("devbox".into());
+        assert!(CloudView::seat_ready(&ssh));
+        ssh.config.last_probe = Some(SeatProbe {
+            online: false,
+            ..Default::default()
+        });
+        assert!(!CloudView::seat_ready(&ssh));
+
+        let mut railway = seat(CloudSeatKind::Railway);
+        railway.config.expires_at = Some(Utc::now() + Duration::minutes(5));
+        assert!(CloudView::seat_ready(&railway));
+        assert!(CloudView::seat_runnable(&railway));
+        railway.config.expires_at = Some(Utc::now() - Duration::minutes(1));
+        assert!(!CloudView::seat_ready(&railway));
+
+        let mut boat = seat(CloudSeatKind::Box);
+        boat.config.box_id = Some("stale-box".into());
+        assert!(!CloudView::seat_ready(&boat));
+        boat.has_box_token = true;
+        assert!(CloudView::seat_ready(&boat));
+
+        let mut github = seat(CloudSeatKind::GitHub);
+        github.config.repo = Some("owner/repo".into());
+        github.has_github_pat = true;
+        assert!(CloudView::seat_ready(&github));
+        assert!(!CloudView::seat_runnable(&github));
+    }
+
+    #[test]
+    fn trial_seats_read_honestly_on_the_chip() {
+        let mut trial = seat(CloudSeatKind::Railway);
+        trial.config.label = "Railway trial".into();
+        assert_eq!(
+            seat_chip_label(Some(&trial), false),
+            "Railway trial — starting…"
+        );
+        assert_eq!(
+            seat_chip_label(Some(&trial), true),
+            "Railway trial — unavailable"
+        );
+        // Never connected: picking it re-asks Railway.
+        assert!(stalled_trial(&trial));
+        trial.config.expires_at = Some(Utc::now() + Duration::minutes(42));
+        trial.config.last_probe = Some(SeatProbe {
+            online: true,
+            ..Default::default()
+        });
+        assert!(!stalled_trial(&trial));
+        assert!(seat_chip_label(Some(&trial), false).starts_with("Railway trial — 4"));
+        assert_eq!(seat_status_note(&trial), None);
+        trial.config.expires_at = Some(Utc::now() - Duration::minutes(1));
+        assert!(stalled_trial(&trial));
+        assert_eq!(
+            seat_chip_label(Some(&trial), false),
+            "Railway trial — ended"
+        );
+        assert_eq!(seat_status_note(&trial), Some("trial ended"));
+
+        let mut boat = seat(CloudSeatKind::Box);
+        boat.config.label = "box".into();
+        assert!(!stalled_trial(&boat));
+        assert_eq!(seat_status_note(&boat), Some("needs token"));
+        boat.has_box_token = true;
+        assert_eq!(seat_status_note(&boat), None);
+        assert_eq!(seat_chip_label(Some(&boat), false), "Cloud — box");
+        assert_eq!(seat_chip_label(None, false), "Choose a seat…");
+    }
+
+    #[test]
+    fn preview_clicks_map_through_the_letterbox() {
+        // 1280×800 in a 640×800 pane: scale 0.5, drawn 640×400, 200px bars.
+        let bounds = (100.0, 50.0, 640.0, 800.0);
+        assert_eq!(
+            seat_point_in(bounds, (1280, 800), (100.0, 250.0)),
+            Some((0, 0))
+        );
+        assert_eq!(
+            seat_point_in(bounds, (1280, 800), (420.0, 450.0)),
+            Some((640, 400))
+        );
+        assert_eq!(seat_point_in(bounds, (1280, 800), (420.0, 100.0)), None);
+        assert_eq!(seat_point_in(bounds, (0, 0), (1.0, 1.0)), None);
+    }
+
+    #[test]
+    fn saved_boat_token_wins_over_the_trial() {
+        let mut railway = seat(CloudSeatKind::Railway);
+        railway.config.id = "trial".into();
+        railway.config.expires_at = Some(Utc::now() + Duration::minutes(30));
+        let mut boat = seat(CloudSeatKind::Box);
+        boat.config.id = "boat".into();
+        let seats = vec![railway.clone(), boat.clone()];
+        // No token yet: the live trial is the pick.
+        assert_eq!(
+            CloudView::preferred_seat(&seats).map(|s| s.config.id.as_str()),
+            Some("trial")
+        );
+        boat.has_box_token = true;
+        let seats = vec![railway.clone(), boat];
+        assert_eq!(
+            CloudView::preferred_seat(&seats).map(|s| s.config.id.as_str()),
+            Some("boat")
+        );
+        railway.config.expires_at = Some(Utc::now() - Duration::minutes(1));
+        assert!(CloudView::preferred_seat(&[railway]).is_none());
+    }
+}
+
 pub(crate) fn seat_pane_icon(pane: CloudPane) -> &'static str {
     match pane {
         CloudPane::Computer => icons::MONITOR,
@@ -118,6 +282,132 @@ pub(crate) fn seat_pane_icon(pane: CloudPane) -> &'static str {
         CloudPane::Context => icons::FOLDER_WITH_FILES,
         CloudPane::Tasks => icons::CHECKLIST,
         CloudPane::PullRequests => icons::PULL_REQUEST,
+    }
+}
+
+pub(crate) fn seat_pane_detail(pane: CloudPane) -> &'static str {
+    match pane {
+        CloudPane::Computer => "Watch and control the seat's desktop",
+        CloudPane::Simulator => "Drive the seat's device emulator",
+        CloudPane::Files => "Browse and preview files on the seat",
+        CloudPane::Changes => "See the agent's file edits",
+        CloudPane::Shell => "Run commands on the seat",
+        CloudPane::Progress => "Follow the run's history and actions",
+        CloudPane::Context => "Files shared in this session",
+        CloudPane::Tasks => "The agent's task list",
+        CloudPane::PullRequests => "View proposed code changes",
+    }
+}
+
+/// One entry in a right-pane launcher list: icon, title, one-line detail.
+/// Shared by the local surface picker and a cloud seat's pane picker so
+/// both modes present the same panel.
+pub(crate) fn surface_pick_row(
+    theme: &Theme,
+    id: impl Into<gpui::ElementId>,
+    icon_path: &'static str,
+    title: &'static str,
+    detail: &'static str,
+) -> gpui::Stateful<gpui::Div> {
+    let hover = theme.element_hover;
+    div()
+        .id(id)
+        .w_full()
+        .px(px(12.0))
+        .py(px(8.0))
+        .rounded(px(8.0))
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(12.0))
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+        .child(
+            div().pt(px(2.0)).child(
+                icon(icon_path)
+                    .size(px(16.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+            ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(13.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted)
+                        .child(detail),
+                ),
+        )
+}
+
+/// A Railway trial seat that isn't live — it never connected, or its hour
+/// is up. Picking one re-asks Railway (the honest retry).
+pub(crate) fn stalled_trial(seat: &SeatRow) -> bool {
+    seat.config.kind == Some(CloudSeatKind::Railway)
+        && (seat.config.expired()
+            || seat
+                .config
+                .last_probe
+                .as_ref()
+                .is_none_or(|probe| !probe.online))
+}
+
+/// The seat's one-word problem for menu rows, if any.
+pub(crate) fn seat_status_note(seat: &SeatRow) -> Option<&'static str> {
+    match seat.config.kind {
+        Some(CloudSeatKind::Railway) if seat.config.expired() => Some("trial ended"),
+        Some(CloudSeatKind::Ssh)
+            if seat
+                .config
+                .last_probe
+                .as_ref()
+                .is_some_and(|probe| !probe.online) =>
+        {
+            Some("offline")
+        }
+        Some(CloudSeatKind::GitHub) if seat.config.repo.is_none() || !seat.has_github_pat => {
+            Some("needs token")
+        }
+        Some(CloudSeatKind::Box) if !seat.has_box_token => Some("needs token"),
+        _ if !CloudView::seat_ready(seat) => Some("needs credentials"),
+        _ => None,
+    }
+}
+
+/// How a picked seat reads on a chip: "Railway trial — 42m", "Cloud — box".
+pub(crate) fn seat_chip_label(seat: Option<&SeatRow>, trial_failed: bool) -> String {
+    match seat {
+        Some(seat) if seat.config.kind == Some(CloudSeatKind::GitHub) => {
+            format!("GitHub — {}", seat.config.label)
+        }
+        Some(seat) if seat.config.kind == Some(CloudSeatKind::Railway) => {
+            match seat.config.expires_at {
+                None if trial_failed => "Railway trial — unavailable".into(),
+                None => "Railway trial — starting…".into(),
+                Some(_) if seat.config.expired() => "Railway trial — ended".into(),
+                Some(at) => format!(
+                    "Railway trial — {}m",
+                    at.signed_duration_since(chrono::Utc::now())
+                        .num_minutes()
+                        .max(0)
+                ),
+            }
+        }
+        Some(seat) => format!("Cloud — {}", seat.config.label),
+        None => "Choose a seat…".into(),
     }
 }
 
@@ -136,6 +426,240 @@ pub(crate) fn status_dot(theme: &Theme, probe: Option<&SeatProbe>) -> gpui::Stat
         .rounded_full()
         .bg(color)
         .tooltip(widgets::text_tooltip(label))
+}
+
+/// A headless Linux seat's live console: a monitor frame with the box's
+/// identity, resource gauges and top processes.
+fn render_vm_screen(theme: &Theme, info: &serde_json::Value) -> AnyElement {
+    let field = |k: &str| {
+        info.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("—")
+            .to_string()
+    };
+    let num = |k: &str| {
+        info.get(k)
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+    };
+    let gib = |kb: f64| kb / 1024.0 / 1024.0;
+    let mem = match (num("mem_total_kb"), num("mem_avail_kb")) {
+        (Some(t), Some(a)) if t > 0.0 => {
+            Some(((t - a) / t, format!("{:.1} / {:.1} GB", gib(t - a), gib(t))))
+        }
+        _ => None,
+    };
+    let disk = match (num("disk_total_kb"), num("disk_used_kb")) {
+        (Some(t), Some(u)) if t > 0.0 => Some((u / t, format!("{:.1} / {:.1} GB", gib(u), gib(t)))),
+        _ => None,
+    };
+    let cpus = num("cpus").unwrap_or(1.0).max(1.0);
+    let load = num("load").map(|l| ((l / cpus).min(1.0), format!("{l:.2} load · {cpus:.0} vCPU")));
+    let uptime = num("uptime").map(|s| {
+        let s = s as u64;
+        if s >= 86_400 {
+            format!("up {}d {}h", s / 86_400, (s % 86_400) / 3600)
+        } else if s >= 3600 {
+            format!("up {}h {}m", s / 3600, (s % 3600) / 60)
+        } else {
+            format!("up {}m", s / 60)
+        }
+    });
+    let mono = theme.font_mono.clone();
+    let screen_bg = gpui::hsla(0.0, 0.0, 0.07, 1.0);
+    let screen_text = gpui::hsla(0.0, 0.0, 0.86, 1.0);
+    let screen_muted = gpui::hsla(0.0, 0.0, 0.55, 1.0);
+    let gauge = |label: &'static str, value: Option<(f64, String)>| {
+        let (frac, text) = value.unwrap_or((0.0, "—".into()));
+        let fill = if frac > 0.85 {
+            theme.danger
+        } else if frac > 0.6 {
+            theme.warning
+        } else {
+            theme.success
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .child(div().text_color(screen_muted).child(label))
+                    .child(
+                        div()
+                            .text_color(screen_text)
+                            .child(SharedString::from(text)),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(4.0))
+                    .w_full()
+                    .rounded(px(2.0))
+                    .bg(gpui::hsla(0.0, 0.0, 1.0, 0.08))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(gpui::relative(frac.clamp(0.0, 1.0) as f32))
+                            .rounded(px(2.0))
+                            .bg(fill),
+                    ),
+            )
+    };
+    let prompt = format!("{}@{}", field("user"), field("host"));
+    let mut procs = div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .font_family(mono.clone());
+    procs = procs.child(
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(8.0))
+            .text_size(crate::typography::ui_rems(10.5))
+            .text_color(screen_muted)
+            .child(div().w(px(48.0)).child("PID"))
+            .child(div().w(px(44.0)).child("CPU%"))
+            .child(div().w(px(44.0)).child("MEM%"))
+            .child(div().flex_1().child("COMMAND")),
+    );
+    for p in info
+        .get("procs")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let col = |k: &str| {
+            SharedString::from(p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string())
+        };
+        procs = procs.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(8.0))
+                .text_size(crate::typography::ui_rems(10.5))
+                .text_color(screen_text)
+                .child(div().w(px(48.0)).child(col("pid")))
+                .child(div().w(px(44.0)).child(col("cpu")))
+                .child(div().w(px(44.0)).child(col("mem")))
+                .child(div().flex_1().min_w_0().truncate().child(col("name"))),
+        );
+    }
+    div()
+        .id("vm-screen")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .p(px(12.0))
+        .child(
+            div()
+                .w_full()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(screen_bg)
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .h(px(28.0))
+                        .px(px(10.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .border_b_1()
+                        .border_color(gpui::hsla(0.0, 0.0, 1.0, 0.08))
+                        .child(icon(icons::MONITOR).size(px(12.0)).text_color(screen_muted))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(screen_text)
+                                .child(SharedString::from(field("os"))),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(screen_muted)
+                                .child(SharedString::from(uptime.unwrap_or_default())),
+                        ),
+                )
+                .child(
+                    div()
+                        .p(px(12.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .font_family(mono.clone())
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(screen_text)
+                                .child(SharedString::from(format!(
+                                    "{prompt}  ·  {} {}",
+                                    field("kernel"),
+                                    field("arch")
+                                ))),
+                        )
+                        .child(gauge("CPU", load))
+                        .child(gauge("Memory", mem))
+                        .child(gauge("Disk", disk))
+                        .child(procs)
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(screen_muted)
+                                .child("Headless Linux — no display is running on this seat. Live every 4s."),
+                        ),
+                ),
+        )
+        .into_any_element()
+}
+
+/// Map a point in window space onto seat pixels for an image of `size`
+/// drawn `object-fit: contain` inside `bounds` (x, y, w, h). `None` when the
+/// point falls in the letterbox.
+fn seat_point_in(
+    bounds: (f32, f32, f32, f32),
+    size: (u32, u32),
+    point: (f32, f32),
+) -> Option<(i32, i32)> {
+    let (bx, by, bw, bh) = bounds;
+    let (iw, ih) = (size.0 as f32, size.1 as f32);
+    if bw <= 0.0 || bh <= 0.0 || iw <= 0.0 || ih <= 0.0 {
+        return None;
+    }
+    let scale = (bw / iw).min(bh / ih);
+    let (dw, dh) = (iw * scale, ih * scale);
+    let (ox, oy) = (bx + (bw - dw) / 2.0, by + (bh - dh) / 2.0);
+    let (x, y) = ((point.0 - ox) / scale, (point.1 - oy) / scale);
+    if x < 0.0 || y < 0.0 || x >= iw || y >= ih {
+        return None;
+    }
+    Some((x.floor() as i32, y.floor() as i32))
+}
+
+/// `size<TAB>name` lines from the evidence listing.
+fn parse_evidence(stdout: &str) -> Vec<(String, u64)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (size, name) = line.split_once('\t')?;
+            let name = name.trim();
+            (!name.is_empty() && !name.contains('/'))
+                .then(|| (name.to_string(), size.trim().parse().unwrap_or(0)))
+        })
+        .collect()
 }
 
 fn pane_empty(theme: &Theme, icon_path: &'static str, title: &str, copy: &str) -> gpui::Div {
@@ -249,12 +773,39 @@ pub struct CloudRail {
     analysis: Loadable<Option<String>>,
     // Computer
     shot: Loadable<Option<Arc<gpui::Image>>>,
+    /// Headless Linux seats: the live system snapshot shown in place of a
+    /// desktop capture.
+    vm_info: Option<serde_json::Value>,
+    screen_task: Option<Task<()>>,
+    /// Seat pixels of the last capture — "Take control" maps clicks on the
+    /// scaled preview back onto them.
+    shot_size: Option<(u32, u32)>,
+    /// Where the preview painted last frame (window coords).
+    shot_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// Clicks/keys on the preview drive the seat's desktop.
+    controlling: bool,
+    type_input: Entity<ComposerInput>,
+    act_task: Option<Task<()>>,
+    act_error: Option<String>,
+    /// "Start desktop" in flight (first run installs Xvfb on the seat).
+    desktop_starting: bool,
+    desktop_error: Option<String>,
+    // Context
+    /// Screenshots / recordings the agent saved under `~/.cosmos/shots`.
+    evidence: Loadable<Vec<(String, u64)>>,
+    evidence_preview: Option<(String, Loadable<(Arc<gpui::Image>, f32)>)>,
+    backup_busy: bool,
+    backup_note: Option<Result<String, String>>,
     /// The chat's latest ledger run — drives the bot bar's status + buttons.
     run: Option<CloudRun>,
+    runs: Vec<CloudRun>,
     /// BYOK label for the model chip (the engine view's cloud default).
     model_label: Option<SharedString>,
     /// The pane "+" menu and the destroy confirmation live on the rail chrome.
-    pane_menu_open: bool,
+    pane_menu: popover::Popup<()>,
+    /// The pane launcher (the empty right-pane list) is showing instead of
+    /// a pane body.
+    picking: bool,
     confirm_destroy: bool,
     control_busy: bool,
     control_error: Option<String>,
@@ -267,9 +818,59 @@ pub struct CloudRail {
     keep_prompted: Option<bool>,
     task: Option<Task<()>>,
     _input_sub: Subscription,
+    _type_sub: Subscription,
     _state_sub: Subscription,
     /// Railway countdown ticker — 1s re-render while a deadline is live.
     _countdown: Option<Task<()>>,
+    _refresh: Option<Task<()>>,
+}
+
+fn cloud_run_finished(previous: Option<&CloudRun>, next: &CloudRun) -> bool {
+    matches!(
+        next.status,
+        CloudRunStatus::Done | CloudRunStatus::Error | CloudRunStatus::Stopped
+    ) && previous.is_none_or(|previous| {
+        previous.id != next.id
+            || matches!(
+                previous.status,
+                CloudRunStatus::Queued
+                    | CloudRunStatus::Working
+                    | CloudRunStatus::WaitingForUser
+                    | CloudRunStatus::NeedsApproval
+            )
+    })
+}
+
+fn cloud_run_prompt(run: &CloudRun, entries: &[zeron_doc::SessionMessageEntry]) -> String {
+    let text = entries
+        .iter()
+        .filter(|entry| {
+            entry.role == zeron_doc::MessageRole::User
+                && entry.created_at <= run.started_at.timestamp_millis()
+        })
+        .max_by_key(|entry| entry.created_at)
+        .map(|entry| {
+            entry
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    zeron_doc::MessagePart::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    let first_line = text.lines().next().unwrap_or_default().trim();
+    if first_line.is_empty() {
+        return "Cloud run".into();
+    }
+    let mut chars = first_line.chars();
+    let truncated = chars.by_ref().take(80).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
 }
 
 impl CloudRail {
@@ -284,6 +885,12 @@ impl CloudRail {
         let input_sub = cx.subscribe(&shell_input, |this, _, event, cx| {
             if let ComposerInputEvent::Submitted = event {
                 this.run_shell_command(cx);
+            }
+        });
+        let type_input = cx.new(|cx| ComposerInput::new("Type on the seat — ⏎ sends", cx));
+        let type_sub = cx.subscribe(&type_input, |this, _, event, cx| {
+            if let ComposerInputEvent::Submitted = event {
+                this.type_on_seat(cx);
             }
         });
         // A session flip (run started/finished) refreshes the ledger row the
@@ -325,9 +932,25 @@ impl CloudRail {
             pr_expanded: std::collections::HashSet::new(),
             analysis: Loadable::Idle,
             shot: Loadable::Idle,
+            vm_info: None,
+            screen_task: None,
+            shot_size: None,
+            shot_bounds: Default::default(),
+            controlling: false,
+            type_input,
+            act_task: None,
+            act_error: None,
+            desktop_starting: false,
+            desktop_error: None,
+            evidence: Loadable::Idle,
+            evidence_preview: None,
+            backup_busy: false,
+            backup_note: None,
             run: None,
+            runs: Vec::new(),
             model_label: None,
-            pane_menu_open: false,
+            pane_menu: popover::Popup::default(),
+            picking: true,
             confirm_destroy: false,
             control_busy: false,
             control_error: None,
@@ -335,8 +958,10 @@ impl CloudRail {
             keep_prompted: None,
             task: None,
             _input_sub: input_sub,
+            _type_sub: type_sub,
             _state_sub: state_sub,
             _countdown: None,
+            _refresh: None,
         };
         // Live countdown: while a Railway deadline is ahead of the clock the
         // rail re-renders once a second so the chip/banner stay honest.
@@ -364,6 +989,25 @@ impl CloudRail {
                 }
             }));
         }
+        let state_for_refresh = rail.state.clone();
+        rail._refresh = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(30))
+                    .await;
+                let alive = this
+                    .update(cx, |_, cx| {
+                        state_for_refresh.update(cx, |state, cx| {
+                            state.refresh_cloud(Some(std::time::Duration::from_secs(30)), cx);
+                        });
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        }));
         rail.load_seat(cx);
         rail.ensure_loaded(cx);
         rail
@@ -383,10 +1027,16 @@ impl CloudRail {
     /// The pane's first load — seat row, then whatever the pane shows.
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
         match self.pane {
-            CloudPane::Files if matches!(self.listing, Loadable::Idle) => self.load_files(cx),
+            CloudPane::Files
+                if matches!(self.listing, Loadable::Idle)
+                    || self.listing.ready().is_some_and(Vec::is_empty) =>
+            {
+                self.load_files(cx)
+            }
             CloudPane::Changes if matches!(self.status, Loadable::Idle) => self.load_changes(cx),
             CloudPane::PullRequests if matches!(self.prs, Loadable::Idle) => self.load_prs(cx),
             CloudPane::Computer if matches!(self.shot, Loadable::Idle) => self.capture_shot(cx),
+            CloudPane::Context if matches!(self.evidence, Loadable::Idle) => self.load_evidence(cx),
             CloudPane::Simulator => {}
             _ => {}
         }
@@ -394,6 +1044,7 @@ impl CloudRail {
 
     fn load_seat(&mut self, cx: &mut Context<Self>) {
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         let Some(engine) = self.engine(cx) else {
             self.seat = Loadable::Error("Engine not connected".into());
             return;
@@ -404,13 +1055,21 @@ impl CloudRail {
                 .call(methods::CLOUD_GET_CONFIG, serde_json::json!({}))
                 .await;
             this.update(cx, |rail, cx| {
+                let mut run_finished = false;
                 rail.seat = match result {
                     Ok(value) => match serde_json::from_value::<CloudView>(value) {
                         Ok(view) => {
-                            rail.run = view
-                                .run_for_chat(&rail.chat_id)
+                            rail.runs = view
+                                .runs
+                                .iter()
+                                .filter(|run| run.chat_id == rail.chat_id)
                                 .cloned()
-                                .or(rail.run.take());
+                                .collect();
+                            let run = view.run_for_chat(&rail.chat_id).cloned();
+                            run_finished = run
+                                .as_ref()
+                                .is_some_and(|next| cloud_run_finished(rail.run.as_ref(), next));
+                            rail.run = run.or_else(|| rail.run.take());
                             rail.model_label = Some(view.cloud_model_label());
                             match view.seat(&seat_id) {
                                 Some(row) => Loadable::Ready(row.clone()),
@@ -423,6 +1082,11 @@ impl CloudRail {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
+                if run_finished
+                    || (rail.pane == CloudPane::Files && matches!(rail.listing, Loadable::Idle))
+                {
+                    rail.load_files(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -432,19 +1096,110 @@ impl CloudRail {
     /// Switch the rail's active pane — the only pane visible, per the "one
     /// pane at a time" rule.
     pub fn set_pane(&mut self, pane: CloudPane, cx: &mut Context<Self>) {
+        if self.picking {
+            self.picking = false;
+            cx.notify();
+        }
         if self.pane == pane {
-            self.pane_menu_open = false;
+            self.close_pane_menu(cx);
+            self.ensure_loaded(cx);
             return;
         }
         self.pane = pane;
-        self.pane_menu_open = false;
+        self.close_pane_menu(cx);
         self.ensure_loaded(cx);
         cx.notify();
+    }
+
+    pub fn show_picker(&mut self, cx: &mut Context<Self>) {
+        self.close_pane_menu(cx);
+        if !self.picking {
+            self.picking = true;
+            cx.notify();
+        }
+    }
+
+    /// The active pane's label, or `None` while the launcher is showing.
+    pub fn active_pane_label(&self) -> Option<&'static str> {
+        (!self.picking).then(|| self.pane.label())
+    }
+
+    /// The pane launcher — the same centered list the local right pane
+    /// shows when empty, listing what this seat can actually back.
+    fn render_picker(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let caps = self.capabilities();
+        let row = |id: SharedString, icon_path, title, detail| {
+            surface_pick_row(theme, id, icon_path, title, detail)
+        };
+        let mut list = div()
+            .w(px(320.0))
+            .max_w_full()
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+        for pane in CloudPane::ALL {
+            let available = match pane {
+                CloudPane::Simulator => caps.simulator,
+                CloudPane::PullRequests => caps.pull_requests,
+                _ => true,
+            };
+            if !available {
+                continue;
+            }
+            list = list.child(
+                row(
+                    SharedString::from(format!("rail-pick-{}", pane.label())),
+                    seat_pane_icon(pane),
+                    pane.label(),
+                    seat_pane_detail(pane),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_pane(pane, cx))),
+            );
+        }
+        list = list.child(
+            row(
+                "rail-pick-sidechat".into(),
+                icons::CHAT_ROUND_LINE,
+                "Side chat",
+                "Ask questions without interrupting the agent",
+            )
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(RailEvent::OpenSideChat))),
+        );
+        div()
+            .id("rail-picker")
+            .size_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .px(px(16.0))
+            .pt(px(16.0))
+            .pb(px(64.0))
+            .child(list)
+            .into_any_element()
+    }
+
+    pub(crate) fn close_pane_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        let mounted = self.pane_menu.get().is_some();
+        if self.pane_menu.begin_close() {
+            popover::reap_popup(cx, |rail: &mut Self| &mut rail.pane_menu);
+            cx.notify();
+        }
+        mounted
     }
 
     /// Bot-bar control: stop / pause / resume / approve / destroy. The
     /// engine decides what each op does for this seat kind; the rail only
     /// reports failures honestly.
+    /// The chat's checkout on the seat — every pane reads and runs there.
+    fn scope(&self) -> (Option<String>, Option<String>) {
+        (
+            self.binding.workspace_path.clone(),
+            self.binding.repo.clone(),
+        )
+    }
+
     fn seat_control(&mut self, op: &'static str, cx: &mut Context<Self>) {
         let Some(engine) = self.engine(cx) else {
             self.control_error = Some("Engine not connected".into());
@@ -454,6 +1209,7 @@ impl CloudRail {
         self.control_error = None;
         let chat_id = self.chat_id.clone();
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -462,7 +1218,7 @@ impl CloudRail {
                     serde_json::json!({
                         "chatId": chat_id,
                         "op": op,
-                        "seatId": seat_id,
+                        "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1,
                     }),
                 )
                 .await;
@@ -479,12 +1235,112 @@ impl CloudRail {
         }));
     }
 
+    /// Re-check the seat now (the header's refresh button): the engine probes
+    /// it and stamps `last_probe`; the rail then re-reads the row.
+    fn probe_seat(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            self.control_error = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        self.control_busy = true;
+        self.control_error = None;
+        let seat_id = self.binding.seat_id.clone();
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_PROBE_SEAT,
+                    serde_json::json!({ "seatId": seat_id }),
+                )
+                .await;
+            this.update(cx, |rail, cx| {
+                rail.control_busy = false;
+                match result {
+                    Err(err) => rail.control_error = Some(err.to_string()),
+                    Ok(value) => {
+                        if value.get("online").and_then(|v| v.as_bool()) == Some(false) {
+                            rail.control_error = value
+                                .get("detail")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                                .or_else(|| Some("The seat didn't answer".into()));
+                        }
+                    }
+                }
+                rail.load_seat(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Move this chat to another seat (its trial ended): the engine rebinds
+    /// the chat row; the chat's workspace backup restores there on the next
+    /// run. The rail follows the new binding at once.
+    fn move_chat(&mut self, seat_id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.control_busy = true;
+        self.control_error = None;
+        let chat_id = self.chat_id.clone();
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_MOVE_CHAT,
+                    serde_json::json!({ "chatId": chat_id, "seatId": seat_id }),
+                )
+                .await;
+            this.update(cx, |rail, cx| {
+                rail.control_busy = false;
+                match result.map(|v| v.get("binding").cloned()) {
+                    Ok(Some(value)) => match serde_json::from_value::<CloudSeatBinding>(value) {
+                        Ok(binding) => rail.rebind(binding, cx),
+                        Err(err) => rail.control_error = Some(err.to_string()),
+                    },
+                    Ok(None) => rail.control_error = Some("the engine didn't return a seat".into()),
+                    Err(err) => rail.control_error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn rebind(&mut self, binding: CloudSeatBinding, cx: &mut Context<Self>) {
+        self.cwd = binding.workspace_path.clone().unwrap_or_else(|| ".".into());
+        self.binding = binding;
+        self.parents.clear();
+        self.seat = Loadable::Loading;
+        self.listing = Loadable::Idle;
+        self.file_path = None;
+        self.file_text = Loadable::Idle;
+        self.status = Loadable::Idle;
+        self.diff = Loadable::Idle;
+        self.prs = Loadable::Idle;
+        self.shot = Loadable::Idle;
+        self.vm_info = None;
+        self.shot_size = None;
+        self.controlling = false;
+        self.evidence = Loadable::Idle;
+        self.run = None;
+        self.keep_prompted = None;
+        self.state
+            .update(cx, |state, cx| state.refresh_cloud(None, cx));
+        self.load_seat(cx);
+        self.ensure_loaded(cx);
+    }
+
     /// Both keep-card answers land here — the engine stamps
     /// `keep_prompted_at` so the card never asks twice, on any device.
     fn mark_keep_prompted(&mut self, cx: &mut Context<Self>) {
         self.keep_prompted = Some(true);
         if let Some(engine) = self.engine(cx) {
             let seat_id = self.binding.seat_id.clone();
+            let scope = self.scope();
             self.task = Some(cx.spawn(async move |this, cx| {
                 let _ = engine
                     .client()
@@ -492,7 +1348,7 @@ impl CloudRail {
                         methods::CLOUD_SEAT_CONTROL,
                         serde_json::json!({
                             "chatId": "",
-                            "seatId": seat_id,
+                            "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1,
                             "op": "markKeepPrompted",
                         }),
                     )
@@ -510,19 +1366,23 @@ impl CloudRail {
             self.listing = Loadable::Error("Engine not connected".into());
             return;
         };
+        if self.seat.ready().is_none() {
+            return;
+        }
         if !self.capabilities().files {
             self.listing = Loadable::Ready(Vec::new());
             return;
         }
         self.listing = Loadable::Loading;
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         let dir = self.cwd.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(
                     methods::CLOUD_LIST_DIR,
-                    serde_json::json!({ "seatId": seat_id, "path": dir }),
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1, "path": dir }),
                 )
                 .await;
             this.update(cx, |rail, cx| {
@@ -554,13 +1414,14 @@ impl CloudRail {
                 return;
             };
             let seat_id = self.binding.seat_id.clone();
+            let scope = self.scope();
             let path = entry.path;
             self.task = Some(cx.spawn(async move |this, cx| {
                 let result = engine
                     .client()
                     .call(
                         methods::CLOUD_READ_FILE,
-                        serde_json::json!({ "seatId": seat_id, "path": path }),
+                        serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1, "path": path }),
                     )
                     .await;
                 this.update(cx, |rail, cx| {
@@ -608,19 +1469,20 @@ impl CloudRail {
         self.status = Loadable::Loading;
         self.diff = Loadable::Loading;
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         self.task = Some(cx.spawn(async move |this, cx| {
             let status = engine
                 .client()
                 .call(
                     methods::CLOUD_GIT_STATUS,
-                    serde_json::json!({ "seatId": seat_id }),
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1 }),
                 )
                 .await;
             let diff = engine
                 .client()
                 .call(
                     methods::CLOUD_GIT_DIFF,
-                    serde_json::json!({ "seatId": seat_id }),
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1 }),
                 )
                 .await;
             this.update(cx, |rail, cx| {
@@ -662,6 +1524,7 @@ impl CloudRail {
             output: String::new(),
         });
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         let cwd = self.cwd.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -669,7 +1532,7 @@ impl CloudRail {
                 .call(
                     methods::CLOUD_EXEC,
                     serde_json::json!({
-                        "seatId": seat_id,
+                        "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1,
                         "command": format!("cd {} && {command}", zeron_engine::cloud::shell_word(&cwd)),
                         "timeoutSecs": 120,
                     }),
@@ -689,13 +1552,14 @@ impl CloudRail {
                             .get("stderr")
                             .and_then(|s| s.as_str())
                             .unwrap_or_default();
-                        line.output = if stderr.is_empty() {
+                        let output = if stderr.is_empty() {
                             stdout.to_string()
                         } else if stdout.is_empty() {
                             stderr.to_string()
                         } else {
                             format!("{stdout}\n{stderr}")
                         };
+                        line.output = zeron_engine::railway::redact_trial_banner(&output);
                     }
                     (Err(err), Some(line)) => {
                         line.code = Some(-1);
@@ -722,12 +1586,13 @@ impl CloudRail {
         }
         self.prs = Loadable::Loading;
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(
                     methods::CLOUD_GITHUB_PRS,
-                    serde_json::json!({ "seatId": seat_id }),
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1 }),
                 )
                 .await;
             this.update(cx, |rail, cx| {
@@ -751,12 +1616,13 @@ impl CloudRail {
         };
         self.pr_detail = Some((number, Loadable::Loading));
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(
                     methods::CLOUD_GITHUB_PR,
-                    serde_json::json!({ "seatId": seat_id, "number": number }),
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1, "number": number }),
                 )
                 .await;
             this.update(cx, |rail, cx| {
@@ -781,12 +1647,13 @@ impl CloudRail {
             return;
         };
         let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(
                     methods::CLOUD_GITHUB_MERGE,
-                    serde_json::json!({ "seatId": seat_id, "number": number }),
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1, "number": number }),
                 )
                 .await;
             this.update(cx, |rail, cx| {
@@ -896,37 +1763,137 @@ impl CloudRail {
     // -- Computer --
 
     fn capture_shot(&mut self, cx: &mut Context<Self>) {
-        if !self.capabilities().computer {
+        let caps = self.capabilities();
+        if !caps.computer && !caps.shell {
             self.shot = Loadable::Ready(None);
             return;
         }
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        self.shot = Loadable::Loading;
+        if !matches!(self.shot, Loadable::Ready(_)) {
+            self.shot = Loadable::Loading;
+        }
         let seat_id = self.binding.seat_id.clone();
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
+        let scope = self.scope();
+        self.screen_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let result = engine
+                    .client()
+                    .call(
+                        methods::CLOUD_SCREENSHOT,
+                        serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1 }),
+                    )
+                    .await;
+                let watching = this
+                    .update(cx, |rail, cx| {
+                        match result {
+                            Ok(value) => {
+                                let image = value
+                                    .get("pngBase64")
+                                    .and_then(|p| p.as_str())
+                                    .and_then(|b64| {
+                                        use base64::Engine as _;
+                                        base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                                    })
+                                    .map(|bytes| {
+                                        Arc::new(gpui::Image::from_bytes(
+                                            gpui::ImageFormat::Png,
+                                            bytes,
+                                        ))
+                                    });
+                                rail.shot_size = match (
+                                    value.get("width").and_then(|w| w.as_u64()),
+                                    value.get("height").and_then(|h| h.as_u64()),
+                                ) {
+                                    (Some(w), Some(h)) => Some((w as u32, h as u32)),
+                                    _ => None,
+                                };
+                                if image.is_none() {
+                                    rail.controlling = false;
+                                }
+                                rail.vm_info = value.get("system").cloned();
+                                rail.shot = Loadable::Ready(image);
+                            }
+                            Err(err) => {
+                                rail.vm_info = None;
+                                rail.shot = Loadable::Error(err.to_string());
+                            }
+                        }
+                        cx.notify();
+                        rail.pane == CloudPane::Computer
+                            && !rail.picking
+                            && matches!(rail.shot, Loadable::Ready(_))
+                    })
+                    .unwrap_or(false);
+                if !watching {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(4))
+                    .await;
+                let still = this
+                    .update(cx, |rail, _| {
+                        rail.pane == CloudPane::Computer && !rail.picking
+                    })
+                    .unwrap_or(false);
+                if !still {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// A bounded command on the seat through `CloudExec` (the chat's scope).
+    fn seat_exec_call(
+        &self,
+        command: String,
+        cx: &App,
+    ) -> Option<impl std::future::Future<Output = anyhow::Result<serde_json::Value>> + use<>> {
+        let engine = self.engine(cx)?;
+        let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
+        Some(async move {
+            engine
                 .client()
                 .call(
-                    methods::CLOUD_SCREENSHOT,
-                    serde_json::json!({ "seatId": seat_id }),
+                    methods::CLOUD_EXEC,
+                    serde_json::json!({
+                        "seatId": seat_id,
+                        "workspace": scope.0,
+                        "repo": scope.1,
+                        "command": command,
+                        "timeoutSecs": 30,
+                    }),
                 )
-                .await;
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))
+        })
+    }
+
+    /// The agent's evidence folder: newest first, with sizes.
+    fn load_evidence(&mut self, cx: &mut Context<Self>) {
+        let Some(call) = self.seat_exec_call(
+            "cd \"$HOME/.cosmos/shots\" 2>/dev/null || exit 0; ls -1t | head -40 | \
+             while IFS= read -r f; do [ -f \"$f\" ] && printf '%s\\t%s\\n' \"$(wc -c < \"$f\")\" \"$f\"; done"
+                .to_string(),
+            cx,
+        ) else {
+            return;
+        };
+        if !matches!(self.evidence, Loadable::Ready(_)) {
+            self.evidence = Loadable::Loading;
+        }
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = call.await;
             this.update(cx, |rail, cx| {
-                rail.shot = match result {
+                rail.evidence = match result {
                     Ok(value) => {
-                        let image = value
-                            .get("pngBase64")
-                            .and_then(|p| p.as_str())
-                            .and_then(|b64| {
-                                use base64::Engine as _;
-                                base64::engine::general_purpose::STANDARD.decode(b64).ok()
-                            })
-                            .map(|bytes| {
-                                Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes))
-                            });
-                        Loadable::Ready(image)
+                        let stdout = value
+                            .get("stdout")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        Loadable::Ready(parse_evidence(stdout))
                     }
                     Err(err) => Loadable::Error(err.to_string()),
                 };
@@ -934,6 +1901,259 @@ impl CloudRail {
             })
             .ok();
         }));
+    }
+
+    fn preview_evidence(&mut self, name: String, cx: &mut Context<Self>) {
+        if self
+            .evidence_preview
+            .as_ref()
+            .is_some_and(|(open, _)| *open == name)
+        {
+            self.evidence_preview = None;
+            cx.notify();
+            return;
+        }
+        let Some(call) = self.seat_exec_call(
+            format!(
+                "base64 < \"$HOME/.cosmos/shots\"/{} | tr -d '\\n'",
+                zeron_engine::cloud::shell_word(&name)
+            ),
+            cx,
+        ) else {
+            return;
+        };
+        self.evidence_preview = Some((name.clone(), Loadable::Loading));
+        self.act_task = Some(cx.spawn(async move |this, cx| {
+            let result = call.await;
+            this.update(cx, |rail, cx| {
+                let image = result.map_err(|e| e.to_string()).and_then(|value| {
+                    use base64::Engine as _;
+                    let b64 = value
+                        .get("stdout")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .map_err(|e| format!("couldn't read the image: {e}"))
+                        .map(|bytes| {
+                            // Width / height, so the preview box hugs the shot.
+                            let ratio = zeron_engine::seat_desktop::png_size(&bytes)
+                                .map(|(w, h)| w as f32 / h as f32)
+                                .unwrap_or(1.6);
+                            (
+                                Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes)),
+                                ratio,
+                            )
+                        })
+                });
+                if let Some((open, slot)) = rail.evidence_preview.as_mut()
+                    && *open == name
+                {
+                    *slot = match image {
+                        Ok(image) => Loadable::Ready(image),
+                        Err(err) => Loadable::Error(err),
+                    };
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn backup_now(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        if self.backup_busy {
+            return;
+        }
+        self.backup_busy = true;
+        self.backup_note = None;
+        let chat_id = self.chat_id.clone();
+        self.act_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_BACKUP_CHAT,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
+                .await;
+            this.update(cx, |rail, cx| {
+                rail.backup_busy = false;
+                rail.backup_note = Some(match result {
+                    Ok(value) => Ok(format!(
+                        "Backed up {} to this computer",
+                        zeron_engine::cloud::human_bytes(
+                            value
+                                .get("backup")
+                                .and_then(|b| b.get("bytes"))
+                                .and_then(|b| b.as_u64())
+                                .unwrap_or(0)
+                        )
+                    )),
+                    Err(err) => Err(err.to_string()),
+                });
+                rail.state
+                    .update(cx, |state, cx| state.refresh_cloud(None, cx));
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Bring the seat's virtual desktop up (the first time installs Xvfb +
+    /// xdotool on the seat — about a minute), then start watching it.
+    fn start_desktop(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        if self.desktop_starting {
+            return;
+        }
+        self.desktop_starting = true;
+        self.desktop_error = None;
+        let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
+        self.act_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_DESKTOP_START,
+                    serde_json::json!({ "seatId": seat_id, "workspace": &scope.0, "repo": &scope.1 }),
+                )
+                .await;
+            this.update(cx, |rail, cx| {
+                rail.desktop_starting = false;
+                match result {
+                    Ok(_) => rail.capture_shot(cx),
+                    Err(err) => rail.desktop_error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// One "Take control" action on the seat desktop, then an immediate
+    /// re-capture so the preview shows the result.
+    fn act(&mut self, action: serde_json::Value, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let seat_id = self.binding.seat_id.clone();
+        let scope = self.scope();
+        self.act_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_COMPUTER_ACT,
+                    serde_json::json!({
+                        "seatId": seat_id,
+                        "workspace": &scope.0,
+                        "repo": &scope.1,
+                        "action": action,
+                    }),
+                )
+                .await;
+            this.update(cx, |rail, cx| {
+                rail.act_error = result.err().map(|err| err.to_string());
+                rail.capture_shot(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Window position → seat pixel, through the preview's `object-fit:
+    /// contain` letterboxing. `None` outside the drawn image.
+    fn seat_point(&self, position: gpui::Point<gpui::Pixels>) -> Option<(i32, i32)> {
+        let bounds = self.shot_bounds.get()?;
+        let (w, h) = self.shot_size?;
+        seat_point_in(
+            (
+                f32::from(bounds.origin.x),
+                f32::from(bounds.origin.y),
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height),
+            ),
+            (w, h),
+            (f32::from(position.x), f32::from(position.y)),
+        )
+    }
+
+    fn click_preview(&mut self, event: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
+        if !self.controlling {
+            return;
+        }
+        let Some((x, y)) = self.seat_point(event.position) else {
+            return;
+        };
+        let action = match (event.button, event.click_count) {
+            (gpui::MouseButton::Right, _) => {
+                serde_json::json!({ "kind": "click", "x": x, "y": y, "button": "right" })
+            }
+            (gpui::MouseButton::Middle, _) => {
+                serde_json::json!({ "kind": "click", "x": x, "y": y, "button": "middle" })
+            }
+            (_, n) if n >= 2 => serde_json::json!({ "kind": "doubleClick", "x": x, "y": y }),
+            _ => serde_json::json!({ "kind": "click", "x": x, "y": y }),
+        };
+        self.act(action, cx);
+    }
+
+    fn scroll_preview(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
+        if !self.controlling {
+            return;
+        }
+        let Some((x, y)) = self.seat_point(event.position) else {
+            return;
+        };
+        let dy = match event.delta {
+            gpui::ScrollDelta::Lines(delta) => delta.y,
+            gpui::ScrollDelta::Pixels(delta) => f32::from(delta.y) / 40.0,
+        };
+        if dy.abs() < 0.5 {
+            return;
+        }
+        let amount = dy.abs().round().clamp(1.0, 10.0) as u32;
+        let direction = if dy > 0.0 { "up" } else { "down" };
+        self.act(
+            serde_json::json!({ "kind": "scroll", "direction": direction, "amount": amount, "x": x, "y": y }),
+            cx,
+        );
+    }
+
+    fn type_on_seat(&mut self, cx: &mut Context<Self>) {
+        let text = self.type_input.read(cx).text().to_string();
+        if text.is_empty() {
+            self.act(serde_json::json!({ "kind": "key", "combo": "Return" }), cx);
+            return;
+        }
+        self.type_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.act(serde_json::json!({ "kind": "type", "text": text }), cx);
+    }
+
+    /// "Open": the bar's URL launches in a browser on the seat's desktop.
+    fn open_on_seat(&mut self, cx: &mut Context<Self>) {
+        let text = self.type_input.read(cx).text().trim().to_string();
+        let url = if text.starts_with("http://") || text.starts_with("https://") {
+            text
+        } else if !text.is_empty() && !text.contains(' ') && text.contains('.') {
+            format!("https://{text}")
+        } else {
+            self.act_error = Some("Type a URL in the bar, then Open".into());
+            cx.notify();
+            return;
+        };
+        self.type_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.act(serde_json::json!({ "kind": "openUrl", "url": url }), cx);
     }
 
     // -- rendering --
@@ -2358,21 +3578,98 @@ impl CloudRail {
     }
 
     fn render_computer(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let seat = self.seat.ready().cloned();
-        let probe = seat.as_ref().and_then(|s| s.config.last_probe.clone());
+        let caps = self.capabilities();
+        let can_watch = caps.computer || caps.shell;
+        let has_image = matches!(self.shot, Loadable::Ready(Some(_)));
+        let desktop_status = self
+            .vm_info
+            .as_ref()
+            .and_then(|v| v.get("desktop"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let mode: SharedString = match &self.shot {
+            Loadable::Ready(Some(_)) if self.controlling => {
+                "You're in control — clicks, scrolls and keys go to the seat".into()
+            }
+            Loadable::Ready(Some(_)) => match self.shot_size {
+                Some((w, h)) => format!("Live desktop · {w}×{h} · every 4s").into(),
+                None => "Live desktop · every 4s".into(),
+            },
+            _ if self.desktop_starting => "Starting the seat's desktop…".into(),
+            Loadable::Ready(None) if self.vm_info.is_some() => "Linux console · no display".into(),
+            Loadable::Error(_) => "Not reachable".into(),
+            Loadable::Ready(None) => "No display".into(),
+            _ => "Connecting…".into(),
+        };
+        let live = has_image || self.vm_info.is_some();
+        let control_id = "rail-take-control";
+        let take_control = div()
+            .id(control_id)
+            .flex_none()
+            .px(px(8.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .rounded(px(6.0))
+            .text_size(crate::typography::ui_rems(11.0))
+            .when(has_image, |el| el.cursor_pointer())
+            .opacity(if has_image { 1.0 } else { 0.4 })
+            .text_color(if self.controlling {
+                theme.accent
+            } else {
+                theme.text_muted
+            })
+            .bg(if self.controlling {
+                theme.accent.opacity(0.12)
+            } else {
+                theme.element_hover.opacity(0.0)
+            })
+            .hover(|s| s.bg(theme.element_hover))
+            .tooltip(widgets::text_tooltip(if has_image {
+                "Drive the seat's desktop yourself — the agent keeps its own control"
+            } else {
+                "Start the desktop to take control"
+            }))
+            .child(
+                icon(icons::MONITOR)
+                    .size(px(12.0))
+                    .text_color(if self.controlling {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    }),
+            )
+            .child(if self.controlling {
+                "Release"
+            } else {
+                "Take control"
+            })
+            .when(has_image, |el| {
+                el.on_click(cx.listener(|this, _, _, cx| {
+                    this.controlling = !this.controlling;
+                    this.act_error = None;
+                    cx.notify();
+                }))
+            });
         let mut col = div().size_full().flex().flex_col();
         col = col.child(
             div()
                 .flex_none()
                 .h(px(36.0))
-                .px(px(10.0))
+                .px(px(12.0))
                 .border_b_1()
                 .border_color(theme.border)
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(8.0))
-                .child(status_dot(theme, probe.as_ref()))
+                .child(div().size(px(6.0)).rounded_full().bg(if live {
+                    theme.success
+                } else {
+                    theme.text_muted
+                }))
                 .child(
                     div()
                         .flex_1()
@@ -2380,20 +3677,17 @@ impl CloudRail {
                         .truncate()
                         .text_size(crate::typography::ui_rems(11.5))
                         .text_color(theme.text_muted)
-                        .child(SharedString::from(self.binding.label.clone())),
+                        .child(mode),
                 )
+                .child(take_control)
                 .child(
                     div()
                         .id("rail-shot-refresh")
                         .cursor_pointer()
-                        .when(self.capabilities().computer, |el| {
+                        .when(can_watch, |el| {
                             el.on_click(cx.listener(|this, _, _, cx| this.capture_shot(cx)))
                         })
-                        .opacity(if self.capabilities().computer {
-                            1.0
-                        } else {
-                            0.35
-                        })
+                        .opacity(if can_watch { 1.0 } else { 0.35 })
                         .child(
                             icon(icons::REFRESH)
                                 .size(px(13.0))
@@ -2401,38 +3695,113 @@ impl CloudRail {
                         ),
                 ),
         );
+        let start_button = |label: &'static str, this: &Self, cx: &mut Context<Self>| {
+            popover::btn_primary(theme, label)
+                .id("rail-start-desktop")
+                .when(this.desktop_starting, |el| el.opacity(0.5))
+                .on_click(cx.listener(|this, _, _, cx| this.start_desktop(cx)))
+        };
         let body = match &self.shot {
-            Loadable::Ready(Some(image)) => div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    gpui::img(image.clone())
-                        .max_w_full()
-                        .max_h_full()
-                        .object_fit(gpui::ObjectFit::Contain),
-                )
-                .into_any_element(),
-            Loadable::Ready(None) => {
-                let keeps = self.capabilities().keeps_running;
-                pane_empty(
-                    theme,
-                    icons::MONITOR,
-                    "seat not controllable yet",
-                    if keeps {
-                        "No remote CUA endpoint is stamped for this seat. \
-                         Files, Changes, Shell and Pull requests still work \
-                         through git/ssh/docker."
+            Loadable::Ready(Some(image)) => {
+                let bounds = self.shot_bounds.clone();
+                div()
+                    .id("rail-shot-surface")
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .m(px(8.0))
+                    .rounded(px(8.0))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(if self.controlling {
+                        theme.accent.opacity(0.6)
                     } else {
-                        "No remote CUA endpoint is stamped for this seat, and \
-                         it runs only while the desktop app is open — no \
-                         remote harness is detached yet."
-                    },
-                )
-                .into_any_element()
+                        theme.border
+                    })
+                    .bg(gpui::hsla(0.0, 0.0, 0.05, 1.0))
+                    .when(self.controlling, |el| el.cursor_crosshair())
+                    .child(
+                        gpui::img(image.clone())
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Contain),
+                    )
+                    .child(
+                        gpui::canvas(move |b, _, _| bounds.set(Some(b)), |_, _, _, _| {})
+                            .absolute()
+                            .inset_0(),
+                    )
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, event, _, cx| this.click_preview(event, cx)),
+                    )
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(|this, event, _, cx| this.click_preview(event, cx)),
+                    )
+                    .on_scroll_wheel(
+                        cx.listener(|this, event, _, cx| this.scroll_preview(event, cx)),
+                    )
+                    .into_any_element()
             }
+            Loadable::Ready(None) if self.vm_info.is_some() => {
+                let installing = matches!(desktop_status.as_str(), "installing" | "starting");
+                let copy: SharedString = if self.desktop_starting || installing {
+                    "Bringing up a virtual display (Xvfb) on the seat. The first start installs \
+                     it — about a minute."
+                        .into()
+                } else if let Some(err) = self.desktop_error.clone() {
+                    err.into()
+                } else if let Some(failed) = desktop_status.strip_prefix("failed") {
+                    format!("The desktop couldn't start{failed}").into()
+                } else {
+                    "The agent gets a desktop on every run — or start it now to watch and \
+                     drive it: screenshots, clicks, typing, a browser, recordings."
+                        .into()
+                };
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex_none()
+                            .p(px(12.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .text_color(theme.text_muted)
+                                    .child(copy),
+                            )
+                            .when(caps.computer, |el| {
+                                el.child(div().flex().child(start_button(
+                                    if self.desktop_starting || installing {
+                                        "Starting…"
+                                    } else {
+                                        "Start desktop"
+                                    },
+                                    self,
+                                    cx,
+                                )))
+                            }),
+                    )
+                    .child(render_vm_screen(
+                        theme,
+                        self.vm_info.as_ref().unwrap_or(&serde_json::Value::Null),
+                    ))
+                    .into_any_element()
+            }
+            Loadable::Ready(None) => pane_empty(
+                theme,
+                icons::MONITOR,
+                "No desktop yet",
+                "This seat can't show a screen until it can run commands — Files, \
+                 Changes and Pull requests still work.",
+            )
+            .into_any_element(),
             Loadable::Error(err) => {
                 pane_empty(theme, icons::DANGER_TRIANGLE, "Seat preview", err).into_any_element()
             }
@@ -2447,6 +3816,83 @@ impl CloudRail {
                 .into_any_element(),
         };
         col = col.child(body);
+        if has_image && self.controlling {
+            let key = |id: &'static str, label: &'static str, combo: &'static str| {
+                div()
+                    .id(id)
+                    .flex_none()
+                    .px(px(7.0))
+                    .h(px(22.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_size(crate::typography::ui_rems(10.5))
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.element_hover))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.act(serde_json::json!({ "kind": "key", "combo": combo }), cx)
+                    }))
+            };
+            col = col.child(
+                div()
+                    .flex_none()
+                    .px(px(8.0))
+                    .pb(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(div().flex_1().min_w_0().child(popover::dialog_field(
+                                self.type_input.clone().into_any_element(),
+                            )))
+                            .child(
+                                popover::btn_ghost(theme, "Open", "rail-open-url")
+                                    .id("rail-open-url")
+                                    .tooltip(widgets::text_tooltip(
+                                        "Open the URL in the bar in a browser on the seat",
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| this.open_on_seat(cx))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(px(4.0))
+                            .child(key("seat-key-enter", "Enter", "Return"))
+                            .child(key("seat-key-tab", "Tab", "Tab"))
+                            .child(key("seat-key-esc", "Esc", "Escape"))
+                            .child(key("seat-key-bksp", "⌫", "BackSpace"))
+                            .child(key("seat-key-up", "↑", "Up"))
+                            .child(key("seat-key-down", "↓", "Down"))
+                            .child(key("seat-key-selall", "Ctrl+A", "ctrl+a"))
+                            .child(key("seat-key-copy", "Ctrl+C", "ctrl+c"))
+                            .child(key("seat-key-paste", "Ctrl+V", "ctrl+v"))
+                            .child(key("seat-key-url", "Ctrl+L", "ctrl+l")),
+                    ),
+            );
+        }
+        if let Some(err) = self.act_error.clone() {
+            col = col.child(
+                div()
+                    .flex_none()
+                    .px(px(12.0))
+                    .pb(px(8.0))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.danger)
+                    .child(SharedString::from(err)),
+            );
+        }
         col.into_any_element()
     }
 
@@ -2470,13 +3916,69 @@ impl CloudRail {
             })
             .collect();
         if steps.is_empty() {
-            return pane_empty(
-                theme,
-                icons::SORT_VERTICAL,
-                "Progress",
-                "The run's tool calls land here as steps while the agent works.",
-            )
-            .into_any_element();
+            if self.runs.is_empty() {
+                return pane_empty(
+                    theme,
+                    icons::SORT_VERTICAL,
+                    "Progress",
+                    "Runs on this seat show up here.",
+                )
+                .into_any_element();
+            }
+            let state = self.state.read(cx);
+            let mut list = div().flex().flex_col().p(px(8.0));
+            for run in &self.runs {
+                let prompt = cloud_run_prompt(run, &state.transcript);
+                let (status_icon, status_color) = match run.status {
+                    CloudRunStatus::Done => (icons::QUEUE_CHECK, theme.success),
+                    CloudRunStatus::Error | CloudRunStatus::Stopped => {
+                        (icons::DANGER_TRIANGLE, theme.danger)
+                    }
+                    _ => (icons::CLOCK_CIRCLE, theme.accent),
+                };
+                let end = run.finished_at.unwrap_or_else(chrono::Utc::now);
+                let elapsed =
+                    crate::transcript::format_elapsed((end - run.started_at).num_seconds().max(0));
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .h(px(24.0))
+                        .child(
+                            icon(status_icon)
+                                .size(px(11.0))
+                                .flex_none()
+                                .text_color(status_color),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .text_color(theme.text)
+                                .child(SharedString::from(prompt)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(crate::typography::ui_rems(10.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!(
+                                    "{} · {elapsed}",
+                                    run.status.label()
+                                ))),
+                        ),
+                );
+            }
+            return div()
+                .id("rail-progress-cloud-runs")
+                .size_full()
+                .overflow_y_scroll()
+                .child(list)
+                .into_any_element();
         }
         let mut list = div().flex().flex_col().p(px(8.0));
         for (ix, (name, done)) in steps.iter().enumerate() {
@@ -2542,42 +4044,299 @@ impl CloudRail {
                 }
             }
         }
-        if paths.is_empty() {
-            return pane_empty(
-                theme,
-                icons::FOLDER_WITH_FILES,
-                "Context",
-                "Files the run reads or edits attach here as it works.",
+        let caps = self.capabilities();
+        let backup = self
+            .state
+            .read(cx)
+            .cloud_view()
+            .and_then(|view| view.backup_for_chat(&self.chat_id))
+            .cloned();
+        let workspace = self
+            .binding
+            .workspace_path
+            .clone()
+            .unwrap_or_else(|| "seat workspace".into());
+        let section = |title: &'static str| {
+            div()
+                .pt(px(12.0))
+                .pb(px(4.0))
+                .px(px(4.0))
+                .text_size(crate::typography::ui_rems(10.5))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text_faint)
+                .child(title)
+        };
+        let mut list = div().flex().flex_col().px(px(8.0)).pb(px(12.0));
+
+        // Workspace: where the work lives and how it's kept.
+        let storage: SharedString = match (&self.binding.repo, &backup) {
+            (Some(repo), _) => {
+                format!("Checkout of {repo} — commits and PRs are the record").into()
+            }
+            (None, Some(b)) => format!(
+                "Local git checkpoint every turn · backed up to this computer {} ({})",
+                crate::cloud::boards::relative(b.taken_at, chrono::Utc::now()),
+                zeron_engine::cloud::human_bytes(b.bytes)
             )
-            .into_any_element();
-        }
-        let mut list = div().flex().flex_col().p(px(8.0));
-        for path in paths {
-            list = list.child(
-                div()
-                    .h(px(24.0))
-                    .px(px(4.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        icon(icons::DOCUMENT)
+            .into(),
+            (None, None) => {
+                "Local git checkpoint every turn · backs up to this computer after each turn".into()
+            }
+        };
+        list = list.child(section("WORKSPACE")).child(
+            div()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.surface_card)
+                .p(px(10.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            icon(if self.binding.repo.is_some() {
+                                icons::GIT_BRANCH
+                            } else {
+                                icons::FOLDER
+                            })
                             .size(px(12.0))
-                            .flex_none()
                             .text_color(theme.text_muted),
-                    )
-                    .child(
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.text)
+                                .child(SharedString::from(workspace)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_muted)
+                        .child(storage),
+                )
+                .when(caps.exec, |el| {
+                    el.child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(11.5))
-                            .font_family(theme.font_mono.clone())
-                            .text_color(theme.text)
-                            .child(SharedString::from(path)),
-                    ),
-            );
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                popover::btn_ghost(
+                                    theme,
+                                    if self.backup_busy {
+                                        "Backing up…"
+                                    } else {
+                                        "Back up now"
+                                    },
+                                    "rail-backup-now",
+                                )
+                                .id("rail-backup-now")
+                                .on_click(cx.listener(|this, _, _, cx| this.backup_now(cx))),
+                            )
+                            .when_some(self.backup_note.clone(), |el, note| {
+                                let (text, color) = match note {
+                                    Ok(text) => (text, theme.success),
+                                    Err(text) => (text, theme.danger),
+                                };
+                                el.child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(crate::typography::ui_rems(10.5))
+                                        .text_color(color)
+                                        .child(SharedString::from(text)),
+                                )
+                            }),
+                    )
+                }),
+        );
+
+        // Evidence: what the agent captured to show its work.
+        list = list.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(section("SCREENSHOTS & RECORDINGS"))
+                .child(div().flex_1())
+                .when(caps.exec, |el| {
+                    el.child(
+                        div()
+                            .id("rail-evidence-refresh")
+                            .pt(px(8.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.load_evidence(cx)))
+                            .child(
+                                icon(icons::REFRESH)
+                                    .size(px(12.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    )
+                }),
+        );
+        match &self.evidence {
+            Loadable::Ready(items) if !items.is_empty() => {
+                for (ix, (name, size)) in items.iter().enumerate() {
+                    let is_image = name.ends_with(".png");
+                    let open = self
+                        .evidence_preview
+                        .as_ref()
+                        .filter(|(open, _)| open == name)
+                        .map(|(_, slot)| slot.clone());
+                    let row_name = name.clone();
+                    list = list.child(
+                        div()
+                            .id(("rail-evidence", ix))
+                            .h(px(26.0))
+                            .px(px(4.0))
+                            .rounded(px(6.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .when(is_image, |el| {
+                                el.cursor_pointer()
+                                    .hover(|s| s.bg(theme.element_hover))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.preview_evidence(row_name.clone(), cx)
+                                    }))
+                            })
+                            .child(
+                                icon(if is_image {
+                                    icons::MONITOR
+                                } else {
+                                    icons::DOCUMENT
+                                })
+                                .size(px(12.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::typography::ui_rems(11.5))
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(name.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(crate::typography::ui_rems(10.0))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from(zeron_engine::cloud::human_bytes(
+                                        *size,
+                                    ))),
+                            ),
+                    );
+                    if let Some(slot) = open {
+                        list = list.child(match slot {
+                            Loadable::Ready((image, ratio)) => div()
+                                .mx(px(4.0))
+                                .mb(px(6.0))
+                                .rounded(px(8.0))
+                                .overflow_hidden()
+                                .border_1()
+                                .border_color(theme.border)
+                                .child(
+                                    gpui::img(image)
+                                        .w_full()
+                                        .aspect_ratio(ratio)
+                                        .object_fit(gpui::ObjectFit::Contain),
+                                )
+                                .into_any_element(),
+                            Loadable::Error(err) => div()
+                                .px(px(4.0))
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.danger)
+                                .child(SharedString::from(err))
+                                .into_any_element(),
+                            _ => div()
+                                .px(px(4.0))
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.text_muted)
+                                .child("Loading…")
+                                .into_any_element(),
+                        });
+                    }
+                }
+            }
+            Loadable::Error(err) => {
+                list = list.child(
+                    div()
+                        .px(px(4.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.danger)
+                        .child(SharedString::from(err.clone())),
+                );
+            }
+            Loadable::Loading => {
+                list = list.child(
+                    div()
+                        .px(px(4.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_muted)
+                        .child("Loading…"),
+                );
+            }
+            _ => {
+                list = list.child(
+                    div()
+                        .px(px(4.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_muted)
+                        .child(
+                            "Nothing yet — the agent saves screenshots and recordings here \
+                             (cosmos-computer screenshot / record).",
+                        ),
+                );
+            }
+        }
+
+        // Files the run touched (structured tool calls).
+        if !paths.is_empty() {
+            list = list.child(section("FILES TOUCHED"));
+            for path in paths {
+                list = list.child(
+                    div()
+                        .h(px(24.0))
+                        .px(px(4.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            icon(icons::DOCUMENT)
+                                .size(px(12.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .font_family(theme.font_mono.clone())
+                                .text_color(theme.text)
+                                .child(SharedString::from(path)),
+                        ),
+                );
+            }
         }
         div()
             .id("rail-context-list")
@@ -2745,251 +4504,614 @@ fn tool_paths(call: &zeron_proto::ToolCall) -> Vec<String> {
 }
 
 impl CloudRail {
-    /// The rail's pane menu: every `CloudPane`, plus the Side chat escape
-    /// that opens the existing side-chat surface in the shell's pane host.
-    fn render_pane_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// The seat header — the agent-mode right pane's idiom: one quiet row
+    /// with the seat's live dot, its name, a muted status line, and size-7
+    /// icon buttons (tooltips carry the words). Every button rides an engine
+    /// RPC the seat actually backs; nothing here is decorative.
+    fn render_bot_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let caps = self.capabilities();
-        let mut menu = popover::popover_card(&theme.for_popup())
-            .absolute()
-            .top(px(30.0))
-            .left(px(8.0))
-            .w(px(200.0));
-        for pane in CloudPane::ALL {
-            let disabled = match pane {
-                CloudPane::Simulator => !caps.simulator,
-                CloudPane::PullRequests => !caps.pull_requests,
-                _ => false,
+        let seat = self.seat.ready();
+        let seat_label = seat
+            .map(|s| s.config.label.clone())
+            .unwrap_or_else(|| self.binding.label.clone());
+        let run_status = self.run.as_ref().map(|r| r.status);
+        let probe = seat.and_then(|s| s.config.last_probe.clone());
+        let busy = self.control_busy;
+        let is_boat = seat.is_some_and(|s| s.config.kind == Some(CloudSeatKind::Box));
+        let sleeping = probe.as_ref().is_some_and(|p| p.sleeping);
+
+        // The status line under the name: the most useful single fact.
+        let trial_left = self
+            .binding
+            .expires_at
+            .map(|at| at.signed_duration_since(chrono::Utc::now()).num_seconds());
+        let (meta, meta_color) = match (trial_left, run_status) {
+            (Some(secs), _) if secs <= 0 => ("Trial ended".to_string(), theme.danger),
+            (Some(secs), _) => (
+                format!("Trial · {:02}:{:02} left", secs / 60, secs % 60),
+                if secs < 10 * 60 {
+                    theme.warning
+                } else {
+                    theme.text_muted
+                },
+            ),
+            (None, _) if sleeping => ("Sleeping · billing off".to_string(), theme.warning),
+            (None, Some(status)) => (status.label().to_string(), theme.text_muted),
+            (None, None) => (
+                match probe.as_ref() {
+                    Some(p) if p.online => "Online".to_string(),
+                    Some(_) => "Offline".to_string(),
+                    None => "Not checked yet".to_string(),
+                },
+                theme.text_muted,
+            ),
+        };
+        let meta = match (&meta[..], run_status) {
+            // A live trial still reports what the agent is doing.
+            (m, Some(status)) if m.starts_with("Trial ·") => format!("{m} · {}", status.label()),
+            _ => meta,
+        };
+
+        let mut buttons = div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.0));
+        match run_status {
+            Some(CloudRunStatus::Working) | Some(CloudRunStatus::Queued) => {
+                buttons = buttons
+                    .child(
+                        rail_icon_button(
+                            "pause",
+                            icons::PAUSE,
+                            "Pause run",
+                            theme.text_muted,
+                            busy,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.seat_control("pause", cx))),
+                    )
+                    .child(
+                        rail_icon_button("stop", icons::STOP, "Stop run", theme.text_muted, busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.seat_control("stop", cx))),
+                    );
+            }
+            Some(CloudRunStatus::Stopped) => {
+                buttons = buttons.child(
+                    rail_icon_button("resume", icons::PLAY, "Resume run", theme.text_muted, busy)
+                        .on_click(cx.listener(|this, _, _, cx| this.seat_control("resume", cx))),
+                );
+            }
+            Some(CloudRunStatus::NeedsApproval) => {
+                buttons = buttons.child(
+                    rail_icon_button(
+                        "approve",
+                        icons::CHECK_CIRCLE,
+                        "Approve",
+                        theme.success,
+                        busy,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.seat_control("approve", cx))),
+                );
+            }
+            _ => {}
+        }
+        // Boat lifecycle — Sleep archives the box (billing off); Wake resumes.
+        if is_boat && seat.is_some_and(|s| s.config.box_id.is_some()) {
+            let (id, glyph, tip, op) = if sleeping {
+                ("wake", icons::SUN, "Wake box", "wake")
+            } else {
+                ("sleep", icons::MOON, "Sleep box — billing off", "sleep")
             };
-            let active = pane == self.pane;
-            let fade = SharedString::from(format!("rail-menu-{}", pane.label()));
-            let mut row = popover::menu_row(theme, active, fade)
-                .id(SharedString::from(format!("rail-pane-{}", pane.label())))
+            buttons = buttons.child(
+                rail_icon_button(id, glyph, tip, theme.text_muted, busy)
+                    .on_click(cx.listener(move |this, _, _, cx| this.seat_control(op, cx))),
+            );
+        }
+        // Preview: a provider-stamped URL opens in the browser; else the
+        // Computer pane carries the seat's live screen.
+        buttons = buttons.child(match seat.and_then(|s| s.config.preview_url.clone()) {
+            Some(url) => rail_icon_button(
+                "preview",
+                icons::GLOBE,
+                "Open preview",
+                theme.text_muted,
+                false,
+            )
+            .on_click(move |_, _, cx| cx.open_url(&url)),
+            None => rail_icon_button(
+                "preview",
+                icons::MONITOR,
+                "Show the seat's screen",
+                theme.text_muted,
+                false,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.set_pane(CloudPane::Computer, cx))),
+        });
+        buttons = buttons.child(
+            rail_icon_button(
+                "probe",
+                icons::REFRESH,
+                "Check seat",
+                theme.text_muted,
+                busy,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.probe_seat(cx))),
+        );
+        let destroy = if self.confirm_destroy {
+            rail_icon_button(
+                "destroy-yes",
+                icons::TRASH_BIN_MINIMALISTIC,
+                "Click again to destroy this seat",
+                theme.danger,
+                busy,
+            )
+            .bg(theme.danger.opacity(0.14))
+            .on_click(cx.listener(|this, _, _, cx| this.seat_control("destroy", cx)))
+        } else {
+            rail_icon_button(
+                "destroy",
+                icons::TRASH_BIN_MINIMALISTIC,
+                "Destroy seat",
+                theme.text_muted,
+                !caps.exec,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.confirm_destroy = true;
+                cx.notify();
+            }))
+        };
+        buttons = buttons.child(destroy);
+
+        div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(44.0))
+            .pl(px(14.0))
+            .pr(px(8.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .size(px(26.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.0))
+                    .bg(crate::theme::wash(0.06))
+                    .child(
+                        icon(if is_boat {
+                            icons::MONITOR
+                        } else {
+                            icons::CLOUD
+                        })
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(SharedString::from(seat_label)),
+                            )
+                            .child(status_dot(theme, probe.as_ref())),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(10.5))
+                            .text_color(meta_color)
+                            .child(SharedString::from(meta)),
+                    ),
+            )
+            .child(buttons)
+            .into_any_element()
+    }
+
+    /// The rail's one notice card — the single most important thing the user
+    /// should know about this seat right now, with its fix as a button.
+    /// Ordered: a dead trial, the keep prompt, a live trial's clock, a
+    /// sleeping box, a desk-bound seat. A control error rides above it.
+    fn render_notices(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let seat_row = self.seat.ready().cloned();
+        let is_railway = seat_row
+            .as_ref()
+            .is_some_and(|s| s.config.kind == Some(CloudSeatKind::Railway))
+            || self.binding.kind == CloudSeatKind::Railway;
+        let railway_expired = is_railway
+            && (seat_row.as_ref().is_some_and(|s| s.config.expired())
+                || self
+                    .binding
+                    .expires_at
+                    .is_some_and(|at| at <= chrono::Utc::now()));
+        let is_boat = seat_row
+            .as_ref()
+            .is_some_and(|s| s.config.kind == Some(CloudSeatKind::Box));
+        let sleeping = seat_row
+            .as_ref()
+            .and_then(|s| s.config.last_probe.as_ref())
+            .is_some_and(|p| p.sleeping);
+        let claim_url = seat_row.as_ref().and_then(|s| s.config.claim_url.clone());
+        let backed_up = seat_row
+            .as_ref()
+            .is_some_and(|s| s.config.backup_at.is_some());
+        let not_persistent = !self.capabilities().keeps_running && !sleeping && !railway_expired;
+        // Where a dead trial's thread can continue: the best live seat.
+        let move_target: Option<(String, String)> = railway_expired
+            .then(|| {
+                let state = self.state.read(cx);
+                let seats: Vec<SeatRow> = state
+                    .cloud_seats()
+                    .iter()
+                    .filter(|s| s.config.id != self.binding.seat_id && CloudView::seat_runnable(s))
+                    .cloned()
+                    .collect();
+                CloudView::preferred_seat(&seats).map(|s| {
+                    (
+                        s.config.id.clone(),
+                        match s.config.kind {
+                            Some(CloudSeatKind::Railway) => "a new trial".to_string(),
+                            _ => s.config.label.clone(),
+                        },
+                    )
+                })
+            })
+            .flatten();
+        // The "Keep this computer" prompt shows once: a Railway seat that
+        // finished a run and has never been asked.
+        let show_keep_prompt = is_railway
+            && self.run.as_ref().is_some_and(|r| {
+                matches!(
+                    r.status,
+                    CloudRunStatus::Done | CloudRunStatus::Stopped | CloudRunStatus::Error
+                )
+            })
+            && self.keep_prompted.is_none()
+            && seat_row
+                .as_ref()
+                .is_some_and(|s| s.config.keep_prompted_at.is_none());
+
+        let mut cards: Vec<AnyElement> = Vec::new();
+        if let Some(err) = self.control_error.clone() {
+            cards.push(
+                notice_card(
+                    theme,
+                    NoticeTone::Danger,
+                    icons::DANGER_TRIANGLE,
+                    "Seat error",
+                    err,
+                )
+                .child(notice_actions().child(
+                    notice_button("notice-dismiss", "Dismiss", theme, false).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.control_error = None;
+                            cx.notify();
+                        },
+                    )),
+                ))
+                .into_any_element(),
+            );
+        }
+
+        let card = if railway_expired {
+            let body = match (&move_target, backed_up) {
+                (Some(_), true) => {
+                    "Your work is backed up on this computer. Continue on another seat and it comes back."
+                }
+                (Some(_), false) => "Continue this chat on another seat to keep going.",
+                (None, true) => {
+                    "Your work is backed up here. Add a Boat token to continue on a persistent cloud PC."
+                }
+                (None, false) => {
+                    "Claim the VM from Railway, or add a Boat token for a persistent cloud PC."
+                }
+            };
+            let mut actions = notice_actions();
+            if let Some((seat_id, label)) = move_target {
+                actions = actions.child(
+                    notice_button(
+                        "rail-move-chat",
+                        &format!("Continue on {label}"),
+                        theme,
+                        true,
+                    )
+                    .when(self.control_busy, |el| el.opacity(0.5))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.move_chat(seat_id.clone(), cx)),
+                    ),
+                );
+            } else {
+                actions = actions.child(
+                    notice_button("rail-attach-boat", "Add Boat token", theme, true).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.mark_keep_prompted(cx);
+                            cx.emit(RailEvent::OpenCloudSettings);
+                        }),
+                    ),
+                );
+            }
+            if let Some(url) = claim_url.clone() {
+                actions = actions.child(
+                    notice_button("rail-claim", "Claim", theme, false)
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                );
+            }
+            Some(
+                notice_card(
+                    theme,
+                    NoticeTone::Danger,
+                    icons::CLOCK_CIRCLE,
+                    "Trial ended",
+                    body,
+                )
+                .child(actions),
+            )
+        } else if show_keep_prompt {
+            let mut actions = notice_actions().child(
+                notice_button("keep-yes", "Add Boat token", theme, true).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.mark_keep_prompted(cx);
+                        cx.emit(RailEvent::OpenCloudSettings);
+                    },
+                )),
+            );
+            if let Some(url) = claim_url.clone() {
+                actions = actions.child(
+                    notice_button("keep-claim", "Claim", theme, false)
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                );
+            }
+            actions = actions.child(
+                notice_button("keep-no", "Not now", theme, false)
+                    .on_click(cx.listener(|this, _, _, cx| this.mark_keep_prompted(cx))),
+            );
+            Some(
+                notice_card(
+                    theme,
+                    NoticeTone::Accent,
+                    icons::STAR,
+                    "Keep this computer?",
+                    "The trial seat lasts an hour. Add a Boat token for a persistent cloud PC, or claim this one on Railway.",
+                )
+                .child(actions),
+            )
+        } else if is_railway {
+            let card = notice_card(
+                theme,
+                NoticeTone::Warning,
+                icons::CLOCK_CIRCLE,
+                "Free trial seat",
+                "It shuts down when the hour ends unless you claim it or add a Boat token.",
+            );
+            Some(match claim_url {
+                Some(url) => card.child(
+                    notice_actions().child(
+                        notice_button("rail-claim", "Claim on Railway", theme, false)
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    ),
+                ),
+                None => card,
+            })
+        } else if is_boat && sleeping {
+            Some(
+                notice_card(
+                    theme,
+                    NoticeTone::Warning,
+                    icons::MOON,
+                    "Box is sleeping",
+                    "Billing is off. Wake it to keep working — your files are kept.",
+                )
+                .child(
+                    notice_actions().child(
+                        notice_button("rail-wake", "Wake", theme, true)
+                            .when(self.control_busy, |el| el.opacity(0.5))
+                            .on_click(cx.listener(|this, _, _, cx| this.seat_control("wake", cx))),
+                    ),
+                ),
+            )
+        } else if not_persistent && self.seat.ready().is_some() {
+            Some(notice_card(
+                theme,
+                NoticeTone::Muted,
+                icons::INFO_CIRCLE,
+                "Runs while Cosmos is open",
+                "This seat stops working when you close the desktop app.",
+            ))
+        } else {
+            None
+        };
+        cards.extend(card.map(IntoElement::into_any_element));
+        (!cards.is_empty()).then(|| {
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .p(px(8.0))
+                .border_b_1()
+                .border_color(theme.border)
+                .children(cards)
+                .into_any_element()
+        })
+    }
+}
+
+/// A size-7 rail icon button — the shell's `header_icon_button` look
+/// (28px, rounded-md, wash hover, 16px glyph) with a tooltip for the words.
+fn rail_icon_button(
+    id: &'static str,
+    glyph: &'static str,
+    tip: &'static str,
+    color: gpui::Hsla,
+    dimmed: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let fade = format!("rail-icon-{id}");
+    div()
+        .id(SharedString::from(fade.clone()))
+        .size(px(28.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .bg(crate::motion::hover_blend(
+            &fade,
+            crate::theme::wash(0.0),
+            crate::theme::wash(0.11),
+        ))
+        .on_hover(crate::motion::hover_listener(fade))
+        .when(dimmed, |el| el.opacity(0.45))
+        .tooltip(widgets::text_tooltip(tip))
+        .child(icon(glyph).size(px(16.0)).text_color(color))
+}
+
+#[derive(Clone, Copy)]
+enum NoticeTone {
+    Danger,
+    Warning,
+    Accent,
+    Muted,
+}
+
+/// The rail's notice card: a tinted rounded-10 card with a glyph, a title,
+/// one line of body, and (via `.child(notice_actions()…)`) its buttons.
+fn notice_card(
+    theme: &Theme,
+    tone: NoticeTone,
+    glyph: &'static str,
+    title: &'static str,
+    body: impl Into<SharedString>,
+) -> gpui::Div {
+    let tint = match tone {
+        NoticeTone::Danger => theme.danger,
+        NoticeTone::Warning => theme.warning,
+        NoticeTone::Accent => theme.accent,
+        NoticeTone::Muted => theme.text_muted,
+    };
+    let fill = match tone {
+        NoticeTone::Muted => crate::theme::wash(0.04),
+        _ => tint.opacity(0.08),
+    };
+    let edge = match tone {
+        NoticeTone::Muted => theme.border,
+        _ => tint.opacity(0.28),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .p(px(10.0))
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(edge)
+        .bg(fill)
+        .child(
+            div()
                 .flex()
                 .flex_row()
-                .items_center()
+                .items_start()
                 .gap(px(8.0))
                 .child(
-                    icon(seat_pane_icon(pane))
-                        .size(px(13.0))
+                    div()
+                        .pt(px(1.0))
                         .flex_none()
-                        .text_color(theme.text_muted),
+                        .child(icon(glyph).size(px(14.0)).text_color(tint)),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
-                        .child(SharedString::from(pane.label())),
-                );
-            if disabled {
-                row = row.opacity(0.45).child(
-                    div()
-                        .flex_none()
-                        .text_size(crate::typography::ui_rems(9.5))
-                        .text_color(theme.text_faint)
-                        .child(if pane == CloudPane::Simulator {
-                            "no endpoint"
-                        } else {
-                            "no repo"
-                        }),
-                );
-            } else {
-                row = row
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_pane(pane, cx)));
-            }
-            menu = menu.child(row);
-        }
-        // Side chat opens the existing surface — the rail hands it to the
-        // shell via an event, never a second chat column of its own.
-        let fade = SharedString::from("rail-menu-sidechat");
-        menu = menu.child(
-            popover::menu_row(theme, false, fade)
-                .id("rail-pane-sidechat")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .cursor_pointer()
-                .child(
-                    icon(icons::CHAT_ROUND_LINE)
-                        .size(px(13.0))
-                        .flex_none()
-                        .text_color(theme.text_muted),
-                )
-                .child(div().flex_1().min_w_0().truncate().child("Side chat"))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.pane_menu_open = false;
-                    cx.emit(RailEvent::OpenSideChat);
-                })),
-        );
-        menu.into_any_element()
-    }
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(theme.text_muted)
+                                .child(body.into()),
+                        ),
+                ),
+        )
+}
 
-    /// The bot control area — seat, model, run status, and the honest
-    /// controls the engine backs: pause/resume/stop, approve (only while the
-    /// run is `NeedsApproval`), preview, destroy.
-    fn render_bot_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let caps = self.capabilities();
-        let seat_label = self
-            .seat
-            .ready()
-            .map(|s| s.config.label.clone())
-            .unwrap_or_else(|| self.binding.label.clone());
-        let model = self
-            .binding
-            .model_label
-            .clone()
-            .or_else(|| self.model_label.as_ref().map(|m| m.to_string()))
-            .unwrap_or_else(|| "seat CLI login".into());
-        let run_status = self.run.as_ref().map(|r| r.status);
-        let probe = self.seat.ready().and_then(|s| s.config.last_probe.clone());
-        let busy = self.control_busy;
+/// The notice card's button row, indented under the title.
+fn notice_actions() -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap(px(6.0))
+        .pl(px(22.0))
+}
 
-        let mut bar = div()
-            .flex_none()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .h(px(30.0))
-            .px(px(10.0))
-            .border_t_1()
-            .border_color(theme.border)
-            .child(status_dot(theme, probe.as_ref()))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(crate::typography::ui_rems(11.5))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text)
-                    .child(SharedString::from(seat_label)),
-            )
-            .child(widgets::badge(theme, model))
-            .when_some(run_status, |el, status| {
-                el.child(widgets::badge(theme, status.label()))
-            })
-            // The Railway countdown chip — the spec's required live MM:SS.
-            // Reads the persisted binding deadline so every device agrees.
-            .when_some(
-                self.binding
-                    .expires_at
-                    .map(|at| at.signed_duration_since(chrono::Utc::now())),
-                |el, left| {
-                    let secs = left.num_seconds().max(0);
-                    let text = format!("{:02}:{:02}", secs / 60, secs % 60);
-                    el.child(
-                        div()
-                            .id("rail-countdown")
-                            .flex_none()
-                            .px(px(6.0))
-                            .py(px(2.0))
-                            .rounded(px(6.0))
-                            .bg(theme.warning.opacity(0.15))
-                            .text_size(crate::typography::ui_rems(10.5))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme.warning)
-                            .child(text)
-                            .tooltip(widgets::text_tooltip("trial time left")),
-                    )
-                },
-            );
-        // Controls — each rides CLOUD_SEAT_CONTROL; never decorative.
-        let mut controls = div().flex_none().flex().flex_row().gap(px(2.0));
-        let small_btn = |id: &'static str, label: &'static str, theme: &Theme| {
-            let fade = SharedString::from(format!("rail-ctl-{id}"));
-            div()
-                .id(SharedString::from(format!("rail-ctl-{id}")))
-                .px(px(6.0))
-                .py(px(3.0))
-                .rounded(px(5.0))
-                .text_size(crate::typography::ui_rems(10.5))
-                .text_color(theme.text_muted)
-                .bg(crate::motion::hover_blend(
-                    &fade,
-                    gpui::transparent_black(),
-                    theme.element_hover,
-                ))
-                .on_hover(crate::motion::hover_listener(fade))
-                .cursor_pointer()
-                .child(SharedString::from(label))
-        };
-        match run_status {
-            Some(CloudRunStatus::Working) | Some(CloudRunStatus::Queued) => {
-                controls = controls.child(
-                    small_btn("pause", "Pause", theme)
-                        .when(busy, |el| el.opacity(0.5))
-                        .on_click(cx.listener(|this, _, _, cx| this.seat_control("pause", cx))),
-                );
-                controls = controls.child(
-                    small_btn("stop", "Stop", theme)
-                        .when(busy, |el| el.opacity(0.5))
-                        .on_click(cx.listener(|this, _, _, cx| this.seat_control("stop", cx))),
-                );
-            }
-            Some(CloudRunStatus::Stopped) => {
-                controls = controls.child(
-                    small_btn("resume", "Resume", theme)
-                        .when(busy, |el| el.opacity(0.5))
-                        .on_click(cx.listener(|this, _, _, cx| this.seat_control("resume", cx))),
-                );
-            }
-            Some(CloudRunStatus::NeedsApproval) => {
-                controls = controls.child(
-                    small_btn("approve", "Approve", theme)
-                        .when(busy, |el| el.opacity(0.5))
-                        .on_click(cx.listener(|this, _, _, cx| this.seat_control("approve", cx))),
-                );
-            }
-            _ => {}
-        }
-        // Boat lifecycle rides the same control RPC — Sleep archives the box
-        // (billing off); Wake resumes it. Only meaningful for a Box seat.
-        let is_boat = self
-            .seat
-            .ready()
-            .is_some_and(|s| s.config.kind == Some(CloudSeatKind::Box));
-        let sleeping = probe.as_ref().is_some_and(|p| p.sleeping);
-        if is_boat && self.seat.ready().is_some_and(|s| s.config.box_id.is_some()) {
-            let (id, label, op) = if sleeping {
-                ("wake", "Wake", "wake")
-            } else {
-                ("sleep", "Sleep", "sleep")
-            };
-            controls = controls.child(
-                small_btn(id, label, theme)
-                    .when(busy, |el| el.opacity(0.5))
-                    .on_click(cx.listener(move |this, _, _, cx| this.seat_control(op, cx))),
-            );
-        }
-        // Open preview: a provider-stamped URL (Railway *.up.railway.app,
-        // Boat desktop) opens in the user's browser; else the Computer pane
-        // carries the last screenshot.
-        let preview_url = self.seat.ready().and_then(|s| s.config.preview_url.clone());
-        controls = controls.child(match preview_url {
-            Some(url) => {
-                small_btn("preview", "Preview", theme).on_click(move |_, _, cx| cx.open_url(&url))
-            }
-            None => small_btn("preview", "Preview", theme)
-                .on_click(cx.listener(|this, _, _, cx| this.set_pane(CloudPane::Computer, cx))),
-        });
-        let destroy = if self.confirm_destroy {
-            small_btn("destroy-yes", "Destroy?", theme)
-                .text_color(theme.danger)
-                .on_click(cx.listener(|this, _, _, cx| this.seat_control("destroy", cx)))
-        } else {
-            small_btn("destroy", "Destroy", theme)
-                .when(!caps.exec, |el| el.opacity(0.45))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.confirm_destroy = true;
-                    cx.notify();
-                }))
-        };
-        bar = bar.child(controls.child(destroy));
-        bar.into_any_element()
-    }
+/// A notice-card button: compact rounded-md pill; `primary` takes the
+/// accent fill, the rest the agent-mode wash.
+fn notice_button(
+    id: &'static str,
+    label: &str,
+    theme: &Theme,
+    primary: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let fade = format!("rail-notice-{id}");
+    let (rest, hover, text) = if primary {
+        (
+            theme.accent.opacity(0.16),
+            theme.accent.opacity(0.26),
+            theme.accent,
+        )
+    } else {
+        (
+            crate::theme::wash(0.06),
+            crate::theme::wash(0.12),
+            theme.text,
+        )
+    };
+    div()
+        .id(SharedString::from(fade.clone()))
+        .h(px(24.0))
+        .px(px(10.0))
+        .flex()
+        .items_center()
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .text_size(crate::typography::ui_rems(11.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(text)
+        .bg(crate::motion::hover_blend(&fade, rest, hover))
+        .on_hover(crate::motion::hover_listener(fade))
+        .child(SharedString::from(label.to_string()))
 }
 
 impl Render for CloudRail {
@@ -3006,283 +5128,27 @@ impl Render for CloudRail {
             CloudPane::Context => self.render_context(&theme, cx),
             CloudPane::Tasks => self.render_tasks(&theme, cx),
         };
-        // The + button top-left opens the pane menu — the screenshot's IA.
-        let plus = div()
-            .id("rail-plus")
-            .size(px(20.0))
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .rounded(px(5.0))
-            .text_size(crate::typography::ui_rems(14.0))
-            .text_color(theme.text_muted)
-            .bg(crate::motion::hover_blend(
-                "rail-plus",
-                gpui::transparent_black(),
-                theme.element_hover,
-            ))
-            .on_hover(crate::motion::hover_listener("rail-plus"))
-            .cursor_pointer()
-            .child("+")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.pane_menu_open = !this.pane_menu_open;
-                cx.notify();
-            }));
-        let header = div()
-            .relative()
-            .flex_none()
-            .h(px(32.0))
-            .px(px(8.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(plus)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(crate::typography::ui_rems(11.5))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(self.pane.label())),
-            )
-            .when(self.pane_menu_open, |el| {
-                el.child(self.render_pane_menu(&theme, cx))
-            });
         let bot_bar = self.render_bot_bar(&theme, cx);
-        let seat_row = self.seat.ready().cloned();
-        let is_railway = seat_row
-            .as_ref()
-            .is_some_and(|s| s.config.kind == Some(CloudSeatKind::Railway))
-            || self.binding.kind == CloudSeatKind::Railway;
-        let railway_expired = is_railway
-            && self
-                .binding
-                .expires_at
-                .map(|at| at <= chrono::Utc::now())
-                .unwrap_or(false);
-        let is_boat = seat_row
-            .as_ref()
-            .is_some_and(|s| s.config.kind == Some(CloudSeatKind::Box));
-        let sleeping = seat_row
-            .as_ref()
-            .and_then(|s| s.config.last_probe.as_ref())
-            .is_some_and(|p| p.sleeping);
-        let claim_url = seat_row.as_ref().and_then(|s| s.config.claim_url.clone());
-        let backed_up = seat_row
-            .as_ref()
-            .is_some_and(|s| s.config.backup_at.is_some());
-        let not_persistent = !self.capabilities().keeps_running && !sleeping && !railway_expired;
-        // The "Keep this computer" card shows once: a Railway (or
-        // desk-bound) seat that finished a run and has never been asked.
-        let show_keep_prompt = is_railway
-            && self.run.as_ref().is_some_and(|r| {
-                matches!(
-                    r.status,
-                    CloudRunStatus::Done | CloudRunStatus::Stopped | CloudRunStatus::Error
-                )
-            })
-            && self.keep_prompted.is_none()
-            && seat_row
-                .as_ref()
-                .is_some_and(|s| s.config.keep_prompted_at.is_none());
+        let notices = self.render_notices(&theme, cx);
         let mut col = div()
             .size_full()
             .flex()
             .flex_col()
-            .child(header)
             .child(bot_bar)
-            .when(not_persistent, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .text_size(crate::typography::ui_rems(10.5))
-                        .text_color(theme.warning)
-                        .child("This seat runs only while the desktop app is open"),
-                )
-            })
-            // Railway's one-line death sentence + the claim escape hatch.
-            .when(is_railway && !railway_expired, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_size(crate::typography::ui_rems(10.5))
-                                .text_color(theme.warning)
-                                .child(
-                                    "This seat dies when the hour ends unless you claim it or attach Boat",
-                                ),
-                        )
-                        .when_some(claim_url.clone(), |el, url| {
-                            el.child(
-                                div()
-                                    .id("rail-claim")
-                                    .flex_none()
-                                    .px(px(6.0))
-                                    .py(px(2.0))
-                                    .rounded(px(5.0))
-                                    .text_size(crate::typography::ui_rems(10.5))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.accent)
-                                    .bg(crate::motion::hover_blend(
-                                        "rail-claim",
-                                        gpui::transparent_black(),
-                                        theme.element_hover,
-                                    ))
-                                    .on_hover(crate::motion::hover_listener("rail-claim"))
-                                    .cursor_pointer()
-                                    .child("Claim")
-                                    .on_click(move |_, _, cx| cx.open_url(&url)),
-                            )
-                        }),
-                )
-            })
-            .when(railway_expired, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .text_size(crate::typography::ui_rems(10.5))
-                        .text_color(theme.danger)
-                        .child(if backed_up {
-                            "Trial ended — workspace backed up locally; a Boat seat restores it on its first run"
-                        } else {
-                            "Trial ended — claim the VM from the link or start a new seat"
-                        }),
-                )
-            })
-            .when(is_boat && sleeping, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .text_size(crate::typography::ui_rems(10.5))
-                        .text_color(theme.warning)
-                        .child("Boat box is sleeping — billing off; Wake to resume"),
-                )
-            })
-            // The one-shot "Keep this computer" card — both answers stamp
-            // `markKeepPrompted` so it never asks twice.
-            .when(show_keep_prompt, |el| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .flex_col()
-                        .gap(px(6.0))
-                        .px(px(10.0))
-                        .py(px(8.0))
-                        .m(px(8.0))
-                        .rounded(px(10.0))
-                        .border_1()
-                        .border_color(theme.accent.opacity(0.4))
-                        .bg(theme.accent.opacity(0.08))
-                        .child(
-                            div()
-                                .text_size(crate::typography::ui_rems(11.5))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.text)
-                                .child("Keep this computer?"),
-                        )
-                        .child(
-                            div()
-                                .text_size(crate::typography::ui_rems(10.5))
-                                .text_color(theme.text_muted)
-                                .child(
-                                    "Attach a Boat token to keep a persistent cloud PC — the trial's hour is almost up.",
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .gap(px(6.0))
-                                .child(
-                                    div()
-                                        .id("keep-yes")
-                                        .px(px(8.0))
-                                        .py(px(3.0))
-                                        .rounded(px(5.0))
-                                        .text_size(crate::typography::ui_rems(10.5))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.accent)
-                                        .bg(crate::motion::hover_blend(
-                                            "keep-yes",
-                                            gpui::transparent_black(),
-                                            theme.element_hover,
-                                        ))
-                                        .on_hover(crate::motion::hover_listener("keep-yes"))
-                                        .cursor_pointer()
-                                        .child("Attach Boat token")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.mark_keep_prompted(cx);
-                                            cx.emit(RailEvent::OpenCloudSettings);
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id("keep-no")
-                                        .px(px(8.0))
-                                        .py(px(3.0))
-                                        .rounded(px(5.0))
-                                        .text_size(crate::typography::ui_rems(10.5))
-                                        .text_color(theme.text_muted)
-                                        .bg(crate::motion::hover_blend(
-                                            "keep-no",
-                                            gpui::transparent_black(),
-                                            theme.element_hover,
-                                        ))
-                                        .on_hover(crate::motion::hover_listener("keep-no"))
-                                        .cursor_pointer()
-                                        .child("Not now")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.mark_keep_prompted(cx);
-                                        })),
-                                ),
-                        ),
-                )
-            })
-            .when_some(self.control_error.clone(), |el, err| {
-                el.child(
-                    div()
-                        .flex_none()
-                        .px(px(10.0))
-                        .py(px(4.0))
-                        .text_size(crate::typography::ui_rems(10.5))
-                        .text_color(theme.danger)
-                        .child(SharedString::from(err)),
-                )
-            });
+            .children(notices);
         match &self.seat {
             Loadable::Error(err) => {
                 col = col.child(div().flex_1().min_h_0().child(
                     pane_empty(&theme, icons::CLOUD, "Cloud seat", err.as_str()).into_any_element(),
                 ));
+            }
+            _ if self.picking => {
+                col = col.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.render_picker(&theme, cx)),
+                );
             }
             _ => {
                 col = col.child(div().flex_1().min_h_0().child(content));

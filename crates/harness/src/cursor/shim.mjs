@@ -574,7 +574,14 @@ function modelSelection(msg) {
 
 async function start(msg) {
   const model = modelSelection(msg);
-  const local = { cwd: msg.cwd || process.cwd(), enableAgentRetries: true };
+  // The SDK loads no ambient settings unless asked. "project" (and so "all")
+  // is left out because the SDK skips MCP approvals, so repo-defined servers
+  // and hooks could run at chat start without the approval gating Cursor applies.
+  const local = {
+    cwd: msg.cwd || process.cwd(),
+    enableAgentRetries: true,
+    settingSources: ["user", "team", "mdm", "plugins"],
+  };
   // Isolated per-run store (see the header above). Resume looks the agent's
   // store up by marker; a markerless (pre-isolation) agent resumes from the
   // SDK's default store exactly as before.

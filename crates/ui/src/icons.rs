@@ -163,6 +163,7 @@ icon_assets![
     (GLOBAL, "global"),
     (CHECKLIST, "checklist"),
     (WIDGET, "widget"),
+    (KANBAN, "kanban"),
     (MAGIC_STICK_3, "magic-stick-3"),
     (WIFI_OFF, "wifi-off"),
     (CLOSE_CIRCLE, "close-circle"),

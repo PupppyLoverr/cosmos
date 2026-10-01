@@ -44,10 +44,50 @@ require `parent_chat_id == None`. Children remain addressable by id, deep
 link, and every MCP tool; `list_chats { parent }` is how an orchestrator
 finds them.
 
-Nothing is injected yet: every harness still launches with an empty MCP config
-(`claude/mod.rs --strict-mcp-config`, ACP `session/new mcpServers: []`, codex
-`mcp_servers.*.enabled = false`). Wiring the injection per harness is the
-follow-up; the env contract above is what it will set.
+The desktop does not currently inject a Cosmos MCP server into Cursor sessions.
+Cursor's user-configured and managed MCP servers and plugins are loaded from
+the SDK's allowed settings sources; project settings remain excluded because
+the SDK skips MCP approval checks, which could run repository-defined commands
+without approval.
+
+### Injection
+
+The host engine stamps the Cosmos MCP server onto runs for harnesses that
+support injection (`RunRequest.mcp`, additive). Each driver spells it in its
+own dialect and leaves the user's configured servers alone:
+
+| Harness | Where |
+| ------- | ----- |
+| Claude  | `--mcp-config <inline json>` (no `--strict-mcp-config`) |
+| ACP (Devin, Grok, Hermes, Antigravity) | `session/new` and `session/load` → `mcpServers: [{name, command, args, env}]` |
+| Pi | Per-run `--extension` bridges stdio MCP into Pi tools (`pi-acp` 0.0.33 ignores `mcpServers`) |
+| OpenCode | Child-only `OPENCODE_CONFIG_CONTENT`: `mcp.zeron` on 1.x, `mcp.servers.zeron` on 2.x |
+| Codex   | `thread/start` config overrides `mcp_servers.zeron.{command,args,env}` |
+| Cursor  | SDK `local.settingSources: ["user", "team", "mdm", "plugins"]`; project settings are excluded because the SDK skips MCP approvals |
+
+OpenCode preserves inherited inline configuration and other servers. Its config
+shape follows the installed binary's major version. Cursor uses the SDK's
+[inline MCP configuration](https://cursor.com/docs/sdk/typescript); OpenCode's
+[1.x config layer](https://opencode.ai/docs/config/) and
+[2.x MCP format](https://opencode.ai/v2/docs/mcp-servers) differ.
+Pi's private wrapper and extension live only for the ACP process lifetime;
+user settings, extensions, and session arguments remain intact. The bridge
+registers `zeron_<tool>` tools, propagates cancellation and errors, and closes
+the MCP child when the Pi session shuts down.
+
+Title runs never carry it. A run with no served port (embedded engine that
+lost the bind) gets no Cosmos tools rather than a dead server.
+
+### Forks and the explorer
+
+`ForkSideChat { chatId, sourceChatId, parentChatId? }` copies a chat's
+history through its latest completed response into a new chat and appends
+a `fork` part (a system entry: `sourceChatId`, `sourceTitle`) as the seam;
+the transcript draws it as "This chat was forked from <title>". `parentChatId`
+defaults to the source; a side chat's own fork button passes its parent so
+the copy lists as a sibling. The file explorer's footer lists a chat's
+**Subagents** (its spawn chips) and **Chats** (its children: forks and
+`create_chat` spawns) and opens either in the right pane.
 
 ## Tools
 

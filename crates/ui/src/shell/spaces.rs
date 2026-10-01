@@ -1604,6 +1604,130 @@ mod pinned_session_tests {
         });
     }
 
+    #[gpui::test]
+    fn archive_pill_follows_a_still_pointer_down_the_list(cx: &mut gpui::TestAppContext) {
+        use super::*;
+
+        struct SidebarHost(Entity<Shell>);
+        impl Render for SidebarHost {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.0.update(cx, |shell, cx| {
+                    div()
+                        .w(px(280.0))
+                        .h(px(800.0))
+                        .child(shell.render_chat_sidebar(&Theme::default(), cx))
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            SidebarHost(cx.new(|cx| {
+                let state = cx.new(|_| AppState::new());
+                let mut shell = Shell::new(
+                    state,
+                    EngineBootConfig {
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: zeron_proto::HarnessId::Mock,
+                    },
+                    cx,
+                );
+                shell.settings.sidebar_organization = SidebarOrganization::InOneList;
+                shell.reduced_motion = true;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.local_device_id = Some("local".into());
+                    state.chats = ["a", "b", "c"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ix, id)| {
+                            serde_json::from_value(serde_json::json!({
+                                "id": id, "title": id, "deviceId": "local", "archived": false,
+                                "createdAt": Utc::now() - chrono::Duration::minutes(ix as i64),
+                            }))
+                            .unwrap()
+                        })
+                        .collect();
+                });
+                shell
+            }))
+        });
+        let shell = host.read_with(cx, |host, _| host.0.clone());
+        let order = shell.update(cx, |shell, cx| shell.sidebar_visible_order(cx));
+        assert_eq!(order, ids(&["a", "b", "c"]));
+        let state = shell.read_with(cx, |shell, _| shell.state.clone());
+
+        let row = cx.debug_bounds("chat-a").unwrap();
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+        let pointer = cx.debug_bounds("chat-a-corner").unwrap().center();
+        cx.simulate_mouse_move(pointer, None, gpui::Modifiers::default());
+        for (archived, next) in [
+            ("a", Some(("b", "chat-b-corner"))),
+            ("b", Some(("c", "chat-c-corner"))),
+            ("c", None),
+        ] {
+            cx.simulate_click(pointer, gpui::Modifiers::default());
+            shell.read_with(cx, |shell, _| {
+                assert!(shell.chat_hover_resync);
+                assert_eq!(
+                    shell.chat_status_hover.as_deref(),
+                    Some(format!("chat-{archived}").as_str())
+                );
+            });
+            // The engine round-trip lands; the next row slides up under the
+            // unmoved pointer.
+            state.update(cx, |state, cx| {
+                state
+                    .chats
+                    .iter_mut()
+                    .find(|chat| chat.id == archived)
+                    .unwrap()
+                    .archived = true;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            shell.update(cx, |shell, cx| {
+                shell.sidebar_resort.clear();
+                shell.sidebar_new_keys.clear();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            // Its Archived-section copy shares the row key and must not stay lit.
+            assert_eq!(
+                crate::motion::hover_t(&format!("chat-{archived}-hover")),
+                0.0
+            );
+            let expected = next.map(|(next, _)| format!("chat-{next}"));
+            shell.read_with(cx, |shell, _| {
+                assert_eq!(shell.chat_status_hover, expected);
+            });
+            if let Some((_, corner)) = next {
+                assert!(cx.debug_bounds(corner).unwrap().contains(&pointer));
+            }
+        }
+
+        // Real pointer movement hands hover back to gpui's own tracking.
+        let row = cx.debug_bounds("chat-c").unwrap();
+        cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+        shell.read_with(cx, |shell, _| assert!(!shell.chat_hover_resync));
+    }
+
     #[test]
     fn missing_duplicate_and_archived_pins_do_not_disturb_regular_rows() {
         let recency = ids(&["b", "a", "c"]);
@@ -1986,6 +2110,8 @@ fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyEle
 #[derive(Clone, PartialEq)]
 pub(super) enum SpacesMenuRow {
     All,
+    /// Cloud mode: a GitHub repo (`owner/name`) for new cloud sessions.
+    Repo(String),
     Space(String),
     AddSpace,
 }
@@ -2127,6 +2253,22 @@ impl popover::ScrollRailHost for Shell {
 
     fn rail_scroll(&self) -> Option<gpui::ScrollHandle> {
         self.spaces_menu.get().map(|menu| menu.list_scroll.clone())
+    }
+
+    fn rail_bar_for(&mut self, id: &'static str) -> &mut popover::MenuScrollbarState {
+        if id == "sidebar-scrollbar" {
+            &mut self.sidebar_bar
+        } else {
+            &mut self.spaces_menu_bar
+        }
+    }
+
+    fn rail_scroll_for(&self, id: &'static str) -> Option<gpui::ScrollHandle> {
+        if id == "sidebar-scrollbar" {
+            Some(self.sidebar_scroll.clone())
+        } else {
+            self.spaces_menu.get().map(|menu| menu.list_scroll.clone())
+        }
     }
 }
 
@@ -2973,6 +3115,21 @@ impl Shell {
             .map(|menu| menu.search.read(cx).text().to_string())
             .unwrap_or_default();
         let state = self.state.read(cx);
+        if state.cloud_mode {
+            let mut rows = Vec::new();
+            if query.trim().is_empty() {
+                rows.push(SpacesMenuRow::All);
+            }
+            if let crate::popover::Loadable::Ready(repos) = &state.cloud_repos {
+                let names: Vec<String> = repos.iter().map(|r| r.full_name.clone()).collect();
+                rows.extend(
+                    popover::filter_indices(&query, &names)
+                        .into_iter()
+                        .map(|ix| SpacesMenuRow::Repo(names[ix].clone())),
+                );
+            }
+            return rows;
+        }
         let spaces = state.spaces_sorted();
         let names: Vec<String> = spaces
             .iter()
@@ -2994,8 +3151,17 @@ impl Shell {
         self.close_sidebar_view_menu(cx);
         // "PaletteSearch" context: ↑↓/⏎ stay unbound in the input and bubble
         // to the card's key handler.
-        let search =
-            cx.new(|cx| ComposerInput::with_context("Search projects…", "PaletteSearch", cx));
+        let cloud_mode = self.state.read(cx).cloud_mode;
+        if cloud_mode {
+            self.state
+                .update(cx, |state, cx| state.refresh_cloud_repos(cx));
+        }
+        let placeholder = if cloud_mode {
+            "Search repositories…"
+        } else {
+            "Search projects…"
+        };
+        let search = cx.new(|cx| ComposerInput::with_context(placeholder, "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
                 if let Some(menu) = this.spaces_menu.open_mut() {
@@ -3018,12 +3184,22 @@ impl Shell {
         // the reopen as scrolling.
         self.spaces_menu_bar.clear_scroll_baseline();
         let rows = self.spaces_menu_rows(cx);
-        let start = match &current {
-            None => 0,
-            Some(id) => rows
+        let current_repo = self
+            .state
+            .read(cx)
+            .cloud_repo_pick
+            .as_ref()
+            .map(|r| r.full_name.clone());
+        let start = match (cloud_mode, &current, &current_repo) {
+            (true, _, Some(repo)) => rows
+                .iter()
+                .position(|row| matches!(row, SpacesMenuRow::Repo(r) if r == repo))
+                .unwrap_or(0),
+            (false, Some(id), _) => rows
                 .iter()
                 .position(|row| matches!(row, SpacesMenuRow::Space(s) if s == id))
                 .unwrap_or(0),
+            _ => 0,
         };
         if let Some(menu) = self.spaces_menu.open_mut() {
             menu.active = start;
@@ -3034,9 +3210,42 @@ impl Shell {
     }
 
     fn activate_spaces_menu_row(&mut self, row: SpacesMenuRow, cx: &mut Context<Self>) {
+        if self.state.read(cx).cloud_mode {
+            match row {
+                SpacesMenuRow::All | SpacesMenuRow::Repo(_) => {
+                    self.state.update(cx, |state, cx| {
+                        let pick = match &row {
+                            SpacesMenuRow::Repo(name) => match &state.cloud_repos {
+                                crate::popover::Loadable::Ready(repos) => {
+                                    repos.iter().find(|r| &r.full_name == name).cloned()
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        state.set_cloud_repo_pick(pick);
+                        cx.notify();
+                    });
+                    self.close_spaces_menu(cx);
+                }
+                SpacesMenuRow::AddSpace | SpacesMenuRow::Space(_) => {
+                    self.close_spaces_menu(cx);
+                    if matches!(
+                        self.state.read(cx).cloud_repos,
+                        crate::popover::Loadable::Error(_)
+                    ) {
+                        self.open_settings(super::SettingsSection::CloudComputer, cx);
+                    } else {
+                        cx.open_url(zeron_engine::cloud::COSMOS_GITHUB_INSTALL_URL);
+                    }
+                }
+            }
+            return;
+        }
         match row {
             SpacesMenuRow::All => self.set_space_filter(None, cx),
             SpacesMenuRow::Space(id) => self.set_space_filter(Some(id), cx),
+            SpacesMenuRow::Repo(_) => {}
             SpacesMenuRow::AddSpace => {
                 self.close_spaces_menu(cx);
                 self.open_add_space(cx);
@@ -3671,20 +3880,32 @@ impl Shell {
                 None => (SharedString::from("All projects"), None),
             }
         };
+        let cloud_mode = self.state.read(cx).cloud_mode;
+        let (label, device_tag) = if cloud_mode {
+            let state = self.state.read(cx);
+            let label = state
+                .cloud_repo_pick
+                .as_ref()
+                .map(|r| SharedString::from(r.full_name.clone()))
+                .unwrap_or_else(|| SharedString::from("No repository"));
+            (label, None)
+        } else {
+            (label, device_tag)
+        };
         let open = self.spaces_menu.is_open();
 
         let trigger = div()
             .id("spaces-filter")
             .flex_1()
             .min_w_0()
-            .h(px(29.0))
+            .h(px(28.0))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(Theme::SPACE_SM))
-            .rounded(px(8.0))
+            .rounded(px(6.0))
             .px(px(Theme::SPACE_SM))
-            .text_size(crate::typography::ui_rems(13.0))
+            .text_size(crate::typography::ui_rems(12.5))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(motion::hover_blend(
                 "spaces-filter",
@@ -3716,10 +3937,14 @@ impl Shell {
                 }
             }))
             .child(
-                icon(icons::FOLDER)
-                    .size(px(16.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
+                icon(if cloud_mode {
+                    icons::GIT_BRANCH
+                } else {
+                    icons::FOLDER
+                })
+                .size(px(14.0))
+                .flex_none()
+                .text_color(theme.text_muted),
             )
             // flex_1 pushes the caret to the trigger's right edge and gives
             // long space names a bound to fade against; the "@ device"
@@ -3784,7 +4009,7 @@ impl Shell {
             .aria_label("Sidebar view options")
             .aria_expanded(view_open)
             .track_focus(&view_focus)
-            .size(px(29.0))
+            .size(px(28.0))
             .flex_none()
             .flex()
             .items_center()
@@ -3878,6 +4103,13 @@ impl Shell {
         let rows = self.spaces_menu_rows(cx);
         let scrollbar = popover::rail(self, "spaces-menu-scrollbar", theme, cx);
         let filter = self.settings.space_filter.clone();
+        let cloud_mode = self.state.read(cx).cloud_mode;
+        let repo_pick = self
+            .state
+            .read(cx)
+            .cloud_repo_pick
+            .as_ref()
+            .map(|r| r.full_name.clone());
         // Keep the host tag so projects with the same name on different
         // devices remain distinguishable. Consume `rows` to avoid cloning
         // the list children per frame.
@@ -3891,6 +4123,13 @@ impl Shell {
             let state = self.state.read(cx);
             rows.into_iter()
                 .map(|row| match row {
+                    SpacesMenuRow::All if cloud_mode => (
+                        SpacesMenuRow::All,
+                        SharedString::from("No repository"),
+                        Some(SharedString::from("empty workspace")),
+                        false,
+                        repo_pick.is_none(),
+                    ),
                     SpacesMenuRow::All => (
                         SpacesMenuRow::All,
                         SharedString::from("All projects"),
@@ -3898,6 +4137,23 @@ impl Shell {
                         false,
                         filter.is_none(),
                     ),
+                    SpacesMenuRow::Repo(name) => {
+                        let private = match &state.cloud_repos {
+                            crate::popover::Loadable::Ready(repos) => repos
+                                .iter()
+                                .find(|r| r.full_name == name)
+                                .is_some_and(|r| r.private),
+                            _ => false,
+                        };
+                        let selected = repo_pick.as_deref() == Some(name.as_str());
+                        (
+                            SpacesMenuRow::Repo(name.clone()),
+                            name.into(),
+                            private.then(|| SharedString::from("private")),
+                            false,
+                            selected,
+                        )
+                    }
                     SpacesMenuRow::Space(id) => {
                         let selected = filter.as_deref() == Some(id.as_str());
                         match state.space_row(&id) {
@@ -3929,6 +4185,27 @@ impl Shell {
         // The pinned footer's keyboard-nav index: one past the last
         // scrollable row, its permanent place at the end of the nav order.
         let add_index = details.len();
+        let (repo_status, footer_label): (Option<SharedString>, SharedString) = if cloud_mode {
+            match &self.state.read(cx).cloud_repos {
+                crate::popover::Loadable::Error(err) => (
+                    Some(err.clone().into()),
+                    SharedString::from("Connect GitHub…"),
+                ),
+                crate::popover::Loadable::Ready(repos) if repos.is_empty() => (
+                    Some("No repositories yet — choose which ones Cosmos can see.".into()),
+                    SharedString::from("Choose repositories on GitHub…"),
+                ),
+                crate::popover::Loadable::Ready(_) => {
+                    (None, SharedString::from("Choose repositories on GitHub…"))
+                }
+                _ => (
+                    Some("Loading repositories…".into()),
+                    SharedString::from("Choose repositories on GitHub…"),
+                ),
+            }
+        } else {
+            (None, SharedString::from("New project…"))
+        };
 
         let list = popover::menu_scroll_host("spaces-menu-list-host")
             .on_hover(cx.listener(Self::on_spaces_menu_list_hover))
@@ -4013,6 +4290,16 @@ impl Shell {
                 theme,
                 search.into_any_element(),
             ))
+            .when_some(repo_status, |el, status| {
+                el.child(
+                    div()
+                        .px(px(Theme::SPACE_SM))
+                        .py(px(6.0))
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .text_color(theme.text_muted)
+                        .child(status),
+                )
+            })
             .child(list)
             // "New project…" is a pinned action row under the list (the
             // chat composer's project menu treatment) — scrolling must
@@ -4041,18 +4328,16 @@ impl Shell {
                     this.activate_spaces_menu_row(SpacesMenuRow::AddSpace, cx);
                 }))
                 .child(
-                    icon(icons::PLUS)
-                        .size(px(12.0))
-                        .flex_none()
-                        .text_color(theme.text_muted),
+                    icon(if cloud_mode {
+                        icons::ARROW_UP_RIGHT
+                    } else {
+                        icons::PLUS
+                    })
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(SharedString::from("New project…")),
-                ),
+                .child(div().flex_1().min_w_0().truncate().child(footer_label)),
             )
             .into_any_element()
     }

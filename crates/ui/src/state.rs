@@ -790,6 +790,37 @@ pub struct AppState {
     cloud_task: Option<Task<()>>,
     /// When the last successful `CloudGetConfig` landed (staleness checks).
     cloud_fetched_at: Option<std::time::Instant>,
+    /// Whether new sessions target a cloud seat instead of this computer.
+    pub cloud_mode: bool,
+    /// The selected cloud seat for new sessions. This is intentionally
+    /// session-local; the mode persists, but a seat is refreshed from config.
+    pub cloud_seat_pick: Option<crate::cloud::SeatRow>,
+    /// The GitHub repo new cloud sessions check out on the seat (the
+    /// sidebar folder picker lists repos in Cloud mode). None = the seat's
+    /// plain workspace.
+    pub cloud_repo_pick: Option<zeron_engine::cloud::RepoHit>,
+    /// The connected GitHub account's repos for that picker.
+    pub cloud_repos: crate::popover::Loadable<Vec<zeron_engine::cloud::RepoHit>>,
+    cloud_repos_task: Option<Task<()>>,
+    /// The branch new cloud sessions start on (the composer's branch chip).
+    /// None = the picked repo's default branch. Cleared on a repo change.
+    pub cloud_branch_pick: Option<String>,
+    /// Each repo's branches, fetched on demand for the branch picker.
+    pub cloud_branches: HashMap<String, crate::popover::Loadable<CloudBranches>>,
+    cloud_branch_tasks: HashMap<String, Task<()>>,
+    /// GitHub login behind `cloud_repos`, from the last repo fetch.
+    pub cloud_github_login: Option<String>,
+    /// Why the last Railway trial start failed, until one succeeds.
+    pub cloud_trial_failure: Option<String>,
+    /// A Railway trial provision is in flight (single-flight guard + the
+    /// "starting…" copy).
+    pub cloud_trial_starting: bool,
+    /// The automatic first-run trial start already fired this session —
+    /// entering Cloud never retry-loops a refused trial.
+    pub cloud_trial_autostarted: bool,
+    /// Seat to pick for new cloud chats on the next refresh (set when the
+    /// user saves a Boat token / VPS seat in Settings).
+    pub cloud_prefer_seat: Option<String>,
 }
 
 /// Text/reasoning growth changes the transcript without changing session
@@ -804,6 +835,14 @@ impl gpui::EventEmitter<TranscriptTextChanged> for AppState {}
 fn is_text_append(frame: &TranscriptFrame) -> bool {
     matches!(frame, TranscriptFrame::Delta { upsert, append, remove, .. }
         if upsert.is_empty() && remove.is_empty() && !append.is_empty())
+}
+
+fn repick(
+    pick: Option<crate::cloud::SeatRow>,
+    view: &crate::cloud::CloudView,
+) -> Option<crate::cloud::SeatRow> {
+    let seat_id = pick?.config.id;
+    view.seat(&seat_id).cloned()
 }
 
 impl Default for AppState {
@@ -862,6 +901,19 @@ impl AppState {
             cloud: crate::popover::Loadable::Idle,
             cloud_task: None,
             cloud_fetched_at: None,
+            cloud_mode: false,
+            cloud_seat_pick: None,
+            cloud_repo_pick: None,
+            cloud_repos: crate::popover::Loadable::Idle,
+            cloud_repos_task: None,
+            cloud_branch_pick: None,
+            cloud_branches: HashMap::new(),
+            cloud_branch_tasks: HashMap::new(),
+            cloud_github_login: None,
+            cloud_trial_failure: None,
+            cloud_trial_starting: false,
+            cloud_trial_autostarted: false,
+            cloud_prefer_seat: None,
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -1940,6 +1992,12 @@ impl AppState {
         self.cloud.ready()
     }
 
+    pub fn active_cloud_seat(&self) -> Option<&crate::cloud::SeatRow> {
+        self.cloud_mode
+            .then_some(self.cloud_seat_pick.as_ref())
+            .flatten()
+    }
+
     /// Configured seats (empty until the first fetch lands).
     pub fn cloud_seats(&self) -> &[crate::cloud::SeatRow] {
         self.cloud
@@ -1970,6 +2028,120 @@ impl AppState {
     /// Latest ledger run for a chat — the Progress pane and the seat bar.
     pub fn cloud_run_for_chat(&self, chat_id: &str) -> Option<&zeron_proto::CloudRun> {
         self.cloud_view()?.run_for_chat(chat_id)
+    }
+
+    /// Pick the repo new cloud sessions check out (None = the seat's plain
+    /// workspace). A different repo drops the branch pick — branches belong
+    /// to their repo.
+    pub fn set_cloud_repo_pick(&mut self, pick: Option<zeron_engine::cloud::RepoHit>) {
+        let changed = self.cloud_repo_pick.as_ref().map(|r| &r.full_name)
+            != pick.as_ref().map(|r| &r.full_name);
+        self.cloud_repo_pick = pick;
+        if changed {
+            self.cloud_branch_pick = None;
+        }
+    }
+
+    /// The branch a new cloud session starts on: the explicit pick, else
+    /// the picked repo's default branch.
+    pub fn cloud_branch(&self) -> Option<String> {
+        let repo = self.cloud_repo_pick.as_ref()?;
+        self.cloud_branch_pick
+            .clone()
+            .or_else(|| (!repo.default_branch.is_empty()).then(|| repo.default_branch.clone()))
+    }
+
+    /// Load `repo`'s branches for the cloud branch picker (single-flight per
+    /// repo; `force` revalidates while keeping the current rows visible).
+    pub fn refresh_cloud_branches(&mut self, repo: &str, force: bool, cx: &mut Context<Self>) {
+        if self.cloud_branch_tasks.contains_key(repo) {
+            return;
+        }
+        let loaded = matches!(
+            self.cloud_branches.get(repo),
+            Some(crate::popover::Loadable::Ready(_))
+        );
+        if loaded && !force {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        if !loaded {
+            self.cloud_branches
+                .insert(repo.to_string(), crate::popover::Loadable::Loading);
+        }
+        let key = repo.to_string();
+        let task = cx.spawn(async move |this, cx| {
+            let reply = engine
+                .client()
+                .call(
+                    methods::CLOUD_GITHUB_BRANCHES,
+                    serde_json::json!({ "repo": key.clone() }),
+                )
+                .await;
+            this.update(cx, |state, cx| {
+                state.cloud_branch_tasks.remove(&key);
+                let next = match reply {
+                    Ok(value) => crate::popover::Loadable::Ready(CloudBranches {
+                        items: serde_json::from_value(
+                            value.get("branches").cloned().unwrap_or_default(),
+                        )
+                        .unwrap_or_default(),
+                        default_branch: value
+                            .get("defaultBranch")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        truncated: value
+                            .get("truncated")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                    }),
+                    Err(err) => crate::popover::Loadable::Error(err.to_string()),
+                };
+                state.cloud_branches.insert(key, next);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.cloud_branch_tasks.insert(repo.to_string(), task);
+    }
+
+    /// Load the connected GitHub account's repos for the Cloud-mode folder
+    /// picker (single-flight; the reply replaces the list).
+    pub fn refresh_cloud_repos(&mut self, cx: &mut Context<Self>) {
+        if self.cloud_repos_task.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        if !matches!(self.cloud_repos, crate::popover::Loadable::Ready(_)) {
+            self.cloud_repos = crate::popover::Loadable::Loading;
+        }
+        self.cloud_repos_task = Some(cx.spawn(async move |this, cx| {
+            let reply = engine
+                .client()
+                .call(methods::CLOUD_GITHUB_REPOS, serde_json::json!({}))
+                .await;
+            this.update(cx, |state, cx| {
+                state.cloud_repos_task = None;
+                state.cloud_github_login = reply
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.get("login")?.as_str().map(str::to_string));
+                state.cloud_repos = match reply {
+                    Ok(value) => crate::popover::Loadable::Ready(
+                        serde_json::from_value(value.get("repos").cloned().unwrap_or_default())
+                            .unwrap_or_default(),
+                    ),
+                    Err(err) => crate::popover::Loadable::Error(err.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Refresh `cloud` from the engine. `stale_after` gates duplicate polls:
@@ -2014,6 +2186,29 @@ impl AppState {
                     }
                     Err(err) => crate::popover::Loadable::Error(err.to_string()),
                 };
+                if let Some(view) = state.cloud.ready() {
+                    state.cloud_seat_pick = repick(state.cloud_seat_pick.take(), view);
+                    // A seat the user just set up (a saved Boat token) takes
+                    // over new cloud chats as soon as it's ready.
+                    if let Some(prefer) = state.cloud_prefer_seat.clone()
+                        && let Some(seat) = view.seat(&prefer)
+                    {
+                        if crate::cloud::CloudView::seat_ready(seat) {
+                            state.cloud_seat_pick = Some(seat.clone());
+                        }
+                        state.cloud_prefer_seat = None;
+                    }
+                    // The picked seat died (a trial's hour ended): fall over
+                    // to the best live one instead of blocking every send.
+                    if state
+                        .cloud_seat_pick
+                        .as_ref()
+                        .is_some_and(|seat| !crate::cloud::CloudView::seat_ready(seat))
+                        && let Some(seat) = crate::cloud::CloudView::preferred_seat(&view.seats)
+                    {
+                        state.cloud_seat_pick = Some(seat.clone());
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -3103,6 +3298,37 @@ mod tests {
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `zeron_proto::view`.
     use zeron_proto::{SessionStatus, UserProfile};
+
+    #[test]
+    fn repick_refreshes_the_selected_seat_and_drops_removed_seats() {
+        let selected = crate::cloud::SeatRow {
+            config: zeron_engine::cloud::SeatConfig {
+                id: "railway-1".into(),
+                harness_command: Some("claude -p".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let updated = crate::cloud::SeatRow {
+            config: zeron_engine::cloud::SeatConfig {
+                id: "railway-1".into(),
+                harness_command: Some("opencode run -m opencode/big-pickle".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let view = crate::cloud::CloudView {
+            seats: vec![updated],
+            ..Default::default()
+        };
+
+        let repicked = repick(Some(selected.clone()), &view).unwrap();
+        assert_eq!(
+            repicked.config.harness_command.as_deref(),
+            Some("opencode run -m opencode/big-pickle")
+        );
+        assert!(repick(Some(selected), &crate::cloud::CloudView::default()).is_none());
+    }
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {
@@ -5119,4 +5345,13 @@ impl AppState {
         };
         self.change_requests.store(key, snapshot);
     }
+}
+
+/// One repo's branches as the cloud branch picker shows them — the default
+/// branch first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CloudBranches {
+    pub items: Vec<String>,
+    pub default_branch: String,
+    pub truncated: bool,
 }

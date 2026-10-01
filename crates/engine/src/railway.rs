@@ -24,6 +24,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// What a successful provision hands back.
 #[derive(Debug, Clone, Default)]
 pub struct RailwayTrial {
+    /// Railway requires the user to claim the expired box before it can be
+    /// reached again.
+    pub claim_required: bool,
     /// Build deadline (the 60-minute mark) — the seat's `expires_at`.
     pub expires_at: Option<DateTime<Utc>>,
     /// `https://railway.com/ssh-signup?code=…` — the human's claim link.
@@ -37,11 +40,11 @@ pub struct RailwayTrial {
 /// Extract the trial fields from whatever Railway printed on stderr — the
 /// documented JSON manifest first, then a URL-pattern fallback for the
 /// human-format welcome banner.
-fn parse_manifest(stderr: &str) -> RailwayTrial {
+fn parse_manifest(stdout: &str, stderr: &str, assign_fallback_deadline: bool) -> RailwayTrial {
     let mut trial = RailwayTrial::default();
     // The manifest is one JSON object; tolerate leading/trailing noise and
     // multi-line pretty prints by trying every brace-balanced slice.
-    for line in stderr.lines() {
+    for line in stdout.lines().chain(stderr.lines()) {
         let trimmed = line.trim();
         let Some(start) = trimmed.find('{') else {
             continue;
@@ -52,6 +55,8 @@ fn parse_manifest(stderr: &str) -> RailwayTrial {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) else {
             continue;
         };
+        trial.claim_required |=
+            value.get("status").and_then(|v| v.as_str()) == Some("claim_required");
         let pick = |keys: &[&str]| -> Option<String> {
             keys.iter().find_map(|k| {
                 value
@@ -61,16 +66,22 @@ fn parse_manifest(stderr: &str) -> RailwayTrial {
                     .map(str::to_string)
             })
         };
-        trial.claim_url =
-            trial
-                .claim_url
-                .or(pick(&["claimUrl", "claim_url", "claim", "signupUrl"]));
+        trial.claim_url = trial.claim_url.or(pick(&[
+            "human_claim_url",
+            "humanClaimUrl",
+            "claimUrl",
+            "claim_url",
+            "claim",
+            "signupUrl",
+        ]));
         trial.preview_url =
             trial
                 .preview_url
                 .or(pick(&["previewUrl", "preview_url", "preview", "url"]));
         if trial.expires_at.is_none() {
             for key in [
+                "build_expires_at",
+                "buildExpiresAt",
                 "buildDeadline",
                 "build_deadline",
                 "deadline",
@@ -102,7 +113,7 @@ fn parse_manifest(stderr: &str) -> RailwayTrial {
             .or_else(|| pick(&["region"]).map(|r| format!("region {r}")));
     }
     // Banner fallback — the welcome message prints `Claim:` and `Try it:`.
-    for line in stderr.lines() {
+    for line in stdout.lines().chain(stderr.lines()) {
         for word in line.split_whitespace() {
             let word = word.trim_matches(|c: char| !c.is_ascii() || c == ' ');
             if trial.claim_url.is_none()
@@ -120,19 +131,56 @@ fn parse_manifest(stderr: &str) -> RailwayTrial {
         }
     }
     // No deadline in the manifest → the documented 60-minute window.
-    if trial.expires_at.is_none() {
+    if assign_fallback_deadline && trial.expires_at.is_none() {
         trial.expires_at = Some(Utc::now() + chrono::Duration::minutes(60));
     }
     trial
+}
+
+/// Drop the lines of Railway's trial banner that carry the claim link or
+/// code, so command output shown on screen never leaks them.
+pub fn redact_trial_banner(output: &str) -> String {
+    output
+        .lines()
+        .filter(|line| {
+            !(line.contains("ssh-signup")
+                || line.contains("claim_url")
+                || line.contains("claimUrl")
+                || line.contains("\"claim_code\"")
+                || line.contains("\"claimCode\""))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A manifest line's human `message`/`error`/`reason`, or the raw line.
+fn host_message(line: &str) -> String {
+    let trimmed = line.trim();
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end])
+    {
+        for key in ["message", "description", "error", "reason", "detail"] {
+            if let Some(text) = value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                return text.to_string();
+            }
+        }
+    }
+    trimmed.to_string()
 }
 
 /// The honest reason a connect failed, from ssh's own stderr.
 fn ssh_failure(out: &crate::cloud::ExecOutcome) -> String {
     let stderr = out.stderr.trim();
     // Railway's own words first — "temporarily disabled", "sign up", rate
-    // limits all arrive in the welcome/manifest text on stderr.
-    let host_lines: Vec<&str> = stderr
+    // limits all arrive in the welcome/manifest text (stderr or stdout).
+    let host_lines: Vec<String> = stderr
         .lines()
+        .chain(out.stdout.lines())
+        .map(host_message)
         .filter(|l| {
             let l = l.to_lowercase();
             l.contains("temporarily disabled")
@@ -142,8 +190,12 @@ fn ssh_failure(out: &crate::cloud::ExecOutcome) -> String {
                 || l.contains("capacity")
         })
         .collect();
-    if let Some(line) = host_lines.first() {
-        return line.trim().to_string();
+    if let Some(line) = host_lines
+        .iter()
+        .map(|line| redact_trial_banner(line.trim()))
+        .find(|line| !line.is_empty())
+    {
+        return line;
     }
     if stderr.contains("identity") || stderr.contains("Permission denied") {
         return "no SSH key on this machine — run `ssh-keygen -t ed25519`, then retry".into();
@@ -165,12 +217,13 @@ fn ssh_failure(out: &crate::cloud::ExecOutcome) -> String {
 /// the host key on first connect. `command` runs on the trial VM itself —
 /// the box IS the ssh session's target.
 async fn railway_ssh(
+    host: &str,
     command: &str,
     timeout: Duration,
 ) -> Result<crate::cloud::ExecOutcome, String> {
     let output = tokio::time::timeout(
         timeout,
-        tokio::process::Command::new("ssh")
+        crate::cloud::ssh()
             .args([
                 "-o",
                 "BatchMode=yes",
@@ -180,14 +233,14 @@ async fn railway_ssh(
                 "StrictHostKeyChecking=accept-new",
                 // The trial VM serves an interactive TUI on a bare connect;
                 // a non-interactive command runs it directly on the box.
-                RAILWAY_HOST,
+                host,
                 command,
             ])
             .output(),
     )
     .await
     .map_err(|_| "ssh railway.new timed out — region may be saturated".to_string())?
-    .map_err(|e| format!("could not run ssh: {e}"))?;
+    .map_err(crate::cloud::ssh_spawn_error)?;
     Ok(crate::cloud::ExecOutcome {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -195,14 +248,121 @@ async fn railway_ssh(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_deadline_is_only_assigned_when_requested() {
+        let without_fallback = parse_manifest("", r#"{"claimUrl":"https://example.test"}"#, false);
+        assert!(without_fallback.expires_at.is_none());
+
+        let with_fallback = parse_manifest("", r#"{"claimUrl":"https://example.test"}"#, true);
+        assert!(with_fallback.expires_at.is_some());
+
+        let explicit = parse_manifest("", r#"{"expiresAt":"2030-01-01T00:00:00Z"}"#, true);
+        assert_eq!(
+            explicit.expires_at,
+            Some("2030-01-01T00:00:00Z".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn parses_current_trial_manifest_fields() {
+        let trial = parse_manifest(
+            "",
+            r#"{"status":"trial_starting","human_claim_url":"https://example.test/claim","preview_url":"https://preview.example.test","build_expires_at":"2030-01-01T00:00:00Z"}"#,
+            true,
+        );
+        assert_eq!(
+            trial.claim_url.as_deref(),
+            Some("https://example.test/claim")
+        );
+        assert_eq!(
+            trial.preview_url.as_deref(),
+            Some("https://preview.example.test")
+        );
+        assert_eq!(
+            trial.expires_at,
+            Some("2030-01-01T00:00:00Z".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn refused_manifest_surfaces_railway_message() {
+        let out = crate::cloud::ExecOutcome {
+            code: 0,
+            stdout: r#"{"status":"refused","description":"limited. Sign up to keep building.","human_signup_url":"https://railway.com/ssh-signup?code=x"}"#.into(),
+            stderr: String::new(),
+        };
+        assert_eq!(ssh_failure(&out), "limited. Sign up to keep building.");
+    }
+
+    #[test]
+    fn redacts_claim_banner_lines() {
+        let out = "hello\n{\"state\":\"expiring\",\"human_claim_url\":\"https://railway.com/ssh-signup?code=abc\"}\nworld";
+        assert_eq!(redact_trial_banner(out), "hello\nworld");
+    }
+
+    #[test]
+    fn parses_claim_required_manifest_from_stdout() {
+        let trial = parse_manifest(
+            r#"{"status":"claim_required","human_claim_url":"https://railway.com/ssh-signup?code=abc","poll_url":"https://example.test"}"#,
+            "",
+            true,
+        );
+        assert!(trial.claim_required);
+        assert_eq!(
+            trial.claim_url.as_deref(),
+            Some("https://railway.com/ssh-signup?code=abc")
+        );
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RailwayFailure {
+    pub detail: String,
+    pub trial: RailwayTrial,
+}
+
+fn claim_required_failure(trial: RailwayTrial) -> RailwayFailure {
+    RailwayFailure {
+        detail: "This machine's Railway trial box has expired — claim it on Railway to keep it, or use a Boat seat".into(),
+        trial,
+    }
+}
+
+fn ssh_failure_result(out: &crate::cloud::ExecOutcome, trial: RailwayTrial) -> RailwayFailure {
+    if trial.claim_required {
+        claim_required_failure(trial)
+    } else {
+        RailwayFailure {
+            detail: ssh_failure(out),
+            trial,
+        }
+    }
+}
+
 /// Provision-or-attach the trial: the SSH key identifies the box, so a
 /// repeat connect reattaches to the SAME VM (until it dies or is claimed).
 /// The manifest on stderr carries the deadline + claim link.
-pub async fn provision() -> Result<RailwayTrial, String> {
-    let out = railway_ssh("echo __cosmos_alive && uname -sm && pwd", PROVISION_TIMEOUT).await?;
-    let mut trial = parse_manifest(&out.stderr);
+pub async fn provision() -> Result<RailwayTrial, RailwayFailure> {
+    let out = railway_ssh(
+        RAILWAY_HOST,
+        "echo __cosmos_alive && uname -sm && pwd",
+        PROVISION_TIMEOUT,
+    )
+    .await
+    .map_err(|detail| RailwayFailure {
+        detail,
+        trial: RailwayTrial::default(),
+    })?;
+    let mut trial = parse_manifest(&out.stdout, &out.stderr, true);
+    if trial.claim_required {
+        return Err(claim_required_failure(trial));
+    }
     if out.code != 0 || !out.stdout.contains("__cosmos_alive") {
-        return Err(ssh_failure(&out));
+        return Err(ssh_failure_result(&out, trial));
     }
     if trial.detail.is_none() {
         trial.detail = out
@@ -218,14 +378,39 @@ pub async fn provision() -> Result<RailwayTrial, String> {
 
 /// Cheap liveness + manifest refresh — the deadline can move when a box is
 /// claimed or reattached.
-pub async fn probe() -> Result<RailwayTrial, String> {
-    let out = railway_ssh("echo __cosmos_alive", PROBE_TIMEOUT).await?;
-    let trial = parse_manifest(&out.stderr);
+pub async fn probe() -> Result<RailwayTrial, RailwayFailure> {
+    probe_with_existing_deadline(RAILWAY_HOST, false).await
+}
+
+/// `host` is the seat's ssh alias (`railway.new` unless the seat names a
+/// claimed box's own alias).
+pub async fn probe_with_existing_deadline(
+    host: &str,
+    existing_deadline: bool,
+) -> Result<RailwayTrial, RailwayFailure> {
+    let out = railway_ssh(host, "echo __cosmos_alive", PROBE_TIMEOUT)
+        .await
+        .map_err(|detail| RailwayFailure {
+            detail,
+            trial: RailwayTrial::default(),
+        })?;
+    let trial = parse_manifest(&out.stdout, &out.stderr, !existing_deadline);
+    if trial.claim_required {
+        return Err(claim_required_failure(trial));
+    }
     if out.code != 0 {
-        return Err(ssh_failure(&out));
+        return Err(ssh_failure_result(&out, trial));
     }
     if !out.stdout.contains("__cosmos_alive") {
-        return Err("railway.new answered without the echo marker".into());
+        let detail = ssh_failure(&out);
+        return Err(RailwayFailure {
+            detail: if detail.is_empty() {
+                "railway.new answered without the echo marker".into()
+            } else {
+                detail
+            },
+            trial,
+        });
     }
     Ok(trial)
 }

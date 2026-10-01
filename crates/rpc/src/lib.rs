@@ -335,9 +335,20 @@ pub mod methods {
     /// `{seatId?, query?}` → `{repos: [RepoHit], orgs: [String]}` — the
     /// GitHub-agent repo picker; resolves the seat's PAT or the shared one.
     pub const CLOUD_GITHUB_REPOS: &str = "CloudGitHubRepos";
+    /// `{repo, seatId?}` → `{branches: [String], defaultBranch, truncated}` —
+    /// the cloud composer's branch picker for the picked repo.
+    pub const CLOUD_GITHUB_BRANCHES: &str = "CloudGitHubBranches";
     /// `{pat}` → `{ok}` — verify + store the shared GitHub PAT (repo scope)
     /// that the picker and every PAT-less GitHub seat fall back to.
     pub const CLOUD_GITHUB_SAVE: &str = "CloudGitHubSave";
+    /// `{}` → `{deviceCode, userCode, verificationUri, interval, expiresIn}` —
+    /// starts the Cosmos GitHub App device flow.
+    pub const CLOUD_GITHUB_DEVICE_START: &str = "CloudGitHubDeviceStart";
+    /// `{deviceCode}` → `{status: pending|slow_down|done, login?}` — one poll;
+    /// `done` stores the user token as the shared GitHub credential.
+    pub const CLOUD_GITHUB_DEVICE_POLL: &str = "CloudGitHubDevicePoll";
+    /// `{}` → `{ok}` — forget the shared GitHub credential.
+    pub const CLOUD_GITHUB_DISCONNECT: &str = "CloudGitHubDisconnect";
     /// `{seatId}` → `[PrRow]` (needs a bound repo + PAT).
     pub const CLOUD_GITHUB_PRS: &str = "CloudGitHubPrs";
     /// `{seatId, number}` → `PrDetail` (files + checks included).
@@ -359,6 +370,29 @@ pub mod methods {
     /// `{seatId}` → `{command}` — the exact local shell line a Terminal pane
     /// spawns for an interactive seat shell (`ssh -tt …`), or an error.
     pub const CLOUD_SSH_COMMAND: &str = "CloudSshCommand";
+    /// `{seatId, workspace?, repo?}` → `{status}` — bring the seat's virtual
+    /// desktop up (installs Xvfb + xdotool when missing) and wait for it.
+    pub const CLOUD_DESKTOP_START: &str = "CloudDesktopStart";
+    /// `{seatId, action: SeatAction}` → `{ok, output}` — the Computer pane's
+    /// "Take control": one click/type/key/scroll/open on the seat desktop.
+    pub const CLOUD_COMPUTER_ACT: &str = "CloudComputerAct";
+    /// `{chatId, seatId}` → `{ok, binding}` — move a chat to another seat
+    /// (a dead trial's thread continuing on Boat); its workspace backup
+    /// restores there on the next run.
+    pub const CLOUD_MOVE_CHAT: &str = "CloudMoveChat";
+    /// `{id}` → `{ok, chatId?}` — fire an automation now, off-schedule.
+    pub const CLOUD_AUTOMATION_RUN_NOW: &str = "CloudAutomationRunNow";
+    /// `{chatId}` → `{ok, backup}` — snapshot a chat's seat workspace to this
+    /// computer now (the Context pane's "Back up now").
+    pub const CLOUD_BACKUP_CHAT: &str = "CloudBackupChat";
+    /// `{prompt, seatId?, spaceId?, harness?, start}` → `{chatId}` — Kanban
+    /// "+ New task": creates the task's chat; `start` queues the run now,
+    /// otherwise it lands in Draft.
+    pub const CLOUD_TASK_CREATE: &str = "CloudTaskCreate";
+    /// `{chatId}` → `{ok}` — start a Draft task (its first run queues).
+    pub const CLOUD_TASK_START: &str = "CloudTaskStart";
+    /// `{chatId}` → `{ok}` — drop a Draft task and its empty chat.
+    pub const CLOUD_TASK_DISCARD: &str = "CloudTaskDiscard";
 }
 
 #[derive(Debug, thiserror::Error)]
