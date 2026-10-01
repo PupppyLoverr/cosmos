@@ -92,6 +92,12 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// Fork seam (`kind: "fork"`, additive): the chat the history above was
+    /// copied from, and its title at the time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_chat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_title: Option<String>,
     /// Tool output summary (additive — absent on old rows and old writers;
     /// pre-strip writers stored up to 4KB of capped output here).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,6 +213,17 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             message: Some(message.clone()),
             ..Default::default()
         },
+        MessagePart::Fork {
+            id,
+            source_chat_id,
+            source_title,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "fork".into(),
+            source_chat_id: Some(source_chat_id.clone()),
+            source_title: Some(source_title.clone()),
+            ..Default::default()
+        },
     })
 }
 
@@ -256,6 +273,11 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
         "reasoning" => MessagePart::Reasoning {
             id: p.id,
             text: p.reasoning.unwrap_or_default(),
+        },
+        "fork" => MessagePart::Fork {
+            id: p.id,
+            source_chat_id: p.source_chat_id.unwrap_or_default(),
+            source_title: p.source_title.unwrap_or_default(),
         },
         _ => MessagePart::Text {
             id: p.id,
@@ -804,6 +826,8 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
         ("path", &doc_part.path),
         ("name", &doc_part.name),
         ("mimeType", &doc_part.mime_type),
+        ("sourceChatId", &doc_part.source_chat_id),
+        ("sourceTitle", &doc_part.source_title),
     ] {
         if let Some(value) = value {
             map.insert(key, value.as_str())?;
@@ -852,6 +876,14 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
         map.insert("subagentTail", subagent_tail.as_str())?;
     }
     Ok(())
+}
+
+/// Decode ONE `messages` entry map's deep JSON value (same strict-then-salvage
+/// policy as [`SessionDoc::read_entries`]). The per-entry seam for viewers
+/// that keep an incremental transcript mirror: they re-decode only the entry
+/// maps a commit touched instead of materializing the whole list.
+pub fn decode_entry_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError> {
+    entry_from_json(v)
 }
 
 fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError> {

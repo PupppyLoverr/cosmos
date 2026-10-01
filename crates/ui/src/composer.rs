@@ -15167,6 +15167,8 @@ mod tests {
             question: format!("Question {id}"),
             options: options.iter().map(|s| s.to_string()).collect(),
             multi_select: multi,
+            prefill: None,
+            multiline: false,
         }
     }
 
