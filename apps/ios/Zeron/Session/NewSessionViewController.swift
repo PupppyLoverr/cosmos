@@ -35,6 +35,7 @@ struct ModelChoice: Equatable {
     let harnessLabel: String
     let id: String
     let label: String
+    let description: String?
     let efforts: [String]
 }
 
@@ -135,7 +136,20 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             guard let self else { return UIMenu() }
             return AttachmentPicker.menu(host: self, limit: 8 - self.composer.images.count) { [weak self] in self?.composer.addImages($0) }
         }
-        composer.onChipTap = { _, _ in }
+        composer.onChipTap = { [weak self] id, anchor in
+            guard let self, id == "model" else { return }
+            let picker = ModelPickerViewController(
+                models: self.models,
+                selected: (harness: self.draft.harness, model: self.draft.model)
+            ) { [weak self] model in
+                guard let self else { return }
+                self.draft.harness = model.harness
+                self.draft.model = model.id
+                self.draft.effort = nil
+                self.refreshChips()
+            }
+            picker.present(from: anchor, in: self)
+        }
         composer.mentionSearch = { [weak self] q in
             guard let self, let p = self.project else { return [] }
             return await self.app.searchFiles(deviceId: p.device, spaceId: p.id, query: q)
@@ -203,7 +217,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
 
     private static func catalogModels() -> [ModelChoice] {
         fallbackHarnesses().filter(\.offered).flatMap { h in
-            fallbackModels(harness: h.id).map { ModelChoice(harness: h.id, harnessLabel: h.label, id: $0.id, label: $0.label, efforts: $0.reasoningLevels) }
+            fallbackModels(harness: h.id).map { ModelChoice(harness: h.id, harnessLabel: h.label, id: $0.id, label: $0.label, description: $0.description, efforts: $0.reasoningLevels) }
         }
     }
 
@@ -256,7 +270,6 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             "project": { [weak self] in self?.projectMenu() },
             "host": { [weak self] in self?.hostMenu() },
             "branch": { [weak self] in self?.branchMenu() },
-            "model": { [weak self] in self?.modelMenu() },
             "effort": { [weak self] in self?.effortMenu() },
         ]
         mark.image = BrandMarks.image(for: draft.harness, side: 34)
@@ -326,20 +339,6 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
                 }
             }]),
         ])
-    }
-
-    private func modelMenu() -> UIMenu {
-        let byHarness = Dictionary(grouping: models, by: \.harness)
-        return UIMenu(title: "Model", children: byHarness.keys.sorted().map { h in
-            UIMenu(title: byHarness[h]!.first!.harnessLabel, image: BrandMarks.image(for: h, side: 16), options: .displayInline, children: byHarness[h]!.map { m in
-                UIAction(title: m.label, state: m.harness == draft.harness && m.id == draft.model ? .on : .off) { [weak self] _ in
-                    self?.draft.harness = m.harness
-                    self?.draft.model = m.id
-                    self?.draft.effort = nil
-                    self?.refreshChips()
-                }
-            })
-        })
     }
 
     private func effortMenu() -> UIMenu {

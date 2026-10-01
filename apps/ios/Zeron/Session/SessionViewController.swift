@@ -68,6 +68,25 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             guard let self else { return UIMenu() }
             return AttachmentPicker.menu(host: self, limit: 8 - self.composer.images.count) { [weak self] in self?.composer.addImages($0) }
         }
+        composer.onChipTap = { [weak self] id, anchor in
+            guard let self, id == "model" else { return }
+            let row = self.app.row(self.chatId)
+            let harness = row?.harness ?? "claude-code"
+            let selected = (harness: harness, model: row?.model)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let models = await self.source.models()
+                guard anchor.window != nil else { return }
+                let picker = ModelPickerViewController(
+                    models: models,
+                    selected: selected,
+                    lockedHarness: harness
+                ) { [weak self] model in
+                    self?.source.selectModel(model)
+                }
+                picker.present(from: anchor, in: self)
+            }
+        }
         composer.onSend = { [weak self] text, images, mode in
             guard let self else { return .kept }
             if self.editingQueueId != nil {

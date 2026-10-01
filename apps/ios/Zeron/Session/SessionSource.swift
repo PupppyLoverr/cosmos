@@ -75,9 +75,17 @@ protocol SessionSource: AnyObject {
     func finishEdit(text: String?) async
     /// Menu for a composer chip (model, effort, branch…), or nil.
     func chipMenu(_ id: String) -> UIMenu?
+    /// Models available to the session's fixed harness.
+    func models() async -> [ModelChoice]
+    func selectModel(_ model: ModelChoice)
     func loadImage(_ reference: String, into view: UIImageView)
     /// Workspace files for `@` mentions.
     func searchFiles(_ query: String) async -> [FileMatch]
+}
+
+extension SessionSource {
+    func models() async -> [ModelChoice] { [] }
+    func selectModel(_ model: ModelChoice) {}
 }
 
 enum QueueAction {

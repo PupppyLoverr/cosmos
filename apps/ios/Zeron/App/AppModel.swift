@@ -491,7 +491,7 @@ final class AppModel {
         var out: [ModelChoice] = []
         for h in harnesses where h.offered {
             let models = (try? await client.listModels(deviceId: deviceId, harness: h.id)) ?? fallbackModels(harness: h.id)
-            out += models.map { ModelChoice(harness: h.id, harnessLabel: h.label, id: $0.id, label: $0.label, efforts: $0.reasoningLevels) }
+            out += models.map { ModelChoice(harness: h.id, harnessLabel: h.label, id: $0.id, label: $0.label, description: $0.description, efforts: $0.reasoningLevels) }
         }
         return out
     }

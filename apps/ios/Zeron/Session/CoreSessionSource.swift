@@ -195,22 +195,25 @@ final class CoreSessionSource: SessionSource {
         try? handle.retryDelivery()
     }
 
+    func models() async -> [ModelChoice] {
+        let row = app?.row(chatId)
+        let harness = row?.harness ?? "claude-code"
+        let device = hostDevice
+        let infos = (try? await client.listModels(deviceId: device, harness: harness)) ?? fallbackModels(harness: harness)
+        let label = row?.harnessLabel ?? HarnessNames.label(harness)
+        return infos.map { ModelChoice(harness: harness, harnessLabel: label, id: $0.id, label: $0.label, description: $0.description, efforts: $0.reasoningLevels) }
+    }
+
+    func selectModel(_ model: ModelChoice) {
+        setConfig { $0.model = model.id }
+    }
+
     func chipMenu(_ id: String) -> UIMenu? {
         guard let row = app?.row(chatId) else { return nil }
         let harness = row.harness ?? "claude-code"
         switch id {
         case "model":
-            return UIMenu(title: "Model", children: [UIDeferredMenuElement { [weak self] done in
-                guard let self else { return done([]) }
-                Task { @MainActor in
-                    let models = (try? await self.client.listModels(deviceId: self.hostDevice, harness: harness)) ?? fallbackModels(harness: harness)
-                    done(models.map { m in
-                        UIAction(title: m.label, subtitle: m.description, state: m.id == row.model ? .on : .off) { [weak self] _ in
-                            self?.setConfig { $0.model = m.id }
-                        }
-                    })
-                }
-            }])
+            return nil
         case "effort":
             return UIMenu(title: "Reasoning effort", children: [UIDeferredMenuElement { [weak self] done in
                 guard let self else { return done([]) }
