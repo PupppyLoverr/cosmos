@@ -5090,6 +5090,7 @@ impl Pickers {
             if restart {
                 state.cloud_trial_failure = None;
             }
+            state.persist_cloud_picks(cx);
             cx.notify();
         });
         cx.emit(CloudChipAction::SeatPicked {
@@ -5145,6 +5146,7 @@ impl Pickers {
                 state.refresh_cloud_branches(&repo.full_name, false, cx);
             }
             state.set_cloud_repo_pick(pick);
+            state.persist_cloud_picks(cx);
             cx.notify();
         });
         self.close(cx);
@@ -5182,6 +5184,7 @@ impl Pickers {
                 .map(|r| r.default_branch.clone())
                 .unwrap_or_default();
             state.cloud_branch_pick = (branch != default).then_some(branch);
+            state.persist_cloud_picks(cx);
             cx.notify();
         });
         self.close(cx);

@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # Cosmos Linux packaging — produces branded, distributable artifacts from the
 # release binary:
-#   artifacts/linux/Cosmos-linux-x86_64.tar.gz   (portable: binary + icon + .desktop + installer)
-#   artifacts/linux/Cosmos-linux-x86_64.deb      (system package, install/uninstall via apt/dpkg)
-#   artifacts/linux/Cosmos-linux-x86_64.AppImage (single-file portable app; best-effort)
+#   artifacts/linux/Cosmos-linux-$ARCH.tar.gz   (portable: binary + icon + .desktop + installer)
+#   artifacts/linux/Cosmos-linux-$ARCH.deb      (system package, install/uninstall via apt/dpkg)
+#   artifacts/linux/Cosmos-linux-$ARCH.AppImage (single-file portable app; best-effort)
 #
 # Usage: scripts/package-linux-cosmos.sh
-# Env:   COSMOS_BIN (default target/release/cosmos), SKIP_APPIMAGE=1 to skip.
+# Env:   COSMOS_BIN (default target/release/cosmos), SKIP_APPIMAGE=1 to skip,
+#        COSMOS_REQUIRE_INSTALLERS=1 to fail if .deb or AppImage cannot be built.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
 ARCH="$(uname -m)"
+REQUIRE_INSTALLERS="${COSMOS_REQUIRE_INSTALLERS:-0}"
 BIN="${COSMOS_BIN:-$ROOT/target/release/cosmos}"
 OUT="$ROOT/artifacts/linux"
 ICON="$ROOT/dist/zeron.png"   # the Cosmos app icon (dist filename predates rename)
@@ -44,7 +46,7 @@ EOF
 
 # ── 1. tar.gz (portable) ──────────────────────────────────────────────────────
 STAGE="$OUT/Cosmos-$VERSION-linux-$ARCH"
-TARBALL="$OUT/Cosmos-linux-x86_64.tar.gz"
+TARBALL="$OUT/Cosmos-linux-$ARCH.tar.gz"
 rm -rf "$STAGE"; mkdir -p "$STAGE/licenses/fonts"
 install -m 755 "$BIN" "$STAGE/cosmos"
 install -m 644 "$ICON" "$STAGE/cosmos.png"
@@ -80,7 +82,7 @@ tar -czf "$TARBALL" -C "$OUT" "$(basename "$STAGE")"
 echo "  ✓ $TARBALL"
 
 # ── 2. .deb ───────────────────────────────────────────────────────────────────
-DEB="$OUT/Cosmos-linux-x86_64.deb"
+DEB="$OUT/Cosmos-linux-$ARCH.deb"
 DEBARCH="amd64"; [[ "$ARCH" == "aarch64" ]] && DEBARCH="arm64"
 PKG="$OUT/deb-root"
 rm -rf "$PKG"
@@ -127,17 +129,25 @@ if command -v dpkg-deb >/dev/null 2>&1; then
   dpkg-deb --build --root-owner-group "$PKG" "$DEB" >/dev/null
   echo "  ✓ $DEB"
 else
+  if [[ "$REQUIRE_INSTALLERS" == "1" ]]; then
+    echo "error: dpkg-deb not found; cannot build required .deb installer" >&2
+    exit 1
+  fi
   echo "  ! dpkg-deb not found; skipping .deb"
 fi
 
 # ── 3. AppImage (best-effort) ─────────────────────────────────────────────────
 if [[ "${SKIP_APPIMAGE:-0}" == "1" ]]; then
+  if [[ "$REQUIRE_INSTALLERS" == "1" ]]; then
+    echo "error: SKIP_APPIMAGE=1 conflicts with COSMOS_REQUIRE_INSTALLERS=1" >&2
+    exit 1
+  fi
   echo "  · SKIP_APPIMAGE=1 — skipping AppImage"
   exit 0
 fi
-APPIMAGE="$OUT/Cosmos-linux-x86_64.AppImage"
+APPIMAGE="$OUT/Cosmos-linux-$ARCH.AppImage"
 APPDIR="$OUT/Cosmos.AppDir"
-TOOL="$OUT/appimagetool-x86_64.AppImage"
+TOOL="$OUT/appimagetool-$ARCH.AppImage"
 rm -rf "$APPDIR"; mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/icons/hicolor/512x512/apps"
 install -m 755 "$BIN" "$APPDIR/usr/bin/cosmos"
 install -m 644 "$ICON" "$APPDIR/cosmos.png"
@@ -153,19 +163,40 @@ chmod 755 "$APPDIR/AppRun"
 
 if [[ ! -f "$TOOL" ]]; then
   echo "  · downloading appimagetool"
-  curl -fsSL -o "$TOOL" \
-    "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" || true
-  chmod +x "$TOOL" 2>/dev/null || true
+  if curl -fsSL -o "$TOOL" \
+    "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage"; then
+    chmod +x "$TOOL" 2>/dev/null || true
+  else
+    rm -f "$TOOL"
+    if [[ "$REQUIRE_INSTALLERS" == "1" ]]; then
+      echo "error: failed to download required appimagetool for $ARCH" >&2
+      exit 1
+    fi
+  fi
 fi
 rm -f "$APPIMAGE"
 if [[ -x "$TOOL" ]]; then
   # No FUSE in most CI/VMs: extract-and-run. ARCH env is required by the tool.
   if ARCH="$ARCH" "$TOOL" --appimage-extract-and-run "$APPDIR" "$APPIMAGE" 2>"$OUT/appimage-build.log"; then
+    if [[ "$REQUIRE_INSTALLERS" == "1" && ! -f "$APPIMAGE" ]]; then
+      echo "error: appimagetool produced no AppImage; build log tail:" >&2
+      tail -n 40 "$OUT/appimage-build.log" >&2
+      exit 1
+    fi
     chmod +x "$APPIMAGE"
     echo "  ✓ $APPIMAGE"
   else
+    if [[ "$REQUIRE_INSTALLERS" == "1" ]]; then
+      echo "error: appimagetool failed; build log tail:" >&2
+      tail -n 40 "$OUT/appimage-build.log" >&2
+      exit 1
+    fi
     echo "  ! appimagetool failed (see $OUT/appimage-build.log); tar.gz and .deb still produced"
   fi
 else
+  if [[ "$REQUIRE_INSTALLERS" == "1" ]]; then
+    echo "error: appimagetool unavailable; cannot build required AppImage" >&2
+    exit 1
+  fi
   echo "  ! appimagetool unavailable; tar.gz and .deb still produced"
 fi

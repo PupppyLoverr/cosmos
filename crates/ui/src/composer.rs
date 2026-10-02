@@ -9760,6 +9760,7 @@ impl Composer {
                         composer.state.update(cx, |state, cx| {
                             state.cloud_seat_pick = Some(row);
                             state.cloud_mode = true;
+                            state.persist_cloud_picks(cx);
                             crate::settings::update(
                                 crate::settings::SavePolicy::Debounced,
                                 cx,

@@ -3588,7 +3588,7 @@ impl<'a> GitHub<'a> {
 }
 
 /// One repo-picker hit.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RepoHit {
     pub full_name: String,
