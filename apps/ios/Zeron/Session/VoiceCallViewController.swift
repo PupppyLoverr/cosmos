@@ -44,7 +44,11 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
         self.latestReply = latestReply
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .overFullScreen
+        modalPresentationCapturesStatusBarAppearance = true
+        overrideUserInterfaceStyle = .dark
     }
+
+    override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
 
     required init?(coder: NSCoder) { fatalError() }
 
@@ -94,6 +98,9 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
         endButton.accessibilityLabel = "End voice mode"
         endButton.tintColor = Palette.danger
         endButton.addAction(UIAction { [weak self] _ in self?.endCall() }, for: .touchUpInside)
+
+        status.translatesAutoresizingMaskIntoConstraints = false
+        caption.translatesAutoresizingMaskIntoConstraints = false
 
         let header = UIStackView(arrangedSubviews: [titleLabel, model])
         header.axis = .vertical
