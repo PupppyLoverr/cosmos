@@ -150,8 +150,17 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         ))
         icon.tintColor = Palette.tertiary
         icon.contentMode = .center
-        icon.frame = CGRect(x: 0, y: 0, width: 36, height: 36)
-        search.leftView = icon
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        let iconContainer = UIView(frame: CGRect(x: 0, y: 0, width: 36, height: 36))
+        iconContainer.translatesAutoresizingMaskIntoConstraints = false
+        iconContainer.addSubview(icon)
+        NSLayoutConstraint.activate([
+            iconContainer.widthAnchor.constraint(equalToConstant: 36),
+            iconContainer.heightAnchor.constraint(equalToConstant: 36),
+            icon.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor, constant: 2),
+            icon.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor),
+        ])
+        search.leftView = iconContainer
         search.leftViewMode = .always
         search.addTarget(self, action: #selector(queryChanged), for: .editingChanged)
     }
