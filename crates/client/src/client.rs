@@ -1179,7 +1179,9 @@ impl Client {
         environment: &str,
         prefs: PushPrefs,
     ) -> Result<()> {
-        let Some(live) = self.inner.live() else { return Ok(()) };
+        let Some(live) = self.inner.live() else {
+            return Ok(());
+        };
         let url = crate::live::urls::registry_push_target(
             &live.edge,
             self.inner.credentials.org_id(),
@@ -1199,14 +1201,19 @@ impl Client {
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
         if !response.status().is_success() {
-            return Err(ClientError::HostError(format!("push registration http {}", response.status())));
+            return Err(ClientError::HostError(format!(
+                "push registration http {}",
+                response.status()
+            )));
         }
         Ok(())
     }
 
     /// Stop notifications to this device (sign-out, turned off).
     pub async fn unregister_push_target(&self) -> Result<()> {
-        let Some(live) = self.inner.live() else { return Ok(()) };
+        let Some(live) = self.inner.live() else {
+            return Ok(());
+        };
         let url = crate::live::urls::registry_push_target(
             &live.edge,
             self.inner.credentials.org_id(),
@@ -1220,7 +1227,10 @@ impl Client {
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
         if !response.status().is_success() {
-            return Err(ClientError::HostError(format!("push removal http {}", response.status())));
+            return Err(ClientError::HostError(format!(
+                "push removal http {}",
+                response.status()
+            )));
         }
         Ok(())
     }

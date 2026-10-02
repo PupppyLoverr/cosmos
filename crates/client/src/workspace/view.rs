@@ -32,9 +32,9 @@ pub const PROJECT_COLOR_COUNT: u32 = 8;
 /// monogram tone: 32-bit FNV-1a of the project's path (`"home"` without a
 /// project), so a project has the same color on every device.
 pub fn project_color_index(space_path: &str) -> u32 {
-    let hash = space_path
-        .bytes()
-        .fold(2_166_136_261u32, |h, b| (h ^ u32::from(b)).wrapping_mul(16_777_619));
+    let hash = space_path.bytes().fold(2_166_136_261u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(16_777_619)
+    });
     hash % PROJECT_COLOR_COUNT
 }
 

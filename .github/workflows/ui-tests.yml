@@ -183,6 +183,8 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a") as env:
               env.write("IOS_SIMULATOR_ID=" + iphones[0]["udid"] + "\n")
           PYTHON
+      - name: Install Rust iOS simulator target
+        run: rustup target add aarch64-apple-ios-sim
       - name: Run iOS unit tests
         working-directory: apps/ios
         run: |

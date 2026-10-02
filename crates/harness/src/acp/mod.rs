@@ -1630,7 +1630,8 @@ impl AcpHarness {
     /// initialize → `session/list`. Agents that don't implement the method
     /// answer with an error we treat as "no sessions", never a failure.
     async fn discover_sessions(&self) -> Result<Vec<zeron_proto::HarnessSession>, HarnessError> {
-        let (_scratch, mut child, _stderr) = self.spawn_agent(None, false, &[], None, None, None).await?;
+        let (_scratch, mut child, _stderr) =
+            self.spawn_agent(None, false, &[], None, None, None).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {

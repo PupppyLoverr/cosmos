@@ -249,8 +249,7 @@ fn questions_answer_through_respond_input() {
     });
     // The host publishes the question, then flips the chat's status.
     wait_for("awaiting input", Duration::from_secs(5), || {
-        client.workspace().session("chat-deploy").unwrap().indicator
-            == ChatIndicator::AwaitingInput
+        client.workspace().session("chat-deploy").unwrap().indicator == ChatIndicator::AwaitingInput
     });
     let input = session.composer().open_input.clone().unwrap();
     session
