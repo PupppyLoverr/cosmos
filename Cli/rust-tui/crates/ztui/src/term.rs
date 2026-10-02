@@ -62,7 +62,7 @@ impl Screen {
             prev(info);
         }));
         let mut out = stdout();
-        queue!(out, EnableBracketedPaste)?;
+        queue!(out, EnableBracketedPaste, crossterm::event::EnableFocusChange)?;
         // Disambiguated keys (shift+enter etc.) where the terminal speaks the
         // kitty protocol; Windows consoles report modifiers natively anyway.
         let enhanced_keys = matches!(terminal::supports_keyboard_enhancement(), Ok(true));
@@ -188,6 +188,7 @@ impl Screen {
             let _ = self.buf.queue(PopKeyboardEnhancementFlags);
         }
         let _ = self.buf.queue(DisableBracketedPaste);
+        let _ = self.buf.queue(crossterm::event::DisableFocusChange);
         let mut out = stdout();
         let _ = out.write_all(&self.buf);
         let _ = out.flush();

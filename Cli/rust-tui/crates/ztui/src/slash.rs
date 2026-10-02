@@ -50,6 +50,8 @@ const BUILTIN: &[(&str, &str, &str)] = &[
     ("tree", "", "Show the session's event tree and branch points"),
     ("clear", "", "Clear the screen"),
     ("theme", "<name>", "Colour theme: cosmos, classic, nebula, mono, solar, light, high-contrast"),
+    ("buddy", "[pet|name|reroll|…]", "Your companion — it watches the task and reacts"),
+    ("notify", "[test]", "Title, bell and desktop notifications — settings, or send a test"),
     ("spinner", "<style>", "Thinking spinner: orb, twinkle, braille, moon, comet, pulse, galaxy, dots, line"),
     ("onboarding", "", "Replay the first-run setup (until it retires itself)"),
     ("help", "", "Keyboard shortcuts"),

@@ -23,7 +23,9 @@ pub fn run(
 ) -> Option<String> {
     let ev = json!({"event": event, "tool": tool, "data": payload, "session": session});
     for h in &cfg.hooks {
-        if h.event != event || !matches(&h.matcher, tool) {
+        // `turn_end` is another name for `stop`
+        let same = h.event == event || (event == "stop" && h.event == "turn_end");
+        if !same || !matches(&h.matcher, tool) {
             continue;
         }
         let mut command = if cfg!(windows) {
@@ -60,4 +62,19 @@ pub fn run(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::HookCfg;
+
+    #[test]
+    fn turn_end_is_another_name_for_stop() {
+        let block = if cfg!(windows) { "echo held 1>&2 & exit 2" } else { "echo held >&2; exit 2" };
+        let mut cfg = Config::default();
+        cfg.hooks.push(HookCfg { event: "turn_end".into(), matcher: String::new(), command: block.into() });
+        assert!(run(&cfg, "stop", "", &json!({}), "s").is_some_and(|e| e.contains("held")));
+        assert!(run(&cfg, "pre_tool", "bash", &json!({}), "s").is_none());
+    }
 }

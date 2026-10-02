@@ -378,6 +378,7 @@ fn worker(
             Cmd::Prompt(text) => {
                 interrupt.store(false, Ordering::Relaxed);
                 run_task(&mut agent, &text, &mut emit, &interrupt, &always, &tx);
+                agent.stop_hook(if interrupt.load(Ordering::Relaxed) { "interrupted" } else { "done" });
                 send(&tx, Msg::TurnDone);
             }
             Cmd::Local(lc) => {
@@ -399,6 +400,7 @@ fn worker(
                 interrupt.store(false, Ordering::Relaxed);
                 agent.approve_plan(&mut emit);
                 run_turns(&mut agent, &mut emit, &interrupt, &always, &tx);
+                agent.stop_hook(if interrupt.load(Ordering::Relaxed) { "interrupted" } else { "done" });
                 send(&tx, Msg::TurnDone);
             }
             Cmd::SetEffort(e) => {

@@ -632,6 +632,11 @@ impl Agent {
         )
     }
 
+    /// §11 `stop` hook: the agent finished responding (`turn_end` matches too).
+    pub fn stop_hook(&self, reason: &str) {
+        crate::hooks::run(&self.cfg, "stop", "", &json!({"reason": reason}), &self.session.id.clone());
+    }
+
     /// §9 compaction check, then one provider turn. Returns true when the
     /// model produced no tool calls (turn ends).
     pub fn turn(&mut self, emit: &mut dyn FnMut(&Event)) -> Result<bool> {
@@ -1660,6 +1665,7 @@ pub fn run_headless(
                     emit(&ev);
                 }
             }
+            agent.stop_hook("done");
             let ev = agent
                 .session
                 .append("session_end", json!({"reason":"done"}));

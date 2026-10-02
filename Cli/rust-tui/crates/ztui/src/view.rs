@@ -552,6 +552,7 @@ fn status_line(app: &App, w: usize) -> Line<'static> {
         let pick = if lw + width_of(&full) + 2 <= w { full } else { short };
         return split_row(left, vec![dim(pick)], w);
     }
+    let face = buddy_mini(app);
     let hint = if matches!(app.popup, Some(Popup::Slash { .. } | Popup::Files { .. })) {
         "tab next · shift+tab prev · ↵ accept · esc close".to_string()
     } else if app.key_entry.is_some() {
@@ -569,7 +570,127 @@ fn status_line(app: &App, w: usize) -> Line<'static> {
     } else {
         "shift+↵ newline · @ to mention a file".to_string()
     };
-    split_row(left, vec![dim(hint)], w)
+    let mut right = Vec::new();
+    if let Some(f) = face {
+        right.push(f);
+        right.push(sp(" "));
+    }
+    right.push(dim(hint));
+    split_row(left, right, w)
+}
+
+// ---- buddy -------------------------------------------------------------------
+
+/// Whose buddy it is (hatching is seeded by this).
+fn buddy_who(app: &App) -> String {
+    app.user
+        .clone()
+        .or_else(|| std::env::var("USERNAME").ok())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "cosmonaut".into())
+}
+
+pub fn buddy_identity(app: &App) -> crate::buddy::Identity {
+    crate::buddy::hatch(&buddy_who(app), &crate::skin::current().buddy)
+}
+
+/// The full sprite needs room beside the composer.
+pub fn buddy_full(app: &App) -> bool {
+    let sk = crate::skin::current();
+    sk.buddy.enabled && sk.buddy.size == "full" && app.width >= 64
+}
+
+fn buddy_mini(app: &App) -> Option<Span<'static>> {
+    let sk = crate::skin::current();
+    if !sk.buddy.enabled || buddy_full(app) || sk.buddy.size == "off" {
+        return None;
+    }
+    let id = buddy_identity(app);
+    Some(crate::buddy::mini(&id, app.buddy.mood(app.busy)))
+}
+
+/// Columns the composer's text may use (less when the buddy sits beside it).
+pub fn input_width(app: &App) -> usize {
+    let base = app.width.saturating_sub(2);
+    if buddy_full(app) {
+        base.saturating_sub(crate::buddy::sprite_width(&buddy_identity(app)) + 2)
+    } else {
+        base
+    }
+}
+
+/// What changes the buddy's look — repaint when this does.
+pub fn buddy_key(app: &App) -> (u8, bool, bool) {
+    let sk = crate::skin::current();
+    if !sk.buddy.enabled {
+        return (0, false, false);
+    }
+    let mood = app.buddy.mood(app.busy) as u8;
+    let blink = !sk.motion.reduce && crate::motion::now_ms() % 4200 < 150;
+    (mood, blink, app.buddy.current_quip(&sk.buddy).is_some())
+}
+
+/// The quip (or hearts, or zZz) above the buddy, right-aligned.
+fn buddy_bubble(app: &App, w: usize) -> Option<Line<'static>> {
+    let sk = crate::skin::current();
+    let mood = app.buddy.mood(app.busy);
+    let (text, style) = match app.buddy.current_quip(&sk.buddy) {
+        Some(q) => (format!("‹ {q} ›"), Style::new().fg(ACCENT()).add_modifier(Modifier::ITALIC)),
+        None if mood == crate::buddy::Mood::Loved => ("♥ ♥ ♥".to_string(), theme::fg(RED())),
+        None if mood == crate::buddy::Mood::Sleeping => ("z Z z".to_string(), DIM()),
+        None => return None,
+    };
+    if !buddy_full(app) && sk.buddy.size != "mini" {
+        return None;
+    }
+    let text = ellipsize(&text, w.saturating_sub(4));
+    let pad = w.saturating_sub(width_of(&text) + 1);
+    Some(Line::from(vec![sp(" ".repeat(pad)), Span::styled(text, style)]))
+}
+
+/// Cut a styled line to `max` columns (no ellipsis — it's decoration).
+fn cut(line: &Line<'static>, max: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut col = 0;
+    for s in &line.spans {
+        let sw = width_of(&s.content);
+        if col + sw <= max {
+            col += sw;
+            out.push(s.clone());
+            continue;
+        }
+        let mut keep = String::new();
+        for c in s.content.chars() {
+            let cw = wrap::cw(c);
+            if col + cw > max {
+                break;
+            }
+            keep.push(c);
+            col += cw;
+        }
+        out.push(Span::styled(keep, s.style));
+        break;
+    }
+    if col < max {
+        out.push(sp(" ".repeat(max - col)));
+    }
+    out
+}
+
+/// Draw the sprite over the right end of the composer's first three rows.
+fn overlay_buddy(app: &App, out: &mut [Line<'static>], top: usize, w: usize, ms: u128) {
+    let sk = crate::skin::current();
+    let id = buddy_identity(app);
+    let rows = crate::buddy::sprite(&id, app.buddy.mood(app.busy), ms, sk.motion.reduce);
+    let sw = crate::buddy::sprite_width(&id);
+    let left = w.saturating_sub(sw + 1);
+    for (k, row) in rows.into_iter().enumerate() {
+        let Some(line) = out.get_mut(top + k) else { break };
+        let mut spans = cut(line, left);
+        spans.push(sp(" "));
+        spans.extend(row);
+        *line = Line::from(spans);
+    }
 }
 
 /// `turn 3 · in 1.2k · cache_r 18k · cache_w 0 · out 312 · $0.0041 · Σ $0.0213 · ctx 41%`
@@ -1112,9 +1233,16 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
         _ => {}
     }
 
-    // composer between two rules
+    // composer between two rules (the buddy sits at their right edge)
+    let pal = crate::skin::current();
+    if pal.buddy.enabled {
+        if let Some(b) = buddy_bubble(app, w) {
+            out.push(b);
+        }
+    }
+    let top_rule = out.len();
     out.push(rule(w));
-    let tw = w.saturating_sub(2);
+    let tw = input_width(app);
     let masked: Vec<char>;
     let shown: &[char] = if app.key_entry.is_some() {
         masked = vec!['•'; app.input.len()];
@@ -1170,6 +1298,9 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
         cursor = Some(((input_top + crow - skip) as u16, (2 + col) as u16));
     }
     out.push(rule(w));
+    if buddy_full(app) {
+        overlay_buddy(app, &mut out, top_rule, w, ms);
+    }
     out.push(status_line(app, w));
 
     match &app.popup {
@@ -1419,8 +1550,47 @@ mod tests {
         app.cursor = app.input.len();
         let (lines, cur) = live(&app);
         let (r, c) = cur.unwrap();
-        assert_eq!(text(&lines[r as usize]), "! ls -la");
+        // (the buddy may sit at the far right of the row)
+        let row = text(&lines[r as usize]);
+        assert!(row.starts_with("! ls -la  ") && row.matches('!').count() == 1, "{row:?}");
         assert_eq!(c, 2 + 6, "cursor after 'ls -la'");
+    }
+
+    #[test]
+    fn buddy_sits_beside_the_composer() {
+        let _env = crate::env_lock();
+        let mut sk = crate::skin::Skin::default();
+        sk.buddy.species = "fox".into();
+        sk.buddy.name = "Pip".into();
+        crate::skin::scoped_skin(sk.clone(), || {
+            let mut app = test_app();
+            app.width = 80;
+            let (lines, _) = live(&app);
+            let rows: Vec<String> = lines.iter().map(text).collect();
+            let top = rows.iter().position(|r| r.starts_with('─')).unwrap();
+            assert!(rows[top].ends_with(r"/\   /\"), "{rows:#?}");
+            assert!(rows[top + 1].starts_with("❯ ") && rows[top + 1].ends_with("( • • )"), "{rows:#?}");
+            assert!(rows[top + 2].starts_with('─'), "{rows:#?}");
+            assert!(lines.iter().all(|l| crate::wrap::line_width(l) <= 80), "{rows:#?}");
+            assert!(input_width(&app) < 78, "typing room leaves space for it");
+            // a quip floats above it
+            app.buddy.on(crate::buddy::Moment::Error, &sk.buddy, "Pip");
+            let rows: Vec<String> = live(&app).0.iter().map(text).collect();
+            let top = rows.iter().position(|r| r.starts_with('─')).unwrap();
+            assert!(rows[top - 1].trim_start().starts_with('‹'), "{rows:#?}");
+            // narrow terminals get the face in the status line instead
+            app.width = 50;
+            let rows: Vec<String> = live(&app).0.iter().map(text).collect();
+            assert!(rows.iter().any(|r| r.contains("(°ᴥ°)")), "{rows:#?}");
+            assert_eq!(input_width(&app), 48);
+        });
+        let mut off = sk;
+        off.buddy.enabled = false;
+        crate::skin::scoped_skin(off, || {
+            let app = test_app();
+            let rows: Vec<String> = live(&app).0.iter().map(text).collect();
+            assert!(!rows.iter().any(|r| r.contains('•') || r.contains('ᴥ')), "{rows:#?}");
+        });
     }
 
     #[test]

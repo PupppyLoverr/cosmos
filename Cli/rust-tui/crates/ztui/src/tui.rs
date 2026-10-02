@@ -236,6 +236,16 @@ pub struct App {
     pub replay_onboard: bool,
     /// `ui.toml` was just written by a command — reload it now, not in a second
     pub skin_reload: bool,
+    /// the companion beside the composer
+    pub buddy: crate::buddy::Buddy,
+    /// terminal focus, once the terminal has reported it
+    pub focused: Option<bool>,
+    /// title / bell escapes to write between frames
+    pub term_out: Vec<u8>,
+    /// we've set the terminal title (reset it on exit)
+    pub titled: bool,
+    /// an error arrived during this turn
+    turn_err: Option<String>,
     /// the dictation key is physically down (Windows reports releases), so
     /// its auto-repeat can't stop a recording it just started
     toggle_held: bool,
@@ -314,6 +324,11 @@ impl App {
             user: None,
             replay_onboard: false,
             skin_reload: false,
+            buddy: crate::buddy::Buddy::new(),
+            focused: None,
+            term_out: Vec::new(),
+            titled: false,
+            turn_err: None,
             toggle_held: false,
             toggle_last: None,
         }
@@ -414,6 +429,44 @@ impl App {
         self.block(view::error(&s.into(), self.width));
     }
 
+    /// Tell the buddy something happened.
+    fn buddy_on(&mut self, m: crate::buddy::Moment) {
+        let sk = crate::skin::current();
+        if !sk.buddy.enabled {
+            return;
+        }
+        let name = view::buddy_identity(self).name;
+        self.buddy.on(m, &sk.buddy, &name);
+        self.dirty = true;
+    }
+
+    fn set_title(&mut self, text: &str) {
+        if crate::skin::current().notify.title {
+            self.term_out.extend(crate::notify::title(text));
+            self.titled = true;
+        }
+    }
+
+    fn busy_title(&mut self) {
+        let sk = crate::skin::current();
+        let verb = crate::motion::pick_verb(&sk.spinner, self.verb_seed).0;
+        self.set_title(&format!("{} {verb}… · cosmostui", sk.spinner.footer_glyph));
+    }
+
+    /// Title, bell, desktop notification — as `[notify]` and focus allow.
+    fn alert(&mut self, kind: crate::notify::Kind, head: &str, body: &str) {
+        let sk = crate::skin::current();
+        let secs = self.busy_since.elapsed().as_secs();
+        let a = crate::notify::alert(&sk.notify, kind, self.focused, secs, head, body);
+        if !a.term.is_empty() {
+            self.titled = true;
+        }
+        self.term_out.extend(&a.term);
+        if !cfg!(test) {
+            crate::notify::fire(&a);
+        }
+    }
+
     fn flash(&mut self, s: impl Into<String>, c: Color) {
         self.notice = Some((s.into(), c, Instant::now()));
         self.dirty = true;
@@ -505,9 +558,11 @@ impl App {
                     self.ready_seen = true;
                     let info = view::info_line(self);
                     self.cont(vec![Line::default(), info]);
-                    if let Some(d) = degraded.filter(|d| !d.is_empty()) {
+                    let degraded = degraded.filter(|d| !d.is_empty());
+                    if let Some(d) = &degraded {
                         self.block(view::warn(&format!("Sandbox degraded — {d}"), self.width));
                     }
+                    self.buddy_on(if degraded.is_some() { crate::buddy::Moment::Degraded } else { crate::buddy::Moment::Hello });
                 }
             }
             Msg::Event(ev) => self.on_event(&ev),
@@ -524,10 +579,23 @@ impl App {
                     .map(|t| view::arg_summary(&t.name, &t.input, 200))
                     .unwrap_or_default();
                 self.popup = None;
+                let body = format!("{} {}", view::tool_label(&tool), detail).trim().to_string();
                 self.perm = Some(Perm { tool, detail, sel: 0, reply });
+                self.buddy_on(crate::buddy::Moment::Waiting);
+                self.alert(crate::notify::Kind::Waiting, "Needs your OK", &body);
             }
-            Msg::Note(s) => self.note(s),
-            Msg::Err(s) => self.error(s),
+            Msg::Note(s) => {
+                if s.starts_with("compacted") {
+                    self.buddy_on(crate::buddy::Moment::Compact);
+                }
+                self.note(s)
+            }
+            Msg::Err(s) => {
+                if self.busy {
+                    self.turn_err = Some(s.lines().next().unwrap_or("").to_string());
+                }
+                self.error(s)
+            }
             Msg::TurnDone => {
                 if let Some(st) = &self.stream {
                     self.turn_chars += st.chars;
@@ -553,6 +621,19 @@ impl App {
                     let lines = view::turn_footer(self);
                     if !lines.is_empty() {
                         self.cont(lines);
+                    }
+                    let secs = self.busy_since.elapsed().as_secs();
+                    match self.turn_err.take() {
+                        Some(e) => {
+                            self.buddy_on(crate::buddy::Moment::Error);
+                            self.alert(crate::notify::Kind::Error, "Something went wrong", &e);
+                        }
+                        None => {
+                            self.buddy_on(crate::buddy::Moment::Done { secs });
+                            let body = self.last_reply.lines().find(|l| !l.trim().is_empty()).unwrap_or("Finished.");
+                            let body = crate::wrap::ellipsize(body.trim().trim_start_matches('#').trim(), 120);
+                            self.alert(crate::notify::Kind::Done, &format!("Done in {}", crate::motion::elapsed(secs)), &body);
+                        }
                     }
                 }
                 if let Some(r) = zproviders::last_rate_limits() {
@@ -625,6 +706,15 @@ impl App {
                     None => (ev.data["name"].as_str().unwrap_or("tool").to_string(), Value::Null, None),
                 };
                 let diff = self.diffs.remove(id);
+                if err {
+                    self.buddy_on(crate::buddy::Moment::ToolError);
+                } else if name == "bash" {
+                    match crate::buddy::test_outcome(input["command"].as_str().unwrap_or(""), content) {
+                        Some(true) => self.buddy_on(crate::buddy::Moment::TestsPass),
+                        Some(false) => self.buddy_on(crate::buddy::Moment::TestsFail),
+                        None => {}
+                    }
+                }
                 if name != "submit_plan" {
                     self.finish_tool(crate::toolview::ToolView {
                         name: &name,
@@ -1036,6 +1126,9 @@ impl App {
             self.busy_since = Instant::now();
             self.verb_seed = crate::motion::now_ms() as u64 / 7;
             self.turn_chars = 0;
+            self.turn_err = None;
+            self.buddy_on(crate::buddy::Moment::TurnStart);
+            self.busy_title();
         }
         self.inflight += 1;
         self.busy = true;
@@ -1230,6 +1323,32 @@ impl App {
                     }
                 }
             }
+            "buddy" => self.buddy_command(args.trim()),
+            "notify" => {
+                let sk = crate::skin::current();
+                let n = &sk.notify;
+                if args.trim() == "test" {
+                    let a = crate::notify::Alert {
+                        term: [crate::notify::title("✓ Test · cosmostui"), if n.sound { Vec::new() } else { vec![0x07] }].concat(),
+                        desktop: Some(("cosmostui — test".into(), "Notifications work.".into())),
+                        chime: n.sound,
+                    };
+                    self.term_out.extend(&a.term);
+                    self.titled = true;
+                    crate::notify::fire(&a);
+                    self.flash("Sent a test notification", theme::ACCENT());
+                } else {
+                    self.note(format!(
+                        "Notify: title {} · bell {} · desktop {} · sound {} · turns ≥ {}s · on {} — change these in ui.toml [notify]; /notify test sends one",
+                        if n.title { "on" } else { "off" },
+                        n.bell,
+                        n.desktop,
+                        if n.sound { "on" } else { "off" },
+                        n.min_secs,
+                        n.events.join(", ")
+                    ));
+                }
+            }
             "theme" => {
                 let name = args.trim();
                 let themes = crate::skin::palette::THEMES;
@@ -1414,6 +1533,61 @@ impl App {
         }
     }
 
+    /// `/buddy` and its subcommands (settings land in ui.toml [buddy]).
+    fn buddy_command(&mut self, args: &str) {
+        use crate::skin::edit::{set_in_file, Val};
+        let sk = crate::skin::current();
+        let (sub, rest) = args.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((args, ""));
+        let path = zcore::cli_home().join("ui.toml");
+        let save = |k: &str, v: Val| set_in_file(&path, "buddy", k, &v);
+        let res = match sub {
+            "" => {
+                if sk.buddy.enabled {
+                    let id = view::buddy_identity(self);
+                    self.block(crate::buddy::card(&id, self.buddy.mood(self.busy)));
+                } else {
+                    self.note("Your buddy is off — /buddy on brings it back");
+                }
+                return;
+            }
+            "pet" => {
+                if !sk.buddy.enabled {
+                    self.note("Your buddy is off — /buddy on brings it back");
+                    return;
+                }
+                self.buddy_on(crate::buddy::Moment::Pet);
+                return;
+            }
+            "name" if rest.is_empty() => {
+                self.error("Usage: /buddy name <name>");
+                return;
+            }
+            "name" => save("name", Val::Str(rest.chars().take(24).collect())).map(|_| format!("Say hi to {rest}")),
+            "reroll" => {
+                let mut cfg = sk.buddy.clone();
+                cfg.seed += 1;
+                let r = save("seed", Val::Int(cfg.seed as i64)).and_then(|_| save("species", Val::Str(String::new())));
+                r.map(|_| "A new buddy hatched — /buddy to meet it".to_string())
+            }
+            "mini" | "full" => save("size", Val::Str(sub.into())).and_then(|_| save("enabled", Val::Bool(true))).map(|_| format!("Buddy → {sub}")),
+            "on" => save("enabled", Val::Bool(true)).map(|_| "Buddy's back".to_string()),
+            "off" => save("enabled", Val::Bool(false)).map(|_| "Buddy off — /buddy on to bring it back".to_string()),
+            "quiet" => save("quips", Val::Str("off".into())).map(|_| "Buddy will keep its thoughts to itself".to_string()),
+            "chatty" => save("quips", Val::Str("builtin".into())).map(|_| "Buddy will speak up again".to_string()),
+            _ => {
+                self.error("Usage: /buddy [pet | name <name> | reroll | mini | full | quiet | chatty | on | off]");
+                return;
+            }
+        };
+        match res {
+            Ok(msg) => {
+                self.skin_reload = true;
+                self.flash(msg, theme::ACCENT());
+            }
+            Err(e) => self.error(format!("Couldn't save the buddy settings: {e}")),
+        }
+    }
+
     fn answer_perm(&mut self, code: u8) {
         if let Some(p) = self.perm.take() {
             let verdict = match code {
@@ -1423,6 +1597,10 @@ impl App {
             };
             let _ = p.reply.send(code);
             self.flash(format!("{verdict} — {}", view::tool_label(&p.tool)), if code == 0 { theme::RED() } else { theme::GREEN() });
+            self.buddy_on(crate::buddy::Moment::Answered);
+            if self.busy {
+                self.busy_title();
+            }
         }
     }
 
@@ -1434,6 +1612,7 @@ impl App {
     // ---- keys --------------------------------------------------------------
 
     fn on_key(&mut self, k: KeyEvent, cmd: &Sender<Cmd>, interrupt: &Arc<AtomicBool>) {
+        self.buddy.on(crate::buddy::Moment::Input, &crate::skin::current().buddy, "");
         if self.quitting {
             return;
         }
@@ -1760,7 +1939,7 @@ impl App {
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.input.len(),
             KeyCode::Up => {
-                let (_, crow, _) = view::wrapped_input(&self.input, self.cursor, self.width.saturating_sub(2));
+                let (_, crow, _) = view::wrapped_input(&self.input, self.cursor, view::input_width(self));
                 if crow == 0 && self.key_entry.is_none() {
                     self.history_prev();
                 } else {
@@ -1768,7 +1947,7 @@ impl App {
                 }
             }
             KeyCode::Down => {
-                let (lines, crow, _) = view::wrapped_input(&self.input, self.cursor, self.width.saturating_sub(2));
+                let (lines, crow, _) = view::wrapped_input(&self.input, self.cursor, view::input_width(self));
                 if crow + 1 >= lines.len() && self.key_entry.is_none() {
                     self.history_next();
                 } else {
@@ -1783,7 +1962,7 @@ impl App {
     }
 
     fn move_vertical(&mut self, dir: isize) {
-        let (lines, crow, ccol) = view::wrapped_input(&self.input, self.cursor, self.width.saturating_sub(2));
+        let (lines, crow, ccol) = view::wrapped_input(&self.input, self.cursor, view::input_width(self));
         let target = (crow as isize + dir).clamp(0, lines.len() as isize - 1) as usize;
         let (start, text) = &lines[target];
         self.cursor = start + ccol.min(text.chars().count());
@@ -1888,6 +2067,13 @@ pub fn try_run(opts: &RunOpts, cwd: &Path) -> Result<Option<i32>> {
         app.error(n);
     }
     let r = run_loop(&mut screen, &mut app, &rx, &cmd, &interrupt, &mut skin);
+    if app.titled {
+        // hand the title back to the shell / terminal profile
+        use std::io::Write;
+        let mut o = std::io::stdout();
+        let _ = o.write_all(&crate::notify::title(""));
+        let _ = o.flush();
+    }
     let bye = view::farewell(&app);
     screen.leave(&bye);
     // contract §13: after a clean interactive session, learn from it in the
@@ -1950,6 +2136,7 @@ fn collect_burst(
 
 fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender<Cmd>, interrupt: &Arc<AtomicBool>, skin: &mut crate::skin::Watcher) -> Result<i32> {
     let mut last_tick = Instant::now();
+    let mut buddy_was = view::buddy_key(app);
     loop {
         while let Ok(m) = rx.try_recv() {
             app.on_msg(m);
@@ -2018,6 +2205,17 @@ fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender
             screen.clear_screen()?;
             app.dirty = true;
         }
+        // the buddy blinks, dozes off, and its quips fade — repaint only then
+        let buddy_now = view::buddy_key(app);
+        if buddy_now != buddy_was {
+            buddy_was = buddy_now;
+            app.dirty = true;
+        }
+        if !app.term_out.is_empty() {
+            let mut o = std::io::stdout();
+            let _ = std::io::Write::write_all(&mut o, &std::mem::take(&mut app.term_out));
+            let _ = std::io::Write::flush(&mut o);
+        }
         if app.dirty {
             app.dirty = false;
             let (lines, cursor) = view::live(app);
@@ -2066,6 +2264,14 @@ fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender
                         app.width = screen.text_width();
                         app.dirty = true;
                     }
+                    CEvent::FocusGained => {
+                        app.focused = Some(true);
+                        // back from elsewhere: the "done" title has been seen
+                        if !app.busy && app.titled {
+                            app.set_title("cosmostui");
+                        }
+                    }
+                    CEvent::FocusLost => app.focused = Some(false),
                     _ => {}
                 }
                 if !event::poll(Duration::ZERO)? {
@@ -2332,6 +2538,72 @@ ok
             a.on_key(key(KeyCode::Esc), &cmd, &stop);
             assert!(a.popup.is_none());
         });
+    }
+
+    #[test]
+    fn turns_set_the_title_and_move_the_buddy() {
+        let _env = crate::env_lock();
+        crate::skin::scoped_skin(crate::skin::Skin::default(), || {
+            let mut a = app();
+            let (cmd, _rx) = std::sync::mpsc::channel();
+            let ev = |kind: &str, data: Value| zproto::Event {
+                v: 1, id: "e".into(), parent: None, ts: String::new(), session: "s".into(),
+                harness: "cosmostui".into(), kind: kind.into(), data,
+            };
+            a.input = "hi".chars().collect();
+            a.cursor = 2;
+            a.on_key(key(KeyCode::Enter), &cmd, &Arc::new(AtomicBool::new(false)));
+            assert!(a.busy);
+            let t = String::from_utf8_lossy(&std::mem::take(&mut a.term_out)).to_string();
+            assert!(t.starts_with("]0;✻ ") && t.contains("… · cosmostui"), "busy title: {t:?}");
+            assert_eq!(a.buddy.mood(a.busy), crate::buddy::Mood::Focused);
+
+            // a red test run worries it
+            a.on_msg(Msg::Event(ev("assistant", serde_json::json!({"text": "", "tool_calls": [{"id": "b", "name": "bash", "input": {"command": "cargo test"}}]}))));
+            a.on_msg(Msg::Event(ev("tool_result", serde_json::json!({"tool_use_id": "b", "name": "bash", "is_error": false,
+                "content": "exit_code=101 log_path=x omitted_chars=0
+<<<UNTRUSTED_SHELL
+FAILED
+>>>"}))));
+            assert_eq!(a.buddy.mood(a.busy), crate::buddy::Mood::Worried);
+
+            // the turn ends: done title, pleased buddy (focus known: no bell)
+            a.focused = Some(true);
+            a.on_msg(Msg::TurnDone);
+            let t = String::from_utf8_lossy(&std::mem::take(&mut a.term_out)).to_string();
+            assert!(t.contains("✓ Done in 0s · cosmostui") && t.matches('').count() == 1, "title, no bell: {t:?}");
+            assert!(!a.busy);
+
+            // looking away during a permission prompt rings
+            a.focused = Some(false);
+            let (reply, _r) = std::sync::mpsc::channel();
+            a.on_msg(Msg::PermissionAsk { tool: "bash".into(), reply });
+            let t = String::from_utf8_lossy(&std::mem::take(&mut a.term_out)).to_string();
+            assert!(t.contains("⚠ Needs your OK") && t.matches('').count() == 2, "title + bell: {t:?}");
+            assert_eq!(a.buddy.mood(false), crate::buddy::Mood::Waiting);
+        });
+    }
+
+    #[test]
+    fn buddy_commands_write_ui_toml() {
+        let _env = crate::env_lock();
+        let mut a = app();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("COSMOS_CLI_HOME", home.path());
+        let (cmd, _rx) = std::sync::mpsc::channel();
+        for c in ["/buddy name Nova", "/buddy mini", "/buddy reroll", "/buddy quiet"] {
+            a.input = c.chars().collect();
+            a.cursor = a.input.len();
+            a.on_key(key(KeyCode::Enter), &cmd, &Arc::new(AtomicBool::new(false)));
+        }
+        let toml = std::fs::read_to_string(home.path().join("ui.toml")).unwrap();
+        let sk: crate::skin::Skin = toml::from_str(&toml).unwrap();
+        assert_eq!((sk.buddy.name.as_str(), sk.buddy.size.as_str(), sk.buddy.seed, sk.buddy.quips.as_str()), ("Nova", "mini", 1, "off"));
+        a.input = "/buddy".chars().collect();
+        a.cursor = a.input.len();
+        a.out.clear();
+        a.on_key(key(KeyCode::Enter), &cmd, &Arc::new(AtomicBool::new(false)));
+        assert!(a.out.iter().map(text).any(|r| r.contains("focus") && r.contains('█')), "the card shows stats");
     }
 
     #[test]

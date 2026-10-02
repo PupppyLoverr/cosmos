@@ -5,6 +5,7 @@
 //! agent on a worker thread; and a line-oriented REPL fallback used when
 //! there's no terminal (piped stdin/stdout, tests).
 
+mod buddy;
 mod highlight;
 #[cfg(feature = "highlight")]
 mod highlight_ts;
@@ -12,6 +13,7 @@ mod line;
 mod logo;
 mod markdown;
 mod motion;
+mod notify;
 mod skin;
 mod slash;
 mod term;

@@ -189,6 +189,72 @@ impl Default for MarkdownCfg {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
+pub struct BuddyCfg {
+    pub enabled: bool,
+    /// "full" (a sprite beside the composer), "mini" (a face in the status line)
+    pub size: String,
+    /// empty: hatched from your name; or one of buddy::SPECIES
+    pub species: String,
+    /// empty: a generated name
+    pub name: String,
+    /// bump to hatch a different buddy (`/buddy reroll`)
+    pub seed: u64,
+    /// "builtin" one-liners, or "off"
+    pub quips: String,
+    /// how long a quip stays up
+    pub quip_secs: u64,
+    /// your own quips by moment: hello, done, long_done, error, tests_pass,
+    /// tests_fail, waiting, compact, pet, sleep, degraded ({name} = the buddy)
+    pub lines: BTreeMap<String, Vec<String>>,
+}
+
+impl Default for BuddyCfg {
+    fn default() -> Self {
+        BuddyCfg {
+            enabled: true,
+            size: "full".into(),
+            species: String::new(),
+            name: String::new(),
+            seed: 0,
+            quips: "builtin".into(),
+            quip_secs: 6,
+            lines: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NotifyCfg {
+    /// show progress in the terminal title (OSC 0)
+    pub title: bool,
+    /// "unfocused", "always" or "never"
+    pub bell: String,
+    /// desktop notification: "unfocused", "always" or "never"
+    pub desktop: String,
+    /// a short chime (needs the voice feature; otherwise the bell)
+    pub sound: bool,
+    /// turns shorter than this never notify
+    pub min_secs: u64,
+    /// which moments notify: done, waiting (a permission prompt), error
+    pub events: Vec<String>,
+}
+
+impl Default for NotifyCfg {
+    fn default() -> Self {
+        NotifyCfg {
+            title: true,
+            bell: "unfocused".into(),
+            desktop: "unfocused".into(),
+            sound: false,
+            min_secs: 15,
+            events: ["done", "waiting", "error"].map(String::from).to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct GlyphsCfg {
     /// the dot before a tool (coloured by its status)
     pub tool: String,
@@ -218,6 +284,8 @@ pub struct Skin {
     pub diff: DiffCfg,
     pub markdown: MarkdownCfg,
     pub glyphs: GlyphsCfg,
+    pub buddy: BuddyCfg,
+    pub notify: NotifyCfg,
 }
 
 impl Skin {
@@ -229,6 +297,7 @@ impl Skin {
         s.tools.style = "classic".into();
         s.diff.style = "classic".into();
         s.markdown.style = "classic".into();
+        s.buddy.enabled = false;
         s.glyphs.tool = "●".into();
         s
     }
