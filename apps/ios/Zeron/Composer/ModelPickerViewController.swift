@@ -305,6 +305,7 @@ final class ModelPickerViewController: UIViewController, UIPopoverPresentationCo
         title.adjustsFontForContentSizeCategory = true
 
         let labels = UIStackView()
+        labels.isUserInteractionEnabled = false
         labels.axis = .vertical
         labels.alignment = .fill
         labels.spacing = 2
@@ -334,7 +335,7 @@ final class ModelPickerViewController: UIViewController, UIPopoverPresentationCo
         check.tintColor = Palette.accent
         check.isHidden = !selectedModel
         check.setContentHuggingPriority(.required, for: .horizontal)
-        let stack = UIStackView(arrangedSubviews: [mark, labels, check, favorite])
+        let stack = PassthroughStackView(arrangedSubviews: [mark, labels, check, favorite])
         stack.axis = .horizontal
         stack.alignment = .center
         stack.spacing = 8
@@ -396,5 +397,13 @@ final class ModelPickerViewController: UIViewController, UIPopoverPresentationCo
 
     private func scaled(_ font: FaceRole, size: CGFloat, style: UIFont.TextStyle) -> UIFont {
         UIFontMetrics(forTextStyle: style).scaledFont(for: Fonts.ui(font, size))
+    }
+}
+
+/// Lets touches on its own background fall through to the row control behind it.
+private final class PassthroughStackView: UIStackView {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let hit = super.hitTest(point, with: event)
+        return hit === self ? nil : hit
     }
 }
