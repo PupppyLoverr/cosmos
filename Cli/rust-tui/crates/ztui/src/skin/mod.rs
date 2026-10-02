@@ -152,6 +152,43 @@ impl Default for DiffCfg {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
+pub struct MarkdownCfg {
+    /// "cosmos" (framed code, callouts, bordered tables, hyperlinks) or "classic"
+    pub style: String,
+    /// box code blocks with a language label
+    pub code_frame: bool,
+    /// tint code blocks with the theme's code_bg
+    pub code_bg: bool,
+    pub code_numbers: bool,
+    /// "auto" (OSC 8 hyperlinks where the terminal supports them), "osc8", "inline"
+    pub links: String,
+    /// `> [!NOTE]` / TIP / IMPORTANT / WARNING / CAUTION
+    pub callouts: bool,
+    pub table_borders: bool,
+    /// list bullets by depth
+    pub bullets: Vec<String>,
+    /// a rule under level-1 headings
+    pub h1_rule: bool,
+}
+
+impl Default for MarkdownCfg {
+    fn default() -> Self {
+        MarkdownCfg {
+            style: "cosmos".into(),
+            code_frame: true,
+            code_bg: true,
+            code_numbers: false,
+            links: "auto".into(),
+            callouts: true,
+            table_borders: true,
+            bullets: ["•", "◦", "▸", "▹"].map(String::from).to_vec(),
+            h1_rule: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct GlyphsCfg {
     /// the dot before a tool (coloured by its status)
     pub tool: String,
@@ -179,6 +216,7 @@ pub struct Skin {
     pub motion: MotionCfg,
     pub tools: ToolsCfg,
     pub diff: DiffCfg,
+    pub markdown: MarkdownCfg,
     pub glyphs: GlyphsCfg,
 }
 
@@ -190,6 +228,7 @@ impl Skin {
         s.theme.name = "classic".into();
         s.tools.style = "classic".into();
         s.diff.style = "classic".into();
+        s.markdown.style = "classic".into();
         s.glyphs.tool = "●".into();
         s
     }

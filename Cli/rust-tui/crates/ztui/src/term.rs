@@ -245,12 +245,21 @@ fn apply(buf: &mut Vec<u8>, s: Style) {
 /// Write one styled line, hard-clipped to `max` display columns.
 pub fn write_line(buf: &mut Vec<u8>, line: &Line<'_>, max: usize) {
     let mut col = 0usize;
+    let mut linked = false;
     'spans: for span in &line.spans {
         let style = line.style.patch(span.style);
         apply(buf, style);
         let mut chunk = String::new();
-        for ch in span.content.chars() {
+        let mut chars = span.content.chars().peekable();
+        while let Some(ch) = chars.next() {
             if ch == '\n' || ch == '\r' {
+                continue;
+            }
+            // a hyperlink marker from markdown → OSC 8
+            if let Some(url) = crate::markdown::take_link(ch, &mut chars) {
+                let _ = buf.queue(Print(std::mem::take(&mut chunk)));
+                let _ = buf.queue(Print(format!("\x1b]8;;{url}\x1b\\")));
+                linked = !url.is_empty();
                 continue;
             }
             let cw = if ch == '\t' { 1 } else { UnicodeWidthChar::width(ch).unwrap_or(0) };
@@ -262,6 +271,9 @@ pub fn write_line(buf: &mut Vec<u8>, line: &Line<'_>, max: usize) {
             col += cw;
         }
         let _ = buf.queue(Print(&chunk));
+    }
+    if linked {
+        let _ = buf.queue(Print("\x1b]8;;\x1b\\"));
     }
     let _ = buf.queue(SetAttribute(Attribute::Reset));
     let _ = buf.queue(ResetColor);

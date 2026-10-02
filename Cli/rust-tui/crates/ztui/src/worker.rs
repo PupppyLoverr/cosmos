@@ -183,7 +183,8 @@ pub fn diff_rows(old: &str, new: &str) -> (Vec<DiffLine>, usize, usize) {
     let d = TextDiff::from_lines(old, new);
     let (mut added, mut removed) = (0, 0);
     let mut rows = Vec::new();
-    for (gi, group) in d.grouped_ops(2).iter().enumerate() {
+    let context = crate::skin::current().diff.context.min(20);
+    for (gi, group) in d.grouped_ops(context).iter().enumerate() {
         if gi > 0 {
             rows.push(DiffLine { kind: '…', no: None, old: None, text: String::new() });
         }
