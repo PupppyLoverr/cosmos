@@ -246,9 +246,9 @@ private final class ChangeFileRow: UIView {
         super.init(frame: .zero)
         accessibilityIdentifier = "change-file-row-\(index)"
         isAccessibilityElement = true
-        let pending = file.additions == 0 && file.deletions == 0
-        accessibilityLabel = pending
-            ? "\(file.path), editing…"
+        let hasNoStats = file.additions == 0 && file.deletions == 0
+        accessibilityLabel = hasNoStats
+            ? "\(file.path), edited"
             : "\(file.path), +\(file.additions), −\(file.deletions)"
 
         let icon = UIImageView(image: UIImage(systemName: Self.icon(for: file.path)))
@@ -267,12 +267,12 @@ private final class ChangeFileRow: UIView {
         counts.alignment = .center
         counts.spacing = 8
         counts.setContentCompressionResistancePriority(.required, for: .horizontal)
-        if pending {
-            let editing = UILabel()
-            editing.text = "editing…"
-            editing.textColor = Palette.tertiary
-            editing.font = Fonts.ui(.mono, 12.5)
-            counts.addArrangedSubview(editing)
+        if hasNoStats {
+            let edited = UILabel()
+            edited.text = "edited"
+            edited.textColor = Palette.tertiary
+            edited.font = Fonts.ui(.mono, 12.5)
+            counts.addArrangedSubview(edited)
         } else {
             let additions = UILabel()
             additions.text = "+\(file.additions)"

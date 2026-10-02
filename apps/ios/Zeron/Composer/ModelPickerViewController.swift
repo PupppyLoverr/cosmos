@@ -124,6 +124,11 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         scrollToSelectedModel()
     }
 
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        updatePreferredContentSize()
+    }
+
     func present(from anchor: UIView, in presenter: UIViewController) {
         let screenWidth = anchor.window?.windowScene?.screen.bounds.width ?? UIScreen.main.bounds.width
         preferredContentSize = CGSize(width: min(320, max(1, screenWidth - 32)), height: fittedHeight)
@@ -207,13 +212,21 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     }
 
     private var fittedHeight: CGFloat {
-        let rowsHeight = sections.reduce(CGFloat(0)) { total, section in
-            total + 30 + section.models.reduce(CGFloat(0)) { height, model in
-                height + ((model.description?.isEmpty == false) ? 56 : 48)
-            }
+        let headerHeight = max(closeButton.bounds.height, 28)
+        let searchHeight = max(searchRow.bounds.height, 37)
+        let tableHeight: CGFloat
+        if isViewLoaded {
+            tableView.layoutIfNeeded()
+            let insets = tableView.adjustedContentInset
+            let minimumTableHeight: CGFloat = sections.isEmpty ? 64 : 56
+            tableHeight = max(
+                minimumTableHeight,
+                tableView.contentSize.height + insets.top + insets.bottom
+            )
+        } else {
+            tableHeight = 64
         }
-        let emptyHeight: CGFloat = sections.isEmpty ? 64 : 0
-        return min(460, max(136, 10 + 30 + 8 + 37 + rowsHeight + emptyHeight + 10))
+        return min(460, 10 + headerHeight + 8 + searchHeight + 8 + tableHeight + 8 + 10)
     }
 
     private var selectedModelID: String? {
@@ -334,7 +347,9 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
 
     private func updatePreferredContentSize() {
         guard preferredContentSize.width > 0 else { return }
-        preferredContentSize.height = fittedHeight
+        let height = fittedHeight
+        guard abs(preferredContentSize.height - height) > 0.5 else { return }
+        preferredContentSize.height = height
     }
 
     private func matching(_ models: [ModelChoice], query: String) -> [ModelChoice] {
