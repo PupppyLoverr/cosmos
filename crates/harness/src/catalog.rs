@@ -466,13 +466,18 @@ mod tests {
         let script = dir.path().join("shim");
         std::fs::write(&script, "#!/bin/sh\ncd -- \"$(dirname -- \"$0\")\"\nprintf 'probe\\n' >> calls\ncat response\nexit \"$(cat status)\"\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let agent = dir.path().join("cursor-agent");
+        std::fs::write(&agent, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
         let response = dir.path().join("response");
         let status = dir.path().join("status");
         let items: Vec<_> = (0..256).map(|i| serde_json::json!({"id":format!("model-{i}"),"displayName":format!("Model {i}"),"description":"x".repeat(4096)})).collect();
         let full = serde_json::json!({"ev":"models","items":items}).to_string();
         std::fs::write(&response, &full).unwrap();
         std::fs::write(&status, "0").unwrap();
-        let harness = CursorHarness::new().with_executable(script);
+        let harness = CursorHarness::new()
+            .with_executable(script)
+            .with_agent_executable(agent);
         let baseline = harness.models().await.unwrap();
         assert_eq!(baseline.len(), 256);
         for cycle in 0..10 {

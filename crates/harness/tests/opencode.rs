@@ -705,21 +705,18 @@ async fn session_error_with_no_content_settles_errored() {
             "data": { "message": "ProviderAuthError: no credentials for anthropic\n    at stack" },
         }},
     }));
-    let quiet = tokio::time::timeout(Duration::from_millis(400), stream.next()).await;
+    let settled = tokio::time::timeout(Duration::from_millis(400), stream.next()).await;
     assert!(
-        quiet.is_err(),
-        "duplicate error must not mint a second chip"
+        matches!(
+            &settled,
+            Ok(Some(Ok(AgentEvent::Done {
+                status: DoneStatus::Errored,
+                error: Some(error),
+                ..
+            }))) if error.contains("no credentials")
+        ),
+        "duplicate error must not mint a second chip; expected errored completion, got {settled:?}"
     );
-    idle(&fake, "ses_test");
-    let events = drain_to_done(&mut stream).await;
-    assert!(matches!(
-        events.last(),
-        Some(AgentEvent::Done {
-            status: DoneStatus::Errored,
-            error: Some(e),
-            ..
-        }) if e.contains("no credentials")
-    ));
 }
 
 #[tokio::test]
