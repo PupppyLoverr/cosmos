@@ -194,9 +194,14 @@ pub enum Credentials {
         tokens: AuthTokens,
     },
     /// `AUTH_MODE=dev` edge: the bearer is `userId@orgId`.
-    Dev { user_id: String, org_id: String },
+    Dev {
+        user_id: String,
+        org_id: String,
+    },
     /// Fully offline dataset with a simulated host.
-    Demo { options: DemoOptions },
+    Demo {
+        options: DemoOptions,
+    },
 }
 
 impl From<Credentials> for zc::Credentials {

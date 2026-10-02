@@ -1811,20 +1811,20 @@ impl ToolsPage {
             enabled,
             format!("tools-provider-toggle-{}", provider.id),
         )
-            .id(format!("tools-provider-toggle-{}", provider.id))
-            .role(gpui::Role::Switch)
-            .aria_label(provider.name.clone())
-            .aria_toggled(if enabled {
-                gpui::Toggled::True
-            } else {
-                gpui::Toggled::False
-            })
-            .tab_index(0)
-            .focus_visible(|style| style.border_2().border_color(theme.accent))
-            .cursor_pointer()
-            .on_click(
-                cx.listener(move |this, _, _, cx| this.toggle_provider(id.clone(), !enabled, cx)),
-            );
+        .id(format!("tools-provider-toggle-{}", provider.id))
+        .role(gpui::Role::Switch)
+        .aria_label(provider.name.clone())
+        .aria_toggled(if enabled {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        })
+        .tab_index(0)
+        .focus_visible(|style| style.border_2().border_color(theme.accent))
+        .cursor_pointer()
+        .on_click(
+            cx.listener(move |this, _, _, cx| this.toggle_provider(id.clone(), !enabled, cx)),
+        );
         let edit_provider = provider.clone();
         let remove_id = provider.id.clone();
         let controls = div()

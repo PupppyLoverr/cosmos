@@ -12,15 +12,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
 };
-use zeron_rpc::{decode_device_frame, device_room_ws_url, methods, DeviceLink};
+use zeron_rpc::{DeviceLink, decode_device_frame, device_room_ws_url, methods};
 
 /// Edge dev auth: the bearer IS the user id — engine dev mode answers
 /// `dev-user`, so every client must present the same bearer to pass the
@@ -173,7 +173,13 @@ async fn live_edge_pairing_roundtrip() {
     // A client from a DIFFERENT account must be refused at the WS upgrade —
     // the edge's owner gate is the only thing standing between a stranger and
     // the desktop's relay-forwarded surface.
-    let stranger_url = device_room_ws_url(&edge_url, device_id, "client", Some("stranger"), "other-user");
+    let stranger_url = device_room_ws_url(
+        &edge_url,
+        device_id,
+        "client",
+        Some("stranger"),
+        "other-user",
+    );
     assert!(
         DeviceLink::connect(&stranger_url).await.is_err(),
         "a different account must be rejected at upgrade"
@@ -204,10 +210,17 @@ async fn live_edge_pairing_roundtrip() {
     // Mint + redeem the on-screen code.
     let (code, _exp) = core.pairing.issue();
     eprintln!("step: PairPhone redeem code={code}");
-    let reply = call(&client, methods::PAIR_PHONE, serde_json::json!({ "code": code }))
-        .await
-        .expect("PairPhone redeems the code");
-    let token = reply["deviceToken"].as_str().expect("deviceToken").to_string();
+    let reply = call(
+        &client,
+        methods::PAIR_PHONE,
+        serde_json::json!({ "code": code }),
+    )
+    .await
+    .expect("PairPhone redeems the code");
+    let token = reply["deviceToken"]
+        .as_str()
+        .expect("deviceToken")
+        .to_string();
 
     eprintln!("step: WatchSessions (open)");
     watch(&client, methods::WATCH_SESSIONS)
@@ -226,13 +239,21 @@ async fn live_edge_pairing_roundtrip() {
     .await
     .expect("second client dials");
     eprintln!("step: AuthorizePhone");
-    call(&phone2.client(), methods::AUTHORIZE_PHONE, serde_json::json!({ "deviceToken": token }))
-        .await
-        .expect("AuthorizePhone accepts the grant");
+    call(
+        &phone2.client(),
+        methods::AUTHORIZE_PHONE,
+        serde_json::json!({ "deviceToken": token }),
+    )
+    .await
+    .expect("AuthorizePhone accepts the grant");
     eprintln!("step: ComputerStatus");
-    call(&phone2.client(), methods::COMPUTER_STATUS, serde_json::json!({}))
-        .await
-        .expect("authorized conn reaches the full surface");
+    call(
+        &phone2.client(),
+        methods::COMPUTER_STATUS,
+        serde_json::json!({}),
+    )
+    .await
+    .expect("authorized conn reaches the full surface");
     eprintln!("step: host drop / host_closed watch");
 
     // Host drop → the edge must broadcast `k:" relay"` / host_closed so
@@ -271,5 +292,8 @@ async fn live_edge_pairing_roundtrip() {
             }
         }
     }
-    assert!(saw_host_closed, "client must see host_closed when the host drops");
+    assert!(
+        saw_host_closed,
+        "client must see host_closed when the host drops"
+    );
 }

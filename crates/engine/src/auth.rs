@@ -556,9 +556,7 @@ impl Auth {
             return Ok(String::new()); // dev mode: nothing to do
         }
         let port = self.ensure_loopback().await?;
-        Ok(self.begin_woozlit_sign_in(&format!(
-            "http://{SIGN_IN_CALLBACK_HOST}:{port}/callback"
-        )))
+        Ok(self.begin_woozlit_sign_in(&format!("http://{SIGN_IN_CALLBACK_HOST}:{port}/callback")))
     }
 
     /// Same Woozlit login URL as headed sign-in. CLI uses the loopback callback
