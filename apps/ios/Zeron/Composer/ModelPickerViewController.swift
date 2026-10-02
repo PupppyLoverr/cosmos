@@ -144,10 +144,13 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         search.clearButtonMode = .whileEditing
         search.backgroundColor = Palette.controlFill
         search.layer.cornerRadius = 10
-        let icon = UIImageView(image: UIImage(systemName: "magnifyingglass"))
+        let icon = UIImageView(image: UIImage(
+            systemName: "magnifyingglass",
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+        ))
         icon.tintColor = Palette.tertiary
         icon.contentMode = .center
-        icon.frame = CGRect(x: 0, y: 0, width: 34, height: 36)
+        icon.frame = CGRect(x: 0, y: 0, width: 36, height: 36)
         search.leftView = icon
         search.leftViewMode = .always
         search.addTarget(self, action: #selector(queryChanged), for: .editingChanged)
@@ -224,12 +227,18 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         configuration.image = image
         configuration.imagePadding = 6
         configuration.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12)
+        let chipFont = scaled(.sansMedium, size: 13, style: .subheadline)
+        configuration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
+            var attributes = attributes
+            attributes.font = chipFont
+            return attributes
+        }
+        configuration.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
         let isSelected = filter == selection
         configuration.baseForegroundColor = isSelected ? Palette.accent : Palette.secondary
         configuration.background.backgroundColor = isSelected ? Palette.accentSoft : Palette.controlFill
         configuration.background.cornerRadius = 17
         let button = UIButton(configuration: configuration)
-        button.titleLabel?.font = scaled(.sansMedium, size: 13, style: .subheadline)
         button.accessibilityLabel = title
         button.accessibilityTraits = .button
         button.addAction(UIAction { [weak self] _ in
