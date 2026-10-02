@@ -52,6 +52,10 @@
 	</dict>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Attach photos to messages.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Dictate messages and talk to your agent in voice mode.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Turns your voice into text on this iPhone for dictation and voice mode.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Take photos to attach to messages.</string>
 	<key>UILaunchScreen</key>

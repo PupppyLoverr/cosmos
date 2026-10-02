@@ -10,6 +10,9 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
     private lazy var engine = TranscriptView(text: TextEngine.shared, listener: relay)
     private lazy var list = TranscriptListView(engine: engine)
     private let composer = ComposerBar()
+    private let changesPill = ChangesAccessoryPill()
+    private let modelPill = ModelAccessoryPill()
+    private let accessoryRow = UIStackView()
     private let questions = QuestionPanel()
     private let queue = QueuePanel()
     private let pill = StatusPill()
@@ -17,6 +20,8 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
     private let jump = Glass.circleButton(symbol: "arrow.down", size: 40, pointSize: 15)
     private let titleView = SessionTitleView()
     private var shown = SessionChrome()
+    private var latestChanges: SessionChanges?
+    private weak var voiceCall: VoiceCallViewController?
     private let openedAt = CACurrentMediaTime()
     private var reportedOpen = false
 
@@ -69,23 +74,8 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             return AttachmentPicker.menu(host: self, limit: 8 - self.composer.images.count) { [weak self] in self?.composer.addImages($0) }
         }
         composer.onChipTap = { [weak self] id, anchor in
-            guard let self, id == "model" else { return }
-            let row = self.app.row(self.chatId)
-            let harness = row?.harness ?? "claude-code"
-            let selected = (harness: harness, model: row?.model)
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                let models = await self.source.models()
-                guard anchor.window != nil else { return }
-                let picker = ModelPickerViewController(
-                    models: models,
-                    selected: selected,
-                    lockedHarness: harness
-                ) { [weak self] model in
-                    self?.source.selectModel(model)
-                }
-                picker.present(from: anchor, in: self)
-            }
+            guard id == "model" else { return }
+            self?.presentModelPicker(from: anchor)
         }
         composer.onSend = { [weak self] text, images, mode in
             guard let self else { return .kept }
@@ -104,6 +94,12 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             return .sent
         }
         composer.onStop = { [weak self] in self?.source.stop() }
+        composer.onVoice = { [weak self] in self?.presentVoiceCall() }
+        changesPill.onTap = { [weak self] in self?.presentChanges() }
+        modelPill.onTap = { [weak self] in
+            guard let self else { return }
+            self.presentModelPicker(from: self.modelPill)
+        }
         composer.text = Drafts.load(chatId)
         composer.mentionSearch = { [weak self] q in await self?.source.searchFiles(q) ?? [] }
         composer.onHeightChange = { [weak self] in self?.view.setNeedsLayout() }
@@ -128,13 +124,21 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         bottom.translatesAutoresizingMaskIntoConstraints = false
         let pillRow = UIStackView(arrangedSubviews: [pill, UIView()])
         pillRow.axis = .horizontal
-        for v in [pillRow, queue, questions, composer] { bottom.addArrangedSubview(v) }
+        accessoryRow.axis = .horizontal
+        accessoryRow.alignment = .center
+        accessoryRow.spacing = 8
+        accessoryRow.translatesAutoresizingMaskIntoConstraints = false
+        accessoryRow.addArrangedSubview(changesPill)
+        accessoryRow.addArrangedSubview(UIView())
+        accessoryRow.addArrangedSubview(modelPill)
+        for v in [pillRow, queue, questions, accessoryRow, composer] { bottom.addArrangedSubview(v) }
         questions.isHidden = true
         queue.isHidden = true
         // Hidden panels start dematerialized so their first appearance grows in.
         questions.setGlassVisible(false, animated: false)
         queue.setGlassVisible(false, animated: false)
         pillRow.isHidden = true
+        accessoryRow.isHidden = true
         view.addSubview(bottom)
         // Transcript fades into the background behind the composer, like the
         // nav bar's edge effect at the top. A gradient overlay (not a mask on
@@ -459,6 +463,12 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
     private func applyFrame() {
         let frame = engine.frame()
         list.apply(frame)
+        let changes = frame.changes()
+        if latestChanges != changes {
+            latestChanges = changes
+            changesPill.configure(changes)
+            updateAccessoryVisibility(animated: true)
+        }
         if !reportedOpen, frame.rowCount() > 0 {
             reportedOpen = true
             showTranscriptIfReady()
@@ -471,6 +481,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
                 try? json.write(to: docs.appendingPathComponent("open.json"), atomically: true, encoding: .utf8)
             }
         }
+        voiceCall?.sessionDidUpdate(chrome: shown, frame: frame)
     }
 
     private func setJumpVisible(_ visible: Bool) {
@@ -485,7 +496,9 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         let c = source.chrome
         let old = shown
         shown = c
+        let oldAccessoryHidden = accessoryRow.isHidden
         titleView.set(title: c.title, subtitle: c.subtitle)
+        configureModelPill()
         list.uploadProgress = c.uploadProgress
         composer.running = c.running
         composer.canSteer = c.canSteer
@@ -494,10 +507,12 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         composer.chipMenus = Dictionary(uniqueKeysWithValues: c.chips.map { chip in
             (chip.id, { [weak self] in self?.source.chipMenu(chip.id) })
         })
+        let accessoryHidden = c.questions != nil || (changesPill.isHidden && modelPill.isHidden)
         let changes = {
             let asking = c.questions != nil
             self.questions.isHidden = !asking
             self.composer.isHidden = asking
+            self.accessoryRow.isHidden = accessoryHidden
             if let q = c.questions { self.questions.configure(q.items) }
             self.queue.isHidden = c.queue.isEmpty || asking
             self.queue.configure(c.queue)
@@ -507,7 +522,10 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             self.bottom.layoutIfNeeded()
             self.view.layoutIfNeeded()
         }
-        let structural = (old.questions == nil) != (c.questions == nil) || old.queue.count != c.queue.count || (old.banner == .none) != (c.banner == .none)
+        let structural = (old.questions == nil) != (c.questions == nil)
+            || old.queue.count != c.queue.count
+            || (old.banner == .none) != (c.banner == .none)
+            || oldAccessoryHidden != accessoryHidden
         // Panels materialize when their content appears; a first render (the
         // session reopened with a queue or an open question) shows them at
         // once — they used to stay dematerialized, so the queue "vanished"
@@ -523,6 +541,116 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         } else {
             changes()
         }
+        if oldAccessoryHidden != accessoryHidden {
+            updateAccessoryVisibility(animated: animated)
+        }
+        voiceCall?.sessionDidUpdate(chrome: shown, frame: engine.frame())
+    }
+
+    private func updateAccessoryVisibility(animated: Bool) {
+        let hidden = shown.questions != nil || (changesPill.isHidden && modelPill.isHidden)
+        guard accessoryRow.isHidden != hidden else { return }
+        let apply = {
+            self.accessoryRow.isHidden = hidden
+            self.bottom.layoutIfNeeded()
+            self.view.layoutIfNeeded()
+        }
+        if animated {
+            UIView.animate(
+                withDuration: 0.38,
+                delay: 0,
+                usingSpringWithDamping: 0.86,
+                initialSpringVelocity: 0,
+                options: [.allowUserInteraction, .beginFromCurrentState],
+                animations: apply
+            )
+        } else {
+            apply()
+        }
+    }
+
+    private func configureModelPill() {
+        guard let row = app.row(chatId), let harness = row.harness else {
+            modelPill.isHidden = true
+            return
+        }
+        let label = row.modelLabel ?? row.harnessLabel ?? HarnessNames.label(harness)
+        modelPill.configure(harness: harness, label: label)
+        modelPill.isHidden = false
+    }
+
+    private func presentModelPicker(from anchor: UIView) {
+        let row = app.row(chatId)
+        let harness = row?.harness ?? "claude-code"
+        let selected = (harness: harness, model: row?.model)
+        Task { @MainActor [weak self, weak anchor] in
+            guard let self else { return }
+            let models = await self.source.models()
+            guard let anchor, anchor.window != nil else { return }
+            let picker = ModelPickerViewController(
+                models: models,
+                selected: selected,
+                lockedHarness: harness
+            ) { [weak self] model in
+                guard let self else { return }
+                self.source.selectModel(model)
+                let message = self.shown.running
+                    ? "Switches to \(model.label) on the next turn"
+                    : "Model: \(model.label)"
+                Toast.show(message, in: self.view.window)
+            }
+            picker.present(from: anchor, in: self)
+        }
+    }
+
+    private func presentChanges() {
+        guard let latestChanges, !latestChanges.files.isEmpty else { return }
+        let sheet = ChangesViewController(changes: latestChanges)
+        sheet.modalPresentationStyle = .pageSheet
+        if let presentation = sheet.sheetPresentationController {
+            presentation.detents = [.medium(), .large()]
+            presentation.prefersGrabberVisible = true
+        }
+        present(sheet, animated: true)
+    }
+
+    private func presentVoiceCall() {
+        guard voiceCall == nil else { return }
+        composer.resignFirstResponder()
+        view.endEditing(true)
+        let model = shown.chips.first { $0.id == "model" }?.title
+            ?? app.row(chatId)?.modelLabel
+            ?? app.row(chatId)?.harnessLabel
+            ?? ""
+        let vc = VoiceCallViewController(
+            source: source,
+            title: shown.title,
+            model: model,
+            harness: app.row(chatId)?.harness ?? "claude-code",
+            latestReply: { [weak self] in self?.latestReply() }
+        )
+        voiceCall = vc
+        present(vc, animated: true)
+        vc.sessionDidUpdate(chrome: shown, frame: engine.frame())
+    }
+
+    func latestReply() -> String? {
+        let frame = engine.frame()
+        let count = Int(frame.rowCount())
+        guard count > 0 else { return nil }
+        var lastUser: Int?
+        for index in 0..<count where frame.placement(index: UInt32(index))?.kind == .user {
+            lastUser = index
+        }
+        guard let lastUser, lastUser + 1 < count else { return nil }
+        for index in stride(from: count - 1, through: lastUser + 1, by: -1) {
+            guard frame.placement(index: UInt32(index))?.kind == .markdown,
+                  let text = frame.messageText(index: UInt32(index)),
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { continue }
+            return text
+        }
+        return nil
     }
 
     private func sessionMenu() -> UIMenu {
