@@ -115,7 +115,7 @@ dmgbuild.build_dmg(
     filename=os.environ["DMG"],
     volume_name="Cosmos",
     settings={
-        "format": "UDZO",
+        "format": "ULMO",
         "files": [app],
         "symlinks": {"Applications": "/Applications"},
         "icon": os.path.join(app, "Contents/Resources/zeron.icns"),

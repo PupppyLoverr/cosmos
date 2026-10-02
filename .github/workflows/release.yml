@@ -1,9 +1,9 @@
 name: release
 
 # Build release artifacts and publish them:
-#   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
+#   - Linux tarballs, .deb packages, and AppImages (x86_64 + aarch64)
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
-#   - Windows portable zip (x86_64) via scripts/package-windows.ps1
+#   - Windows installer and portable zip (x86_64) via scripts/package-windows.ps1
 # then create a GitHub Release on this repository. Cosmos never publishes to
 # the upstream Zeron distribution (zeron.sh R2 bucket / latest.txt): the
 # in-app updater is disabled (crates/update) and releases are mirrored by
@@ -16,6 +16,12 @@ name: release
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/package-*.sh"
+      - "scripts/package-windows.ps1"
+      - "dist/**"
   workflow_dispatch:
 
 permissions:
@@ -42,16 +48,23 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev \
-            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev \
+            file desktop-file-utils
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: package
         run: scripts/package-linux.sh
+      - name: package Linux installers
+        run: COSMOS_REQUIRE_INSTALLERS=1 COSMOS_BIN=target/release/cosmos scripts/package-linux-cosmos.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ runner.arch }}
-          path: target/package/*.tar.gz
+          path: |
+            target/package/*.tar.gz
+            artifacts/linux/Cosmos-linux-*.tar.gz
+            artifacts/linux/Cosmos-linux-*.deb
+            artifacts/linux/Cosmos-linux-*.AppImage
           if-no-files-found: error
 
   # Every platform must build before publishing the release and updater manifest.
@@ -132,8 +145,19 @@ jobs:
           if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
           "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
       - uses: Swatinem/rust-cache@v2
+      - name: Ensure Inno Setup is installed
+        run: |
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          if (-not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe') -and -not $iscc) {
+            choco install innosetup -y --no-progress
+          }
       - name: package portable app
         run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+      - name: Verify Windows installer
+        run: |
+          if (-not (Test-Path 'target/package/Cosmos-Setup-x86_64.exe')) {
+            throw 'target/package/Cosmos-Setup-x86_64.exe was not produced'
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: windows-${{ runner.arch }}
@@ -161,7 +185,12 @@ jobs:
             test -f "dist/cosmos-$ver-$platform" \
               || { echo "missing artifact for tag v$ver: $platform — check builds and Cargo.toml version"; exit 1; }
           done
-          test -f dist/Cosmos-Setup-x86_64.exe || echo "note: Windows installer absent (Inno Setup step is best-effort)"
+          for installer in Cosmos-Setup-x86_64.exe \
+              Cosmos-linux-x86_64.deb Cosmos-linux-aarch64.deb \
+              Cosmos-linux-x86_64.AppImage Cosmos-linux-aarch64.AppImage; do
+            test -f "dist/$installer" \
+              || { echo "missing required installer for tag v$ver: $installer"; exit 1; }
+          done
           echo "VERSION=$ver" >> "$GITHUB_ENV"
       - name: checksum manifest
         run: |
