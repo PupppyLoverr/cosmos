@@ -12,17 +12,18 @@
 
 pub mod edit;
 pub mod palette;
+pub mod schema;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub use palette::Palette;
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ThemeCfg {
     /// a built-in theme: cosmos, classic, nebula, mono, solar, light, high-contrast
@@ -47,7 +48,7 @@ pub const VERBS: &[&str] = &[
     "Bending spacetime:Bent spacetime", "Counting stars:Counted stars",
 ];
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct SpinnerCfg {
     /// orb, twinkle, braille, moon, comet, pulse, galaxy, dots, line
@@ -92,7 +93,7 @@ impl Default for SpinnerCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct MotionCfg {
     /// no animation at all: static spinner, no shimmer, no fade-in
@@ -108,7 +109,7 @@ impl Default for MotionCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ToolsCfg {
     /// "cosmos" (status glyph, meta, grouping) or "classic"
@@ -127,7 +128,7 @@ impl Default for ToolsCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct DiffCfg {
     /// "cosmos" (word highlights, syntax colour, wrapping) or "classic"
@@ -150,7 +151,7 @@ impl Default for DiffCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct MarkdownCfg {
     /// "cosmos" (framed code, callouts, bordered tables, hyperlinks) or "classic"
@@ -187,7 +188,7 @@ impl Default for MarkdownCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct BuddyCfg {
     pub enabled: bool,
@@ -223,7 +224,7 @@ impl Default for BuddyCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct NotifyCfg {
     /// show progress in the terminal title (OSC 0)
@@ -253,7 +254,26 @@ impl Default for NotifyCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// How `/customise` runs. The customiser itself can't change this section.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct CustomiseCfg {
+    /// model alias for customising; empty = the session's model
+    pub model: String,
+    /// apply each change as soon as it validates (otherwise ctrl+y applies)
+    pub auto_apply: bool,
+    pub max_turns: u32,
+    /// spend cap per request, USD
+    pub max_usd: f64,
+}
+
+impl Default for CustomiseCfg {
+    fn default() -> Self {
+        CustomiseCfg { model: String::new(), auto_apply: false, max_turns: 12, max_usd: 0.25 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct GlyphsCfg {
     /// the dot before a tool (coloured by its status)
@@ -274,7 +294,7 @@ impl Default for GlyphsCfg {
 
 /// The whole `ui.toml`. Unknown keys are ignored on load (a file written
 /// for a newer cosmostui still loads) but rejected by `/customise`.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Skin {
     pub theme: ThemeCfg,
@@ -286,11 +306,13 @@ pub struct Skin {
     pub glyphs: GlyphsCfg,
     pub buddy: BuddyCfg,
     pub notify: NotifyCfg,
+    pub customise: CustomiseCfg,
 }
 
 impl Skin {
-    /// The look cosmostui had before skins: classic colours and layouts.
-    #[cfg_attr(not(test), allow(dead_code))] // `/customise reset classic` (phase 6)
+    /// The look cosmostui had before skins: classic colours and layouts
+    /// (`/customise reset classic` writes the same thing as TOML).
+    #[cfg(test)]
     pub fn classic() -> Skin {
         let mut s = Skin::default();
         s.theme.name = "classic".into();
@@ -307,10 +329,24 @@ impl Skin {
     /// The palette this skin resolves to, plus warnings for bad entries.
     pub fn palette(&self) -> (Palette, Vec<String>) {
         let mut warn = Vec::new();
-        let mut p = palette::builtin(&self.theme.name).unwrap_or_else(|| {
-            warn.push(format!("unknown theme {:?} — using cosmos (themes: {})", self.theme.name, palette::THEMES.join(", ")));
-            palette::COSMOS
-        });
+        let mut p = match palette::builtin(&self.theme.name) {
+            Some(p) => p,
+            None => match saved_theme(&self.theme.name) {
+                Some(t) => {
+                    let mut p = palette::builtin(&t.base).unwrap_or(palette::COSMOS);
+                    for (k, v) in &t.colors {
+                        if let Some(c) = palette::parse_color(v) {
+                            p.set(k, c);
+                        }
+                    }
+                    p
+                }
+                None => {
+                    warn.push(format!("unknown theme {:?} — using cosmos (themes: {})", self.theme.name, themes().join(", ")));
+                    palette::COSMOS
+                }
+            },
+        };
         for (k, v) in &self.theme.colors {
             match palette::parse_color(v) {
                 Some(c) if p.set(k, c) => {}
@@ -320,6 +356,50 @@ impl Skin {
         }
         (p, warn)
     }
+}
+
+// ---- saved themes --------------------------------------------------------------------
+
+/// A theme saved by `/customise` (`theme_save`): a built-in base plus colours,
+/// in `~/.cosmos-cli/themes/<name>.toml`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct SavedTheme {
+    pub base: String,
+    pub colors: BTreeMap<String, String>,
+}
+
+/// Lowercase letters, digits and dashes, 1–32 long.
+pub fn valid_name(name: &str) -> bool {
+    (1..=32).contains(&name.len()) && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+pub fn themes_dir() -> PathBuf {
+    zcore::cli_home().join("themes")
+}
+
+pub fn saved_theme(name: &str) -> Option<SavedTheme> {
+    if !valid_name(name) {
+        return None;
+    }
+    let text = std::fs::read_to_string(themes_dir().join(format!("{name}.toml"))).ok()?;
+    let t: toml::Table = toml::from_str(&text).ok()?;
+    toml::Value::Table(t).try_into().ok()
+}
+
+/// Built-in themes, then saved ones.
+pub fn themes() -> Vec<String> {
+    let mut v: Vec<String> = palette::THEMES.iter().map(|s| s.to_string()).collect();
+    if let Ok(rd) = std::fs::read_dir(themes_dir()) {
+        let mut saved: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.strip_suffix(".toml").map(str::to_string))
+            .filter(|n| valid_name(n) && !v.contains(n))
+            .collect();
+        saved.sort();
+        v.extend(saved);
+    }
+    v
 }
 
 // ---- current skin ----------------------------------------------------------------
@@ -360,7 +440,6 @@ pub fn palette() -> Palette {
 }
 
 /// Run `f` with `p` as this thread's palette.
-#[cfg(test)]
 pub fn scoped<T>(p: Palette, f: impl FnOnce() -> T) -> T {
     let prev = SCOPED.with(|c| c.replace(Some(p)));
     let out = f();
@@ -368,8 +447,8 @@ pub fn scoped<T>(p: Palette, f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// Run `f` with `skin` (and its palette) as this thread's skin.
-#[cfg(test)]
+/// Run `f` with `skin` (and its palette) as this thread's skin — tests,
+/// and `/customise` previews of a draft.
 pub fn scoped_skin<T>(skin: Skin, f: impl FnOnce() -> T) -> T {
     let p = skin.palette().0;
     let prev = SCOPED_SKIN.with(|c| c.replace(Some(Arc::new(skin))));
@@ -411,6 +490,13 @@ fn merge(base: &mut toml::Table, top: toml::Table) {
             }
         }
     }
+}
+
+/// Parse one ui.toml text. Everything goes through a toml::Table first so
+/// the crate carries one Skin deserializer, not one per entry point.
+pub fn parse(text: &str) -> Result<Skin, String> {
+    let t: toml::Table = toml::from_str(text).map_err(|e| format!("not valid TOML: {}", e.to_string().trim()))?;
+    toml::Value::Table(t).try_into::<Skin>().map_err(|e| format!("not a valid ui.toml: {}", e.to_string().trim()))
 }
 
 /// Read and merge the files that exist. Err = the first file that does not

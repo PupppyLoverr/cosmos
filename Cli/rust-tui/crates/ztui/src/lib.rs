@@ -6,6 +6,7 @@
 //! there's no terminal (piped stdin/stdout, tests).
 
 mod buddy;
+mod customise;
 mod highlight;
 #[cfg(feature = "highlight")]
 mod highlight_ts;

@@ -716,7 +716,13 @@ pub fn ledger(app: &App) -> (String, String) {
         money(u.last_usd),
         money(u.cum_usd)
     );
-    let short = format!("Σ {} · ctx {pct}%", money(u.cum_usd));
+    let mut short = format!("Σ {} · ctx {pct}%", money(u.cum_usd));
+    let mut full = full;
+    if app.mod_usd > 0.0 {
+        // what /customise spent, kept apart from the conversation's ledger
+        full.push_str(&format!(" · mod ${:.4}", app.mod_usd));
+        short.push_str(&format!(" · mod ${:.4}", app.mod_usd));
+    }
     (full, short)
 }
 
@@ -806,6 +812,7 @@ fn help_rows(w: usize) -> Vec<Line<'static>> {
         ("ctrl+w · ctrl+u · ctrl+k", "delete word · to start · to end"),
         ("ctrl+l", "clear the screen"),
         ("ctrl+o", "expand the last tool output"),
+        ("ctrl+y / ctrl+n", "apply / discard a /customise draft"),
         ("/", "commands — /model /providers /connect /login /resume /review …"),
     ];
     let kw = ROWS.iter().map(|(k, _)| width_of(k)).max().unwrap_or(0);
@@ -1095,6 +1102,59 @@ pub fn turn_footer(app: &App) -> Vec<Line<'static>> {
     vec![Line::from(vec![sp(" "), Span::styled(format!("{} ", cfg.footer_glyph), theme::fg(ACCENT())), dim(text)])]
 }
 
+/// `✎ customising · setting spinner.style = "comet" · 4s · /customise stop`,
+/// or the pending draft's keys.
+fn customise_strip(app: &App, w: usize, ms: u128) -> Option<Line<'static>> {
+    if let Some(r) = &app.customise {
+        let sk = crate::skin::current();
+        let secs = r.started.elapsed().as_secs();
+        let text = format!("customising with {} · {} · {} · /customise stop", r.model, app.mod_status, crate::motion::elapsed(secs));
+        return Some(Line::from(vec![
+            sp(" "),
+            crate::motion::spinner_span(&sk.spinner, ACCENT(), ms, sk.motion.reduce),
+            Span::styled(ellipsize(&text, w.saturating_sub(4)), DIM()),
+        ]));
+    }
+    if app.draft_ready {
+        return Some(Line::from(vec![
+            sp(" "),
+            Span::styled("✎ draft ready", theme::fg(ACCENT())),
+            dim(ellipsize(" — ctrl+y apply · ctrl+n discard · /customise diff", w.saturating_sub(16))),
+        ]));
+    }
+    None
+}
+
+/// `/customise`: the quick settings, each cycled with ←/→.
+fn customise_picker(sel: usize, w: usize) -> Vec<Line<'static>> {
+    let sk = crate::skin::current();
+    let mut out = vec![
+        rule(w),
+        Line::from(vec![
+            sp(" "),
+            Span::styled("✎ Customise", theme::bold(Style::new())),
+            dim("  · changes apply as you go"),
+        ]),
+        Line::default(),
+    ];
+    for (i, (label, path)) in crate::customise::PICKER.iter().enumerate() {
+        let on = i == sel;
+        let v = crate::customise::picker_shown(path, &crate::customise::picker_value(&sk, path));
+        let help = crate::skin::schema::HELP.iter().find(|(p, _)| p == path).map(|(_, h)| *h).unwrap_or("");
+        let value = format!("‹ {v} ›");
+        let used = 2 + 16 + width_of(&value) + 2;
+        out.push(Line::from(vec![
+            if on { Span::styled("❯ ", theme::fg(ACCENT())) } else { sp("  ") },
+            Span::styled(format!("{label:<16}"), if on { theme::bold(Style::new()) } else { Style::new() }),
+            Span::styled(value, if on { theme::fg(ACCENT()) } else { Style::new() }),
+            dim(format!("  {}", ellipsize(help, w.saturating_sub(used)))),
+        ]));
+    }
+    out.push(Line::default());
+    out.push(Line::from(dim(" ↑↓ choose · ←→ change · esc done · /customise <ask anything> lets a model do the rest")));
+    out
+}
+
 /// Rows the ctrl+o pager shows at once.
 pub const PAGER_ROWS: usize = 18;
 
@@ -1230,10 +1290,17 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
             out.extend(pager(app, *idx, *scroll, w));
             return (out, None);
         }
+        Some(Popup::Customise { sel }) => {
+            out.extend(customise_picker(*sel, w));
+            return (out, None);
+        }
         _ => {}
     }
 
     // composer between two rules (the buddy sits at their right edge)
+    if let Some(strip) = customise_strip(app, w, ms) {
+        out.push(strip);
+    }
     let pal = crate::skin::current();
     if pal.buddy.enabled {
         if let Some(b) = buddy_bubble(app, w) {

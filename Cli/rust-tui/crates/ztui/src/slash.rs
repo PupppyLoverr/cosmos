@@ -52,6 +52,8 @@ const BUILTIN: &[(&str, &str, &str)] = &[
     ("theme", "<name>", "Colour theme: cosmos, classic, nebula, mono, solar, light, high-contrast"),
     ("buddy", "[pet|name|reroll|…]", "Your companion — it watches the task and reacts"),
     ("notify", "[test]", "Title, bell and desktop notifications — settings, or send a test"),
+    ("customise", "[request|…]", "Restyle the TUI: a quick picker, or ask any model (stop, undo, reset, log, diff, model)"),
+    ("verbs", "[add|remove|reset]", "The thinking verbs — Cosmosing, Plotting, Cooking…"),
     ("spinner", "<style>", "Thinking spinner: orb, twinkle, braille, moon, comet, pulse, galaxy, dots, line"),
     ("onboarding", "", "Replay the first-run setup (until it retires itself)"),
     ("help", "", "Keyboard shortcuts"),

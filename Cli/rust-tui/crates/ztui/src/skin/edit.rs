@@ -4,6 +4,7 @@
 // Val variants, from_json and remove serve /customise.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// A TOML value for one key. Strings are escaped; lists hold strings.
@@ -84,6 +85,33 @@ fn key_of(line: &str) -> Option<String> {
     Some(t[..eq].trim().trim_matches('"').to_string())
 }
 
+/// How many lines the value starting on `lines[i]` spans (a hand-written
+/// list can run over several).
+fn span(lines: &[&str], i: usize) -> usize {
+    let mut depth = 0i32;
+    let mut n = 0;
+    for l in &lines[i..] {
+        n += 1;
+        let body = if n == 1 { l.split_once('=').map(|(_, v)| v).unwrap_or("") } else { l };
+        let mut in_str = false;
+        let mut prev = ' ';
+        for c in body.chars() {
+            match c {
+                '"' if prev != '\\' => in_str = !in_str,
+                '#' if !in_str => break,
+                '[' if !in_str => depth += 1,
+                ']' if !in_str => depth -= 1,
+                _ => {}
+            }
+            prev = c;
+        }
+        if depth <= 0 {
+            break;
+        }
+    }
+    n
+}
+
 /// Set `table.key = value` (table like "theme.colors"; "" = top level).
 pub fn set(text: &str, table: &str, key: &str, value: &Val) -> String {
     let line = format!("{} = {}", key_text(key), value.toml());
@@ -99,9 +127,10 @@ pub fn set(text: &str, table: &str, key: &str, value: &Val) -> String {
             table_end = Some(i + 1);
             if key_of(l).as_deref() == Some(key) {
                 // keep a trailing comment on the line
-                let comment = l.find(" #").map(|c| &l[c..]).filter(|c| !c.contains('"')).unwrap_or("");
+                let n = span(&lines, i);
+                let comment = if n == 1 { l.find(" #").map(|c| &l[c..]).filter(|c| !c.contains('"')).unwrap_or("") } else { "" };
                 let mut out: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
-                out[i] = format!("{line}{comment}");
+                out.splice(i..i + n, [format!("{line}{comment}")]);
                 return out.join("\n") + "\n";
             }
         }
@@ -130,17 +159,78 @@ pub fn set(text: &str, table: &str, key: &str, value: &Val) -> String {
 
 /// Remove `table.key`; unchanged when absent.
 pub fn remove(text: &str, table: &str, key: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
     let mut cur = String::new();
     let mut out = Vec::new();
-    for l in text.lines() {
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
         if let Some(h) = header_of(l) {
             cur = h;
         } else if cur == table && key_of(l).as_deref() == Some(key) {
+            i += span(&lines, i);
             continue;
         }
         out.push(l);
+        i += 1;
     }
     out.join("\n") + "\n"
+}
+
+/// Remove a whole table and its sub-tables (`[theme]` takes `[theme.colors]`).
+pub fn remove_table(text: &str, table: &str) -> String {
+    let mut skip = false;
+    let mut out = Vec::new();
+    for l in text.lines() {
+        if let Some(h) = header_of(l) {
+            skip = h == table || h.starts_with(&format!("{table}."));
+        }
+        if !skip {
+            out.push(l);
+        }
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    if out.is_empty() {
+        String::new()
+    } else {
+        out.join("\n") + "\n"
+    }
+}
+
+/// Every leaf as ((table, key), value) — tables are dotted paths, keys may
+/// themselves hold dots (`theme.colors` / `syntax.keyword`).
+pub fn flatten(text: &str) -> BTreeMap<(String, String), toml::Value> {
+    fn walk(prefix: &str, t: &toml::Table, out: &mut BTreeMap<(String, String), toml::Value>) {
+        for (k, v) in t {
+            match v {
+                toml::Value::Table(sub) => walk(&if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") }, sub, out),
+                _ => {
+                    out.insert((prefix.to_string(), k.clone()), v.clone());
+                }
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    if let Ok(t) = toml::from_str::<toml::Table>(text) {
+        walk("", &t, &mut out);
+    }
+    out
+}
+
+impl Val {
+    /// From a parsed TOML leaf (lists of strings only).
+    pub fn from_toml(v: &toml::Value) -> Option<Val> {
+        Some(match v {
+            toml::Value::String(s) => Val::Str(s.clone()),
+            toml::Value::Integer(i) => Val::Int(*i),
+            toml::Value::Float(f) => Val::Float(*f),
+            toml::Value::Boolean(b) => Val::Bool(*b),
+            toml::Value::Array(a) => Val::List(a.iter().map(|x| x.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?),
+            _ => return None,
+        })
+    }
 }
 
 /// How many previous versions `ui.toml` keeps (`ui.toml.bak.1` newest).
@@ -149,8 +239,7 @@ pub const BACKUPS: usize = 10;
 /// Write `text` to `path` after checking it parses as a skin; the old file
 /// rotates into the backup ring first.
 pub fn write(path: &Path, text: &str) -> Result<(), String> {
-    let table: toml::Table = toml::from_str(text).map_err(|e| format!("not valid TOML: {}", e.to_string().trim()))?;
-    toml::Value::Table(table).try_into::<super::Skin>().map_err(|e| format!("not a valid ui.toml: {}", e.to_string().trim()))?;
+    super::parse(text)?;
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
     }
@@ -189,6 +278,21 @@ pub fn set_in_file(path: &Path, table: &str, key: &str, value: &Val) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_line_values_tables_and_flatten() {
+        let src = "[spinner]\nverbs = [\n  \"A:B\",\n  \"C:D\", # mine\n]\nfps = 9\n\n[theme]\nname = \"mono\"\n[theme.colors]\n\"syntax.keyword\" = \"red\"\n";
+        let out = set(src, "spinner", "verbs", &Val::List(vec!["X:Y".into()]));
+        assert_eq!(out.lines().take(3).collect::<Vec<_>>(), vec!["[spinner]", "verbs = [\"X:Y\"]", "fps = 9"]);
+        let out = remove(src, "spinner", "verbs");
+        assert!(out.starts_with("[spinner]\nfps = 9\n"), "{out}");
+        let out = remove_table(src, "theme");
+        assert!(!out.contains("theme") && !out.contains("syntax") && out.contains("fps = 9"), "{out}");
+        let flat = flatten(src);
+        assert_eq!(flat.get(&("theme.colors".into(), "syntax.keyword".into())), Some(&toml::Value::String("red".into())));
+        assert_eq!(flat.get(&("spinner".into(), "fps".into())), Some(&toml::Value::Integer(9)));
+        assert_eq!(Val::from_toml(&toml::Value::Integer(3)), Some(Val::Int(3)));
+    }
 
     #[test]
     fn set_keeps_comments_and_other_keys() {

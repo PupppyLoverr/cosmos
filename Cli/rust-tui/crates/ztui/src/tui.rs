@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui_core::style::Color;
-use ratatui_core::text::Line;
+use ratatui_core::style::{Color, Style};
+use ratatui_core::text::{Line, Span};
 use serde_json::Value;
 use zcore::agent::Mode;
 use zproto::RunOpts;
@@ -95,6 +95,8 @@ pub enum Popup {
     Help,
     /// ctrl+o: a kept tool output — `idx` 0 is the newest.
     Pager { idx: usize, scroll: usize },
+    /// `/customise`: quick settings, each changed with ←/→
+    Customise { sel: usize },
 }
 
 /// A tool output kept for the ctrl+o pager.
@@ -102,6 +104,27 @@ pub struct Output {
     pub title: String,
     pub body: Vec<String>,
 }
+
+/// `/customise reset classic`: the look cosmostui had before skins.
+const CLASSIC_UI: &str = r#"# the look cosmostui had before skins
+[theme]
+name = "classic"
+
+[tools]
+style = "classic"
+
+[diff]
+style = "classic"
+
+[markdown]
+style = "classic"
+
+[glyphs]
+tool = "●"
+
+[buddy]
+enabled = false
+"#;
 
 /// Tool outputs kept for ctrl+o, and the most lines kept from each.
 const KEEP_OUTPUTS: usize = 50;
@@ -246,6 +269,16 @@ pub struct App {
     pub titled: bool,
     /// an error arrived during this turn
     turn_err: Option<String>,
+    /// `/customise <request>` running in the background
+    pub customise: Option<crate::customise::Runner>,
+    /// what the customiser is doing (status strip)
+    pub mod_status: String,
+    /// its steps, for `/customise log`
+    mod_log: Vec<String>,
+    /// what customising has cost this session
+    pub mod_usd: f64,
+    /// a draft waits for ctrl+y / ctrl+n
+    pub draft_ready: bool,
     /// the dictation key is physically down (Windows reports releases), so
     /// its auto-repeat can't stop a recording it just started
     toggle_held: bool,
@@ -329,6 +362,11 @@ impl App {
             term_out: Vec::new(),
             titled: false,
             turn_err: None,
+            customise: None,
+            mod_status: String::new(),
+            mod_log: Vec::new(),
+            mod_usd: 0.0,
+            draft_ready: crate::customise::Paths::new(&zcore::cli_home()).has_draft(),
             toggle_held: false,
             toggle_last: None,
         }
@@ -802,6 +840,7 @@ impl App {
 
     /// Poll dictation, sign-in and shell jobs (once per loop turn).
     fn poll_jobs(&mut self) {
+        self.poll_customise();
         if let Some(rec) = &mut self.rec {
             if !rec.transcribing {
                 rec.tick();
@@ -1056,7 +1095,7 @@ impl App {
 
     /// Open / close the `/` and `@` menus to match the input.
     fn refresh_popups(&mut self) {
-        if matches!(self.popup, Some(Popup::Model { .. } | Popup::Connect { .. } | Popup::Resume { .. } | Popup::Help | Popup::Pager { .. })) || self.key_entry.is_some() {
+        if matches!(self.popup, Some(Popup::Model { .. } | Popup::Connect { .. } | Popup::Resume { .. } | Popup::Help | Popup::Pager { .. } | Popup::Customise { .. })) || self.key_entry.is_some() {
             return;
         }
         let slash_open = self.slash_state().is_some_and(|(_, a)| a.is_empty() && !self.input.contains(&' '));
@@ -1324,6 +1363,8 @@ impl App {
                 }
             }
             "buddy" => self.buddy_command(args.trim()),
+            "customise" | "customize" => self.customise_command(args.trim()),
+            "verbs" => self.verbs_command(args.trim()),
             "notify" => {
                 let sk = crate::skin::current();
                 let n = &sk.notify;
@@ -1533,6 +1574,263 @@ impl App {
         }
     }
 
+    // ---- /customise ----------------------------------------------------------
+
+    fn customise_paths() -> crate::customise::Paths {
+        crate::customise::Paths::new(&zcore::cli_home())
+    }
+
+    /// `/customise`: the picker, a subcommand, or a request for a model.
+    fn customise_command(&mut self, args: &str) {
+        use crate::skin::edit;
+        let p = Self::customise_paths();
+        let (sub, rest) = args.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((args, ""));
+        let lone = rest.is_empty();
+        match sub {
+            "" => self.popup = Some(Popup::Customise { sel: 0 }),
+            "stop" if lone => match &self.customise {
+                Some(r) => {
+                    r.stop();
+                    self.flash("Stopping the customiser after this step…", theme::YELLOW());
+                }
+                None => self.note("Nothing is being customised"),
+            },
+            "apply" if lone => self.apply_draft(),
+            "discard" if lone => self.discard_draft(),
+            "undo" if lone => match edit::undo(&p.ui) {
+                Ok(()) => {
+                    self.skin_reload = true;
+                    self.flash("Restored the previous ui.toml", theme::ACCENT());
+                }
+                Err(e) => self.error(format!("Couldn't undo: {e}")),
+            },
+            "reset" if lone || matches!(rest, "defaults" | "classic") || crate::skin::schema::SECTIONS.contains(&rest) => {
+                let text = match rest {
+                    "" | "defaults" => String::new(),
+                    "classic" => CLASSIC_UI.to_string(),
+                    s => edit::remove_table(&std::fs::read_to_string(&p.ui).unwrap_or_default(), s),
+                };
+                match edit::write(&p.ui, &text) {
+                    Ok(()) => {
+                        self.skin_reload = true;
+                        self.flash(format!("Reset {} — /customise undo brings it back", if lone { "to defaults" } else { rest }), theme::ACCENT());
+                    }
+                    Err(e) => self.error(format!("Couldn't reset: {e}")),
+                }
+            }
+            "log" if lone => {
+                if self.mod_log.is_empty() {
+                    self.note("No customise activity yet");
+                } else {
+                    let rows: Vec<Line<'static>> = self.mod_log.iter().map(|l| Line::from(Span::styled(format!(" {l}"), theme::DIM()))).collect();
+                    self.block(rows);
+                }
+            }
+            "diff" if lone => {
+                let ch = crate::customise::changes(&p);
+                if ch.is_empty() {
+                    self.note("No draft changes");
+                } else {
+                    let mut rows = vec![Line::from(Span::styled(" ✎ Draft changes", theme::bold(Style::new())))];
+                    rows.extend(ch.into_iter().map(|c| Line::from(Span::styled(format!("   {c}"), theme::DIM()))));
+                    self.block(rows);
+                }
+            }
+            "schema" if lone => {
+                let rows: Vec<Line<'static>> = crate::skin::schema::text().lines().map(|l| Line::from(Span::styled(format!(" {l}"), theme::DIM()))).collect();
+                self.block(rows);
+            }
+            "preview" if lone => self.show_draft(),
+            "model" if !rest.contains(' ') => {
+                if lone {
+                    let m = crate::skin::current().customise.model.clone();
+                    self.note(format!("Customising with {} — /customise model <alias> picks another", if m.is_empty() { format!("{} (this session's model)", self.alias) } else { m }));
+                } else if zcore::config::Config::load(&zcore::cli_home()).provider_for(rest).is_none() {
+                    self.error(format!("No model {rest:?} — see /model"));
+                } else {
+                    match edit::set_in_file(&p.ui, "customise", "model", &edit::Val::Str(rest.into())) {
+                        Ok(()) => {
+                            self.skin_reload = true;
+                            self.flash(format!("Customising with {rest}"), theme::ACCENT());
+                        }
+                        Err(e) => self.error(e),
+                    }
+                }
+            }
+            _ => self.start_customise(args),
+        }
+    }
+
+    fn start_customise(&mut self, request: &str) {
+        if let Some(r) = &self.customise {
+            self.error(format!("Already customising ({:?}) — wait for it, or /customise stop", crate::wrap::ellipsize(&r.request, 60)));
+            return;
+        }
+        let sk = crate::skin::current();
+        let model = if sk.customise.model.is_empty() { self.alias.clone() } else { sk.customise.model.clone() };
+        if (model.is_empty() || model == "fixture") && !request.starts_with("tool:") {
+            self.note("No model is connected, so here's the picker — /connect adds a model for /customise <request>");
+            self.popup = Some(Popup::Customise { sel: 0 });
+            return;
+        }
+        let c = &sk.customise;
+        self.mod_log.push(format!("» {request}  ({model})"));
+        self.mod_status = format!("starting with {model}");
+        self.customise = Some(crate::customise::Runner::start(request.to_string(), model, Self::customise_paths(), c.auto_apply, c.max_turns, c.max_usd));
+        self.dirty = true;
+    }
+
+    /// Drain the customiser's messages (once per loop turn).
+    fn poll_customise(&mut self) {
+        use crate::customise::{Effect, Up};
+        let Some(r) = &self.customise else { return };
+        let msgs: Vec<Up> = r.rx.try_iter().collect();
+        if msgs.is_empty() {
+            return;
+        }
+        self.dirty = true;
+        let mut finished = None;
+        for m in msgs {
+            match m {
+                Up::Status(s) => self.mod_status = s,
+                Up::Log(s) => {
+                    self.mod_log.push(s);
+                    if self.mod_log.len() > 300 {
+                        self.mod_log.drain(..100);
+                    }
+                }
+                Up::Effect(Effect::Draft) => self.draft_ready = true,
+                Up::Effect(Effect::Apply) => self.apply_draft(),
+                Up::Effect(Effect::Config) => self.reload_models(),
+                Up::Effect(Effect::Command) => self.commands = slash::load(&self.cwd),
+                Up::Spent(c) => self.mod_usd += c,
+                Up::Done(s) => finished = Some(Ok(s)),
+                Up::Failed(e) => finished = Some(Err(e)),
+            }
+        }
+        let Some(res) = finished else { return };
+        self.customise = None;
+        self.mod_status.clear();
+        match res {
+            Ok(s) => {
+                self.mod_log.push(format!("✓ {}", s.lines().next().unwrap_or("done")));
+                if !s.trim().is_empty() {
+                    let mut rows = vec![Line::from(vec![Span::styled(" ✎ ", theme::fg(theme::ACCENT())), Span::styled("Customise", theme::bold(Style::new()))])];
+                    rows.extend(markdown::render(s.trim(), self.width));
+                    self.block(rows);
+                }
+                self.show_draft();
+            }
+            Err(e) => {
+                self.mod_log.push(format!("✗ {e}"));
+                self.error(format!("Customise: {e}"));
+            }
+        }
+    }
+
+    /// The pending draft, drawn in its own look, with how to keep it.
+    fn show_draft(&mut self) {
+        let p = Self::customise_paths();
+        if !p.has_draft() {
+            self.draft_ready = false;
+            return;
+        }
+        let ch = crate::customise::changes(&p);
+        if ch.is_empty() {
+            crate::customise::discard(&p);
+            self.draft_ready = false;
+            return;
+        }
+        self.draft_ready = true;
+        let skin = crate::skin::parse(&std::fs::read_to_string(&p.draft).unwrap_or_default()).unwrap_or_default();
+        let mut rows = vec![Line::from(vec![
+            Span::styled(" ✎ Draft", theme::bold(Style::new())),
+            Span::styled(format!(" · {} change{}", ch.len(), if ch.len() == 1 { "" } else { "s" }), theme::DIM()),
+        ])];
+        rows.extend(ch.iter().take(8).map(|c| Line::from(Span::styled(format!("   {c}"), theme::DIM()))));
+        if ch.len() > 8 {
+            rows.push(Line::from(Span::styled(format!("   … +{} more · /customise diff", ch.len() - 8), theme::DIM())));
+        }
+        rows.push(Line::default());
+        rows.extend(crate::customise::preview(&skin, self.width.min(100)));
+        rows.push(Line::default());
+        rows.push(Line::from(Span::styled(" ctrl+y apply · ctrl+n discard · /customise diff", theme::fg(theme::ACCENT()))));
+        self.block(rows);
+    }
+
+    fn apply_draft(&mut self) {
+        match crate::customise::apply(&Self::customise_paths()) {
+            Ok(a) => {
+                self.draft_ready = false;
+                self.skin_reload = true;
+                let mut msg = match a.changed.len() {
+                    0 => "Nothing new in the draft".to_string(),
+                    1 => "Applied 1 change".to_string(),
+                    n => format!("Applied {n} changes"),
+                };
+                if !a.kept.is_empty() {
+                    msg.push_str(&format!(" · kept your {}", a.kept.join(", ")));
+                }
+                msg.push_str(" — /customise undo reverts");
+                self.flash(msg, theme::GREEN());
+            }
+            Err(e) => self.error(format!("Couldn't apply the draft: {e}")),
+        }
+    }
+
+    fn discard_draft(&mut self) {
+        crate::customise::discard(&Self::customise_paths());
+        self.draft_ready = false;
+        self.flash("Draft discarded", theme::YELLOW());
+    }
+
+    /// `/verbs`, `/verbs add Warping:Warped`, `/verbs remove Warping`, `/verbs reset`.
+    fn verbs_command(&mut self, args: &str) {
+        use crate::skin::edit;
+        let sk = crate::skin::current();
+        let path = zcore::cli_home().join("ui.toml");
+        let (sub, rest) = args.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((args, ""));
+        let mut verbs = sk.spinner.verbs.clone();
+        let res = match sub {
+            "" => {
+                let now: Vec<String> = verbs.iter().map(|v| crate::motion::verb_forms(v).0).collect();
+                self.note(format!("Verbs: {} — /verbs add Present:Past · /verbs remove <verb> · /verbs reset", now.join(", ")));
+                return;
+            }
+            "add" if !rest.is_empty() => {
+                for v in rest.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                    if !verbs.iter().any(|x| x.eq_ignore_ascii_case(v)) {
+                        verbs.push(v.to_string());
+                    }
+                }
+                Ok(())
+            }
+            "remove" if !rest.is_empty() => {
+                verbs.retain(|v| !crate::motion::verb_forms(v).0.eq_ignore_ascii_case(rest) && !v.eq_ignore_ascii_case(rest));
+                Ok(())
+            }
+            "reset" => {
+                let text = edit::remove(&std::fs::read_to_string(&path).unwrap_or_default(), "spinner", "verbs");
+                edit::write(&path, &text).map(|_| verbs = crate::skin::SpinnerCfg::default().verbs)
+            }
+            _ => Err("Usage: /verbs [add Present:Past[, …] | remove <verb> | reset]".to_string()),
+        };
+        let res = res.and_then(|_| {
+            if sub == "reset" {
+                return Ok(());
+            }
+            let (t, k, v) = crate::skin::schema::check("spinner.verbs", &serde_json::json!(verbs))?;
+            edit::set_in_file(&path, &t, &k, &v)
+        });
+        match res {
+            Ok(()) => {
+                self.skin_reload = true;
+                self.flash(format!("{} verbs", verbs.len()), theme::ACCENT());
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
     /// `/buddy` and its subcommands (settings land in ui.toml [buddy]).
     fn buddy_command(&mut self, args: &str) {
         use crate::skin::edit::{set_in_file, Val};
@@ -1671,6 +1969,14 @@ impl App {
             self.clear_screen = true;
             return;
         }
+        if ctrl && self.draft_ready && self.perm.is_none() && matches!(k.code, KeyCode::Char('y') | KeyCode::Char('n')) {
+            if k.code == KeyCode::Char('y') {
+                self.apply_draft();
+            } else {
+                self.discard_draft();
+            }
+            return;
+        }
         if ctrl && k.code == KeyCode::Char('o') && self.perm.is_none() {
             if matches!(self.popup, Some(Popup::Pager { .. })) {
                 self.popup = None;
@@ -1780,6 +2086,32 @@ impl App {
                         *sel = 0;
                     }
                     _ => {}
+                }
+                return;
+            }
+            Some(Popup::Customise { sel }) => {
+                let n = crate::customise::PICKER.len();
+                let mut step = 0;
+                match k.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                        self.popup = None;
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => *sel = (*sel + n - 1) % n,
+                    KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => *sel = (*sel + 1) % n,
+                    KeyCode::Left | KeyCode::Char('h') => step = -1,
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => step = 1,
+                    _ => {}
+                }
+                let row = *sel;
+                if step != 0 {
+                    match crate::customise::picker_step(&zcore::cli_home().join("ui.toml"), row, step) {
+                        Ok(msg) => {
+                            self.skin_reload = true;
+                            self.flash(msg, theme::ACCENT());
+                        }
+                        Err(e) => self.error(e),
+                    }
                 }
                 return;
             }
@@ -2189,7 +2521,7 @@ fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender
             app.dirty = true;
         }
         // animate spinners ~12 fps while something is moving
-        let animating = app.busy || !app.tools.is_empty() || app.rec.is_some() || app.shell.is_some() || app.login.is_some();
+        let animating = app.busy || !app.tools.is_empty() || app.rec.is_some() || app.shell.is_some() || app.login.is_some() || app.customise.is_some();
         let sk = crate::skin::current();
         let frame_ms = if sk.motion.reduce { 1000 } else { 1000 / u64::from(sk.spinner.fps.clamp(1, 60)) };
         if animating && last_tick.elapsed() >= Duration::from_millis(frame_ms) {
@@ -2604,6 +2936,74 @@ FAILED
         a.out.clear();
         a.on_key(key(KeyCode::Enter), &cmd, &Arc::new(AtomicBool::new(false)));
         assert!(a.out.iter().map(text).any(|r| r.contains("focus") && r.contains('█')), "the card shows stats");
+    }
+
+    #[test]
+    fn customise_end_to_end_while_you_work() {
+        let _env = crate::env_lock();
+        crate::skin::scoped_skin(crate::skin::Skin::default(), || {
+            let mut a = app();
+            let home = tempfile::tempdir().unwrap();
+            std::env::set_var("COSMOS_CLI_HOME", home.path());
+            a.alias = "fixture".into();
+            let (cmd, _rx) = std::sync::mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let enter = |a: &mut App, s: &str| {
+                a.input = s.chars().collect();
+                a.cursor = a.input.len();
+                a.on_key(key(KeyCode::Enter), &cmd, &stop);
+            };
+            // no real model: the picker opens instead
+            enter(&mut a, "/customise make it purple");
+            assert!(matches!(a.popup, Some(Popup::Customise { .. })));
+            let rows: Vec<String> = view::live(&a).0.iter().map(text).collect();
+            assert!(rows.iter().any(|r| r.contains("Theme") && r.contains("‹ cosmos ›")), "{rows:#?}");
+            a.on_key(key(KeyCode::Right), &cmd, &stop);
+            let ui = std::fs::read_to_string(home.path().join("ui.toml")).unwrap();
+            assert!(ui.contains("name = \"classic\""), "the picker writes ui.toml: {ui}");
+            a.on_key(key(KeyCode::Esc), &cmd, &stop);
+            assert!(a.popup.is_none());
+
+            // the fixture model drives a real customiser run
+            enter(&mut a, r#"/customise tool:ui_set {"changes":[{"path":"spinner.style","value":"comet"},{"path":"hooks.cmd","value":"x"}]}"#);
+            assert!(a.customise.is_some());
+            let rows: Vec<String> = view::live(&a).0.iter().map(text).collect();
+            assert!(rows.iter().any(|r| r.contains("customising with fixture")), "{rows:#?}");
+            // you keep working meanwhile: typing is untouched
+            a.input = "still typing".chars().collect();
+            let t0 = Instant::now();
+            while a.customise.is_some() && t0.elapsed() < Duration::from_secs(20) {
+                a.poll_customise();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(a.customise.is_none(), "the run finished");
+            assert_eq!(a.input.iter().collect::<String>(), "still typing");
+            assert!(a.draft_ready);
+            let out: Vec<String> = a.out.iter().map(text).collect();
+            assert!(out.iter().any(|r| r.contains("✎ Draft") && r.contains("1 change")), "{out:#?}");
+            assert!(out.iter().any(|r| r.contains("ctrl+y apply")), "{out:#?}");
+            let ui = std::fs::read_to_string(home.path().join("ui.toml")).unwrap();
+            assert!(!ui.contains("comet"), "nothing lands before you say so");
+            assert!(a.mod_log.iter().any(|l| l.contains("hard boundary")), "the hook write was refused: {:?}", a.mod_log);
+
+            // ctrl+y applies it (your earlier picker change survives)
+            a.input.clear();
+            a.cursor = 0;
+            a.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL), &cmd, &stop);
+            let ui = std::fs::read_to_string(home.path().join("ui.toml")).unwrap();
+            assert!(ui.contains("style = \"comet\"") && ui.contains("name = \"classic\"") && !ui.contains("hooks"), "{ui}");
+            assert!(!a.draft_ready && a.skin_reload);
+            // and /customise undo puts the old file back
+            enter(&mut a, "/customise undo");
+            let ui = std::fs::read_to_string(home.path().join("ui.toml")).unwrap();
+            assert!(!ui.contains("comet"), "{ui}");
+        });
+    }
+
+    #[test]
+    fn classic_preset_is_the_classic_skin() {
+        let sk: crate::skin::Skin = toml::from_str(CLASSIC_UI).unwrap();
+        assert_eq!(sk, crate::skin::Skin::classic());
     }
 
     #[test]
