@@ -1,6 +1,6 @@
 import UIKit
 
-final class ModelPickerViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
+final class ModelPickerViewController: UIViewController, UITableViewDataSource, UITableViewDelegate, UIPopoverPresentationControllerDelegate {
     private enum Filter: Equatable {
         case all
         case favorites
@@ -22,12 +22,15 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     private var favorites = Set(UserDefaults.standard.stringArray(forKey: "modelFavorites") ?? [])
     private var sections: [Section] = []
     private let titleLabel = UILabel()
-    private let subtitleLabel = UILabel()
     private let closeButton = UIButton(type: .system)
     private let search = UITextField()
-    private let chipScroll = UIScrollView()
-    private let chipStack = UIStackView()
+    private let searchRow = UIView()
+    private let searchDivider = UIView()
+    private let railScroll = UIScrollView()
+    private let railStack = UIStackView()
+    private let railDivider = UIView()
     private let tableView = UITableView(frame: .zero, style: .plain)
+    private let rootStack = UIStackView()
     private let contentStack = UIStackView()
 
     init(
@@ -41,7 +44,13 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         self.lockedHarness = lockedHarness
         self.onSelect = onSelect
         super.init(nibName: nil, bundle: nil)
-        modalPresentationStyle = .pageSheet
+        modalPresentationStyle = .popover
+        if lockedHarness == nil {
+            let hasFavorites = models.contains {
+                favorites.contains(Self.favoriteKey($0))
+            }
+            filter = hasFavorites ? .favorites : .harness(selected.harness)
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -50,67 +59,65 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         super.viewDidLoad()
         view.backgroundColor = Palette.elevated
 
-        titleLabel.text = "Model"
+        titleLabel.text = "Models"
         titleLabel.textColor = Palette.text
         titleLabel.font = scaled(.sansSemibold, size: 17, style: .headline)
         titleLabel.adjustsFontForContentSizeCategory = true
-        subtitleLabel.text = lockedHarness.map(harnessLabel) ?? "Pick a model for this session"
-        subtitleLabel.textColor = Palette.secondary
-        subtitleLabel.font = scaled(.sans, size: 13, style: .subheadline)
-        subtitleLabel.adjustsFontForContentSizeCategory = true
-        let titles = UIStackView(arrangedSubviews: [titleLabel, subtitleLabel])
-        titles.axis = .vertical
-        titles.alignment = .leading
-        titles.spacing = 2
 
         var closeConfiguration = UIButton.Configuration.plain()
         closeConfiguration.image = UIImage(
-            systemName: "xmark",
-            withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+            systemName: "chevron.left",
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .medium)
         )
         closeConfiguration.baseForegroundColor = Palette.secondary
-        closeConfiguration.background.backgroundColor = Palette.controlFill
-        closeConfiguration.background.cornerRadius = 15
         closeConfiguration.contentInsets = .zero
         closeButton.configuration = closeConfiguration
         closeButton.accessibilityLabel = "Close model picker"
         closeButton.addAction(UIAction { [weak self] _ in self?.dismiss(animated: true) }, for: .touchUpInside)
         closeButton.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            closeButton.widthAnchor.constraint(equalToConstant: 30),
-            closeButton.heightAnchor.constraint(equalToConstant: 30),
+            closeButton.widthAnchor.constraint(equalToConstant: 28),
+            closeButton.heightAnchor.constraint(equalToConstant: 28),
         ])
 
-        let header = UIStackView(arrangedSubviews: [titles, UIView(), closeButton])
+        let header = UIStackView(arrangedSubviews: [closeButton, titleLabel, UIView()])
         header.axis = .horizontal
         header.alignment = .center
-        header.spacing = 12
+        header.spacing = 8
 
         configureSearch()
-        configureChips()
+        configureRail()
         configureTable()
 
         contentStack.axis = .vertical
         contentStack.alignment = .fill
-        contentStack.spacing = 12
+        contentStack.spacing = 8
         contentStack.translatesAutoresizingMaskIntoConstraints = false
         contentStack.addArrangedSubview(header)
-        contentStack.addArrangedSubview(search)
-        contentStack.addArrangedSubview(chipScroll)
+        contentStack.addArrangedSubview(searchRow)
         contentStack.addArrangedSubview(tableView)
-        view.addSubview(contentStack)
 
+        rootStack.axis = .horizontal
+        rootStack.alignment = .fill
+        rootStack.spacing = 8
+        rootStack.translatesAutoresizingMaskIntoConstraints = false
+        rootStack.addArrangedSubview(railScroll)
+        rootStack.addArrangedSubview(railDivider)
+        rootStack.addArrangedSubview(contentStack)
+        view.addSubview(rootStack)
         NSLayoutConstraint.activate([
-            contentStack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
-            contentStack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
-            contentStack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
-            contentStack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -10),
-            search.heightAnchor.constraint(equalToConstant: 38),
-            chipScroll.heightAnchor.constraint(equalToConstant: 34),
+            rootStack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 6),
+            rootStack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8),
+            rootStack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
+            rootStack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -10),
+            railScroll.widthAnchor.constraint(equalToConstant: 44),
+            railDivider.widthAnchor.constraint(equalToConstant: 1),
+            searchRow.heightAnchor.constraint(equalToConstant: 37),
         ])
 
-        renderChips()
         renderSections()
+        updatePreferredContentSize()
+        updatePreferredContentSize()
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -119,17 +126,22 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     }
 
     func present(from anchor: UIView, in presenter: UIViewController) {
-        modalPresentationStyle = .pageSheet
-        if let sheet = sheetPresentationController {
-            sheet.detents = [.medium(), .large()]
-            sheet.prefersGrabberVisible = true
-            sheet.preferredCornerRadius = 22
-        }
-        if UIDevice.current.userInterfaceIdiom == .pad, let presentation = popoverPresentationController {
+        let screenWidth = anchor.window?.windowScene?.screen.bounds.width ?? UIScreen.main.bounds.width
+        preferredContentSize = CGSize(width: min(320, max(1, screenWidth - 32)), height: fittedHeight)
+        if let presentation = popoverPresentationController {
+            presentation.delegate = self
             presentation.sourceView = anchor
             presentation.sourceRect = anchor.bounds
+            presentation.permittedArrowDirections = [.down, .up]
         }
         presenter.present(self, animated: true)
+    }
+
+    func adaptivePresentationStyle(
+        for controller: UIPresentationController,
+        traitCollection: UITraitCollection
+    ) -> UIModalPresentationStyle {
+        .none
     }
 
     private func configureSearch() {
@@ -142,8 +154,6 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         search.accessibilityIdentifier = "model-search"
         search.autocorrectionType = .no
         search.clearButtonMode = .whileEditing
-        search.backgroundColor = Palette.controlFill
-        search.layer.cornerRadius = 10
         let icon = UIImageView(image: UIImage(
             systemName: "magnifyingglass",
             withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .medium)
@@ -151,35 +161,28 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         icon.tintColor = Palette.tertiary
         icon.contentMode = .center
         icon.translatesAutoresizingMaskIntoConstraints = false
-        let iconContainer = UIView(frame: CGRect(x: 0, y: 0, width: 36, height: 36))
-        iconContainer.translatesAutoresizingMaskIntoConstraints = false
-        iconContainer.addSubview(icon)
+        searchRow.translatesAutoresizingMaskIntoConstraints = false
+        search.translatesAutoresizingMaskIntoConstraints = false
+        searchRow.addSubview(icon)
+        searchRow.addSubview(search)
+        searchDivider.translatesAutoresizingMaskIntoConstraints = false
+        searchDivider.backgroundColor = Palette.hairline
+        searchRow.addSubview(searchDivider)
         NSLayoutConstraint.activate([
-            iconContainer.widthAnchor.constraint(equalToConstant: 36),
-            iconContainer.heightAnchor.constraint(equalToConstant: 36),
-            icon.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor, constant: 2),
-            icon.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor),
+            icon.leadingAnchor.constraint(equalTo: searchRow.leadingAnchor, constant: 2),
+            icon.centerYAnchor.constraint(equalTo: searchRow.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 16),
+            icon.heightAnchor.constraint(equalToConstant: 16),
+            search.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
+            search.trailingAnchor.constraint(equalTo: searchRow.trailingAnchor, constant: -2),
+            search.topAnchor.constraint(equalTo: searchRow.topAnchor),
+            search.bottomAnchor.constraint(equalTo: searchDivider.topAnchor),
+            searchDivider.leadingAnchor.constraint(equalTo: searchRow.leadingAnchor),
+            searchDivider.trailingAnchor.constraint(equalTo: searchRow.trailingAnchor),
+            searchDivider.bottomAnchor.constraint(equalTo: searchRow.bottomAnchor),
+            searchDivider.heightAnchor.constraint(equalToConstant: 1 / UIScreen.main.scale),
         ])
-        search.leftView = iconContainer
-        search.leftViewMode = .always
         search.addTarget(self, action: #selector(queryChanged), for: .editingChanged)
-    }
-
-    private func configureChips() {
-        chipScroll.showsHorizontalScrollIndicator = false
-        chipScroll.translatesAutoresizingMaskIntoConstraints = false
-        chipStack.axis = .horizontal
-        chipStack.alignment = .center
-        chipStack.spacing = 8
-        chipStack.translatesAutoresizingMaskIntoConstraints = false
-        chipScroll.addSubview(chipStack)
-        NSLayoutConstraint.activate([
-            chipStack.leadingAnchor.constraint(equalTo: chipScroll.contentLayoutGuide.leadingAnchor),
-            chipStack.trailingAnchor.constraint(equalTo: chipScroll.contentLayoutGuide.trailingAnchor),
-            chipStack.topAnchor.constraint(equalTo: chipScroll.contentLayoutGuide.topAnchor),
-            chipStack.bottomAnchor.constraint(equalTo: chipScroll.contentLayoutGuide.bottomAnchor),
-            chipStack.heightAnchor.constraint(equalTo: chipScroll.frameLayoutGuide.heightAnchor),
-        ])
     }
 
     private func configureTable() {
@@ -195,101 +198,144 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     }
 
     @objc private func queryChanged() {
+        renderRail()
         renderSections()
+        updatePreferredContentSize()
     }
 
     private var harnesses: [String] {
         Self.harnesses(in: models, lockedTo: lockedHarness)
     }
 
-    private var visibleFavoritesExist: Bool {
-        models.contains { model in
-            (lockedHarness == nil || model.harness == lockedHarness) && isFavorite(model)
+    private var fittedHeight: CGFloat {
+        let rowsHeight = sections.reduce(CGFloat(0)) { total, section in
+            total + 30 + section.models.reduce(CGFloat(0)) { height, model in
+                height + ((model.description?.isEmpty == false) ? 56 : 48)
+            }
         }
+        let emptyHeight: CGFloat = sections.isEmpty ? 64 : 0
+        return min(460, max(136, 10 + 30 + 8 + 37 + rowsHeight + emptyHeight + 10))
     }
 
     private var selectedModelID: String? {
         selected.model ?? models.first(where: { $0.harness == selected.harness })?.id
     }
 
-    private func renderChips() {
-        chipStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        chipStack.addArrangedSubview(filterChip(title: "All", image: nil, selection: .all))
-        if visibleFavoritesExist {
-            chipStack.addArrangedSubview(
-                filterChip(title: "Favorites", image: UIImage(systemName: "star.fill"), selection: .favorites)
-            )
-        }
-        if harnesses.count > 1 {
-            for harness in harnesses {
-                chipStack.addArrangedSubview(
-                    filterChip(
-                        title: harnessLabel(harness),
-                        image: BrandMarks.image(for: harness, side: 15)?.withRenderingMode(.alwaysTemplate),
-                        selection: .harness(harness)
-                    )
-                )
-            }
-        }
-        chipScroll.isHidden = chipStack.arrangedSubviews.count == 1
+    private func configureRail() {
+        railScroll.showsVerticalScrollIndicator = false
+        railScroll.translatesAutoresizingMaskIntoConstraints = false
+        railStack.axis = .vertical
+        railStack.alignment = .center
+        railStack.spacing = 4
+        railStack.translatesAutoresizingMaskIntoConstraints = false
+        railScroll.addSubview(railStack)
+        railDivider.backgroundColor = Palette.hairline
+        railDivider.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            railStack.centerXAnchor.constraint(equalTo: railScroll.frameLayoutGuide.centerXAnchor),
+            railStack.topAnchor.constraint(equalTo: railScroll.contentLayoutGuide.topAnchor, constant: 6),
+            railStack.bottomAnchor.constraint(equalTo: railScroll.contentLayoutGuide.bottomAnchor, constant: -6),
+            railStack.widthAnchor.constraint(lessThanOrEqualTo: railScroll.frameLayoutGuide.widthAnchor),
+        ])
+        renderRail()
     }
 
-    private func filterChip(title: String, image: UIImage?, selection: Filter) -> UIButton {
-        var configuration = UIButton.Configuration.plain()
-        configuration.title = title
-        configuration.image = image?.withRenderingMode(.alwaysTemplate)
-        configuration.imagePadding = 6
-        configuration.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12)
-        let chipFont = scaled(.sansMedium, size: 13, style: .subheadline)
-        configuration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
-            var attributes = attributes
-            attributes.font = chipFont
-            return attributes
+    private func renderRail() {
+        railStack.arrangedSubviews.forEach {
+            railStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
         }
-        configuration.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
-        let isSelected = filter == selection
-        configuration.baseForegroundColor = isSelected ? Palette.elevated : Palette.secondary
-        configuration.background.backgroundColor = isSelected ? Palette.text : Palette.controlFill
-        configuration.background.cornerRadius = 17
-        let button = UIButton(configuration: configuration)
-        button.accessibilityLabel = title
-        button.accessibilityTraits = .button
-        button.addAction(UIAction { [weak self] _ in
-            self?.filter = selection
-            self?.renderChips()
+        let searching = !(search.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let selectedFilter: Filter? = searching ? nil : filter
+        railStack.addArrangedSubview(railButton(
+            image: UIImage(systemName: "star.fill"),
+            label: "Favorites",
+            identifier: "model-rail-favorites",
+            selected: selectedFilter == .favorites
+        ) { [weak self] in
+            self?.filter = .favorites
+            self?.renderRail()
             self?.renderSections()
-        }, for: .touchUpInside)
+            self?.updatePreferredContentSize()
+        })
+        for harness in harnesses {
+            railStack.addArrangedSubview(railButton(
+                image: BrandMarks.image(for: harness, side: 16)?.withRenderingMode(.alwaysTemplate),
+                label: harnessLabel(harness),
+                identifier: "model-rail-\(harness)",
+                selected: selectedFilter == .harness(harness)
+            ) { [weak self] in
+                self?.filter = .harness(harness)
+                self?.renderRail()
+                self?.renderSections()
+                self?.updatePreferredContentSize()
+            })
+        }
+        railScroll.isHidden = lockedHarness != nil || harnesses.count <= 1
+        railDivider.isHidden = railScroll.isHidden
+    }
+
+    private func railButton(
+        image: UIImage?,
+        label: String,
+        identifier: String,
+        selected: Bool,
+        action: @escaping () -> Void
+    ) -> UIButton {
+        var configuration = UIButton.Configuration.plain()
+        configuration.image = image?.withRenderingMode(.alwaysTemplate)
+        configuration.baseForegroundColor = selected ? Palette.text : Palette.secondary
+        configuration.background.backgroundColor = selected ? Palette.controlFill : .clear
+        configuration.background.cornerRadius = 8
+        configuration.contentInsets = .zero
+        configuration.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+        let button = UIButton(configuration: configuration)
+        button.accessibilityIdentifier = identifier
+        button.accessibilityLabel = label
+        button.accessibilityTraits = .button
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 32),
+            button.heightAnchor.constraint(equalToConstant: 32),
+        ])
+        button.addAction(UIAction { _ in action() }, for: .touchUpInside)
         return button
     }
 
-    private func renderSections() {
+    private func renderSections(keepingOffset: Bool = false) {
+        let contentOffset = tableView.contentOffset
         let query = (search.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let visible = models.filter { lockedHarness == nil || $0.harness == lockedHarness }
-        switch filter {
-        case .all:
-            if query.isEmpty {
-                let favorites = visible.filter(isFavorite)
-                sections = []
-                if !favorites.isEmpty { sections.append(Section(title: "Favorites", models: favorites)) }
-                sections.append(contentsOf: group(visible))
-            } else {
-                sections = group(matching(visible, query: query))
-            }
-        case .favorites:
+        if !query.isEmpty {
+            sections = group(matching(visible, query: query))
+        } else if lockedHarness != nil {
             let favoriteModels = visible.filter(isFavorite)
-            let matches = matching(favoriteModels, query: query)
-            sections = query.isEmpty
-                ? (matches.isEmpty ? [] : [Section(title: "Favorites", models: matches)])
-                : group(matches)
-        case let .harness(harness):
-            let harnessModels = visible.filter { $0.harness == harness }
-            let matches = matching(harnessModels, query: query)
-            sections = query.isEmpty
-                ? (matches.isEmpty ? [] : [Section(title: harnessLabel(harness), models: matches)])
-                : group(matches)
+            sections = favoriteModels.isEmpty ? [] : [Section(title: "Favorites", models: favoriteModels)]
+            sections.append(contentsOf: group(visible))
+        } else {
+            switch filter {
+            case .all:
+                sections = group(visible)
+            case .favorites:
+                let favoriteModels = visible.filter(isFavorite)
+                sections = favoriteModels.isEmpty ? [] : [Section(title: "Favorites", models: favoriteModels)]
+            case let .harness(harness):
+                let harnessModels = visible.filter { $0.harness == harness }
+                sections = harnessModels.isEmpty ? [] : [Section(title: harnessLabel(harness), models: harnessModels)]
+            }
         }
         tableView.reloadData()
         tableView.backgroundView = emptyState(query: query)
+        if keepingOffset {
+            tableView.layoutIfNeeded()
+            let maxOffset = max(0, tableView.contentSize.height - tableView.bounds.height)
+            tableView.setContentOffset(CGPoint(x: contentOffset.x, y: min(contentOffset.y, maxOffset)), animated: false)
+        }
+    }
+
+    private func updatePreferredContentSize() {
+        guard preferredContentSize.width > 0 else { return }
+        preferredContentSize.height = fittedHeight
     }
 
     private func matching(_ models: [ModelChoice], query: String) -> [ModelChoice] {
@@ -304,9 +350,9 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         guard sections.isEmpty else { return nil }
         let label = UILabel()
         if !query.isEmpty {
-            label.text = "No models match “\(query)”"
+            label.text = "No models match"
         } else if filter == .favorites {
-            label.text = "Swipe a model left to add it to Favorites"
+            label.text = "No favorites yet. Tap the star on a model to add it."
         } else {
             label.text = "No models available"
         }
@@ -365,8 +411,9 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
             favorites.insert(key)
         }
         UserDefaults.standard.set(favorites.sorted(), forKey: Self.favoritesStorageKey)
-        renderChips()
-        renderSections()
+        renderRail()
+        renderSections(keepingOffset: true)
+        updatePreferredContentSize()
     }
 
     private func isFavorite(_ model: ModelChoice) -> Bool {
@@ -438,9 +485,9 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         let container = UIView()
         container.backgroundColor = Palette.elevated
         let label = UILabel()
-        label.text = sections[section].title.uppercased()
+        label.text = sections[section].title
         label.textColor = Palette.tertiary
-        label.font = scaled(.sansMedium, size: 11, style: .caption1)
+        label.font = scaled(.sansMedium, size: 12, style: .caption1)
         label.adjustsFontForContentSizeCategory = true
         label.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(label)
@@ -518,10 +565,11 @@ private final class ModelPickerCell: UITableViewCell {
     private let mark = UIImageView()
     private let title = UILabel()
     private let detail = UILabel()
-    private let favoriteMark = UIImageView(image: UIImage(systemName: "star.fill"))
+    private let favoriteButton = UIButton(type: .system)
     private let checkmark = UIImageView(image: UIImage(systemName: "checkmark"))
     private let labels = UIStackView()
     private let rowContent = UIStackView()
+    private var minimumHeightConstraint: NSLayoutConstraint!
     private var selectedModel = false
     private var toggleFavorite: (() -> Void)?
 
@@ -529,15 +577,16 @@ private final class ModelPickerCell: UITableViewCell {
         super.init(style: style, reuseIdentifier: reuseIdentifier)
         backgroundColor = .clear
         contentView.backgroundColor = .clear
-        selectionBackground.layer.cornerRadius = 12
+        selectionBackground.layer.cornerRadius = 10
         selectionBackground.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(selectionBackground)
+        minimumHeightConstraint = contentView.heightAnchor.constraint(greaterThanOrEqualToConstant: 48)
         NSLayoutConstraint.activate([
-            selectionBackground.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 10),
-            selectionBackground.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -10),
+            selectionBackground.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 6),
+            selectionBackground.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -6),
             selectionBackground.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 3),
             selectionBackground.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -3),
-            contentView.heightAnchor.constraint(greaterThanOrEqualToConstant: 56),
+            minimumHeightConstraint,
         ])
 
         mark.contentMode = .scaleAspectFit
@@ -546,10 +595,11 @@ private final class ModelPickerCell: UITableViewCell {
         title.font = dynamicFont(.sansMedium, size: 15, style: .body)
         title.textColor = Palette.text
         title.lineBreakMode = .byTruncatingTail
+        title.numberOfLines = 1
         title.adjustsFontForContentSizeCategory = true
         detail.font = dynamicFont(.sans, size: 12.5, style: .caption1)
         detail.textColor = Palette.secondary
-        detail.numberOfLines = 2
+        detail.numberOfLines = 1
         detail.lineBreakMode = .byTruncatingTail
         detail.adjustsFontForContentSizeCategory = true
         labels.axis = .vertical
@@ -559,9 +609,12 @@ private final class ModelPickerCell: UITableViewCell {
         labels.addArrangedSubview(detail)
         labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        favoriteMark.tintColor = Palette.secondary
-        favoriteMark.contentMode = .scaleAspectFit
-        favoriteMark.setContentHuggingPriority(.required, for: .horizontal)
+        favoriteButton.contentHorizontalAlignment = .center
+        favoriteButton.contentVerticalAlignment = .center
+        favoriteButton.setContentHuggingPriority(.required, for: .horizontal)
+        favoriteButton.addAction(UIAction { [weak self] _ in
+            self?.toggleFavorite?()
+        }, for: .touchUpInside)
         checkmark.tintColor = Palette.text
         checkmark.contentMode = .scaleAspectFit
         checkmark.setContentHuggingPriority(.required, for: .horizontal)
@@ -571,20 +624,20 @@ private final class ModelPickerCell: UITableViewCell {
         rowContent.translatesAutoresizingMaskIntoConstraints = false
         rowContent.addArrangedSubview(mark)
         rowContent.addArrangedSubview(labels)
-        rowContent.addArrangedSubview(favoriteMark)
+        rowContent.addArrangedSubview(favoriteButton)
         rowContent.addArrangedSubview(checkmark)
         contentView.addSubview(rowContent)
         NSLayoutConstraint.activate([
-            rowContent.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
-            rowContent.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
-            rowContent.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 8),
-            rowContent.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -8),
-            mark.widthAnchor.constraint(equalToConstant: 20),
-            mark.heightAnchor.constraint(equalToConstant: 20),
-            favoriteMark.widthAnchor.constraint(equalToConstant: 11),
-            favoriteMark.heightAnchor.constraint(equalToConstant: 11),
-            checkmark.widthAnchor.constraint(equalToConstant: 14),
-            checkmark.heightAnchor.constraint(equalToConstant: 14),
+            rowContent.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            rowContent.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            rowContent.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 5),
+            rowContent.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -5),
+            mark.widthAnchor.constraint(equalToConstant: 18),
+            mark.heightAnchor.constraint(equalToConstant: 18),
+            favoriteButton.widthAnchor.constraint(equalToConstant: 28),
+            favoriteButton.heightAnchor.constraint(equalToConstant: 28),
+            checkmark.widthAnchor.constraint(equalToConstant: 13),
+            checkmark.heightAnchor.constraint(equalToConstant: 13),
         ])
         selectionStyle = .default
         isAccessibilityElement = true
@@ -598,14 +651,25 @@ private final class ModelPickerCell: UITableViewCell {
     }
 
     func configure(model: ModelChoice, selected: Bool, favorite: Bool, onToggleFavorite: @escaping () -> Void) {
-        mark.image = BrandMarks.image(for: model.harness, side: 20)?.withRenderingMode(.alwaysTemplate)
+        mark.image = BrandMarks.image(for: model.harness, side: 18)?.withRenderingMode(.alwaysTemplate)
         mark.isHidden = mark.image == nil
         title.text = model.label
         title.textColor = Palette.text
         title.font = dynamicFont(selected ? .sansSemibold : .sansMedium, size: 15, style: .body)
         detail.text = model.description
         detail.isHidden = model.description?.isEmpty ?? true
-        favoriteMark.isHidden = !favorite
+        minimumHeightConstraint.constant = detail.isHidden ? 48 : 56
+        favoriteButton.setImage(
+            UIImage(
+                systemName: favorite ? "star.fill" : "star",
+                withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+            ),
+            for: .normal
+        )
+        favoriteButton.tintColor = favorite ? Palette.text : Palette.tertiary
+        favoriteButton.accessibilityIdentifier = "model-favorite-\(model.id)"
+        favoriteButton.accessibilityLabel = favorite ? "Unfavorite" : "Favorite"
+        favoriteButton.accessibilityTraits = .button
         checkmark.isHidden = !selected
         selectedModel = selected
         toggleFavorite = onToggleFavorite
