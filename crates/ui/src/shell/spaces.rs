@@ -3224,6 +3224,7 @@ impl Shell {
                             _ => None,
                         };
                         state.set_cloud_repo_pick(pick);
+                        state.persist_cloud_picks(cx);
                         cx.notify();
                     });
                     self.close_spaces_menu(cx);

@@ -543,9 +543,12 @@ impl CloudSeatsPage {
                     Ok(_) => {
                         page.gh_login = None;
                         page.note = Some("GitHub disconnected.".into());
-                        page.state.update(cx, |state, _| {
+                        page.state.update(cx, |state, cx| {
                             state.cloud_github_login = None;
                             state.cloud_repos = crate::popover::Loadable::Idle;
+                            state.set_cloud_repo_pick(None);
+                            state.cloud_branch_pick = None;
+                            state.persist_cloud_picks(cx);
                         });
                     }
                     Err(err) => page.error = Some(err.to_string()),

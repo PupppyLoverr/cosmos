@@ -673,6 +673,12 @@ pub struct UiSettings {
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
     pub cloud_mode: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_seat_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_repo: Option<zeron_engine::cloud::RepoHit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_branch: Option<String>,
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
     /// folder inherently). Kept for file compatibility; no longer read.
     pub sidebar_grouped: bool,
@@ -855,6 +861,9 @@ impl Default for UiSettings {
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
             cloud_mode: false,
+            cloud_seat_id: None,
+            cloud_repo: None,
+            cloud_branch: None,
             sidebar_grouped: false,
             sidebar_organization: SidebarOrganization::InOneList,
             sidebar_sort: SidebarSort::LastUpdated,
@@ -1720,6 +1729,41 @@ mod tests {
     }
 
     #[test]
+    fn cloud_picks_default_for_legacy_settings() {
+        let loaded: UiSettings = serde_json::from_str(r#"{"cloudMode":true}"#).unwrap();
+        assert!(loaded.cloud_mode);
+        assert!(loaded.cloud_seat_id.is_none());
+        assert!(loaded.cloud_repo.is_none());
+        assert!(loaded.cloud_branch.is_none());
+    }
+
+    #[test]
+    fn cloud_picks_round_trip() {
+        let repo = zeron_engine::cloud::RepoHit {
+            full_name: "owner/repo".into(),
+            default_branch: "main".into(),
+            private: true,
+            pushed_at: Some("2026-01-02T03:04:05Z".into()),
+            description: Some("A test repository".into()),
+        };
+        let settings = UiSettings {
+            cloud_seat_id: Some("seat-1".into()),
+            cloud_repo: Some(repo.clone()),
+            cloud_branch: Some("feature".into()),
+            ..Default::default()
+        };
+
+        let loaded: UiSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.cloud_seat_id.as_deref(), Some("seat-1"));
+        assert_eq!(loaded.cloud_branch.as_deref(), Some("feature"));
+        assert_eq!(
+            serde_json::to_value(loaded.cloud_repo.unwrap()).unwrap(),
+            serde_json::to_value(repo).unwrap()
+        );
+    }
+
+    #[test]
     fn composer_send_behavior_is_opt_in_for_old_and_partial_settings() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2252,6 +2296,9 @@ mod tests {
         let settings = UiSettings {
             window_geometry: None,
             cloud_mode: false,
+            cloud_seat_id: None,
+            cloud_repo: None,
+            cloud_branch: None,
             sidebar_width: 300.0,
             sidebar_collapsed: true,
             sidebar_grouped: true,

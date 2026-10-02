@@ -224,6 +224,9 @@ pub fn run_app(config: UiConfig) {
         let state = cx.new(|_| {
             let mut state = state::AppState::new();
             state.cloud_mode = ui_settings.cloud_mode;
+            state.cloud_repo_pick = ui_settings.cloud_repo.clone();
+            state.cloud_branch_pick = ui_settings.cloud_branch.clone();
+            state.cloud_saved_seat = ui_settings.cloud_seat_id.clone();
             state
         });
         let url_state = state.clone();

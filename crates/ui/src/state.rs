@@ -795,6 +795,8 @@ pub struct AppState {
     /// The selected cloud seat for new sessions. This is intentionally
     /// session-local; the mode persists, but a seat is refreshed from config.
     pub cloud_seat_pick: Option<crate::cloud::SeatRow>,
+    /// Saved seat id is resolved against the first ready CloudView.
+    pub cloud_saved_seat: Option<String>,
     /// The GitHub repo new cloud sessions check out on the seat (the
     /// sidebar folder picker lists repos in Cloud mode). None = the seat's
     /// plain workspace.
@@ -843,6 +845,18 @@ fn repick(
 ) -> Option<crate::cloud::SeatRow> {
     let seat_id = pick?.config.id;
     view.seat(&seat_id).cloned()
+}
+
+fn restore_saved_seat(
+    pick: Option<crate::cloud::SeatRow>,
+    saved_id: Option<String>,
+    view: &crate::cloud::CloudView,
+) -> (Option<crate::cloud::SeatRow>, Option<String>) {
+    match (pick, saved_id) {
+        (Some(pick), saved_id) => (Some(pick), saved_id),
+        (None, Some(id)) => (view.seat(&id).cloned(), None),
+        (None, None) => (None, None),
+    }
 }
 
 impl Default for AppState {
@@ -903,6 +917,7 @@ impl AppState {
             cloud_fetched_at: None,
             cloud_mode: false,
             cloud_seat_pick: None,
+            cloud_saved_seat: None,
             cloud_repo_pick: None,
             cloud_repos: crate::popover::Loadable::Idle,
             cloud_repos_task: None,
@@ -2042,6 +2057,24 @@ impl AppState {
         }
     }
 
+    pub fn persist_cloud_picks(&self, cx: &mut App) {
+        let seat_id = self
+            .cloud_seat_pick
+            .as_ref()
+            .map(|seat| seat.config.id.clone());
+        let repo = self.cloud_repo_pick.clone();
+        let branch = self.cloud_branch_pick.clone();
+        crate::settings::update(
+            crate::settings::SavePolicy::Debounced,
+            cx,
+            move |settings| {
+                settings.cloud_seat_id = seat_id;
+                settings.cloud_repo = repo;
+                settings.cloud_branch = branch;
+            },
+        );
+    }
+
     /// The branch a new cloud session starts on: the explicit pick, else
     /// the picked repo's default branch.
     pub fn cloud_branch(&self) -> Option<String> {
@@ -2187,7 +2220,13 @@ impl AppState {
                     Err(err) => crate::popover::Loadable::Error(err.to_string()),
                 };
                 if let Some(view) = state.cloud.ready() {
-                    state.cloud_seat_pick = repick(state.cloud_seat_pick.take(), view);
+                    let (pick, saved_id) = restore_saved_seat(
+                        state.cloud_seat_pick.take(),
+                        state.cloud_saved_seat.take(),
+                        view,
+                    );
+                    state.cloud_saved_seat = saved_id;
+                    state.cloud_seat_pick = repick(pick, view);
                     // A seat the user just set up (a saved Boat token) takes
                     // over new cloud chats as soon as it's ready.
                     if let Some(prefer) = state.cloud_prefer_seat.clone()
@@ -3328,6 +3367,65 @@ mod tests {
             Some("opencode run -m opencode/big-pickle")
         );
         assert!(repick(Some(selected), &crate::cloud::CloudView::default()).is_none());
+    }
+
+    #[test]
+    fn saved_cloud_seat_is_restored_and_consumed_when_present() {
+        let seat = crate::cloud::SeatRow {
+            config: zeron_engine::cloud::SeatConfig {
+                id: "seat-1".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let view = crate::cloud::CloudView {
+            seats: vec![seat],
+            ..Default::default()
+        };
+
+        let (pick, saved_id) = restore_saved_seat(None, Some("seat-1".into()), &view);
+
+        assert_eq!(pick.unwrap().config.id, "seat-1");
+        assert!(saved_id.is_none());
+    }
+
+    #[test]
+    fn missing_saved_cloud_seat_is_consumed_without_a_pick() {
+        let (pick, saved_id) = restore_saved_seat(
+            None,
+            Some("missing-seat".into()),
+            &crate::cloud::CloudView::default(),
+        );
+
+        assert!(pick.is_none());
+        assert!(saved_id.is_none());
+    }
+
+    #[test]
+    fn saved_cloud_seat_does_not_override_an_existing_pick() {
+        let existing = crate::cloud::SeatRow {
+            config: zeron_engine::cloud::SeatConfig {
+                id: "existing-seat".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let saved = crate::cloud::SeatRow {
+            config: zeron_engine::cloud::SeatConfig {
+                id: "saved-seat".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let view = crate::cloud::CloudView {
+            seats: vec![saved],
+            ..Default::default()
+        };
+
+        let (pick, saved_id) = restore_saved_seat(Some(existing), Some("saved-seat".into()), &view);
+
+        assert_eq!(pick.unwrap().config.id, "existing-seat");
+        assert_eq!(saved_id.as_deref(), Some("saved-seat"));
     }
 
     /// A localhost port that was just free (bind :0, read, drop).

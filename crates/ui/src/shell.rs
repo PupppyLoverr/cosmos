@@ -8153,10 +8153,12 @@ impl Shell {
 
             if let Some(picked) = picked {
                 state.cloud_seat_pick = Some(picked);
+                state.persist_cloud_picks(cx);
             } else if (picked_id.is_none() || view_loaded)
                 && let Some(seat) = crate::cloud::CloudView::preferred_seat(&seats).cloned()
             {
                 state.cloud_seat_pick = Some(seat);
+                state.persist_cloud_picks(cx);
             }
             state.refresh_cloud(Some(Duration::from_secs(10)), cx);
         });
@@ -8371,9 +8373,10 @@ impl Shell {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.composer
                         .update(cx, |composer, cx| composer.clear_failure(cx));
-                    this.state.update(cx, |state, _| {
+                    this.state.update(cx, |state, cx| {
                         state.cloud_seat_pick = Some(seat_data.clone());
                         state.cloud_mode = true;
+                        state.persist_cloud_picks(cx);
                     });
                     this.close_cloud_seat_menu(cx);
                     // A trial seat that isn't live (it never connected, or
