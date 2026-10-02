@@ -31,7 +31,7 @@ final class DotOrbView: UIView {
     }
 
     private static let dots: [Dot] = {
-        let count = 440
+        let count = 900
         let goldenAngle = CGFloat.pi * (3 - sqrt(5))
         return (0..<count).map { index in
             let y = 1 - 2 * (CGFloat(index) + 0.5) / CGFloat(count)
@@ -196,7 +196,7 @@ final class DotOrbView: UIView {
         case .idle:
             return Parameters(rotation: 0.25, breathing: 0.02, tint: accent)
         case .listening:
-            return Parameters(rotation: 0.35, ripple: 0.22, tint: accent)
+            return Parameters(rotation: 0.35, ripple: 0.14, tint: accent)
         case .thinking:
             return Parameters(rotation: 1.1, radius: 0.96, thinkingBand: 1, tint: accent)
         case .speaking:
@@ -247,7 +247,10 @@ final class DotOrbView: UIView {
             let rotatedZ = -dot.x * sine + dot.z * cosine
             let rotatedY = dot.y * tiltCosine - rotatedZ * tiltSine
             let depth = dot.y * tiltSine + rotatedZ * tiltCosine
-            let ripple = sin(dot.phase + time * 4 * dot.speed) * parameters.ripple * energy
+            let ripple = (
+                sin(3.2 * dot.y + 2.4 * dot.x + time * 4.2) * 0.6
+                    + sin(dot.phase + time * 3 * dot.speed) * 0.4
+            ) * parameters.ripple * energy
             let breath = parameters.breathing * sin(time * 1.2)
                 + parameters.speakingBreath * energy
             let displacement = 1 + breath + ripple
@@ -257,7 +260,7 @@ final class DotOrbView: UIView {
             let bucket = min(buckets.count - 1, Int(depth01 * CGFloat(buckets.count)))
             let bandDistance = abs(rotatedY - bandY)
             let bandStrength = parameters.thinkingBand * max(0, 1 - bandDistance / 0.16)
-            let side = (1.1 + (3 - 1.1) * depth01) * (1 + 0.4 * bandStrength)
+            let side = (1.2 + (3.4 - 1.2) * depth01) * (1 + 0.4 * bandStrength)
             let pixelSide = max(1 / scale, round(side * scale) / scale)
             let pixelX = round((x - pixelSide * 0.5) * scale) / scale
             let pixelY = round((y - pixelSide * 0.5) * scale) / scale
@@ -274,7 +277,7 @@ final class DotOrbView: UIView {
             let depth01 = CGFloat(index) / CGFloat(buckets.count - 1)
             let highlight: CGFloat = index == buckets.count - 1 ? 0.22 : (index == buckets.count - 2 ? 0.1 : 0)
             bucket.fillColor = mix(parameters.tint, .white, amount: highlight).cgColor
-            bucket.opacity = Float((0.12 + 0.88 * depth01) * parameters.opacity)
+            bucket.opacity = Float((0.08 + 0.92 * depth01) * parameters.opacity)
             bucket.path = paths[index]
         }
         highlightLayer.path = highlightPath

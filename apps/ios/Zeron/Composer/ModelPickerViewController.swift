@@ -215,6 +215,7 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
                 )
             }
         }
+        chipScroll.isHidden = chipStack.arrangedSubviews.count == 1
     }
 
     private func filterChip(title: String, image: UIImage?, selection: Filter) -> UIButton {
@@ -386,6 +387,7 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     }
 
     func tableView(_ tableView: UITableView, viewForHeaderInSection section: Int) -> UIView? {
+        guard !shouldHideLockedHarnessHeader(in: section) else { return nil }
         let container = UIView()
         let label = UILabel()
         label.text = sections[section].title.uppercased()
@@ -404,7 +406,19 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     }
 
     func tableView(_ tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat {
-        30
+        shouldHideLockedHarnessHeader(in: section) ? 0 : 30
+    }
+
+    private func shouldHideLockedHarnessHeader(in section: Int) -> Bool {
+        guard
+            lockedHarness != nil,
+            filter == .all,
+            sections.count == 1,
+            (search.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return false
+        }
+        return sections[section].title != "Favorites"
     }
 
     func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
