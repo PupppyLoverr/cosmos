@@ -2061,7 +2061,8 @@ impl AppState {
         let seat_id = self
             .cloud_seat_pick
             .as_ref()
-            .map(|seat| seat.config.id.clone());
+            .map(|seat| seat.config.id.clone())
+            .or_else(|| self.cloud_saved_seat.clone());
         let repo = self.cloud_repo_pick.clone();
         let branch = self.cloud_branch_pick.clone();
         crate::settings::update(
