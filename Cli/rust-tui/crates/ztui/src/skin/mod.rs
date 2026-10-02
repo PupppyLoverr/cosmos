@@ -37,12 +37,85 @@ impl Default for ThemeCfg {
     }
 }
 
+/// Default thinking verbs: `Present:Past` (the past tense is for the
+/// turn-end footer, "✻ Cooked for 12s").
+pub const VERBS: &[&str] = &[
+    "Cosmosing:Cosmosed", "Plotting:Plotted", "Cooking:Cooked", "Orbiting:Orbited", "Stargazing:Stargazed",
+    "Warping:Warped", "Terraforming:Terraformed", "Nebulising:Nebulised", "Charting:Charted", "Scheming:Schemed",
+    "Brewing:Brewed", "Calibrating:Calibrated", "Conjuring:Conjured", "Pondering:Pondered", "Tinkering:Tinkered",
+    "Moonwalking:Moonwalked", "Supernova-ing:Supernova'd", "Mapping constellations:Mapped constellations",
+    "Bending spacetime:Bent spacetime", "Counting stars:Counted stars",
+];
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SpinnerCfg {
+    /// orb, twinkle, braille, moon, comet, pulse, galaxy, dots, line
+    pub style: String,
+    /// custom frames; when set they replace `style`
+    pub frames: Vec<String>,
+    pub fps: u32,
+    /// `Present:Past` pairs (or just `Present`); one is picked per turn
+    pub verbs: Vec<String>,
+    /// verb while a tool runs, by tool name ("bash" = "Running")
+    pub tool_verbs: BTreeMap<String, String>,
+    /// a highlight sweeping across the verb
+    pub shimmer: bool,
+    pub show_elapsed: bool,
+    pub show_tokens: bool,
+    pub hint: String,
+    /// "✻ Cooked for 12s · ↓ 1.2k tokens" after each turn
+    pub footer: bool,
+    pub footer_glyph: String,
+}
+
+impl Default for SpinnerCfg {
+    fn default() -> Self {
+        let tv = [
+            ("read", "Reading"), ("grep", "Searching"), ("glob", "Scanning"), ("ls", "Listing"), ("bash", "Running"),
+            ("edit", "Editing"), ("write", "Writing"), ("task", "Delegating"), ("memory_search", "Remembering"),
+            ("memory_write", "Noting"), ("tool_search", "Looking up tools"), ("mcp_call", "Calling"),
+        ];
+        SpinnerCfg {
+            style: "orb".into(),
+            frames: Vec::new(),
+            fps: 12,
+            verbs: VERBS.iter().map(|s| s.to_string()).collect(),
+            tool_verbs: tv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            shimmer: true,
+            show_elapsed: true,
+            show_tokens: true,
+            hint: "esc to interrupt".into(),
+            footer: true,
+            footer_glyph: "✻".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MotionCfg {
+    /// no animation at all: static spinner, no shimmer, no fade-in
+    pub reduce: bool,
+    /// streamed text fades in instead of popping
+    pub reveal: bool,
+    pub reveal_ms: u64,
+}
+
+impl Default for MotionCfg {
+    fn default() -> Self {
+        MotionCfg { reduce: false, reveal: true, reveal_ms: 160 }
+    }
+}
+
 /// The whole `ui.toml`. Unknown keys are ignored on load (a file written
 /// for a newer cosmostui still loads) but rejected by `/customise`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Skin {
     pub theme: ThemeCfg,
+    pub spinner: SpinnerCfg,
+    pub motion: MotionCfg,
 }
 
 impl Skin {

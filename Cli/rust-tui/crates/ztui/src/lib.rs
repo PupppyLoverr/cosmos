@@ -11,6 +11,7 @@ mod highlight_ts;
 mod line;
 mod logo;
 mod markdown;
+mod motion;
 mod skin;
 mod slash;
 mod term;

@@ -28,7 +28,6 @@ use crate::wrap::{self, ellipsize, line_width, pad_line, width_of};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// twinkling star for the working line
-const TWINKLE: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
 pub const MENU_ROWS: usize = 6;
 const MODEL_ROWS: usize = 9;
 
@@ -915,10 +914,58 @@ fn recorder_row(app: &App, tick: usize) -> Line<'static> {
     ])
 }
 
+/// " ◉ Cosmosing… (12s · ↓ 1.2k tokens · esc to interrupt)" — the orb
+/// breathes, a highlight sweeps the verb, all from the skin.
+pub fn busy_line(app: &App, ms: u128) -> Line<'static> {
+    let sk = crate::skin::current();
+    let cfg = &sk.spinner;
+    let reduce = sk.motion.reduce;
+    let verb = match app.tools.first() {
+        Some(t) => crate::motion::tool_verb(cfg, &t.name, &tool_label(&t.name)),
+        None => crate::motion::pick_verb(cfg, app.verb_seed).0,
+    };
+    let mut meta: Vec<String> = Vec::new();
+    if cfg.show_elapsed {
+        meta.push(crate::motion::elapsed(app.busy_since.elapsed().as_secs()));
+    }
+    if cfg.show_tokens {
+        if let Some(st) = &app.stream {
+            meta.push(format!("↓ {} tokens", kfmt((st.chars / 4) as u64)));
+        }
+    }
+    if !cfg.hint.is_empty() {
+        meta.push(cfg.hint.clone());
+    }
+    let mut spans = vec![sp(" "), crate::motion::spinner_span(cfg, ACCENT(), ms, reduce)];
+    spans.extend(crate::motion::shimmer(&format!("{verb}…"), ACCENT(), ms, cfg.shimmer && !reduce));
+    if !meta.is_empty() {
+        spans.push(dim(format!(" ({})", meta.join(" · "))));
+    }
+    Line::from(spans)
+}
+
+/// " ✻ Cooked for 14s · ↓ 3.1k tokens" — committed once a turn ends.
+pub fn turn_footer(app: &App) -> Vec<Line<'static>> {
+    let sk = crate::skin::current();
+    let cfg = &sk.spinner;
+    let secs = app.busy_since.elapsed().as_secs();
+    if !cfg.footer || secs < 1 {
+        return Vec::new();
+    }
+    let past = crate::motion::pick_verb(cfg, app.verb_seed).1;
+    let out_tokens = if app.usage.last[3] > 0 { app.usage.last[3] } else { (app.turn_chars / 4) as u64 };
+    let mut text = format!("{past} for {}", crate::motion::elapsed(secs));
+    if out_tokens > 0 {
+        text.push_str(&format!(" · ↓ {} tokens", kfmt(out_tokens)));
+    }
+    vec![Line::from(vec![sp(" "), Span::styled(format!("{} ", cfg.footer_glyph), theme::fg(ACCENT())), dim(text)])]
+}
+
 /// Everything still in motion, plus the composer and whatever menu is open.
 pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
     let w = app.width;
-    let tick = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) / 80) as usize;
+    let ms = crate::motion::now_ms();
+    let tick = (ms / 80) as usize;
     let mut out: Vec<Line<'static>> = Vec::new();
 
     // streaming tail — the line still being written
@@ -926,6 +973,13 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
         let mut tail = st.md.preview(&st.partial, w);
         if tail.len() > 6 {
             tail.drain(..tail.len() - 6);
+        }
+        let sk = crate::skin::current();
+        if sk.motion.reveal && !sk.motion.reduce {
+            if let Some(last) = tail.pop() {
+                let fresh = st.fresh(sk.motion.reveal_ms).min(last.spans.iter().map(|s| s.content.chars().count()).sum());
+                tail.push(Line::from(crate::motion::fade_tail(last.spans, fresh, crate::skin::palette().ghost)));
+            }
         }
         if !tail.is_empty() && !app.last_out_blank() {
             out.push(Line::default());
@@ -935,7 +989,8 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
     // tools in flight
     for t in &app.tools {
         let mut l = head(&t.name, &t.input, Style::new(), w);
-        l.spans[1] = Span::styled(format!("{} ", SPINNER[tick % SPINNER.len()]), theme::fg(ACCENT()));
+        let sk = crate::skin::current();
+        l.spans[1] = crate::motion::spinner_span(&sk.spinner, ACCENT(), ms, sk.motion.reduce);
         if out.is_empty() && !app.last_out_blank() {
             out.push(Line::default());
         }
@@ -947,30 +1002,16 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
         }
         out.push(Line::from(vec![
             sp(" "),
-            Span::styled(format!("{} ", SPINNER[tick % SPINNER.len()]), theme::fg(theme::ORANGE())),
+            {
+                let sk = crate::skin::current();
+                crate::motion::spinner_span(&sk.spinner, theme::ORANGE(), ms, sk.motion.reduce)
+            },
             Span::styled(format!("! {}", ellipsize(&job.cmd, w.saturating_sub(8))), theme::bold(Style::new())),
         ]));
     }
     if app.busy && app.perm.is_none() {
-        let secs = app.busy_since.elapsed().as_secs();
-        let verb = if let Some(t) = app.tools.first() {
-            format!("Running {}", tool_label(&t.name).to_lowercase())
-        } else if app.stream.is_some() {
-            "Writing".into()
-        } else {
-            "Thinking".into()
-        };
-        let mut meta = format!("{secs}s");
-        if let Some(st) = &app.stream {
-            meta.push_str(&format!(" · ↓ {} tokens", kfmt((st.chars / 4) as u64)));
-        }
         out.push(Line::default());
-        out.push(Line::from(vec![
-            sp(" "),
-            Span::styled(format!("{} ", TWINKLE[tick % TWINKLE.len()]), theme::fg(ACCENT())),
-            Span::styled(format!("{verb}…"), Style::new().fg(ACCENT())),
-            dim(format!(" ({meta} · esc to interrupt)")),
-        ]));
+        out.push(busy_line(app, ms));
     }
     if !out.is_empty() {
         out.push(Line::default());

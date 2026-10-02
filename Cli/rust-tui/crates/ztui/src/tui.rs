@@ -118,6 +118,20 @@ pub struct Stream {
     pub chars: usize,
     /// full text, for /copy
     all: String,
+    /// (when, total chars by then) — recent deltas, for the fade-in
+    pub arrivals: std::collections::VecDeque<(Instant, usize)>,
+}
+
+impl Stream {
+    /// Characters that arrived within the last `ms`.
+    pub fn fresh(&self, ms: u64) -> usize {
+        let cutoff = Instant::now() - Duration::from_millis(ms);
+        let before = self.arrivals.iter().rev().find(|(t, _)| *t < cutoff).map(|(_, n)| *n);
+        match before {
+            Some(n) => self.chars - n,
+            None => self.chars - self.arrivals.front().map(|(_, n)| *n).unwrap_or(self.chars),
+        }
+    }
 }
 
 /// Typing an API key for /connect — the composer is masked.
@@ -161,6 +175,10 @@ pub struct App {
     pub busy: bool,
     inflight: usize,
     pub busy_since: Instant,
+    /// picks this turn's thinking verb (fixed when the turn starts)
+    pub verb_seed: u64,
+    /// characters streamed this turn (footer fallback when usage is unknown)
+    pub turn_chars: usize,
     pub mode: Mode,
     pub model: String,
     pub alias: String,
@@ -239,6 +257,8 @@ impl App {
             busy: false,
             inflight: 0,
             busy_since: Instant::now(),
+            verb_seed: 0,
+            turn_chars: 0,
             mode: Mode::Agent,
             model: "…".into(),
             alias: String::new(),
@@ -341,10 +361,21 @@ impl App {
 
     fn on_delta(&mut self, s: &str) {
         let w = self.width;
-        let st = self.stream.get_or_insert_with(|| Stream { md: Md::new(), partial: String::new(), started: false, chars: 0, all: String::new() });
+        let st = self.stream.get_or_insert_with(|| Stream {
+            md: Md::new(),
+            partial: String::new(),
+            started: false,
+            chars: 0,
+            all: String::new(),
+            arrivals: std::collections::VecDeque::from([(Instant::now(), 0)]),
+        });
         st.partial.push_str(s);
         st.all.push_str(s);
         st.chars += s.chars().count();
+        st.arrivals.push_back((Instant::now(), st.chars));
+        while st.arrivals.len() > 64 {
+            st.arrivals.pop_front();
+        }
         let mut ready: Vec<Line<'static>> = Vec::new();
         while let Some(i) = st.partial.find('\n') {
             let line: String = st.partial[..i].to_string();
@@ -432,6 +463,9 @@ impl App {
             Msg::Note(s) => self.note(s),
             Msg::Err(s) => self.error(s),
             Msg::TurnDone => {
+                if let Some(st) = &self.stream {
+                    self.turn_chars += st.chars;
+                }
                 self.end_stream();
                 // anything still pending was cut short
                 for t in std::mem::take(&mut self.tools) {
@@ -441,6 +475,10 @@ impl App {
                 self.inflight = self.inflight.saturating_sub(1);
                 if self.inflight == 0 {
                     self.busy = false;
+                    let lines = view::turn_footer(self);
+                    if !lines.is_empty() {
+                        self.cont(lines);
+                    }
                 }
                 if let Some(r) = zproviders::last_rate_limits() {
                     self.rate = Some(r);
@@ -905,6 +943,8 @@ impl App {
     fn start_busy(&mut self) {
         if self.inflight == 0 {
             self.busy_since = Instant::now();
+            self.verb_seed = crate::motion::now_ms() as u64 / 7;
+            self.turn_chars = 0;
         }
         self.inflight += 1;
         self.busy = true;
@@ -1074,6 +1114,30 @@ impl App {
             "usage" | "cost" => {
                 let lines = view::usage(self);
                 self.block(lines);
+            }
+            "spinner" => {
+                let name = args.trim();
+                let styles = crate::motion::STYLES;
+                if name.is_empty() {
+                    let now = crate::skin::current().spinner.style.clone();
+                    let list = styles
+                        .iter()
+                        .map(|s| format!("{}{}", crate::motion::frames(s).join(""), if *s == now { format!(" {s} ✓") } else { format!(" {s}") }))
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    self.note(format!("Spinners: {list}"));
+                } else if !styles.contains(&name) {
+                    self.error(format!("No spinner {name:?} — try {}", styles.join(", ")));
+                } else {
+                    let path = zcore::cli_home().join("ui.toml");
+                    match crate::skin::edit::set_in_file(&path, "spinner", "style", &crate::skin::edit::Val::Str(name.into())) {
+                        Ok(()) => {
+                            self.skin_reload = true;
+                            self.flash(format!("Spinner → {name}"), theme::ACCENT());
+                        }
+                        Err(e) => self.error(format!("Couldn't save the spinner: {e}")),
+                    }
+                }
             }
             "theme" => {
                 let name = args.trim();
@@ -1813,7 +1877,9 @@ fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender
         }
         // animate spinners ~12 fps while something is moving
         let animating = app.busy || !app.tools.is_empty() || app.rec.is_some() || app.shell.is_some() || app.login.is_some();
-        if animating && last_tick.elapsed() >= Duration::from_millis(80) {
+        let sk = crate::skin::current();
+        let frame_ms = if sk.motion.reduce { 1000 } else { 1000 / u64::from(sk.spinner.fps.clamp(1, 60)) };
+        if animating && last_tick.elapsed() >= Duration::from_millis(frame_ms) {
             last_tick = Instant::now();
             app.dirty = true;
         }
@@ -2111,6 +2177,39 @@ mod tests {
         let (lines, _) = view::live(&a);
         let rows: Vec<String> = lines.iter().map(text).collect();
         assert!(rows.iter().any(|r| r.contains("turn 2") && r.contains("· plan ·")), "{rows:?}");
+    }
+
+    #[test]
+    fn busy_line_and_turn_footer() {
+        let _env = crate::env_lock();
+        let mut a = app();
+        a.busy = true;
+        a.busy_since = Instant::now() - Duration::from_secs(14);
+        a.verb_seed = 2; // Cooking / Cooked
+        let line: String = view::busy_line(&a, 0).spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(line.contains("Cooking…") && line.contains("14s") && line.contains("esc to interrupt"), "{line}");
+        // a running tool names what it is doing
+        a.tools.push(PendingTool { id: "t".into(), name: "grep".into(), input: Value::Null });
+        let line: String = view::busy_line(&a, 0).spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(line.contains("Searching…"), "{line}");
+        a.tools.clear();
+        a.turn_chars = 4000;
+        let foot: String = view::turn_footer(&a).iter().flat_map(|l| l.spans.iter().map(|s| s.content.to_string())).collect();
+        assert!(foot.contains("Cooked for 14s · ↓ 1.0k tokens"), "{foot}");
+        a.busy_since = Instant::now();
+        assert!(view::turn_footer(&a).is_empty(), "no footer for an instant turn");
+    }
+
+    #[test]
+    fn stream_tracks_fresh_characters() {
+        let _env = crate::env_lock();
+        let mut a = app();
+        a.on_msg(Msg::Delta("hello ".into()));
+        a.on_msg(Msg::Delta("world".into()));
+        let st = a.stream.as_ref().unwrap();
+        assert_eq!(st.fresh(10_000), 11, "everything is fresh within the window");
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(a.stream.as_ref().unwrap().fresh(10), 0, "settled after the window");
     }
 
     #[test]
