@@ -319,11 +319,36 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
             guard let rowIndex = section.models.firstIndex(where: {
                 $0.harness == selected.harness && $0.id == selectedModelID
             }) else { continue }
-            tableView.scrollToRow(
-                at: IndexPath(row: rowIndex, section: sectionIndex),
-                at: .middle,
-                animated: false
-            )
+            let indexPath = IndexPath(row: rowIndex, section: sectionIndex)
+            tableView.layoutIfNeeded()
+            let rowRect = tableView.rectForRow(at: indexPath)
+            let insetTop = tableView.adjustedContentInset.top
+            let insetBottom = tableView.adjustedContentInset.bottom
+            let viewH = tableView.bounds.height - insetTop - insetBottom
+            let minY = -insetTop
+            let maxY = max(minY, tableView.contentSize.height - tableView.bounds.height + insetBottom)
+
+            if abs(tableView.contentOffset.y - minY) < 1, rowRect.maxY <= viewH {
+                tableView.setContentOffset(CGPoint(x: 0, y: minY), animated: false)
+                return
+            }
+
+            var target = rowRect.midY - insetTop - viewH / 2
+            target = min(max(target, minY), maxY)
+
+            let visibleTop = target + insetTop
+            let sectionAtTop = tableView.indexPathForRow(at: CGPoint(x: 1, y: visibleTop))?.section ?? indexPath.section
+            let headerHeight = tableView.rectForHeader(inSection: sectionAtTop).height
+            let probe = CGPoint(x: 1, y: visibleTop + headerHeight + 1)
+            let p = tableView.indexPathForRow(at: probe) ?? indexPath
+            let headerRect = tableView.rectForHeader(inSection: p.section)
+            if p.row == 0 {
+                target = headerRect.minY - insetTop
+            } else {
+                target = tableView.rectForRow(at: p).minY - headerRect.height - insetTop
+            }
+            target = max(target, minY)
+            tableView.setContentOffset(CGPoint(x: 0, y: target), animated: false)
             return
         }
     }
@@ -407,6 +432,7 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     func tableView(_ tableView: UITableView, viewForHeaderInSection section: Int) -> UIView? {
         guard !shouldHideLockedHarnessHeader(in: section) else { return nil }
         let container = UIView()
+        container.backgroundColor = Palette.elevated
         let label = UILabel()
         label.text = sections[section].title.uppercased()
         label.textColor = Palette.tertiary
