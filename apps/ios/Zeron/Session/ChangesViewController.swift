@@ -7,6 +7,8 @@ final class ChangesAccessoryPill: UIControl {
     private let title = UILabel()
     private let additions = UILabel()
     private let deletions = UILabel()
+    private let content = UIStackView()
+    private var lastCounts: (files: Int, additions: UInt64, deletions: UInt64)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -28,7 +30,9 @@ final class ChangesAccessoryPill: UIControl {
             label.font = Fonts.ui(.mono, 12.5)
         }
 
-        let content = UIStackView(arrangedSubviews: [title, additions, deletions])
+        content.addArrangedSubview(title)
+        content.addArrangedSubview(additions)
+        content.addArrangedSubview(deletions)
         content.axis = .horizontal
         content.alignment = .center
         content.spacing = 6
@@ -51,10 +55,53 @@ final class ChangesAccessoryPill: UIControl {
     required init?(coder: NSCoder) { fatalError() }
 
     func configure(_ changes: SessionChanges) {
-        additions.text = "+\(changes.additions)"
-        deletions.text = "−\(changes.deletions)"
+        let isVisible = !isHidden && !changes.files.isEmpty
+        let countsChanged = lastCounts.map {
+            $0.files != changes.files.count
+                || $0.additions != changes.additions
+                || $0.deletions != changes.deletions
+        } ?? false
+        let shouldAnimate = isVisible && countsChanged && !UIAccessibility.isReduceMotionEnabled
+        let hasDiffs = changes.additions != 0 || changes.deletions != 0
+        let updateLabels = {
+            if hasDiffs {
+                self.additions.text = "+\(changes.additions)"
+                self.additions.textColor = Palette.success
+                self.deletions.text = "−\(changes.deletions)"
+                self.deletions.textColor = Palette.danger
+                self.deletions.isHidden = false
+            } else {
+                let count = changes.files.count
+                self.additions.text = "\(count) file\(count == 1 ? "" : "s")"
+                self.additions.textColor = Palette.secondary
+                self.deletions.text = nil
+                self.deletions.isHidden = true
+            }
+        }
+        if shouldAnimate {
+            UIView.transition(
+                with: content,
+                duration: 0.2,
+                options: .transitionCrossDissolve,
+                animations: updateLabels
+            )
+            transform = CGAffineTransform(scaleX: 1.04, y: 1.04)
+            UIView.animate(
+                withDuration: 0.28,
+                delay: 0,
+                usingSpringWithDamping: 0.62,
+                initialSpringVelocity: 0.25,
+                options: [.beginFromCurrentState]
+            ) {
+                self.transform = .identity
+            }
+        } else {
+            updateLabels()
+            transform = .identity
+        }
         isHidden = changes.files.isEmpty
         accessibilityLabel = "Changes, \(changes.files.count) files, +\(changes.additions), −\(changes.deletions)"
+        lastCounts = (changes.files.count, changes.additions, changes.deletions)
     }
 }
 
@@ -123,7 +170,10 @@ final class ModelAccessoryPill: UIControl {
 }
 
 final class ChangesViewController: UIViewController {
-    private let changes: SessionChanges
+    private var changes: SessionChanges
+    private let summary = UILabel()
+    private let rowsStack = UIStackView()
+    private let scroll = UIScrollView()
 
     init(changes: SessionChanges) {
         self.changes = changes
@@ -141,23 +191,16 @@ final class ChangesViewController: UIViewController {
         title.text = "Changes"
         title.textColor = Palette.text
         title.font = Fonts.ui(.sansSemibold, 23)
-        let summary = UILabel()
-        summary.text = "\(changes.files.count) files · +\(changes.additions) −\(changes.deletions)"
         summary.textColor = Palette.secondary
         summary.font = Fonts.ui(.mono, 12.5)
 
-        let rows = UIStackView()
-        rows.axis = .vertical
-        rows.alignment = .fill
-        rows.spacing = 0
-        rows.translatesAutoresizingMaskIntoConstraints = false
-        for (index, file) in changes.files.enumerated() {
-            rows.addArrangedSubview(ChangeFileRow(file: file, index: index))
-        }
-        let scroll = UIScrollView()
+        rowsStack.axis = .vertical
+        rowsStack.alignment = .fill
+        rowsStack.spacing = 0
+        rowsStack.translatesAutoresizingMaskIntoConstraints = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.alwaysBounceVertical = false
-        scroll.addSubview(rows)
+        scroll.addSubview(rowsStack)
         title.translatesAutoresizingMaskIntoConstraints = false
         summary.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(title)
@@ -174,12 +217,27 @@ final class ChangesViewController: UIViewController {
             scroll.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             scroll.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
             scroll.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8),
-            rows.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
-            rows.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
-            rows.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
-            rows.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
-            rows.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
+            rowsStack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+            rowsStack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+            rowsStack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+            rowsStack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+            rowsStack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
         ])
+        update(changes)
+    }
+
+    func update(_ changes: SessionChanges) {
+        self.changes = changes
+        guard isViewLoaded else { return }
+        let count = changes.files.count
+        summary.text = "\(count) file\(count == 1 ? "" : "s") · +\(changes.additions) −\(changes.deletions)"
+        rowsStack.arrangedSubviews.forEach {
+            rowsStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+        for (index, file) in changes.files.enumerated() {
+            rowsStack.addArrangedSubview(ChangeFileRow(file: file, index: index))
+        }
     }
 }
 
@@ -188,7 +246,10 @@ private final class ChangeFileRow: UIView {
         super.init(frame: .zero)
         accessibilityIdentifier = "change-file-row-\(index)"
         isAccessibilityElement = true
-        accessibilityLabel = "\(file.path), +\(file.additions), −\(file.deletions)"
+        let hasNoStats = file.additions == 0 && file.deletions == 0
+        accessibilityLabel = hasNoStats
+            ? "\(file.path), edited"
+            : "\(file.path), +\(file.additions), −\(file.deletions)"
 
         let icon = UIImageView(image: UIImage(systemName: Self.icon(for: file.path)))
         icon.tintColor = Palette.secondary
@@ -201,19 +262,29 @@ private final class ChangeFileRow: UIView {
         path.font = Fonts.ui(.mono, 12.5)
         path.lineBreakMode = .byTruncatingHead
         path.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let additions = UILabel()
-        additions.text = "+\(file.additions)"
-        additions.textColor = Palette.success
-        additions.font = Fonts.ui(.mono, 12.5)
-        let deletions = UILabel()
-        deletions.text = "−\(file.deletions)"
-        deletions.textColor = Palette.danger
-        deletions.font = Fonts.ui(.mono, 12.5)
-        let counts = UIStackView(arrangedSubviews: [additions, deletions])
+        let counts = UIStackView()
         counts.axis = .horizontal
         counts.alignment = .center
         counts.spacing = 8
         counts.setContentCompressionResistancePriority(.required, for: .horizontal)
+        if hasNoStats {
+            let edited = UILabel()
+            edited.text = "edited"
+            edited.textColor = Palette.tertiary
+            edited.font = Fonts.ui(.mono, 12.5)
+            counts.addArrangedSubview(edited)
+        } else {
+            let additions = UILabel()
+            additions.text = "+\(file.additions)"
+            additions.textColor = Palette.success
+            additions.font = Fonts.ui(.mono, 12.5)
+            let deletions = UILabel()
+            deletions.text = "−\(file.deletions)"
+            deletions.textColor = Palette.danger
+            deletions.font = Fonts.ui(.mono, 12.5)
+            counts.addArrangedSubview(additions)
+            counts.addArrangedSubview(deletions)
+        }
         let content = UIStackView(arrangedSubviews: [icon, path, counts])
         content.axis = .horizontal
         content.alignment = .center

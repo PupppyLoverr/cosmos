@@ -749,7 +749,11 @@ fn session_changes(entries: &[Arc<SessionMessageEntry>]) -> SessionChanges {
     for entry in entries {
         for part in &entry.parts {
             let MessagePart::Tool {
-                diff_stats, diff, ..
+                call,
+                is_error,
+                diff_stats,
+                diff,
+                ..
             } = part
             else {
                 continue;
@@ -760,6 +764,20 @@ fn session_changes(entries: &[Arc<SessionMessageEntry>]) -> SessionChanges {
                 }
             } else if let Some(diff) = diff {
                 record(&diff_stat(diff));
+            } else if !*is_error {
+                let path = match call {
+                    zeron_proto::ToolCall::EditFile { path, .. }
+                    | zeron_proto::ToolCall::WriteFile { path, .. }
+                    | zeron_proto::ToolCall::ApplyPatch { path: Some(path) } => Some(path),
+                    _ => None,
+                };
+                if let Some(path) = path {
+                    record(&ToolDiffStat {
+                        path: path.clone(),
+                        additions: 0,
+                        deletions: 0,
+                    });
+                }
             }
         }
     }
