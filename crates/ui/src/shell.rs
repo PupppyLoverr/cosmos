@@ -1937,6 +1937,8 @@ pub struct Shell {
     cloud_rails: std::collections::HashMap<String, Entity<crate::cloud::CloudRail>>,
     cloud_rail_subs: std::collections::HashMap<String, Subscription>,
     cloud_rail_order: Vec<String>,
+    /// Cloud chats whose right pane has already been opened once.
+    cloud_rail_shown: std::collections::HashSet<String>,
     active_cloud_rail: Option<String>,
     /// Rail Event::OpenSideChat — surface creation needs `window`, so the
     /// subscription queues it and render() drains it.
@@ -2437,6 +2439,7 @@ impl Shell {
             cloud_rails: std::collections::HashMap::new(),
             cloud_rail_subs: std::collections::HashMap::new(),
             cloud_rail_order: Vec::new(),
+            cloud_rail_shown: std::collections::HashSet::new(),
             active_cloud_rail: None,
             pending_side_chat: false,
             cloud_side_chat: std::collections::HashSet::new(),
@@ -4983,7 +4986,9 @@ impl Shell {
                 self.cloud_rails.insert(chat_id.clone(), rail);
                 // A cloud chat's seat panes live in the right pane — open it
                 // the first time the chat is shown.
-                self.set_surfaces_open(true, cx);
+                if self.cloud_rail_shown.insert(chat_id.clone()) {
+                    self.set_surfaces_open(true, cx);
+                }
             }
             if let Some(rail) = self.cloud_rails.get(&chat_id) {
                 rail.update(cx, |rail, cx| rail.set_active(true, cx));
