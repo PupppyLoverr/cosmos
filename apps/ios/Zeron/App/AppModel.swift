@@ -339,6 +339,7 @@ final class AppModel {
             if row.status == .working { counts.working += 1 }
             if row.status == .awaiting { counts.awaiting += 1 }
         }
+        let changedRows = all.keys.filter { rows[$0] != all[$0] }
         rows = all
         // Devices coming and going (Settings, host pickers) count as changes.
         let hosts = hostOptions
@@ -348,6 +349,8 @@ final class AppModel {
         frontPage = page
         archived = archivedVMs
         if changed { observers.values.forEach { $0() } }
+        // An open session's chrome (model chip, harness) reads its row.
+        for id in changedRows { sessionObservers[id]?.values.forEach { $0() } }
     }
 
     static func status(_ i: ChatIndicator) -> SessionRowVM.Status {
