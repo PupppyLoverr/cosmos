@@ -36,7 +36,7 @@ fn sp(s: impl Into<String>) -> Span<'static> {
     Span::raw(s.into())
 }
 fn dim(s: impl Into<String>) -> Span<'static> {
-    Span::styled(s.into(), DIM)
+    Span::styled(s.into(), DIM())
 }
 
 pub fn kfmt(n: u64) -> String {
@@ -58,11 +58,11 @@ pub fn note(s: &str, w: usize) -> Vec<Line<'static>> {
 }
 
 pub fn error(s: &str, w: usize) -> Vec<Line<'static>> {
-    wrap::wrap(&[Span::styled(s.to_string(), theme::fg(RED))], w, &[Span::styled(" ✗ ", theme::fg(RED))], &[sp("   ")])
+    wrap::wrap(&[Span::styled(s.to_string(), theme::fg(RED()))], w, &[Span::styled(" ✗ ", theme::fg(RED()))], &[sp("   ")])
 }
 
 pub fn warn(s: &str, w: usize) -> Vec<Line<'static>> {
-    wrap::wrap(&[Span::styled(s.to_string(), theme::fg(YELLOW))], w, &[Span::styled(" ! ", theme::fg(YELLOW))], &[sp("   ")])
+    wrap::wrap(&[Span::styled(s.to_string(), theme::fg(YELLOW()))], w, &[Span::styled(" ! ", theme::fg(YELLOW()))], &[sp("   ")])
 }
 
 fn home_short(p: &std::path::Path) -> String {
@@ -88,12 +88,12 @@ pub fn info_line(app: &App) -> Line<'static> {
         parts.push(format!("{} context", kfmt(m.context)));
     }
     parts.push(home_short(&app.cwd));
-    Line::from(Span::styled(parts.join(" · "), DIM))
+    Line::from(Span::styled(parts.join(" · "), DIM()))
 }
 
 /// A user turn: `❯ text` on a full-width grey bar.
 pub fn user(text: &str, w: usize) -> Vec<Line<'static>> {
-    let bg = Style::new().bg(USER_BG);
+    let bg = Style::new().bg(USER_BG());
     let mut out = Vec::new();
     for (i, para) in text.split('\n').enumerate() {
         let first = if i == 0 { vec![Span::styled("❯ ", bg)] } else { vec![Span::styled("  ", bg)] };
@@ -107,7 +107,7 @@ pub fn user(text: &str, w: usize) -> Vec<Line<'static>> {
 }
 
 pub fn plan(text: &str, w: usize) -> Vec<Line<'static>> {
-    let mut out = vec![Line::from(vec![Span::styled(" ▍", theme::fg(YELLOW)), Span::styled("Plan", theme::bold(Style::new()))])];
+    let mut out = vec![Line::from(vec![Span::styled(" ▍", theme::fg(YELLOW())), Span::styled("Plan", theme::bold(Style::new()))])];
     out.extend(markdown::render(text, w));
     out.push(Line::default());
     out.push(Line::from(dim(" /approve to run it · or keep typing to refine")));
@@ -176,7 +176,7 @@ fn result_rows(lines: &[&str], style: Style, w: usize, keep: usize) -> Vec<Line<
     for (i, l) in lines.iter().take(keep).enumerate() {
         let pre = if i == 0 { "   ⎿  " } else { "      " };
         let room = w.saturating_sub(width_of(pre));
-        out.push(Line::from(vec![Span::styled(pre, DIM), Span::styled(ellipsize(l, room), style)]));
+        out.push(Line::from(vec![Span::styled(pre, DIM()), Span::styled(ellipsize(l, room), style)]));
     }
     if lines.len() > keep {
         out.push(Line::from(dim(format!("      … +{} lines", lines.len() - keep))));
@@ -195,10 +195,10 @@ fn diff_rows(d: &Diff, w: usize) -> Vec<Line<'static>> {
     let nw = d.lines.iter().filter_map(|l| l.no).max().unwrap_or(1).to_string().len().max(3);
     for l in &d.lines {
         let (bg, sign, fg) = match l.kind {
-            '+' => (Some(theme::DIFF_ADD_BG), "+", theme::fg(GREEN)),
-            '-' => (Some(theme::DIFF_DEL_BG), "-", theme::fg(RED)),
-            '…' => (None, "…", DIM),
-            _ => (None, " ", DIM),
+            '+' => (Some(theme::DIFF_ADD_BG()), "+", theme::fg(GREEN())),
+            '-' => (Some(theme::DIFF_DEL_BG()), "-", theme::fg(RED())),
+            '…' => (None, "…", DIM()),
+            _ => (None, " ", DIM()),
         };
         let no = l.no.map(|n| format!("{n:>nw$}")).unwrap_or_else(|| " ".repeat(nw));
         let base = bg.map(|b| Style::new().bg(b)).unwrap_or_default();
@@ -206,9 +206,9 @@ fn diff_rows(d: &Diff, w: usize) -> Vec<Line<'static>> {
         let text = if l.kind == '…' { l.text.clone() } else { ellipsize(&l.text.replace('\t', "    "), room) };
         let mut line = Line::from(vec![
             sp("      "),
-            Span::styled(format!("{no} "), DIM.patch(base)),
+            Span::styled(format!("{no} "), DIM().patch(base)),
             Span::styled(format!("{sign} "), fg.patch(base)),
-            Span::styled(text, if l.kind == ' ' { DIM.patch(base) } else { base }),
+            Span::styled(text, if l.kind == ' ' { DIM().patch(base) } else { base }),
         ]);
         if bg.is_some() {
             pad_line(&mut line, w, base);
@@ -221,11 +221,11 @@ fn diff_rows(d: &Diff, w: usize) -> Vec<Line<'static>> {
 /// A finished (or interrupted) tool call: header + result summary / diff.
 pub fn tool_block(name: &str, input: &Value, content: Option<&str>, err: bool, diff: Option<&Diff>, w: usize, interrupted: bool) -> Vec<Line<'static>> {
     let dot = if interrupted {
-        DIM
+        DIM()
     } else if err {
-        theme::fg(RED)
+        theme::fg(RED())
     } else {
-        theme::fg(GREEN)
+        theme::fg(GREEN())
     };
     let mut out = vec![head(name, input, dot, w)];
     if interrupted {
@@ -235,7 +235,7 @@ pub fn tool_block(name: &str, input: &Value, content: Option<&str>, err: bool, d
     let content = content.unwrap_or("");
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     if err {
-        out.extend(result_rows(&lines, theme::fg(RED), w, 4));
+        out.extend(result_rows(&lines, theme::fg(RED()), w, 4));
         return out;
     }
     if let Some(d) = diff {
@@ -254,7 +254,7 @@ pub fn tool_block(name: &str, input: &Value, content: Option<&str>, err: bool, d
         None if lines.is_empty() => out.push(Line::from(vec![dim("   ⎿  "), dim("(no output)")])),
         None => {
             let keep = if matches!(name, "grep" | "glob" | "ls") { 3 } else { 4 };
-            out.extend(result_rows(&lines, DIM, w, keep));
+            out.extend(result_rows(&lines, DIM(), w, keep));
         }
     }
     out
@@ -377,13 +377,13 @@ pub fn context(app: &App) -> Vec<Line<'static>> {
     let pct = (used as f64 / window as f64 * 100.0).min(100.0);
     let cells = 24usize;
     let filled = ((pct / 100.0) * cells as f64).round() as usize;
-    let color = if pct > 85.0 { RED } else if pct > 60.0 { YELLOW } else { ACCENT };
+    let color = if pct > 85.0 { RED() } else if pct > 60.0 { YELLOW() } else { ACCENT() };
     vec![
         Line::from(vec![sp(" "), Span::styled("Context", theme::bold(Style::new())), dim(format!("  {}", app.model))]),
         Line::from(vec![
             sp("   "),
             Span::styled("■".repeat(filled), theme::fg(color)),
-            Span::styled("■".repeat(cells - filled), RULE),
+            Span::styled("■".repeat(cells - filled), RULE()),
             sp(format!("  {} / {} tokens", kfmt(used), kfmt(window))),
             dim(format!("  ({pct:.0}%)")),
         ]),
@@ -426,7 +426,7 @@ pub fn farewell(app: &App) -> Vec<Line<'static>> {
 /// The sign-in URL, shown in case the browser didn't open.
 pub fn login_url(url: &str, w: usize) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(vec![sp(" "), Span::styled("Sign in with ChatGPT", theme::bold(Style::new())), dim("  — finish in your browser (esc cancels)")])];
-    out.extend(wrap::wrap(&[Span::styled(url.to_string(), theme::fg(ACCENT))], w, &[dim("   ")], &[dim("   ")]));
+    out.extend(wrap::wrap(&[Span::styled(url.to_string(), theme::fg(ACCENT()))], w, &[dim("   ")], &[dim("   ")]));
     out
 }
 
@@ -435,9 +435,9 @@ pub fn shell_block(cmd: &str, output: &str, code: Option<i32>, w: usize) -> Vec<
     let ok = code == Some(0);
     let mut out = vec![Line::from(vec![
         sp(" "),
-        Span::styled("! ", theme::fg(theme::ORANGE)),
+        Span::styled("! ", theme::fg(theme::ORANGE())),
         Span::styled(ellipsize(cmd, w.saturating_sub(12)), theme::bold(Style::new())),
-        if ok { sp("") } else { Span::styled(format!("  exit {}", code.map(|c| c.to_string()).unwrap_or_else(|| "?".into())), theme::fg(RED)) },
+        if ok { sp("") } else { Span::styled(format!("  exit {}", code.map(|c| c.to_string()).unwrap_or_else(|| "?".into())), theme::fg(RED())) },
     ])];
     let lines: Vec<&str> = output.lines().collect();
     if lines.iter().all(|l| l.trim().is_empty()) {
@@ -447,7 +447,7 @@ pub fn shell_block(cmd: &str, output: &str, code: Option<i32>, w: usize) -> Vec<
     let keep = 14;
     for (i, l) in lines.iter().take(keep).enumerate() {
         let pre = if i == 0 { "   ⎿  " } else { "      " };
-        out.push(Line::from(vec![dim(pre), Span::styled(ellipsize(&l.replace('\t', "    "), w.saturating_sub(7)), DIM)]));
+        out.push(Line::from(vec![dim(pre), Span::styled(ellipsize(&l.replace('\t', "    "), w.saturating_sub(7)), DIM())]));
     }
     if lines.len() > keep {
         out.push(Line::from(dim(format!("      … +{} lines (sent with your next message)", lines.len() - keep))));
@@ -489,7 +489,7 @@ pub fn wrapped_input(input: &[char], cursor: usize, width: usize) -> (Vec<(usize
 }
 
 fn rule(w: usize) -> Line<'static> {
-    Line::from(Span::styled("─".repeat(w), RULE))
+    Line::from(Span::styled("─".repeat(w), RULE()))
 }
 
 /// Left and right halves on one row, padded apart.
@@ -527,9 +527,9 @@ fn status_line(app: &App, w: usize) -> Line<'static> {
         left.push(sp(format!(" {e}")));
     }
     match app.mode {
-        Mode::Plan => left.push(Span::styled("  plan mode", theme::fg(YELLOW))),
-        Mode::Yolo => left.push(Span::styled("  yolo", theme::fg(RED))),
-        Mode::AcceptEdits => left.push(Span::styled("  accept-edits", theme::fg(ACCENT))),
+        Mode::Plan => left.push(Span::styled("  plan mode", theme::fg(YELLOW()))),
+        Mode::Yolo => left.push(Span::styled("  yolo", theme::fg(RED()))),
+        Mode::AcceptEdits => left.push(Span::styled("  accept-edits", theme::fg(ACCENT()))),
         Mode::Agent => {}
     }
     let first = app.input.first().copied();
@@ -593,10 +593,10 @@ fn menu_row(on: bool, label: String, col: usize, desc: String, w: usize) -> Line
     let gap = col.saturating_sub(2 + width_of(&lab));
     let desc = ellipsize(&desc, w.saturating_sub(col + 1));
     Line::from(vec![
-        if on { Span::styled("○ ", theme::fg(ACCENT)) } else { sp("  ") },
+        if on { Span::styled("○ ", theme::fg(ACCENT())) } else { sp("  ") },
         Span::styled(lab, if on { theme::bold(Style::new()) } else { Style::new() }),
         sp(" ".repeat(gap)),
-        Span::styled(desc, if on { Style::new() } else { DIM }),
+        Span::styled(desc, if on { Style::new() } else { DIM() }),
     ])
 }
 
@@ -651,7 +651,7 @@ fn file_rows(app: &App, sel: usize, w: usize) -> Vec<Line<'static>> {
                 None => (String::new(), p.clone()),
             };
             Line::from(vec![
-                if on { Span::styled("○ ", theme::fg(ACCENT)) } else { sp("  ") },
+                if on { Span::styled("○ ", theme::fg(ACCENT())) } else { sp("  ") },
                 Span::styled(ellipsize(&name, w / 2), if on { theme::bold(Style::new()) } else { Style::new() }),
                 dim(format!("  {}", ellipsize(&dir, w.saturating_sub(width_of(&name) + 6)))),
             ])
@@ -698,13 +698,13 @@ pub fn connect_order(q: &str) -> Vec<usize> {
 
 fn bars(level: usize, on: bool) -> Vec<Span<'static>> {
     let n = EFFORTS.len() - 1;
-    let lit = if on { ACCENT_BOLD } else { Style::new() };
-    vec![Span::styled("■".repeat(level), lit), Span::styled("■".repeat(n - level), RULE)]
+    let lit = if on { ACCENT_BOLD() } else { Style::new() };
+    vec![Span::styled("■".repeat(level), lit), Span::styled("■".repeat(n - level), RULE())]
 }
 
 /// Search box shared by the pickers: `/ Type to search` between rules.
 fn search_box(q: &str, placeholder: &str, w: usize) -> (Vec<Line<'static>>, (u16, u16)) {
-    let search = if q.is_empty() { vec![dim("/ "), Span::styled(placeholder.to_string(), GHOST)] } else { vec![dim("/ "), sp(q.to_string())] };
+    let search = if q.is_empty() { vec![dim("/ "), Span::styled(placeholder.to_string(), GHOST())] } else { vec![dim("/ "), sp(q.to_string())] };
     (vec![rule(w), Line::from(search), rule(w)], (1, 2 + width_of(q) as u16))
 }
 
@@ -720,18 +720,18 @@ fn model_picker(app: &App, filter: &[char], sel: usize, effort: usize, w: usize)
     for (vi, &mi) in order.iter().enumerate().skip(top).take(MODEL_ROWS) {
         let m = &app.models[mi];
         let on = vi == sel;
-        let mut spans = vec![if on { Span::styled("❯ ", ACCENT_BOLD) } else { dim("· ") }];
+        let mut spans = vec![if on { Span::styled("❯ ", ACCENT_BOLD()) } else { dim("· ") }];
         let name = ellipsize(&m.name, nw - 1);
         let pad = nw - width_of(&name);
-        spans.push(Span::styled(name, if on { ACCENT_BOLD } else { Style::new() }));
+        spans.push(Span::styled(name, if on { ACCENT_BOLD() } else { Style::new() }));
         spans.push(sp(" ".repeat(pad)));
-        spans.push(if m.alias == app.alias { Span::styled("✱ ", theme::fg(GREEN)) } else { sp("  ") });
+        spans.push(if m.alias == app.alias { Span::styled("✱ ", theme::fg(GREEN())) } else { sp("  ") });
         if m.effort_ok {
-            spans.push(if on { Span::styled("← ", theme::fg(ACCENT)) } else { sp("  ") });
+            spans.push(if on { Span::styled("← ", theme::fg(ACCENT())) } else { sp("  ") });
             spans.extend(bars(if on { effort } else { app.effort }, on));
-            spans.push(if on { Span::styled(" → ", theme::fg(ACCENT)) } else { sp("   ") });
+            spans.push(if on { Span::styled(" → ", theme::fg(ACCENT())) } else { sp("   ") });
             let lvl = EFFORTS[if on { effort } else { app.effort }].0;
-            spans.push(Span::styled(format!("{lvl:<8}"), if on { theme::fg(ACCENT) } else { DIM }));
+            spans.push(Span::styled(format!("{lvl:<8}"), if on { theme::fg(ACCENT()) } else { DIM() }));
         } else {
             spans.push(sp(" ".repeat(2 + EFFORTS.len() - 1 + 3 + 8)));
         }
@@ -746,8 +746,8 @@ fn model_picker(app: &App, filter: &[char], sel: usize, effort: usize, w: usize)
     if order.len() >= top && order.len() < top + MODEL_ROWS {
         let on = sel == order.len();
         out.push(Line::from(vec![
-            if on { Span::styled("❯ ", ACCENT_BOLD) } else { dim("+ ") },
-            Span::styled("Connect a provider…", if on { ACCENT_BOLD } else { DIM }),
+            if on { Span::styled("❯ ", ACCENT_BOLD()) } else { dim("+ ") },
+            Span::styled("Connect a provider…", if on { ACCENT_BOLD() } else { DIM() }),
             dim("  API key or ChatGPT sign-in"),
         ]));
     }
@@ -764,7 +764,7 @@ fn model_picker(app: &App, filter: &[char], sel: usize, effort: usize, w: usize)
             } else {
                 " · no quota consumed"
             };
-            vec![sp("  "), Span::styled(" FREE ", Style::new().fg(ratatui_core::style::Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)), dim(what)]
+            vec![sp("  "), Span::styled(" FREE ", Style::new().fg(crate::skin::palette().badge_fg).bg(ACCENT()).add_modifier(Modifier::BOLD)), dim(what)]
         } else {
             vec![sp("  "), sp(format!("${:.2} in · ${:.2} out", m.price.input, m.price.output)), dim(" per 1M tokens")]
         };
@@ -774,7 +774,7 @@ fn model_picker(app: &App, filter: &[char], sel: usize, effort: usize, w: usize)
         out.push(Line::from(dim("  30 providers: OpenAI, Anthropic, Google, xAI, Meta, MiMo, Qwen, Kimi, GLM, MiniMax, DeepSeek, Mistral…")));
     }
     out.push(Line::default());
-    out.push(Line::from(vec![sp("  "), Span::styled("✱ Current", theme::fg(GREEN)), sp("   "), Span::styled("■ Effort", theme::fg(ACCENT)), sp("   "), Span::styled("+ Connect", DIM)]));
+    out.push(Line::from(vec![sp("  "), Span::styled("✱ Current", theme::fg(GREEN())), sp("   "), Span::styled("■ Effort", theme::fg(ACCENT())), sp("   "), Span::styled("+ Connect", DIM())]));
     out.push(Line::default());
     out.push(Line::from(dim("↑↓ select · ↔ reasoning effort · ↵ confirm · esc cancel")));
     (out, cursor)
@@ -797,25 +797,25 @@ fn connect_picker(filter: &[char], sel: usize, w: usize) -> (Vec<Line<'static>>,
             "chatgpt" => match zcore::chatgpt::load() {
                 Some(t) => Span::styled(
                     format!("✓ signed in{}", t.email.map(|e| format!(" as {e}")).unwrap_or_default()),
-                    theme::fg(GREEN),
+                    theme::fg(GREEN()),
                 ),
                 None => dim("sign in"),
             },
             "acp" => {
                 if zcore::acp_client::installed(&p.id) {
-                    Span::styled("✓ CLI installed", theme::fg(GREEN))
+                    Span::styled("✓ CLI installed", theme::fg(GREEN()))
                 } else {
                     dim("not installed")
                 }
             }
             _ => match zcore::creds::key_for(&p.id, &p.env) {
-                Some((k, src)) => Span::styled(format!("✓ {} · {}", zcore::creds::mask(&k), src.label()), theme::fg(GREEN)),
+                Some((k, src)) => Span::styled(format!("✓ {} · {}", zcore::creds::mask(&k), src.label()), theme::fg(GREEN())),
                 None => dim(format!("{} models", p.models.len())),
             },
         };
         out.push(Line::from(vec![
-            if on { Span::styled("❯ ", ACCENT_BOLD) } else { dim("· ") },
-            Span::styled(format!("{:<30}", ellipsize(&p.name, 29)), if on { ACCENT_BOLD } else { Style::new() }),
+            if on { Span::styled("❯ ", ACCENT_BOLD()) } else { dim("· ") },
+            Span::styled(format!("{:<30}", ellipsize(&p.name, 29)), if on { ACCENT_BOLD() } else { Style::new() }),
             status,
         ]));
     }
@@ -847,8 +847,8 @@ fn resume_picker(items: &[(String, String, String)], sel: usize, w: usize) -> Ve
         let on = i == sel;
         let when = started.get(..16).unwrap_or(started).replace('T', " ");
         out.push(Line::from(vec![
-            if on { Span::styled("❯ ", ACCENT_BOLD) } else { dim("· ") },
-            Span::styled(ellipsize(&preview.replace('\n', " "), w.saturating_sub(24)), if on { ACCENT_BOLD } else { Style::new() }),
+            if on { Span::styled("❯ ", ACCENT_BOLD()) } else { dim("· ") },
+            Span::styled(ellipsize(&preview.replace('\n', " "), w.saturating_sub(24)), if on { ACCENT_BOLD() } else { Style::new() }),
             dim(format!("  {when}")),
         ]));
     }
@@ -863,7 +863,7 @@ fn resume_picker(items: &[(String, String, String)], sel: usize, w: usize) -> Ve
 fn perm_prompt(p: &Perm, w: usize) -> Vec<Line<'static>> {
     let label = tool_label(&p.tool);
     let mut out = vec![rule(w)];
-    let mut head = vec![Span::styled(" ! ", theme::fg(YELLOW)), Span::styled(format!("Allow {label}?"), theme::bold(Style::new()))];
+    let mut head = vec![Span::styled(" ! ", theme::fg(YELLOW())), Span::styled(format!("Allow {label}?"), theme::bold(Style::new()))];
     if !p.detail.is_empty() {
         head.push(dim(format!("  {}", ellipsize(&p.detail, w.saturating_sub(width_of(&label) + 12)))));
     }
@@ -877,9 +877,9 @@ fn perm_prompt(p: &Perm, w: usize) -> Vec<Line<'static>> {
     for (i, o) in opts.iter().enumerate() {
         let on = i == p.sel;
         out.push(Line::from(vec![
-            if on { Span::styled("❯ ", ACCENT_BOLD) } else { sp("  ") },
+            if on { Span::styled("❯ ", ACCENT_BOLD()) } else { sp("  ") },
             dim(format!("{}. ", i + 1)),
-            Span::styled(o.clone(), if on { ACCENT_BOLD } else { Style::new() }),
+            Span::styled(o.clone(), if on { ACCENT_BOLD() } else { Style::new() }),
         ]));
     }
     out.push(Line::default());
@@ -892,13 +892,13 @@ fn recorder_row(app: &App, tick: usize) -> Line<'static> {
     let Some(rec) = &app.rec else { return Line::default() };
     if rec.transcribing {
         return Line::from(vec![
-            Span::styled(format!("{} ", SPINNER[tick % SPINNER.len()]), theme::fg(ACCENT)),
-            Span::styled(format!("Transcribing with {}…", rec.backend.label()), theme::fg(ACCENT)),
+            Span::styled(format!("{} ", SPINNER[tick % SPINNER.len()]), theme::fg(ACCENT())),
+            Span::styled(format!("Transcribing with {}…", rec.backend.label()), theme::fg(ACCENT())),
         ]);
     }
     if !rec.live {
         return Line::from(vec![
-            Span::styled(format!("{} ", SPINNER[tick % SPINNER.len()]), theme::fg(ACCENT)),
+            Span::styled(format!("{} ", SPINNER[tick % SPINNER.len()]), theme::fg(ACCENT())),
             Span::styled("Starting the microphone…", theme::bold(Style::new())),
             dim("   esc cancel"),
         ]);
@@ -908,9 +908,9 @@ fn recorder_row(app: &App, tick: usize) -> Line<'static> {
     let secs = rec.started.elapsed().as_secs();
     let blink = (rec.started.elapsed().as_millis() / 500) % 2 == 0;
     Line::from(vec![
-        Span::styled(if blink { "● " } else { "○ " }, theme::fg(RED)),
+        Span::styled(if blink { "● " } else { "○ " }, theme::fg(RED())),
         Span::styled("Recording ", theme::bold(Style::new())),
-        Span::styled(format!("{meter:<24}"), theme::fg(ACCENT)),
+        Span::styled(format!("{meter:<24}"), theme::fg(ACCENT())),
         dim(format!(" {}:{:02}   ctrl+space again to stop and transcribe · esc cancel", secs / 60, secs % 60)),
     ])
 }
@@ -935,7 +935,7 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
     // tools in flight
     for t in &app.tools {
         let mut l = head(&t.name, &t.input, Style::new(), w);
-        l.spans[1] = Span::styled(format!("{} ", SPINNER[tick % SPINNER.len()]), theme::fg(ACCENT));
+        l.spans[1] = Span::styled(format!("{} ", SPINNER[tick % SPINNER.len()]), theme::fg(ACCENT()));
         if out.is_empty() && !app.last_out_blank() {
             out.push(Line::default());
         }
@@ -947,7 +947,7 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
         }
         out.push(Line::from(vec![
             sp(" "),
-            Span::styled(format!("{} ", SPINNER[tick % SPINNER.len()]), theme::fg(theme::ORANGE)),
+            Span::styled(format!("{} ", SPINNER[tick % SPINNER.len()]), theme::fg(theme::ORANGE())),
             Span::styled(format!("! {}", ellipsize(&job.cmd, w.saturating_sub(8))), theme::bold(Style::new())),
         ]));
     }
@@ -967,8 +967,8 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
         out.push(Line::default());
         out.push(Line::from(vec![
             sp(" "),
-            Span::styled(format!("{} ", TWINKLE[tick % TWINKLE.len()]), theme::fg(ACCENT)),
-            Span::styled(format!("{verb}…"), Style::new().fg(ACCENT)),
+            Span::styled(format!("{} ", TWINKLE[tick % TWINKLE.len()]), theme::fg(ACCENT())),
+            Span::styled(format!("{verb}…"), Style::new().fg(ACCENT())),
             dim(format!(" ({meta} · esc to interrupt)")),
         ]));
     }
@@ -1020,9 +1020,9 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
     const MAX_INPUT: usize = 10;
     let skip = (crow + 1).saturating_sub(MAX_INPUT);
     let (glyph, glyph_style) = match (app.key_entry.is_some(), app.input.first()) {
-        (true, _) => ("⚿ ", theme::fg(ACCENT)),
-        (_, Some('!')) => ("! ", theme::fg(theme::ORANGE)),
-        (_, Some('#')) => ("# ", theme::fg(ACCENT)),
+        (true, _) => ("⚿ ", theme::fg(ACCENT())),
+        (_, Some('!')) => ("! ", theme::fg(theme::ORANGE())),
+        (_, Some('#')) => ("# ", theme::fg(ACCENT())),
         _ => ("❯ ", Style::new()),
     };
     let mut cursor = None;
@@ -1033,7 +1033,7 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
             Some(k) => format!("Paste your {} API key", k.name),
             None => PLACEHOLDER.to_string(),
         };
-        out.push(Line::from(vec![Span::styled(glyph, glyph_style), Span::styled(ph, GHOST)]));
+        out.push(Line::from(vec![Span::styled(glyph, glyph_style), Span::styled(ph, GHOST())]));
         cursor = Some((input_top as u16, 2));
     } else {
         let ghost = match (&app.popup, app.slash_state()) {
@@ -1050,7 +1050,7 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
             spans.push(sp(body));
             if i + 1 == vis.len() {
                 if let Some(g) = &ghost {
-                    spans.push(Span::styled(g.clone(), GHOST));
+                    spans.push(Span::styled(g.clone(), GHOST()));
                 }
             }
             out.push(Line::from(spans));
@@ -1086,6 +1086,100 @@ mod tests {
 
     fn text(l: &Line<'_>) -> String {
         l.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    /// Deterministic screens covering every styled surface. Rendered with
+    /// their exact styles so a theme refactor can prove it changed nothing.
+    pub(crate) fn golden_screens() -> Vec<(&'static str, Vec<Line<'static>>)> {
+        use crate::tui::ModelRow;
+        let w = 96;
+        let free = zproto::Prices::default();
+        let paid = zproto::Prices { input: 3.0, cache_read: 0.3, cache_write: 3.75, output: 15.0 };
+        let m = |a: &str, p: &str, id: &str, c: u64, price: zproto::Prices, e: bool| ModelRow {
+            alias: a.into(), provider: p.into(), id: id.into(), name: a.into(), context: c, price, effort_ok: e,
+        };
+        let mut app = App::new(
+            std::path::Path::new("/work/zeron"),
+            vec![m("r9", "router9", "kr/claude-sonnet-4.5", 200_000, free, true), m("sonnet", "anthropic", "claude-sonnet-5", 200_000, paid, false)],
+            w,
+        );
+        app.alias = "r9".into();
+        app.model = "r9 (kr/claude-sonnet-4.5)".into();
+        app.session = "01k5zq8m3v".into();
+        let md = "# Title\n## Sub\n### Third\nPlain **bold** _it_ `code` ~~gone~~ [docs](https://x.dev)\n\n- one\n  - nested\n- [ ] todo\n- [x] done\n1. first\n\n> quoted line\n\n---\n\n```rust\nfn main() { let s = \"hi\"; // note\n}\n```\n\n| name | n |\n|------|---|\n| alpha | 1 |\n";
+        let d = crate::worker::Diff {
+            path: "src/a.rs".into(),
+            added: 1,
+            removed: 1,
+            created: false,
+            lines: vec![
+                DiffLine { kind: ' ', no: Some(1), text: "fn a() {".into() },
+                DiffLine { kind: '-', no: Some(2), text: "    old();".into() },
+                DiffLine { kind: '+', no: Some(2), text: "    new();".into() },
+                DiffLine { kind: '…', no: None, text: String::new() },
+            ],
+        };
+        let mut out = vec![
+            ("banner", crate::logo::banner("cosmos", "v0.1.0")),
+            ("info", vec![info_line(&app)]),
+            ("user", user("Hello what can you do", w)),
+            ("markdown", markdown::render(md, w)),
+            ("tool ok", tool_block("bash", &serde_json::json!({"command": "cargo test"}), Some("running 32 tests\ntest result: ok"), false, None, w, false)),
+            ("tool err", tool_block("read", &serde_json::json!({"path": "x.rs"}), Some("ERROR: missing"), true, None, w, false)),
+            ("tool interrupted", tool_block("grep", &serde_json::json!({"pattern": "foo"}), None, false, None, w, true)),
+            ("diff", tool_block("edit", &serde_json::json!({"path": "src/a.rs"}), Some("ok"), false, Some(&d), w, false)),
+            ("shell", shell_block("ls", "a\nb", Some(0), w)),
+        ];
+        out.push(("live main", live(&app).0));
+        app.input = "/".chars().collect();
+        app.cursor = 1;
+        app.popup = Some(Popup::Slash { sel: 0 });
+        out.push(("slash", live(&app).0));
+        app.input.clear();
+        app.cursor = 0;
+        app.popup = Some(Popup::Model { filter: vec![], sel: 0, effort: 3 });
+        out.push(("model picker", live(&app).0));
+        out
+    }
+
+    fn golden_text() -> String {
+        golden_screens()
+            .into_iter()
+            .map(|(name, lines)| format!("## {name}\n{}", lines.iter().map(|l| format!("{l:?}\n")).collect::<String>()))
+            .collect()
+    }
+
+    #[test]
+    fn every_theme_renders_every_screen() {
+        for t in crate::skin::palette::THEMES {
+            let p = crate::skin::palette::builtin(t).unwrap();
+            let screens = crate::skin::scoped(p, golden_screens);
+            assert!(screens.iter().all(|(_, l)| !l.is_empty()), "{t}");
+        }
+        // a theme really changes the colours
+        let block = || format!("{:?}", tool_block("read", &serde_json::json!({}), Some("x"), true, None, 60, false));
+        assert_ne!(crate::skin::scoped(crate::skin::palette::CLASSIC, block), crate::skin::scoped(crate::skin::palette::NEBULA, block));
+    }
+
+    /// The `classic` theme must render exactly what cosmostui rendered before
+    /// themes existed. `UPDATE_GOLDEN=1` re-records the file.
+    #[test]
+    fn classic_matches_golden() {
+        let _env = crate::env_lock();
+        std::env::set_var("COSMOS_CLI_HOME", std::env::temp_dir().join("cosmos-golden-test"));
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/classic.txt");
+        let got = crate::skin::scoped(crate::skin::palette::CLASSIC, golden_text);
+        if std::env::var_os("UPDATE_GOLDEN").is_some() || !path.exists() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &got).unwrap();
+            return;
+        }
+        let want = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
+        if got != want {
+            let (g, w): (Vec<&str>, Vec<&str>) = (got.lines().collect(), want.lines().collect());
+            let i = g.iter().zip(&w).position(|(a, b)| a != b).unwrap_or(g.len().min(w.len()));
+            panic!("classic render changed at line {i}:\n got: {}\nwant: {}", g.get(i).unwrap_or(&""), w.get(i).unwrap_or(&""));
+        }
     }
 
     #[test]

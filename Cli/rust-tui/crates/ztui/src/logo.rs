@@ -7,7 +7,7 @@
 
 use std::sync::OnceLock;
 
-use ratatui_core::style::{Color, Modifier, Style};
+use ratatui_core::style::{Modifier, Style};
 use ratatui_core::text::{Line, Span};
 
 pub const COLS: usize = 12;
@@ -90,11 +90,11 @@ fn grid() -> &'static Vec<Vec<Cell>> {
 
 pub(crate) fn shade(lum: f32) -> Style {
     if lum > 1.0 {
-        Style::new().fg(Color::Rgb(0xf4, 0xf4, 0xf4)).add_modifier(Modifier::BOLD)
+        Style::new().fg(crate::skin::palette().logo_bright).add_modifier(Modifier::BOLD)
     } else if lum > 0.55 {
-        Style::new().fg(Color::Rgb(0xc4, 0xc4, 0xc4))
+        Style::new().fg(crate::skin::palette().logo_mid)
     } else {
-        Style::new().fg(Color::Rgb(0x7c, 0x7c, 0x7c))
+        Style::new().fg(crate::skin::palette().logo_dim)
     }
 }
 
@@ -115,7 +115,7 @@ pub fn banner(name: &str, version: &str) -> Vec<Line<'static>> {
         spans.push(Span::raw("   "));
         match r {
             1 => spans.push(Span::raw(name.to_string())),
-            2 => spans.push(Span::styled(version.to_string(), crate::theme::DIM)),
+            2 => spans.push(Span::styled(version.to_string(), crate::theme::DIM())),
             _ => {}
         }
         out.push(Line::from(spans));

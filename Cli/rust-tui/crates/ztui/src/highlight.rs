@@ -8,24 +8,29 @@
 use ratatui_core::style::{Color, Modifier, Style};
 use ratatui_core::text::Span;
 
-pub(crate) const BASE: Color = Color::Rgb(0xd4, 0xd4, 0xd4);
+/// Plain code text in the current theme.
+#[cfg_attr(not(feature = "highlight"), allow(dead_code))]
+pub(crate) fn base() -> Color {
+    crate::skin::palette().syn_base
+}
 
 pub(crate) fn style_for(name: &str) -> Style {
-    let c = |r, g, b| Style::new().fg(Color::Rgb(r, g, b));
+    let p = crate::skin::palette();
+    let c = |col: Color| Style::new().fg(col);
     match name {
-        "comment" => c(0x6a, 0x73, 0x7d).add_modifier(Modifier::ITALIC),
-        "keyword" | "label" => c(0xc6, 0x8f, 0xf2),
-        "string" | "string.special" => c(0x9e, 0xce, 0x6a),
-        "string.escape" | "escape" => c(0x89, 0xdd, 0xff),
-        "number" | "boolean" | "constant" | "constant.builtin" => c(0xff, 0x9e, 0x64),
-        "function" | "function.method" | "function.builtin" | "function.macro" => c(0x7a, 0xa2, 0xf7),
-        "type" | "type.builtin" | "constructor" | "module" => c(0x2a, 0xc3, 0xde),
-        "tag" => c(0xf7, 0x76, 0x8e),
-        "attribute" | "property" => c(0x73, 0xda, 0xca),
-        "operator" => c(0x89, 0xdd, 0xff),
-        "variable.builtin" | "variable.parameter" => c(0xe0, 0xaf, 0x68),
-        n if n.starts_with("punctuation") => c(0x9a, 0xa5, 0xb8),
-        _ => Style::new().fg(BASE),
+        "comment" => c(p.syn_comment).add_modifier(Modifier::ITALIC),
+        "keyword" | "label" => c(p.syn_keyword),
+        "string" | "string.special" => c(p.syn_string),
+        "string.escape" | "escape" => c(p.syn_escape),
+        "number" | "boolean" | "constant" | "constant.builtin" => c(p.syn_number),
+        "function" | "function.method" | "function.builtin" | "function.macro" => c(p.syn_function),
+        "type" | "type.builtin" | "constructor" | "module" => c(p.syn_type),
+        "tag" => c(p.syn_tag),
+        "attribute" | "property" => c(p.syn_attribute),
+        "operator" => c(p.syn_operator),
+        "variable.builtin" | "variable.parameter" => c(p.syn_variable),
+        n if n.starts_with("punctuation") => c(p.syn_punct),
+        _ => Style::new().fg(p.syn_base),
     }
 }
 

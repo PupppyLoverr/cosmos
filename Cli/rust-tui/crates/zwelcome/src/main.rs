@@ -905,7 +905,7 @@ impl Ob {
     }
 
     fn flash(&mut self, s: impl Into<String>, ok: bool) {
-        self.status = Some((s.into(), if ok { kit::fg(GREEN) } else { kit::fg(RED) }, Instant::now()));
+        self.status = Some((s.into(), if ok { kit::fg(GREEN()) } else { kit::fg(RED()) }, Instant::now()));
     }
 
     fn secs(&self) -> f32 {
@@ -1008,7 +1008,7 @@ impl Ob {
         blit(c, &grid);
         if t > 0.6 {
             let hint = "any key to skip";
-            c.text(w.saturating_sub(width_of(hint) + 2), h.saturating_sub(2), hint, GHOST);
+            c.text(w.saturating_sub(width_of(hint) + 2), h.saturating_sub(2), hint, GHOST());
         }
     }
 
@@ -1052,7 +1052,7 @@ impl Ob {
             let n = ((t - 1.3) / 0.012) as usize;
             let y = self.gy + self.art_rows + 1;
             let x = w.saturating_sub(width_of(SUBTITLE)) / 2;
-            c.text(x, y, &SUBTITLE.chars().take(n).collect::<String>(), DIM);
+            c.text(x, y, &SUBTITLE.chars().take(n).collect::<String>(), DIM());
         }
     }
 
@@ -1082,17 +1082,17 @@ impl Ob {
     /// "✶ cosmos" on the left, the step you're on at the right.
     fn draw_header(&self, c: &mut Canvas, step: usize) {
         c.clear(0, 0, c.w, 3);
-        c.text(3, 1, "✶ ", kit::fg(ACCENT));
+        c.text(3, 1, "✶ ", kit::fg(ACCENT()));
         c.text(5, 1, "cosmos", kit::bold(Style::new()));
         let mut spans: Vec<Span> = Vec::new();
         for (i, s) in STEPS.iter().enumerate() {
             if i > 0 {
-                spans.push(Span::styled(" ─ ", RULE));
+                spans.push(Span::styled(" ─ ", RULE()));
             }
             spans.push(match i.cmp(&step) {
-                std::cmp::Ordering::Less => Span::styled(format!("✓ {s}"), kit::fg(GREEN)),
-                std::cmp::Ordering::Equal => Span::styled(s.to_string(), ACCENT_BOLD),
-                std::cmp::Ordering::Greater => Span::styled(s.to_string(), DIM),
+                std::cmp::Ordering::Less => Span::styled(format!("✓ {s}"), kit::fg(GREEN())),
+                std::cmp::Ordering::Equal => Span::styled(s.to_string(), ACCENT_BOLD()),
+                std::cmp::Ordering::Greater => Span::styled(s.to_string(), DIM()),
             });
         }
         let sw: usize = spans.iter().map(|s| width_of(&s.content)).sum();
@@ -1105,7 +1105,7 @@ impl Ob {
     fn draw_footer(&self, c: &mut Canvas, hint: &str) {
         let y = c.h.saturating_sub(2);
         c.clear(0, y, c.w, 1);
-        c.center(y, &[Span::styled(hint.to_string(), DIM)]);
+        c.center(y, &[Span::styled(hint.to_string(), DIM())]);
     }
 
     fn draw_status(&self, c: &mut Canvas, x: usize, y: usize, w: usize) {
@@ -1134,7 +1134,7 @@ impl Ob {
             let v = 200.0 + 55.0 * (-d * d).exp();
             c.set(self.gx + x, self.gy + y, ch, kit::bold(Style::new().fg(gray(v as u8))));
         }
-        c.center(self.gy + self.art_rows + 1, &[Span::styled(SUBTITLE, DIM)]);
+        c.center(self.gy + self.art_rows + 1, &[Span::styled(SUBTITLE, DIM())]);
     }
 
     fn draw_name(&mut self, c: &mut Canvas) -> Option<(usize, usize)> {
@@ -1146,9 +1146,9 @@ impl Ob {
         c.clear(x, y, bw, 4);
         c.center(y, &[Span::styled(QUESTION, kit::bold(Style::new()))]);
         let text: String = self.name.iter().collect();
-        c.text(x, y + 2, "❯ ", ACCENT_BOLD);
+        c.text(x, y + 2, "❯ ", ACCENT_BOLD());
         c.text(x + 2, y + 2, &text, Style::new());
-        c.text(x, y + 3, &"─".repeat(bw), RULE);
+        c.text(x, y + 3, &"─".repeat(bw), RULE());
         self.draw_footer(c, "enter to continue · esc to skip");
         let col = x + 2 + width_of(&self.name[..self.nc].iter().collect::<String>());
         Some((col.min(self.w.saturating_sub(1)), y + 2))
@@ -1175,13 +1175,13 @@ impl Ob {
         c.text(x, top, "Bring your own keys", kit::bold(Style::new()));
         if n > 0 {
             let s = format!("{n} connected");
-            c.text(x + cw.saturating_sub(width_of(&s)), top, &s, kit::fg(GREEN));
+            c.text(x + cw.saturating_sub(width_of(&s)), top, &s, kit::fg(GREEN()));
         }
         c.text(
             x,
             top + 1,
             &kit::ellipsize("Keys stay on this machine, in your OS keychain. Connect as many as you like.", cw),
-            DIM,
+            DIM(),
         );
 
         if let Some(o) = &self.oauth {
@@ -1189,11 +1189,11 @@ impl Ob {
             c.spans(
                 x,
                 y,
-                &[Span::styled(format!("{} ", self.spinner()), kit::fg(ACCENT)), Span::raw("Signing in with ChatGPT — finish in your browser")],
+                &[Span::styled(format!("{} ", self.spinner()), kit::fg(ACCENT())), Span::raw("Signing in with ChatGPT — finish in your browser")],
             );
             if let Some(u) = &o.url {
-                c.text(x + 2, y + 2, "If it didn't open, visit:", DIM);
-                c.text(x + 2, y + 3, u, kit::fg(ACCENT));
+                c.text(x + 2, y + 2, "If it didn't open, visit:", DIM());
+                c.text(x + 2, y + 3, u, kit::fg(ACCENT()));
             }
             self.draw_footer(c, "esc cancel");
             return None;
@@ -1203,18 +1203,18 @@ impl Ob {
             let p = &self.provs[i];
             let y = top + 4;
             c.text(x, y, &format!("{} API key", p.name), kit::bold(Style::new()));
-            c.text(x, y + 1, "Paste or type it — it's hidden as you type.", DIM);
-            c.text(x, y + 3, "❯ ", ACCENT_BOLD);
+            c.text(x, y + 1, "Paste or type it — it's hidden as you type.", DIM());
+            c.text(x, y + 3, "❯ ", ACCENT_BOLD());
             let dots = "•".repeat(self.key_buf.len().min(cw.saturating_sub(4)));
             c.text(x + 2, y + 3, &dots, Style::new());
-            c.text(x, y + 4, &"─".repeat(cw.min(64)), RULE);
+            c.text(x, y + 4, &"─".repeat(cw.min(64)), RULE());
             let mut yy = y + 6;
             if !p.key_url.is_empty() {
-                c.spans(x, yy, &[Span::styled("get one at ", DIM), Span::styled(p.key_url, kit::fg(ACCENT))]);
+                c.spans(x, yy, &[Span::styled("get one at ", DIM()), Span::styled(p.key_url, kit::fg(ACCENT()))]);
                 yy += 1;
             }
             if let Some(e) = p.def.env.first() {
-                c.text(x, yy, &format!("or set {e} in your environment"), DIM);
+                c.text(x, yy, &format!("or set {e} in your environment"), DIM());
             }
             self.draw_status(c, x, yy + 2, cw);
             self.draw_footer(c, "enter save · esc back");
@@ -1223,13 +1223,13 @@ impl Ob {
 
         let q: String = self.filter.iter().collect();
         let fy = top + 3;
-        c.text(x, fy, "/ ", DIM);
+        c.text(x, fy, "/ ", DIM());
         if q.is_empty() {
-            c.text(x + 2, fy, &format!("Type to search {} providers", self.provs.len()), GHOST);
+            c.text(x + 2, fy, &format!("Type to search {} providers", self.provs.len()), GHOST());
         } else {
             c.text(x + 2, fy, &q, Style::new());
         }
-        c.text(x, fy + 1, &"─".repeat(cw), RULE);
+        c.text(x, fy + 1, &"─".repeat(cw), RULE());
 
         let order = self.prov_order();
         let items = order.len() + 1; // + continue row
@@ -1241,14 +1241,14 @@ impl Ob {
         for (r, vi) in (first..items.min(first + rows)).enumerate() {
             let y = list_y + r;
             let on = vi == self.sel;
-            c.text(x, y, if on { "❯ " } else { "  " }, ACCENT_BOLD);
+            c.text(x, y, if on { "❯ " } else { "  " }, ACCENT_BOLD());
             if vi == order.len() {
                 let label = if self.model.is_some() || !self.keyed.is_empty() { "Continue →" } else { "Skip for now →" };
-                c.text(x + 2, y, label, if on { ACCENT_BOLD } else { DIM });
+                c.text(x + 2, y, label, if on { ACCENT_BOLD() } else { DIM() });
                 continue;
             }
             let p = &self.provs[order[vi]];
-            c.text(x + 2, y, &kit::ellipsize(&p.name, name_w - 2), if on { ACCENT_BOLD } else { Style::new() });
+            c.text(x + 2, y, &kit::ellipsize(&p.name, name_w - 2), if on { ACCENT_BOLD() } else { Style::new() });
             // right side: connection and the model chosen for it
             let right = if let Some(m) = self.chosen.get(&p.def.id) {
                 let alias = format!("{}/{m}", p.def.id);
@@ -1265,16 +1265,16 @@ impl Ob {
             };
             let rw = width_of(&right).min(cw / 2);
             let pitch_w = cw.saturating_sub(2 + name_w + rw + 2);
-            c.text(x + 2 + name_w, y, &kit::ellipsize(&p.pitch, pitch_w), DIM);
+            c.text(x + 2 + name_w, y, &kit::ellipsize(&p.pitch, pitch_w), DIM());
             if rw > 0 {
-                c.text(x + cw - rw, y, &kit::ellipsize(&right, rw), kit::fg(GREEN));
+                c.text(x + cw - rw, y, &kit::ellipsize(&right, rw), kit::fg(GREEN()));
             }
         }
         let below = items.saturating_sub(first + rows);
         let by = list_y + rows;
-        c.text(x, by, &"─".repeat(cw), RULE);
+        c.text(x, by, &"─".repeat(cw), RULE());
         if below > 0 {
-            c.text(x + 2, by, &format!(" ↓ {below} more "), DIM);
+            c.text(x + 2, by, &format!(" ↓ {below} more "), DIM());
         }
         self.draw_status(c, x, by + 1, cw);
         self.draw_footer(c, "↑↓ choose · enter connect or pick a model · type to search · esc continue");
@@ -1392,7 +1392,7 @@ impl Ob {
             c.spans(
                 x,
                 top + 1,
-                &[Span::styled(format!("{spin} "), kit::fg(ACCENT)), Span::styled(format!("fetching live models from {}…", p.def.host()), DIM)],
+                &[Span::styled(format!("{spin} "), kit::fg(ACCENT())), Span::styled(format!("fetching live models from {}…", p.def.host()), DIM())],
             );
             self.draw_status(c, x, top + 3, cw);
             self.draw_footer(c, "esc back");
@@ -1402,14 +1402,14 @@ impl Ob {
             x,
             top + 1,
             &kit::ellipsize(&format!("{} · the one you pick becomes your default", pk.source), cw),
-            if pk.live { DIM } else { kit::fg(RED) },
+            if pk.live { DIM() } else { kit::fg(RED()) },
         );
 
         let q: String = pk.filter.iter().collect();
         let fy = top + 3;
-        c.text(x, fy, "/ ", DIM);
+        c.text(x, fy, "/ ", DIM());
         if q.is_empty() {
-            c.text(x + 2, fy, &format!("Type to search {} models", pk.models.len()), GHOST);
+            c.text(x + 2, fy, &format!("Type to search {} models", pk.models.len()), GHOST());
         } else {
             c.text(x + 2, fy, &q, Style::new());
         }
@@ -1417,10 +1417,10 @@ impl Ob {
         let (ctx_w, price_w) = (7, 17);
         let id_w = cw.saturating_sub(2 + ctx_w + price_w + 4);
         let (cx_ctx, cx_price) = (x + 2 + id_w + 2, x + 2 + id_w + 4 + ctx_w);
-        c.text(x + 2, fy + 1, "model", DIM);
-        c.text(cx_ctx, fy + 1, &format!("{:>ctx_w$}", "context"), DIM);
-        c.text(cx_price, fy + 1, &format!("{:>price_w$}", "$/M in / out"), DIM);
-        c.text(x, fy + 2, &"─".repeat(cw), RULE);
+        c.text(x + 2, fy + 1, "model", DIM());
+        c.text(cx_ctx, fy + 1, &format!("{:>ctx_w$}", "context"), DIM());
+        c.text(cx_price, fy + 1, &format!("{:>price_w$}", "$/M in / out"), DIM());
+        c.text(x, fy + 2, &"─".repeat(cw), RULE());
 
         let list_y = fy + 3;
         let rows = c.h.saturating_sub(list_y + 6).max(3);
@@ -1431,26 +1431,26 @@ impl Ob {
             let y = list_y + r;
             let on = vi == sel;
             let m = &pk.models[order[vi]];
-            c.text(x, y, if on { "❯ " } else { "  " }, ACCENT_BOLD);
+            c.text(x, y, if on { "❯ " } else { "  " }, ACCENT_BOLD());
             let alias = format!("{}/{}", p.def.id, m.id);
             let mark = if current.as_deref() == Some(alias.as_str()) { " ★" } else { "" };
-            c.text(x + 2, y, &kit::ellipsize(&format!("{}{mark}", m.id), id_w), if on { ACCENT_BOLD } else { Style::new() });
-            c.text(cx_ctx, y, &format!("{:>ctx_w$}", kfmt(m.context)), DIM);
+            c.text(x + 2, y, &kit::ellipsize(&format!("{}{mark}", m.id), id_w), if on { ACCENT_BOLD() } else { Style::new() });
+            c.text(cx_ctx, y, &format!("{:>ctx_w$}", kfmt(m.context)), DIM());
             let price = kit::ellipsize(&price_label(p, m), price_w);
-            c.text(cx_price, y, &format!("{price:>price_w$}"), DIM);
+            c.text(cx_price, y, &format!("{price:>price_w$}"), DIM());
         }
         if order.is_empty() {
-            c.text(x + 2, list_y, "no model matches", DIM);
+            c.text(x + 2, list_y, "no model matches", DIM());
         }
         let by = list_y + rows;
-        c.text(x, by, &"─".repeat(cw), RULE);
+        c.text(x, by, &"─".repeat(cw), RULE());
         let below = order.len().saturating_sub(first + rows);
         if below > 0 {
-            c.text(x + 2, by, &format!(" ↓ {below} more "), DIM);
+            c.text(x + 2, by, &format!(" ↓ {below} more "), DIM());
         }
         if let Some(m) = order.get(sel).map(|&i| &pk.models[i]) {
             if m.name != m.id {
-                c.text(x, by + 1, &kit::ellipsize(&m.name, cw), DIM);
+                c.text(x, by + 1, &kit::ellipsize(&m.name, cw), DIM());
             }
         }
         self.draw_footer(c, "↑↓ choose · enter use this model · type to search · esc back");
@@ -1528,25 +1528,25 @@ impl Ob {
         let y = self.h.saturating_sub(bh) / 2;
         c.clear(x.saturating_sub(2), y.saturating_sub(1), bw + 4, bh + 2);
         let hello = if name.is_empty() { "You're all set.".to_string() } else { format!("You're all set, {name}.") };
-        c.spans(x, y, &[Span::styled("✶ ", kit::fg(ACCENT)), Span::styled(hello, kit::bold(Style::new()))]);
+        c.spans(x, y, &[Span::styled("✶ ", kit::fg(ACCENT())), Span::styled(hello, kit::bold(Style::new()))]);
         match &self.model {
             Some((m, _)) => {
-                c.spans(x, y + 2, &[Span::styled("model  ", DIM), Span::styled(m.clone(), kit::bold(Style::new())), Span::styled("  · /model to switch", DIM)]);
+                c.spans(x, y + 2, &[Span::styled("model  ", DIM()), Span::styled(m.clone(), kit::bold(Style::new())), Span::styled("  · /model to switch", DIM())]);
             }
             None => {
-                c.text(x, y + 2, "no provider yet — /connect or /login inside Cosmos when you're ready", DIM);
+                c.text(x, y + 2, "no provider yet — /connect or /login inside Cosmos when you're ready", DIM());
             }
         }
         let keys: Vec<&str> = self.provs.iter().filter(|p| self.keyed.contains(&p.def.id)).map(|p| p.name.as_str()).collect();
         if !keys.is_empty() {
-            c.spans(x, y + 3, &[Span::styled("keys   ", DIM), Span::styled(kit::ellipsize(&keys.join(" · "), bw.saturating_sub(7)), kit::fg(GREEN))]);
+            c.spans(x, y + 3, &[Span::styled("keys   ", DIM()), Span::styled(kit::ellipsize(&keys.join(" · "), bw.saturating_sub(7)), kit::fg(GREEN()))]);
         }
         for (i, (k, d)) in ROWS.iter().enumerate() {
             let yy = y + 5 + i;
-            c.text(x, yy, &format!("{k:<kw$}"), kit::fg(ACCENT));
-            c.text(x + kw + 3, yy, d, DIM);
+            c.text(x, yy, &format!("{k:<kw$}"), kit::fg(ACCENT()));
+            c.text(x + kw + 3, yy, d, DIM());
         }
-        c.spans(x, y + 6 + ROWS.len(), &[Span::styled("enter ", ACCENT_BOLD), Span::raw("launch Cosmos")]);
+        c.spans(x, y + 6 + ROWS.len(), &[Span::styled("enter ", ACCENT_BOLD()), Span::raw("launch Cosmos")]);
         self.draw_footer(c, "enter launch · esc back to keys · this setup removes itself once you launch");
     }
 

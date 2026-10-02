@@ -49,6 +49,7 @@ const BUILTIN: &[(&str, &str, &str)] = &[
     ("session", "", "Show the session id and how to resume it"),
     ("tree", "", "Show the session's event tree and branch points"),
     ("clear", "", "Clear the screen"),
+    ("theme", "<name>", "Colour theme: cosmos, classic, nebula, mono, solar, light, high-contrast"),
     ("onboarding", "", "Replay the first-run setup (until it retires itself)"),
     ("help", "", "Keyboard shortcuts"),
     ("quit", "", "Exit Cosmos"),

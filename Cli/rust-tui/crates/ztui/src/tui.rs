@@ -199,6 +199,8 @@ pub struct App {
     pub user: Option<String>,
     /// `/onboarding` asked the loop to hand the terminal to cosmostui-welcome
     pub replay_onboard: bool,
+    /// `ui.toml` was just written by a command — reload it now, not in a second
+    pub skin_reload: bool,
     /// the dictation key is physically down (Windows reports releases), so
     /// its auto-repeat can't stop a recording it just started
     toggle_held: bool,
@@ -272,6 +274,7 @@ impl App {
             last_reply: String::new(),
             user: None,
             replay_onboard: false,
+            skin_reload: false,
             toggle_held: false,
             toggle_last: None,
         }
@@ -566,10 +569,10 @@ impl App {
                     Mode::Agent => "Agent mode",
                 };
                 self.flash(label, match self.mode {
-                    Mode::Plan => theme::YELLOW,
-                    Mode::Yolo => theme::RED,
-                    Mode::AcceptEdits => theme::ACCENT,
-                    Mode::Agent => theme::GREEN,
+                    Mode::Plan => theme::YELLOW(),
+                    Mode::Yolo => theme::RED(),
+                    Mode::AcceptEdits => theme::ACCENT(),
+                    Mode::Agent => theme::GREEN(),
                 });
             }
             _ => {}
@@ -595,10 +598,10 @@ impl App {
                             self.insert(' ');
                         }
                         self.insert_str(&text);
-                        self.flash(format!("Transcribed with {label} — review, then ↵ to send"), theme::GREEN);
+                        self.flash(format!("Transcribed with {label} — review, then ↵ to send"), theme::GREEN());
                     }
-                    Err(e) if e.to_string() == "cancelled" => self.flash("Dictation cancelled", theme::YELLOW),
-                    Err(e) => self.flash(format!("Dictation failed: {e}"), theme::RED),
+                    Err(e) if e.to_string() == "cancelled" => self.flash("Dictation cancelled", theme::YELLOW()),
+                    Err(e) => self.flash(format!("Dictation failed: {e}"), theme::RED()),
                 }
             }
         }
@@ -621,7 +624,7 @@ impl App {
                             let who = t.email.clone().map(|e| format!(" as {e}")).unwrap_or_default();
                             let plan = t.plan.clone().map(|p| format!(" ({p})")).unwrap_or_default();
                             self.note(format!("Signed in to ChatGPT{who}{plan} · pick a chatgpt/… model in /model"));
-                            self.flash("ChatGPT connected", theme::GREEN);
+                            self.flash("ChatGPT connected", theme::GREEN());
                             self.open_model_picker_for("chatgpt");
                         }
                         Err(e) => self.error(format!("ChatGPT sign-in failed: {e:#}")),
@@ -689,7 +692,7 @@ impl App {
 
     fn start_login(&mut self) {
         if self.login.is_some() {
-            self.flash("A ChatGPT sign-in is already waiting in your browser", theme::YELLOW);
+            self.flash("A ChatGPT sign-in is already waiting in your browser", theme::YELLOW());
             return;
         }
         let (tx, rx) = channel();
@@ -704,7 +707,7 @@ impl App {
             let _ = tx.send(LoginMsg::Done(r));
         });
         self.login = Some(Login { rx, cancel, url: None });
-        self.flash("Opening your browser to sign in with ChatGPT… (esc cancels)", theme::ACCENT);
+        self.flash("Opening your browser to sign in with ChatGPT… (esc cancels)", theme::ACCENT());
     }
 
     fn start_shell(&mut self, cmd: String) {
@@ -926,7 +929,7 @@ impl App {
             self.clear_input();
             let key = raw.trim();
             if key.is_empty() {
-                self.flash("No key entered", theme::YELLOW);
+                self.flash("No key entered", theme::YELLOW());
                 return;
             }
             match zcore::creds::store_key(&k.provider, key) {
@@ -1072,6 +1075,26 @@ impl App {
                 let lines = view::usage(self);
                 self.block(lines);
             }
+            "theme" => {
+                let name = args.trim();
+                let themes = crate::skin::palette::THEMES;
+                let now = crate::skin::current().theme.name.clone();
+                if name.is_empty() {
+                    let list = themes.iter().map(|t| if *t == now { format!("{t} ✓") } else { t.to_string() }).collect::<Vec<_>>().join(" · ");
+                    self.note(format!("Themes: {list} — /theme <name> switches; ~/.cosmos-cli/ui.toml holds the rest"));
+                } else if !themes.contains(&name) {
+                    self.error(format!("No theme {name:?} — try {}", themes.join(", ")));
+                } else {
+                    let path = zcore::cli_home().join("ui.toml");
+                    match crate::skin::edit::set_in_file(&path, "theme", "name", &crate::skin::edit::Val::Str(name.into())) {
+                        Ok(()) => {
+                            self.skin_reload = true;
+                            self.flash(format!("Theme → {name}"), theme::ACCENT());
+                        }
+                        Err(e) => self.error(format!("Couldn't save the theme: {e}")),
+                    }
+                }
+            }
             "context" => {
                 let lines = view::context(self);
                 self.block(lines);
@@ -1133,7 +1156,7 @@ impl App {
                     self.note("Nothing to copy yet");
                 } else {
                     copy_osc52(&self.last_reply);
-                    self.flash(format!("Copied the last reply ({} chars)", self.last_reply.chars().count()), theme::GREEN);
+                    self.flash(format!("Copied the last reply ({} chars)", self.last_reply.chars().count()), theme::GREEN());
                 }
             }
             "session" => self.note(format!("Session {} · resume with  cosmostui --resume {}", self.session, self.session)),
@@ -1174,7 +1197,7 @@ impl App {
                 self.clear_input();
                 self.key_entry = Some(KeyEntry { provider: p.id.clone(), name: p.name.clone() });
                 let env = p.env.first().cloned().unwrap_or_default();
-                self.flash(format!("Paste your {} API key and press ↵ (or set {env}) · esc cancels", p.name), theme::ACCENT);
+                self.flash(format!("Paste your {} API key and press ↵ (or set {env}) · esc cancels", p.name), theme::ACCENT());
             }
             None => self.error(format!("Unknown provider: {id}")),
         }
@@ -1244,13 +1267,13 @@ impl App {
                 _ => "Denied",
             };
             let _ = p.reply.send(code);
-            self.flash(format!("{verdict} — {}", view::tool_label(&p.tool)), if code == 0 { theme::RED } else { theme::GREEN });
+            self.flash(format!("{verdict} — {}", view::tool_label(&p.tool)), if code == 0 { theme::RED() } else { theme::GREEN() });
         }
     }
 
     fn interrupt(&mut self, flag: &Arc<AtomicBool>) {
         flag.store(true, Ordering::Relaxed);
-        self.flash("Interrupting — stops after the current step", theme::YELLOW);
+        self.flash("Interrupting — stops after the current step", theme::YELLOW());
     }
 
     // ---- keys --------------------------------------------------------------
@@ -1291,7 +1314,7 @@ impl App {
                 self.answer_perm(0);
             } else if let Some(l) = self.login.take() {
                 l.cancel.store(true, Ordering::Relaxed);
-                self.flash("Sign-in cancelled", theme::YELLOW);
+                self.flash("Sign-in cancelled", theme::YELLOW());
             } else if self.busy {
                 self.interrupt(interrupt);
             } else if !self.input.is_empty() || self.popup.is_some() || self.key_entry.is_some() {
@@ -1302,7 +1325,7 @@ impl App {
                 self.request_quit(cmd);
             } else {
                 self.ctrl_c_at = Some(Instant::now());
-                self.flash("Press Ctrl+C again to exit", theme::YELLOW);
+                self.flash("Press Ctrl+C again to exit", theme::YELLOW());
             }
             return;
         }
@@ -1334,13 +1357,13 @@ impl App {
         if self.key_entry.is_some() && k.code == KeyCode::Esc {
             self.key_entry = None;
             self.clear_input();
-            self.flash("Cancelled", theme::YELLOW);
+            self.flash("Cancelled", theme::YELLOW());
             return;
         }
         if k.code == KeyCode::Esc {
             if let Some(l) = self.login.take() {
                 l.cancel.store(true, Ordering::Relaxed);
-                self.flash("Sign-in cancelled", theme::YELLOW);
+                self.flash("Sign-in cancelled", theme::YELLOW());
                 return;
             }
         }
@@ -1670,7 +1693,11 @@ pub fn try_run(opts: &RunOpts, cwd: &Path) -> Result<Option<i32>> {
     app.user = zcore::welcome::user_name();
     app.cont(crate::logo::banner("cosmos", concat!("v", env!("CARGO_PKG_VERSION"))));
 
-    let r = run_loop(&mut screen, &mut app, &rx, &cmd, &interrupt);
+    let (mut skin, notes) = crate::skin::Watcher::start(&app.cwd);
+    for n in notes {
+        app.error(n);
+    }
+    let r = run_loop(&mut screen, &mut app, &rx, &cmd, &interrupt, &mut skin);
     let bye = view::farewell(&app);
     screen.leave(&bye);
     // contract §13: after a clean interactive session, learn from it in the
@@ -1731,11 +1758,20 @@ fn collect_burst(
     }
 }
 
-fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender<Cmd>, interrupt: &Arc<AtomicBool>) -> Result<i32> {
+fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender<Cmd>, interrupt: &Arc<AtomicBool>, skin: &mut crate::skin::Watcher) -> Result<i32> {
     let mut last_tick = Instant::now();
     loop {
         while let Ok(m) = rx.try_recv() {
             app.on_msg(m);
+        }
+        // the look changed on disk (hand edit, /theme, /customise): swap it in
+        // here, between frames — never while one is being drawn
+        let reloaded = if std::mem::take(&mut app.skin_reload) { Some(skin.force()) } else { skin.poll() };
+        if let Some(notes) = reloaded {
+            for n in notes {
+                app.flash(n, theme::RED());
+            }
+            app.dirty = true;
         }
         app.poll_jobs();
         if app.replay_onboard {
@@ -2075,6 +2111,22 @@ mod tests {
         let (lines, _) = view::live(&a);
         let rows: Vec<String> = lines.iter().map(text).collect();
         assert!(rows.iter().any(|r| r.contains("turn 2") && r.contains("· plan ·")), "{rows:?}");
+    }
+
+    #[test]
+    fn theme_command_writes_ui_toml() {
+        let _env = crate::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = app();
+        std::env::set_var("COSMOS_CLI_HOME", dir.path());
+        let (tx, _rx) = channel();
+        a.run_slash("theme", "nebula", &tx);
+        assert!(a.skin_reload);
+        let text = std::fs::read_to_string(dir.path().join("ui.toml")).unwrap();
+        assert!(text.contains("name = \"nebula\""), "{text}");
+        a.skin_reload = false;
+        a.run_slash("theme", "plaid", &tx);
+        assert!(!a.skin_reload, "unknown themes are not written");
     }
 
     #[test]

@@ -48,7 +48,7 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
             Event::Start(Tag::Strikethrough) => stack.push(top(&stack).add_modifier(Modifier::CROSSED_OUT)),
             Event::Start(Tag::Link { dest_url, .. }) => {
                 link = Some(dest_url.to_string());
-                stack.push(top(&stack).fg(theme::ACCENT).add_modifier(Modifier::UNDERLINED));
+                stack.push(top(&stack).fg(crate::skin::palette().link).add_modifier(Modifier::UNDERLINED));
             }
             Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough) => {
                 if stack.len() > 1 {
@@ -63,12 +63,12 @@ pub fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
                 if let Some(url) = link.take() {
                     let shown: String = out.iter().rev().take(1).map(|s| s.content.to_string()).collect();
                     if !url.is_empty() && shown != url {
-                        out.push(Span::styled(format!(" ({url})"), DIM));
+                        out.push(Span::styled(format!(" ({url})"), DIM()));
                     }
                 }
             }
             Event::Text(t) => out.push(Span::styled(t.to_string(), top(&stack))),
-            Event::Code(t) => out.push(Span::styled(t.to_string(), CODE_INLINE)),
+            Event::Code(t) => out.push(Span::styled(t.to_string(), CODE_INLINE())),
             Event::Html(t) | Event::InlineHtml(t) => out.push(Span::styled(t.to_string(), top(&stack))),
             Event::SoftBreak | Event::HardBreak => out.push(Span::styled(" ", top(&stack))),
             Event::TaskListMarker(done) => out.push(Span::raw(if done { "☑ " } else { "☐ " })),
@@ -159,7 +159,7 @@ impl Md {
             f.code.push_str(line);
             let spans = highlight::highlight(&f.lang, &f.code)
                 .and_then(|mut l| l.pop())
-                .unwrap_or_else(|| vec![Span::styled(line.to_string(), CODE_INLINE)]);
+                .unwrap_or_else(|| vec![Span::styled(line.to_string(), CODE_INLINE())]);
             return code_rows(&spans, w);
         }
 
@@ -202,12 +202,12 @@ impl Md {
             return Vec::new();
         }
         if self.fence.is_some() {
-            return code_rows(&[Span::styled(partial.to_string(), CODE_INLINE)], w);
+            return code_rows(&[Span::styled(partial.to_string(), CODE_INLINE())], w);
         }
         if !self.table.is_empty() || is_table_row(partial) {
             let mut rows = Vec::new();
             for l in self.table.iter().map(String::as_str).chain(std::iter::once(partial)) {
-                rows.extend(wrap::wrap(&[Span::styled(l.to_string(), DIM)], w, &[sp(M)], &[sp(M)]));
+                rows.extend(wrap::wrap(&[Span::styled(l.to_string(), DIM())], w, &[sp(M)], &[sp(M)]));
             }
             return rows;
         }
@@ -239,26 +239,27 @@ fn render_line(line: &str, w: usize) -> Vec<Line<'static>> {
         return vec![Line::default()];
     }
     if let Some((level, text)) = heading(t) {
+        let p = crate::skin::palette();
         let style = if level <= 2 {
-            Style::new().add_modifier(Modifier::BOLD)
+            theme::fg_or_default(p.heading).add_modifier(Modifier::BOLD)
         } else {
-            Style::new().add_modifier(Modifier::BOLD).fg(ratatui_core::style::Color::Rgb(0xc8, 0xc8, 0xc8))
+            Style::new().add_modifier(Modifier::BOLD).fg(p.heading_sub)
         };
         return wrap::wrap(&inline(text, style), w, &[sp(M)], &[sp(M)]);
     }
     if is_rule(t) {
         let n = w.saturating_sub(2).min(56);
-        return vec![Line::from(vec![sp(M), Span::styled("─".repeat(n), RULE)])];
+        return vec![Line::from(vec![sp(M), Span::styled("─".repeat(n), RULE())])];
     }
     if let Some(q) = t.strip_prefix('>') {
         let q = q.strip_prefix(' ').unwrap_or(q);
-        let bar = [sp(M), Span::styled("│ ", DIM)];
-        return wrap::wrap(&inline(q, DIM.add_modifier(Modifier::ITALIC)), w, &bar, &bar);
+        let bar = [sp(M), Span::styled("│ ", DIM())];
+        return wrap::wrap(&inline(q, DIM().add_modifier(Modifier::ITALIC)), w, &bar, &bar);
     }
     if let Some((indent, marker, rest)) = list_item(line) {
         let level = (indent / 2).min(4);
         let pad = format!("{M}  {}", "  ".repeat(level));
-        let first = [Span::raw(pad.clone()), Span::styled(format!("{marker} "), DIM)];
+        let first = [Span::raw(pad.clone()), Span::styled(format!("{marker} "), DIM())];
         let cont = [Span::raw(format!("{pad}{}", " ".repeat(width_of(&marker) + 1)))];
         return wrap::wrap(&inline(rest, Style::new()), w, &first, &cont);
     }
@@ -291,7 +292,7 @@ fn render_table(rows: Vec<Vec<String>>, w: usize) -> Vec<Line<'static>> {
             let mut spans = Vec::new();
             for (i, c) in r.iter().enumerate() {
                 if i > 0 {
-                    spans.push(Span::styled(" · ", DIM));
+                    spans.push(Span::styled(" · ", DIM()));
                 }
                 spans.extend(c.iter().cloned());
             }
@@ -304,7 +305,7 @@ fn render_table(rows: Vec<Vec<String>>, w: usize) -> Vec<Line<'static>> {
         let mut spans = vec![sp(M)];
         for (i, wdt) in widths.iter().enumerate() {
             if i > 0 {
-                spans.push(Span::styled(" │ ", RULE));
+                spans.push(Span::styled(" │ ", RULE()));
             }
             let cell = r.get(i).cloned().unwrap_or_default();
             let cw: usize = cell.iter().map(|s| width_of(&s.content)).sum();
@@ -317,7 +318,7 @@ fn render_table(rows: Vec<Vec<String>>, w: usize) -> Vec<Line<'static>> {
         out.push(Line::from(spans));
         if ri + 1 == header_rows {
             let sep: Vec<String> = widths.iter().map(|w| "─".repeat(*w)).collect();
-            out.push(Line::from(vec![sp(M), Span::styled(sep.join("─┼─"), RULE)]));
+            out.push(Line::from(vec![sp(M), Span::styled(sep.join("─┼─"), RULE())]));
         }
     }
     out
@@ -352,7 +353,7 @@ mod tests {
         assert!(b.style.add_modifier.contains(Modifier::BOLD));
         let c = s.iter().find(|x| x.content == "c").unwrap();
         assert!(c.style.add_modifier.contains(Modifier::ITALIC));
-        assert_eq!(s.iter().find(|x| x.content == "d").unwrap().style, CODE_INLINE);
+        assert_eq!(s.iter().find(|x| x.content == "d").unwrap().style, CODE_INLINE());
         let e = s.iter().find(|x| x.content == "e").unwrap();
         assert!(e.style.add_modifier.contains(Modifier::CROSSED_OUT));
     }
@@ -392,7 +393,7 @@ mod tests {
     fn code_is_highlighted() {
         let l = render("```rust\nfn main() {}\n```", 60);
         assert_eq!(l.len(), 1);
-        assert!(l[0].spans.iter().any(|s| s.content == "fn" && s.style != CODE_INLINE));
+        assert!(l[0].spans.iter().any(|s| s.content == "fn" && s.style != CODE_INLINE()));
     }
 
     #[test]

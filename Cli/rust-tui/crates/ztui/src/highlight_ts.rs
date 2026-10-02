@@ -10,7 +10,7 @@ use ratatui_core::style::Style;
 use ratatui_core::text::Span;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
-use crate::highlight::{canonical, style_for, BASE};
+use crate::highlight::{base, canonical, style_for};
 
 /// Capture names we colour; index = `Highlight.0` in events.
 const NAMES: &[&str] = &[
@@ -123,7 +123,7 @@ pub fn highlight(lang: &str, code: &str) -> Option<Vec<Vec<Span<'static>>>> {
                 stack.pop();
             }
             HighlightEvent::Source { start, end } => {
-                let style = stack.last().copied().unwrap_or(Style::new().fg(BASE));
+                let style = stack.last().copied().unwrap_or(Style::new().fg(base()));
                 let text = &code[start..end];
                 for (i, part) in text.split('\n').enumerate() {
                     if i > 0 {
