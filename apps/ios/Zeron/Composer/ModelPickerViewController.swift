@@ -18,9 +18,13 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     private let selected: (harness: String, model: String?)
     private let lockedHarness: String?
     private let onSelect: (ModelChoice) -> Void
+    private weak var presentationAnchor: UIView?
     private var filter: Filter = .all
     private var favorites = Set(UserDefaults.standard.stringArray(forKey: "modelFavorites") ?? [])
     private var sections: [Section] = []
+    private var cachedRowHeights: [String: CGFloat] = [:]
+    private var cachedRowHeightWidth: CGFloat = -1
+    private var cachedRowHeightCategory: UIContentSizeCategory?
     private let titleLabel = UILabel()
     private let closeButton = UIButton(type: .system)
     private let search = UITextField()
@@ -30,6 +34,7 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     private let railStack = UIStackView()
     private let railDivider = UIView()
     private let tableView = UITableView(frame: .zero, style: .plain)
+    private let headerRow = UIStackView()
     private let rootStack = UIStackView()
     private let contentStack = UIStackView()
 
@@ -80,10 +85,12 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
             closeButton.heightAnchor.constraint(equalToConstant: 28),
         ])
 
-        let header = UIStackView(arrangedSubviews: [closeButton, titleLabel, UIView()])
-        header.axis = .horizontal
-        header.alignment = .center
-        header.spacing = 8
+        headerRow.addArrangedSubview(closeButton)
+        headerRow.addArrangedSubview(titleLabel)
+        headerRow.addArrangedSubview(UIView())
+        headerRow.axis = .horizontal
+        headerRow.alignment = .center
+        headerRow.spacing = 8
 
         configureSearch()
         configureRail()
@@ -93,7 +100,7 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         contentStack.alignment = .fill
         contentStack.spacing = 8
         contentStack.translatesAutoresizingMaskIntoConstraints = false
-        contentStack.addArrangedSubview(header)
+        contentStack.addArrangedSubview(headerRow)
         contentStack.addArrangedSubview(searchRow)
         contentStack.addArrangedSubview(tableView)
 
@@ -117,6 +124,9 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
 
         renderSections()
         updatePreferredContentSize()
+        registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (self: ModelPickerViewController, _) in
+            self.contentSizeCategoryDidChange()
+        }
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -130,14 +140,19 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     }
 
     func present(from anchor: UIView, in presenter: UIViewController) {
-        let screenWidth = anchor.window?.windowScene?.screen.bounds.width ?? UIScreen.main.bounds.width
-        preferredContentSize = CGSize(width: min(320, max(1, screenWidth - 32)), height: fittedHeight)
+        presentationAnchor = anchor
+        preferredContentSize.width = preferredWidth(for: anchor)
         if let presentation = popoverPresentationController {
             presentation.delegate = self
             presentation.sourceView = anchor
             presentation.sourceRect = anchor.bounds
             presentation.permittedArrowDirections = [.down, .up]
         }
+        loadViewIfNeeded()
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        tableView.layoutIfNeeded()
+        updatePreferredContentSize()
         presenter.present(self, animated: true)
     }
 
@@ -151,6 +166,7 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     private func configureSearch() {
         search.borderStyle = .none
         search.font = scaled(.sans, size: 14, style: .body)
+        search.adjustsFontForContentSizeCategory = true
         search.textColor = Palette.text
         search.tintColor = Palette.text
         search.placeholder = "Search models…"
@@ -211,14 +227,26 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         Self.harnesses(in: models, lockedTo: lockedHarness)
     }
 
+    private var isAccessibilitySizeCategory: Bool {
+        traitCollection.preferredContentSizeCategory.isAccessibilityCategory
+    }
+
+    private var maximumPopoverHeight: CGFloat {
+        guard isAccessibilitySizeCategory else { return 460 }
+        let window = presentationAnchor?.window ?? viewIfLoaded?.window
+        let safeAreaHeight = window?.safeAreaLayoutGuide.layoutFrame.height ?? 0
+        let availableHeight = safeAreaHeight > 0 ? safeAreaHeight : window?.bounds.height ?? UIScreen.main.bounds.height
+        return max(1, availableHeight - 120)
+    }
+
     private var fittedHeight: CGFloat {
-        let headerHeight = max(closeButton.bounds.height, 28)
-        let searchHeight = max(searchRow.bounds.height, 37)
         let tableHeight: CGFloat
         if isViewLoaded {
             tableView.layoutIfNeeded()
             let insets = tableView.adjustedContentInset
-            let minimumTableHeight: CGFloat = sections.isEmpty ? 64 : 56
+            let minimumTableHeight = sections.isEmpty
+                ? minimumEmptyStateHeight(query: currentQuery, filter: filter)
+                : 56
             tableHeight = max(
                 minimumTableHeight,
                 tableView.contentSize.height + insets.top + insets.bottom
@@ -226,7 +254,99 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         } else {
             tableHeight = 64
         }
-        return min(460, 10 + headerHeight + 8 + searchHeight + 8 + tableHeight + 8 + 10)
+        return min(maximumPopoverHeight, fixedChromeHeight + tableHeight)
+    }
+
+    private var fixedChromeHeight: CGFloat {
+        10 + max(headerRow.bounds.height, 28)
+            + max(contentStack.spacing, 8)
+            + max(searchRow.bounds.height, 37)
+            + max(contentStack.spacing, 8)
+            + 8 + 10
+    }
+
+    private var currentQuery: String {
+        (search.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var railFilters: [Filter] {
+        [.favorites] + harnesses.map { .harness($0) }
+    }
+
+    private func stableRailHeight() -> CGFloat {
+        let rowHeights = measuredRowHeights()
+        let tableHeight = railFilters.map { filter in
+            measuredTableHeight(
+                for: makeSections(for: filter, query: ""),
+                filter: filter,
+                rowHeights: rowHeights
+            )
+        }.max() ?? 64
+        return min(maximumPopoverHeight, fixedChromeHeight + tableHeight)
+    }
+
+    private func measuredTableHeight(
+        for sections: [Section],
+        filter: Filter,
+        rowHeights: [String: CGFloat]
+    ) -> CGFloat {
+        guard !sections.isEmpty else {
+            return minimumEmptyStateHeight(query: "", filter: filter)
+        }
+        let contentHeight = sections.reduce(CGFloat(0)) { total, section in
+            total + tableView.sectionHeaderTopPadding + sectionHeaderHeight
+                + section.models.reduce(CGFloat(0)) { height, model in
+                    height + (rowHeights[Self.favoriteKey(model)] ?? 56)
+                }
+        }
+        let insets = tableView.adjustedContentInset
+        return max(56, contentHeight + insets.top + insets.bottom)
+    }
+
+    private func measuredRowHeights() -> [String: CGFloat] {
+        let width = tableView.bounds.width
+        let category = traitCollection.preferredContentSizeCategory
+        guard width > 0 else { return [:] }
+        if abs(width - cachedRowHeightWidth) < 0.5,
+           category == cachedRowHeightCategory,
+           cachedRowHeights.count == models.count {
+            return cachedRowHeights
+        }
+
+        let cell = ModelPickerCell(style: .default, reuseIdentifier: nil)
+        var rowHeights: [String: CGFloat] = [:]
+        for model in models {
+            let isSelected = model.harness == selected.harness && model.id == selectedModelID
+            cell.configure(
+                model: model,
+                selected: isSelected,
+                favorite: isFavorite(model),
+                contentSizeCategory: category,
+                onToggleFavorite: {}
+            )
+            rowHeights[Self.favoriteKey(model)] = cell.fittingHeight(for: width)
+        }
+        cachedRowHeights = rowHeights
+        cachedRowHeightWidth = width
+        cachedRowHeightCategory = category
+        return rowHeights
+    }
+
+    private var sectionHeaderHeight: CGFloat {
+        max(30, ceil(scaled(.sansMedium, size: 12, style: .caption1).lineHeight) + 10)
+    }
+
+    private func minimumEmptyStateHeight(query: String, filter: Filter) -> CGFloat {
+        let label = UILabel()
+        label.text = emptyStateText(query: query, filter: filter)
+        label.font = scaled(.sans, size: 14, style: .body)
+        label.numberOfLines = 0
+        let railWidth = railScroll.isHidden ? 0 : 44 + 1 + max(rootStack.spacing, 8) * 2
+        let availableWidth = tableView.bounds.width > 0
+            ? tableView.bounds.width
+            : max(1, preferredContentSize.width - 14 - railWidth)
+        let textSize = label.sizeThatFits(CGSize(width: max(1, availableWidth - 40), height: .greatestFiniteMagnitude))
+        return max(64, ceil(textSize.height) + 10)
     }
 
     private var selectedModelID: String? {
@@ -294,6 +414,7 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         selected: Bool,
         action: @escaping () -> Void
     ) -> UIButton {
+        let buttonSize = min(44, UIFontMetrics(forTextStyle: .body).scaledValue(for: 32))
         var configuration = UIButton.Configuration.plain()
         configuration.image = image?.withRenderingMode(.alwaysTemplate)
         configuration.baseForegroundColor = selected ? Palette.text : Palette.secondary
@@ -307,8 +428,8 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         button.accessibilityTraits = .button
         button.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 32),
-            button.heightAnchor.constraint(equalToConstant: 32),
+            button.widthAnchor.constraint(equalToConstant: buttonSize),
+            button.heightAnchor.constraint(equalToConstant: buttonSize),
         ])
         button.addAction(UIAction { _ in action() }, for: .touchUpInside)
         return button
@@ -316,26 +437,8 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
 
     private func renderSections(keepingOffset: Bool = false) {
         let contentOffset = tableView.contentOffset
-        let query = (search.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let visible = models.filter { lockedHarness == nil || $0.harness == lockedHarness }
-        if !query.isEmpty {
-            sections = group(matching(visible, query: query))
-        } else if lockedHarness != nil {
-            let favoriteModels = visible.filter(isFavorite)
-            sections = favoriteModels.isEmpty ? [] : [Section(title: "Favorites", models: favoriteModels)]
-            sections.append(contentsOf: group(visible))
-        } else {
-            switch filter {
-            case .all:
-                sections = group(visible)
-            case .favorites:
-                let favoriteModels = visible.filter(isFavorite)
-                sections = favoriteModels.isEmpty ? [] : [Section(title: "Favorites", models: favoriteModels)]
-            case let .harness(harness):
-                let harnessModels = visible.filter { $0.harness == harness }
-                sections = harnessModels.isEmpty ? [] : [Section(title: harnessLabel(harness), models: harnessModels)]
-            }
-        }
+        let query = currentQuery
+        sections = makeSections(for: filter, query: query)
         tableView.reloadData()
         tableView.backgroundView = emptyState(query: query)
         if keepingOffset {
@@ -345,11 +448,53 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         }
     }
 
+    private func makeSections(for filter: Filter, query: String) -> [Section] {
+        let visible = models.filter { lockedHarness == nil || $0.harness == lockedHarness }
+        if !query.isEmpty {
+            return group(matching(visible, query: query))
+        } else if lockedHarness != nil {
+            let favoriteModels = visible.filter(isFavorite)
+            return (favoriteModels.isEmpty ? [] : [Section(title: "Favorites", models: favoriteModels)])
+                + group(visible)
+        }
+        switch filter {
+        case .all:
+            return group(visible)
+        case .favorites:
+            let favoriteModels = visible.filter(isFavorite)
+            return favoriteModels.isEmpty ? [] : [Section(title: "Favorites", models: favoriteModels)]
+        case let .harness(harness):
+            let harnessModels = visible.filter { $0.harness == harness }
+            return harnessModels.isEmpty ? [] : [Section(title: harnessLabel(harness), models: harnessModels)]
+        }
+    }
+
     private func updatePreferredContentSize() {
         guard preferredContentSize.width > 0 else { return }
-        let height = fittedHeight
+        tableView.layoutIfNeeded()
+        let height = !railScroll.isHidden && currentQuery.isEmpty
+            ? stableRailHeight()
+            : fittedHeight
         guard abs(preferredContentSize.height - height) > 0.5 else { return }
         preferredContentSize.height = height
+    }
+
+    private func preferredWidth(for anchor: UIView) -> CGFloat {
+        let screenWidth = anchor.window?.windowScene?.screen.bounds.width ?? UIScreen.main.bounds.width
+        let width = screenWidth - 32
+        return max(1, isAccessibilitySizeCategory ? width : min(320, width))
+    }
+
+    private func contentSizeCategoryDidChange() {
+        if let presentationAnchor {
+            preferredContentSize.width = preferredWidth(for: presentationAnchor)
+        }
+        renderRail()
+        renderSections(keepingOffset: true)
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        tableView.layoutIfNeeded()
+        updatePreferredContentSize()
     }
 
     private func matching(_ models: [ModelChoice], query: String) -> [ModelChoice] {
@@ -363,18 +508,22 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     private func emptyState(query: String) -> UILabel? {
         guard sections.isEmpty else { return nil }
         let label = UILabel()
-        if !query.isEmpty {
-            label.text = "No models match"
-        } else if filter == .favorites {
-            label.text = "No favorites yet. Tap the star on a model to add it."
-        } else {
-            label.text = "No models available"
-        }
+        label.text = emptyStateText(query: query, filter: filter)
         label.font = scaled(.sans, size: 14, style: .body)
         label.textColor = Palette.secondary
         label.textAlignment = .center
         label.numberOfLines = 0
         return label
+    }
+
+    private func emptyStateText(query: String, filter: Filter) -> String {
+        if !query.isEmpty {
+            return "No models match"
+        }
+        if filter == .favorites {
+            return "No favorites yet. Tap the star on a model to add it."
+        }
+        return "No models available"
     }
 
     private func scrollToSelectedModel() {
@@ -515,7 +664,7 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     }
 
     func tableView(_ tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat {
-        shouldHideLockedHarnessHeader(in: section) ? 0 : 30
+        shouldHideLockedHarnessHeader(in: section) ? 0 : sectionHeaderHeight
     }
 
     private func shouldHideLockedHarnessHeader(in section: Int) -> Bool {
@@ -664,13 +813,28 @@ private final class ModelPickerCell: UITableViewCell {
         updateSelectionBackground()
     }
 
-    func configure(model: ModelChoice, selected: Bool, favorite: Bool, onToggleFavorite: @escaping () -> Void) {
+    func configure(
+        model: ModelChoice,
+        selected: Bool,
+        favorite: Bool,
+        contentSizeCategory: UIContentSizeCategory? = nil,
+        onToggleFavorite: @escaping () -> Void
+    ) {
+        let category = contentSizeCategory ?? traitCollection.preferredContentSizeCategory
         mark.image = BrandMarks.image(for: model.harness, side: 18)?.withRenderingMode(.alwaysTemplate)
         mark.isHidden = mark.image == nil
         title.text = model.label
         title.textColor = Palette.text
-        title.font = dynamicFont(selected ? .sansSemibold : .sansMedium, size: 15, style: .body)
+        title.font = dynamicFont(
+            selected ? .sansSemibold : .sansMedium,
+            size: 15,
+            style: .body,
+            contentSizeCategory: category
+        )
+        title.numberOfLines = category.isAccessibilityCategory ? 0 : 1
         detail.text = model.description
+        detail.font = dynamicFont(.sans, size: 12.5, style: .caption1, contentSizeCategory: category)
+        detail.numberOfLines = category.isAccessibilityCategory ? 0 : 1
         detail.isHidden = model.description?.isEmpty ?? true
         minimumHeightConstraint.constant = detail.isHidden ? 48 : 56
         favoriteButton.setImage(
@@ -705,13 +869,35 @@ private final class ModelPickerCell: UITableViewCell {
         updateSelectionBackground()
     }
 
+    func fittingHeight(for width: CGFloat) -> CGFloat {
+        bounds = CGRect(x: 0, y: 0, width: width, height: 100)
+        contentView.bounds = bounds
+        setNeedsLayout()
+        layoutIfNeeded()
+        let size = contentView.systemLayoutSizeFitting(
+            CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
+            withHorizontalFittingPriority: .required,
+            verticalFittingPriority: .fittingSizeLevel
+        )
+        return ceil(size.height)
+    }
+
     private func updateSelectionBackground() {
         selectionBackground.backgroundColor = isHighlighted
             ? Palette.controlFill
             : (selectedModel ? Palette.controlFill : .clear)
     }
 
-    private func dynamicFont(_ face: FaceRole, size: CGFloat, style: UIFont.TextStyle) -> UIFont {
-        UIFontMetrics(forTextStyle: style).scaledFont(for: Fonts.ui(face, size))
+    private func dynamicFont(
+        _ face: FaceRole,
+        size: CGFloat,
+        style: UIFont.TextStyle,
+        contentSizeCategory: UIContentSizeCategory? = nil
+    ) -> UIFont {
+        let font = Fonts.ui(face, size)
+        let metrics = UIFontMetrics(forTextStyle: style)
+        guard let contentSizeCategory else { return metrics.scaledFont(for: font) }
+        let traits = UITraitCollection(preferredContentSizeCategory: contentSizeCategory)
+        return metrics.scaledFont(for: font, compatibleWith: traits)
     }
 }
