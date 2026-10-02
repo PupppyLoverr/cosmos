@@ -5,6 +5,14 @@ enum DictationError: Error, Equatable {
     case permissionDenied
     case recognizerUnavailable
     case audioInputUnavailable
+
+    var message: String {
+        switch self {
+        case .permissionDenied: "Microphone or Speech Recognition access is off"
+        case .recognizerUnavailable: "Speech recognition isn't available right now"
+        case .audioInputUnavailable: "No microphone available"
+        }
+    }
 }
 
 @MainActor
@@ -73,7 +81,7 @@ final class SpeechCapture {
 
             let input = engine.inputNode
             let format = input.outputFormat(forBus: 0)
-            guard format.channelCount > 0 else { throw DictationError.audioInputUnavailable }
+            guard format.channelCount > 0, format.sampleRate > 0 else { throw DictationError.audioInputUnavailable }
             let request = SFSpeechAudioBufferRecognitionRequest()
             request.shouldReportPartialResults = true
             request.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition

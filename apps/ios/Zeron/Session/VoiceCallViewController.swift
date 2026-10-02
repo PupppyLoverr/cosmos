@@ -201,7 +201,11 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
                 self.listening = true
             } catch {
                 guard !Task.isCancelled, !self.ended else { return }
-                self.presentSpeechSettingsAlert()
+                if (error as? DictationError) == .permissionDenied {
+                    self.presentSpeechSettingsAlert()
+                } else {
+                    self.setStatus((error as? DictationError)?.message ?? "Voice isn't available right now")
+                }
             }
         }
     }

@@ -675,6 +675,8 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
                 self.dictationStartTask = nil
                 if (error as? DictationError) == .permissionDenied {
                     self.presentSpeechSettingsAlert()
+                } else {
+                    Toast.show((error as? DictationError)?.message ?? "Dictation isn't available right now", in: self.window)
                 }
             }
         }
