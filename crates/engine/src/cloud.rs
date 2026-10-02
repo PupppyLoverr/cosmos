@@ -2904,6 +2904,14 @@ pub fn github<'a>(http: &'a reqwest::Client, pat: &'a str) -> GitHub<'a> {
     GitHub { http, pat }
 }
 
+fn format_github_error(status: reqwest::StatusCode, message: &str) -> String {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        "GitHub connection expired — reconnect GitHub in Settings → Cloud computer".into()
+    } else {
+        format!("github {status}: {message}")
+    }
+}
+
 pub struct RepoInfo {
     pub full_name: String,
     pub default_branch: String,
@@ -3047,7 +3055,7 @@ impl<'a> GitHub<'a> {
                     .map(str::to_string)
             })
             .unwrap_or_else(|| body.chars().take(160).collect());
-        format!("github {status}: {message}")
+        format_github_error(status, &message)
     }
 
     /// `/repos/{owner}/{name}` — the probe + repo header.
@@ -4097,6 +4105,18 @@ pub type SchedulerHandle = Arc<Scheduler>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_unauthorized_error_prompts_reconnection() {
+        assert_eq!(
+            format_github_error(reqwest::StatusCode::UNAUTHORIZED, "Bad credentials"),
+            "GitHub connection expired — reconnect GitHub in Settings → Cloud computer"
+        );
+        assert_eq!(
+            format_github_error(reqwest::StatusCode::FORBIDDEN, "Forbidden"),
+            "github 403 Forbidden: Forbidden"
+        );
+    }
 
     #[test]
     fn scoped_seat_uses_the_chat_checkout() {

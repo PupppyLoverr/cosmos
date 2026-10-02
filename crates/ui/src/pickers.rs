@@ -5362,7 +5362,7 @@ impl Pickers {
                                     div()
                                         .flex_none()
                                         .text_size(crate::typography::ui_rems(10.0))
-                                        .text_color(theme.warning.opacity(0.9))
+                                        .text_color(theme.text_muted)
                                         .child(note),
                                 )
                             })
@@ -5655,17 +5655,10 @@ impl Pickers {
             }
             _ => None,
         };
-        let (seat_label, seat_warn, repo_label) = {
+        let (seat_label, repo_label) = {
             let state = self.state.read(cx);
             let seat = state.active_cloud_seat();
             let failed = state.cloud_trial_failure.is_some();
-            // Amber only for a real problem (a failed start, a dead or
-            // offline seat) — never for "not checked yet".
-            let warn = failed
-                || seat.is_some_and(|s| {
-                    crate::cloud::seat_status_note(s).is_some()
-                        || s.config.last_probe.as_ref().is_some_and(|p| !p.online)
-                });
             let repo: SharedString = state
                 .cloud_repo_pick
                 .as_ref()
@@ -5680,20 +5673,17 @@ impl Pickers {
                 .into();
             (
                 SharedString::from(crate::cloud::seat_chip_label(seat, failed)),
-                warn,
                 repo,
             )
         };
-        let device_chip = self
-            .footer_chip(
-                PickerKind::Device,
-                "picker-device",
-                crate::icons::CLOUD,
-                seat_label,
-                &theme,
-                cx,
-            )
-            .when(seat_warn, |el| el.text_color(theme.warning.opacity(0.8)));
+        let device_chip = self.footer_chip(
+            PickerKind::Device,
+            "picker-device",
+            crate::icons::CLOUD,
+            seat_label,
+            &theme,
+            cx,
+        );
         let project_chip = self.footer_chip(
             PickerKind::Space,
             "picker-project",

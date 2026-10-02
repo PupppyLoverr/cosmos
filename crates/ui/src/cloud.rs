@@ -462,7 +462,7 @@ pub(crate) fn seat_chip_label(seat: Option<&SeatRow>, trial_failed: bool) -> Str
     }
 }
 
-/// The green/red/sleeping dot used by the bot bar and seat rows.
+/// The monochrome status dot used by the bot bar and seat rows.
 pub(crate) fn status_dot(
     theme: &Theme,
     probe: Option<&SeatProbe>,
@@ -472,9 +472,9 @@ pub(crate) fn status_dot(
         (theme.text_faint, "ended")
     } else {
         match probe {
-            Some(p) if p.sleeping => (theme.warning, "sleeping"),
-            Some(p) if p.online => (theme.success, "online"),
-            Some(_) => (theme.danger, "offline"),
+            Some(p) if p.sleeping => (theme.text_faint, "sleeping"),
+            Some(p) if p.online => (theme.text_muted, "online"),
+            Some(_) => (theme.text_faint, "offline"),
             None => (theme.text_faint, "not probed"),
         }
     };
@@ -2435,7 +2435,7 @@ impl CloudRail {
                 Loadable::Error(err) => div()
                     .p(px(10.0))
                     .text_size(crate::typography::ui_rems(12.0))
-                    .text_color(theme.danger)
+                    .text_color(theme.text_muted)
                     .child(SharedString::from(err.clone()))
                     .into_any_element(),
                 _ => div()
@@ -3311,7 +3311,7 @@ impl CloudRail {
                                 .flex_1()
                                 .min_w_0()
                                 .text_size(crate::typography::ui_rems(10.5))
-                                .text_color(theme.danger)
+                                .text_color(theme.text_muted)
                                 .child(SharedString::from(format!("Analysis failed: {err}")))
                                 .into_any_element(),
                         }),
@@ -4375,7 +4375,7 @@ impl CloudRail {
                             Loadable::Error(err) => div()
                                 .px(px(4.0))
                                 .text_size(crate::typography::ui_rems(11.0))
-                                .text_color(theme.danger)
+                                .text_color(theme.text_muted)
                                 .child(SharedString::from(err))
                                 .into_any_element(),
                             _ => div()
@@ -4393,7 +4393,7 @@ impl CloudRail {
                     div()
                         .px(px(4.0))
                         .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.danger)
+                        .text_color(theme.text_muted)
                         .child(SharedString::from(err.clone())),
                 );
             }

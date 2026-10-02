@@ -8450,7 +8450,7 @@ impl Shell {
                     div()
                         .flex_none()
                         .text_size(crate::typography::ui_rems(9.5))
-                        .text_color(theme.warning)
+                        .text_color(theme.text_muted)
                         .child(status),
                 );
             }
@@ -8463,7 +8463,7 @@ impl Shell {
                         .id(SharedString::from(format!("sidebar-seat-claim-{ix}")))
                         .flex_none()
                         .text_size(crate::typography::ui_rems(9.5))
-                        .text_color(theme.accent)
+                        .text_color(theme.text)
                         .cursor_pointer()
                         .child("Claim")
                         .on_click(move |_, _, cx| {
