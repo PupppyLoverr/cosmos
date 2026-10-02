@@ -15,6 +15,7 @@ final class ChangesAccessoryPill: UIControl {
         accessibilityTraits = .button
         isHidden = true
 
+        glass.isUserInteractionEnabled = false
         glass.translatesAutoresizingMaskIntoConstraints = false
         addSubview(glass)
 
@@ -71,6 +72,7 @@ final class ModelAccessoryPill: UIControl {
         accessibilityIdentifier = "session-model"
         accessibilityTraits = .button
 
+        glass.isUserInteractionEnabled = false
         glass.translatesAutoresizingMaskIntoConstraints = false
         addSubview(glass)
         mark.contentMode = .scaleAspectFit
