@@ -792,8 +792,8 @@ pub struct AppState {
     cloud_fetched_at: Option<std::time::Instant>,
     /// Whether new sessions target a cloud seat instead of this computer.
     pub cloud_mode: bool,
-    /// The selected cloud seat for new sessions. This is intentionally
-    /// session-local; the mode persists, but a seat is refreshed from config.
+    /// The selected cloud seat row for new sessions. Its id is saved in
+    /// settings while this row is refreshed from config.
     pub cloud_seat_pick: Option<crate::cloud::SeatRow>,
     /// Saved seat id is resolved against the first ready CloudView.
     pub cloud_saved_seat: Option<String>,
