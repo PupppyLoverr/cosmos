@@ -1666,8 +1666,10 @@ pub fn rows_for_entry(
                         });
                     }
                     // Tools and thoughts are grouped by the outer arms;
-                    // nothing reaches here.
-                    MessagePart::Tool { .. } | MessagePart::Reasoning { .. } => {}
+                    // fork metadata does not produce a transcript row.
+                    MessagePart::Tool { .. }
+                    | MessagePart::Reasoning { .. }
+                    | MessagePart::Fork { .. } => {}
                 }
             }
         }

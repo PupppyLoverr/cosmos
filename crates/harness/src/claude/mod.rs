@@ -1011,6 +1011,8 @@ fn parse_questions(input: &Value) -> Vec<UserInputQuestion> {
                             .into(),
                     })
                     .collect(),
+                prefill: None,
+                multiline: false,
             }
         })
         .collect()

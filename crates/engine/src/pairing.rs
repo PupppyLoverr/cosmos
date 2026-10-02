@@ -2,8 +2,9 @@
 //! 6-char code + QR; the phone redeems it over the device-room relay for a
 //! persistent grant token. Relay conns are gated: until a conn proves a grant
 //! (`PairPhone`/`AuthorizePhone`) it may only call the bootstrap set plus the
-//! `forwardable` peer surface — the physical/computer surface and the rest of
-//! the control plane stay closed to unpaired conns.
+//! `forwardable` peer surface and account-scoped `Mutate` — the
+//! physical/computer surface and the rest of the control plane stay closed to
+//! unpaired conns.
 //!
 //! Trust model: the edge already restricts a device room to the account's own
 //! identity; pairing adds proof of physical presence at the desktop (you saw
@@ -322,15 +323,22 @@ fn is_bootstrap_method(method: &str) -> bool {
     )
 }
 
+/// Account authentication at the edge is the authorization boundary for
+/// account-scoped workspace mutations; it does not grant physical-device access.
+fn account_method(method: &str) -> bool {
+    matches!(method, zeron_rpc::methods::MUTATE)
+}
+
 /// Per-conn service wrapper the host relay installs: gates the physical
 /// phone-control surface behind phone pairing while leaving the
 /// peer-forwardable surface (desktop↔desktop `targetDeviceId` routing)
 /// untouched for same-account callers — the edge already enforces account
 /// ownership on the room, and a desktop peer carries no phone grant, so
 /// `forwardable` must stay open for multi-device routing to work at all.
-/// `from` is an opaque per-conn id the client picks, so the gate cannot tell
-/// a phone from a peer desktop; account auth is the boundary for that set,
-/// QR pairing is the boundary for everything else.
+/// `Mutate` is likewise authorized by the account identity enforced by the
+/// edge. `from` is an opaque per-conn id the client picks, so the gate cannot
+/// distinguish phone from peer desktop; QR pairing remains the boundary for
+/// physical/computer control and all other methods.
 pub struct RelayGate {
     conn_id: String,
     inner: Arc<dyn RpcService>,
@@ -383,7 +391,10 @@ impl RpcService for RelayGate {
                     device_token: String,
                 }
                 let p: AuthorizePhoneParams = zeron_rpc::parse_params(params)?;
-                match self.pairing.authorize_checked(&p.device_token, &self.conn_id) {
+                match self
+                    .pairing
+                    .authorize_checked(&p.device_token, &self.conn_id)
+                {
                     Ok(()) => RpcReply::value(&serde_json::json!({ "ok": true })),
                     Err(PairingError::GrantExpired) => {
                         Err(RpcError::Failed(PairingError::GrantExpired.to_string()))
@@ -396,6 +407,7 @@ impl RpcService for RelayGate {
             _ => {
                 if is_bootstrap_method(method)
                     || forwardable(method)
+                    || account_method(method)
                     || self.pairing.conn_authorized(&self.conn_id)
                 {
                     self.inner.handle(method, params).await
@@ -412,6 +424,21 @@ impl RpcService for RelayGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingService(AtomicUsize);
+
+    #[async_trait]
+    impl RpcService for CountingService {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            RpcReply::value(&serde_json::json!({ "method": method }))
+        }
+    }
 
     fn store() -> Arc<PairingStore> {
         let dir = tempfile::tempdir().unwrap();
@@ -473,9 +500,11 @@ mod tests {
         let (code, _) = store.issue();
         let grant = store.redeem(&code, "conn-1", None).unwrap();
         let ttl = GRANT_TTL.as_millis() as i64;
-        assert!(store
-            .authorize_at(&grant.token, "conn-2", grant.created_at + ttl - 1)
-            .is_ok());
+        assert!(
+            store
+                .authorize_at(&grant.token, "conn-2", grant.created_at + ttl - 1)
+                .is_ok()
+        );
         assert!(matches!(
             store.authorize_at(&grant.token, "conn-3", grant.created_at + ttl),
             Err(PairingError::GrantExpired)
@@ -499,5 +528,27 @@ mod tests {
             assert!(store.authorize(&grant.token, &format!("conn-{}", i + 1)));
         }
         assert_eq!(store.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unpaired_conn_can_mutate_but_not_use_computer_methods() {
+        let inner = Arc::new(CountingService(AtomicUsize::new(0)));
+        let gate = RelayGate::new("unpaired", inner.clone(), store());
+
+        let reply = gate
+            .handle(
+                zeron_rpc::methods::MUTATE,
+                serde_json::json!({ "op": "createSpace" }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reply, RpcReply::Value(_)));
+        assert_eq!(inner.0.load(Ordering::SeqCst), 1);
+
+        let result = gate
+            .handle(zeron_rpc::methods::COMPUTER_STATUS, serde_json::json!({}))
+            .await;
+        assert!(matches!(result, Err(RpcError::Failed(_))));
+        assert_eq!(inner.0.load(Ordering::SeqCst), 1);
     }
 }

@@ -146,6 +146,7 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
                 }
             }
             MessagePart::Error { message, .. } => errors.push(message.clone()),
+            MessagePart::Fork { .. } => {}
         }
     }
     RenderedMessage {
