@@ -183,16 +183,23 @@ fn result_rows(lines: &[&str], style: Style, w: usize, keep: usize) -> Vec<Line<
     out
 }
 
-fn diff_rows(d: &Diff, w: usize) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
+/// `⎿  Updated src/a.rs with 2 additions and 1 removal`
+fn diff_head(d: &Diff) -> Line<'static> {
     let head = if d.created {
         format!("Created {} ({} lines)", d.path, d.added)
     } else {
         format!("Updated {} with {} addition{} and {} removal{}", d.path, d.added, if d.added == 1 { "" } else { "s" }, d.removed, if d.removed == 1 { "" } else { "s" })
     };
-    out.push(Line::from(vec![dim("   ⎿  "), sp(head)]));
-    let nw = d.lines.iter().filter_map(|l| l.no).max().unwrap_or(1).to_string().len().max(3);
-    for l in &d.lines {
+    Line::from(vec![dim("   ⎿  "), sp(head)])
+}
+
+pub fn diff_rows(d: &Diff, w: usize) -> Vec<Line<'static>> {
+    let mut out = vec![diff_head(d)];
+    let (shown, more) = crate::toolview::capped(&d.lines, crate::skin::current().diff.max_rows);
+    let gap = crate::worker::DiffLine { kind: '…', no: None, old: None, text: format!("{more} more lines") };
+    let rows: Vec<&crate::worker::DiffLine> = shown.iter().chain((more > 0).then_some(&gap)).collect();
+    let nw = rows.iter().filter_map(|l| l.no).max().unwrap_or(1).to_string().len().max(3);
+    for l in rows {
         let (bg, sign, fg) = match l.kind {
             '+' => (Some(theme::DIFF_ADD_BG()), "+", theme::fg(GREEN())),
             '-' => (Some(theme::DIFF_DEL_BG()), "-", theme::fg(RED())),
@@ -238,7 +245,12 @@ pub fn tool_block(name: &str, input: &Value, content: Option<&str>, err: bool, d
         return out;
     }
     if let Some(d) = diff {
-        out.extend(diff_rows(d, w));
+        if crate::skin::current().diff.style == "classic" {
+            out.extend(diff_rows(d, w));
+        } else {
+            out.push(diff_head(d));
+            out.extend(crate::toolview::diff(d, w));
+        }
         return out;
     }
     let summary = match name {
@@ -672,6 +684,7 @@ fn help_rows(w: usize) -> Vec<Line<'static>> {
         ("↑ ↓", "prompt history"),
         ("ctrl+w · ctrl+u · ctrl+k", "delete word · to start · to end"),
         ("ctrl+l", "clear the screen"),
+        ("ctrl+o", "expand the last tool output"),
         ("/", "commands — /model /providers /connect /login /resume /review …"),
     ];
     let kw = ROWS.iter().map(|(k, _)| width_of(k)).max().unwrap_or(0);
@@ -961,6 +974,42 @@ pub fn turn_footer(app: &App) -> Vec<Line<'static>> {
     vec![Line::from(vec![sp(" "), Span::styled(format!("{} ", cfg.footer_glyph), theme::fg(ACCENT())), dim(text)])]
 }
 
+/// Rows the ctrl+o pager shows at once.
+pub const PAGER_ROWS: usize = 18;
+
+/// The ctrl+o pager: one kept tool output, scrollable, newest first.
+fn pager(app: &App, idx: usize, scroll: usize, w: usize) -> Vec<Line<'static>> {
+    let n = app.outputs.len();
+    let Some(o) = app.outputs.iter().rev().nth(idx) else {
+        return vec![Line::from(dim(" Nothing to expand yet · esc"))];
+    };
+    let total = o.body.len();
+    let top = scroll.min(total.saturating_sub(PAGER_ROWS));
+    let nw = total.max(1).to_string().len();
+    let mut out = vec![
+        rule(w),
+        Line::from(vec![
+            sp(" "),
+            Span::styled(format!("{} ", crate::skin::current().glyphs.tool), theme::fg(ACCENT())),
+            Span::styled(ellipsize(&o.title, w.saturating_sub(30)), theme::bold(Style::new())),
+            dim(format!("  {}/{n}", idx + 1)),
+        ]),
+    ];
+    for (i, l) in o.body.iter().enumerate().skip(top).take(PAGER_ROWS) {
+        let room = w.saturating_sub(nw + 4);
+        out.push(Line::from(vec![dim(format!(" {:>nw$}  ", i + 1)), sp(ellipsize(&l.replace('\t', "    "), room))]));
+    }
+    if total == 0 {
+        out.push(Line::from(dim("   (no output)")));
+    }
+    let end = (top + PAGER_ROWS).min(total);
+    out.push(Line::from(dim(format!(
+        " {}–{end} of {total} · ↑↓ pgup/pgdn scroll · ←→ older/newer · esc close",
+        if total == 0 { 0 } else { top + 1 }
+    ))));
+    out
+}
+
 /// Everything still in motion, plus the composer and whatever menu is open.
 pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
     let w = app.width;
@@ -968,6 +1017,13 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
     let tick = (ms / 80) as usize;
     let mut out: Vec<Line<'static>> = Vec::new();
 
+    // reads and searches still being folded together
+    if !app.explore.is_empty() {
+        if out.is_empty() && !app.last_out_blank() {
+            out.push(Line::default());
+        }
+        out.extend(crate::toolview::group(&app.explore, w));
+    }
     // streaming tail — the line still being written
     if let Some(st) = &app.stream {
         let mut tail = st.md.preview(&st.partial, w);
@@ -988,9 +1044,15 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
     }
     // tools in flight
     for t in &app.tools {
-        let mut l = head(&t.name, &t.input, Style::new(), w);
         let sk = crate::skin::current();
-        l.spans[1] = crate::motion::spinner_span(&sk.spinner, ACCENT(), ms, sk.motion.reduce);
+        let spin = crate::motion::spinner_span(&sk.spinner, ACCENT(), ms, sk.motion.reduce);
+        let l = if sk.tools.style == "classic" {
+            let mut l = head(&t.name, &t.input, Style::new(), w);
+            l.spans[1] = spin;
+            l
+        } else {
+            crate::toolview::running(&t.name, &t.input, spin, t.started.elapsed(), w)
+        };
         if out.is_empty() && !app.last_out_blank() {
             out.push(Line::default());
         }
@@ -1041,6 +1103,10 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
         }
         Some(Popup::Resume { items, sel }) => {
             out.extend(resume_picker(items, *sel, w));
+            return (out, None);
+        }
+        Some(Popup::Pager { idx, scroll }) => {
+            out.extend(pager(app, *idx, *scroll, w));
             return (out, None);
         }
         _ => {}
@@ -1154,10 +1220,10 @@ mod tests {
             removed: 1,
             created: false,
             lines: vec![
-                DiffLine { kind: ' ', no: Some(1), text: "fn a() {".into() },
-                DiffLine { kind: '-', no: Some(2), text: "    old();".into() },
-                DiffLine { kind: '+', no: Some(2), text: "    new();".into() },
-                DiffLine { kind: '…', no: None, text: String::new() },
+                DiffLine { kind: ' ', no: Some(1), old: Some(1), text: "fn a() {".into() },
+                DiffLine { kind: '-', no: Some(2), old: Some(2), text: "    old();".into() },
+                DiffLine { kind: '+', no: Some(2), old: None, text: "    new();".into() },
+                DiffLine { kind: '…', no: None, old: None, text: String::new() },
             ],
         };
         let mut out = vec![
@@ -1209,7 +1275,7 @@ mod tests {
         let _env = crate::env_lock();
         std::env::set_var("COSMOS_CLI_HOME", std::env::temp_dir().join("cosmos-golden-test"));
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/classic.txt");
-        let got = crate::skin::scoped(crate::skin::palette::CLASSIC, golden_text);
+        let got = crate::skin::scoped_skin(crate::skin::Skin::classic(), golden_text);
         if std::env::var_os("UPDATE_GOLDEN").is_some() || !path.exists() {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, &got).unwrap();
@@ -1238,8 +1304,8 @@ mod tests {
             removed: 1,
             created: false,
             lines: vec![
-                DiffLine { kind: '-', no: Some(3), text: "old".into() },
-                DiffLine { kind: '+', no: Some(3), text: "new".into() },
+                DiffLine { kind: '-', no: Some(3), old: Some(3), text: "old".into() },
+                DiffLine { kind: '+', no: Some(3), old: None, text: "new".into() },
             ],
         };
         let rows: Vec<String> = tool_block("edit", &serde_json::json!({"path": "src/a.rs"}), Some("ok"), false, Some(&d), 60, false)

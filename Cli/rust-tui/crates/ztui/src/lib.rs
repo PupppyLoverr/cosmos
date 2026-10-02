@@ -16,6 +16,7 @@ mod skin;
 mod slash;
 mod term;
 mod theme;
+mod toolview;
 mod tui;
 mod view;
 mod files;

@@ -93,7 +93,19 @@ pub enum Popup {
     /// earlier sessions for /resume: (id, preview, started)
     Resume { items: Vec<(String, String, String)>, sel: usize },
     Help,
+    /// ctrl+o: a kept tool output — `idx` 0 is the newest.
+    Pager { idx: usize, scroll: usize },
 }
+
+/// A tool output kept for the ctrl+o pager.
+pub struct Output {
+    pub title: String,
+    pub body: Vec<String>,
+}
+
+/// Tool outputs kept for ctrl+o, and the most lines kept from each.
+const KEEP_OUTPUTS: usize = 50;
+const KEEP_OUTPUT_LINES: usize = 5000;
 
 pub struct Perm {
     pub tool: String,
@@ -108,6 +120,7 @@ pub struct PendingTool {
     pub id: String,
     pub name: String,
     pub input: Value,
+    pub started: Instant,
 }
 
 /// The assistant reply currently streaming in.
@@ -196,6 +209,10 @@ pub struct App {
     pub stream: Option<Stream>,
     pub tools: Vec<PendingTool>,
     diffs: HashMap<String, Diff>,
+    /// finished reads/searches waiting to be committed as one group
+    pub explore: Vec<crate::toolview::Explored>,
+    /// recent tool outputs, oldest first (ctrl+o)
+    pub outputs: std::collections::VecDeque<Output>,
     pub plan_pending: bool,
     echoes: Vec<String>,
     quitting: bool,
@@ -276,6 +293,8 @@ impl App {
             stream: None,
             tools: Vec::new(),
             diffs: HashMap::new(),
+            explore: Vec::new(),
+            outputs: std::collections::VecDeque::new(),
             plan_pending: false,
             echoes: Vec::new(),
             quitting: false,
@@ -315,8 +334,54 @@ impl App {
             .unwrap_or(self.last_blank);
     }
 
+    /// Commit any reads/searches still waiting to be grouped.
+    fn flush_explore(&mut self) {
+        if self.explore.is_empty() {
+            return;
+        }
+        let items = std::mem::take(&mut self.explore);
+        self.block(crate::toolview::group(&items, self.width));
+    }
+
+    /// Keep a tool's full output for the ctrl+o pager.
+    fn keep_output(&mut self, title: String, mut body: Vec<String>) {
+        if body.len() > KEEP_OUTPUT_LINES {
+            let more = body.len() - KEEP_OUTPUT_LINES;
+            body.truncate(KEEP_OUTPUT_LINES);
+            body.push(format!("… {more} more lines not kept"));
+        }
+        self.outputs.push_back(Output { title, body });
+        while self.outputs.len() > KEEP_OUTPUTS {
+            self.outputs.pop_front();
+        }
+    }
+
+    /// A finished tool call: kept for ctrl+o, then grouped or committed.
+    fn finish_tool(&mut self, v: crate::toolview::ToolView) {
+        let w = self.width;
+        let title = format!("{} {}", view::tool_label(v.name), view::arg_summary(v.name, v.input, 200)).trim().to_string();
+        let body: Vec<String> = match v.diff {
+            Some(d) => crate::toolview::diff_text(d),
+            None => crate::toolview::body_of(v.name, v.content.unwrap_or("")).lines().map(str::to_string).collect(),
+        };
+        self.keep_output(title, body);
+        let sk = crate::skin::current();
+        if !v.interrupted && v.diff.is_none() && crate::toolview::groups(&sk, v.name, v.err) {
+            self.explore.push(crate::toolview::Explored {
+                name: v.name.to_string(),
+                input: v.input.clone(),
+                content: v.content.unwrap_or("").to_string(),
+                elapsed: v.elapsed,
+            });
+            self.dirty = true;
+            return;
+        }
+        self.block(crate::toolview::render(&v, w));
+    }
+
     /// Commit a block, separated from the previous one by one blank row.
     pub fn block(&mut self, lines: Vec<Line<'static>>) {
+        self.flush_explore();
         if lines.is_empty() {
             return;
         }
@@ -331,6 +396,7 @@ impl App {
 
     /// Continue the previous block (streamed rows).
     fn cont(&mut self, lines: Vec<Line<'static>>) {
+        self.flush_explore();
         if lines.is_empty() {
             return;
         }
@@ -469,9 +535,18 @@ impl App {
                 self.end_stream();
                 // anything still pending was cut short
                 for t in std::mem::take(&mut self.tools) {
-                    let lines = view::tool_block(&t.name, &t.input, None, false, None, self.width, true);
-                    self.block(lines);
+                    let v = crate::toolview::ToolView {
+                        name: &t.name,
+                        input: &t.input,
+                        content: None,
+                        err: false,
+                        diff: None,
+                        interrupted: true,
+                        elapsed: Some(t.started.elapsed()),
+                    };
+                    self.block(crate::toolview::render(&v, self.width));
                 }
+                self.flush_explore();
                 self.inflight = self.inflight.saturating_sub(1);
                 if self.inflight == 0 {
                     self.busy = false;
@@ -533,6 +608,7 @@ impl App {
                             id: c["id"].as_str().unwrap_or("").to_string(),
                             name,
                             input,
+                            started: Instant::now(),
                         });
                     }
                 }
@@ -541,17 +617,24 @@ impl App {
                 let id = ev.data["tool_use_id"].as_str().unwrap_or("");
                 let err = ev.data["is_error"].as_bool().unwrap_or(false);
                 let content = ev.data["content"].as_str().unwrap_or("");
-                let (name, input) = match self.tools.iter().position(|t| t.id == id) {
+                let (name, input, elapsed) = match self.tools.iter().position(|t| t.id == id) {
                     Some(i) => {
                         let t = self.tools.remove(i);
-                        (t.name, t.input)
+                        (t.name, t.input, Some(t.started.elapsed()))
                     }
-                    None => (ev.data["name"].as_str().unwrap_or("tool").to_string(), Value::Null),
+                    None => (ev.data["name"].as_str().unwrap_or("tool").to_string(), Value::Null, None),
                 };
                 let diff = self.diffs.remove(id);
                 if name != "submit_plan" {
-                    let lines = view::tool_block(&name, &input, Some(content), err, diff.as_ref(), w, false);
-                    self.block(lines);
+                    self.finish_tool(crate::toolview::ToolView {
+                        name: &name,
+                        input: &input,
+                        content: Some(content),
+                        err,
+                        diff: diff.as_ref(),
+                        interrupted: false,
+                        elapsed,
+                    });
                 }
             }
             // a subscription agent's own tool (ACP) — shown, never replayed
@@ -560,7 +643,15 @@ impl App {
                 let status = ev.data["status"].as_str().unwrap_or("");
                 let input = serde_json::json!({"title": ev.data["title"]});
                 let out = ev.data["output"].as_str().unwrap_or("");
-                self.block(view::tool_block(name, &input, Some(out), status == "failed", None, w, false));
+                self.finish_tool(crate::toolview::ToolView {
+                    name,
+                    input: &input,
+                    content: Some(out),
+                    err: status == "failed",
+                    diff: None,
+                    interrupted: false,
+                    elapsed: None,
+                });
             }
             "plan" => {
                 self.plan_pending = true;
@@ -875,7 +966,7 @@ impl App {
 
     /// Open / close the `/` and `@` menus to match the input.
     fn refresh_popups(&mut self) {
-        if matches!(self.popup, Some(Popup::Model { .. } | Popup::Connect { .. } | Popup::Resume { .. } | Popup::Help)) || self.key_entry.is_some() {
+        if matches!(self.popup, Some(Popup::Model { .. } | Popup::Connect { .. } | Popup::Resume { .. } | Popup::Help | Popup::Pager { .. })) || self.key_entry.is_some() {
             return;
         }
         let slash_open = self.slash_state().is_some_and(|(_, a)| a.is_empty() && !self.input.contains(&' '));
@@ -1401,6 +1492,16 @@ impl App {
             self.clear_screen = true;
             return;
         }
+        if ctrl && k.code == KeyCode::Char('o') && self.perm.is_none() {
+            if matches!(self.popup, Some(Popup::Pager { .. })) {
+                self.popup = None;
+            } else if self.outputs.is_empty() {
+                self.flash("Nothing to expand yet", crate::skin::palette().dim);
+            } else {
+                self.popup = Some(Popup::Pager { idx: 0, scroll: 0 });
+            }
+            return;
+        }
 
         // permission prompt owns the keyboard
         if let Some(p) = &mut self.perm {
@@ -1498,6 +1599,31 @@ impl App {
                     KeyCode::Char(c) if !ctrl => {
                         filter.push(c);
                         *sel = 0;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            Some(Popup::Pager { idx, scroll }) => {
+                let n = self.outputs.len();
+                let len = self.outputs.iter().rev().nth(*idx).map(|o| o.body.len()).unwrap_or(0);
+                let last = len.saturating_sub(view::PAGER_ROWS);
+                let page = view::PAGER_ROWS - 1;
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.popup = None,
+                    KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1).min(last),
+                    KeyCode::Down | KeyCode::Char('j') => *scroll = (*scroll + 1).min(last),
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(page).min(last),
+                    KeyCode::PageDown | KeyCode::Char(' ') => *scroll = (*scroll + page).min(last),
+                    KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+                    KeyCode::End | KeyCode::Char('G') => *scroll = last,
+                    KeyCode::Left | KeyCode::Char('h') if *idx + 1 < n => {
+                        *idx += 1;
+                        *scroll = 0;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') if *idx > 0 => {
+                        *idx -= 1;
+                        *scroll = 0;
                     }
                     _ => {}
                 }
@@ -2156,6 +2282,59 @@ mod tests {
     }
 
     #[test]
+    fn explores_group_then_ctrl_o_expands() {
+        let _env = crate::env_lock();
+        crate::skin::scoped_skin(crate::skin::Skin::default(), || {
+            let mut a = app();
+            let (cmd, _rx) = std::sync::mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let ev = |kind: &str, data: Value| zproto::Event {
+                v: 1, id: "e".into(), parent: None, ts: String::new(), session: "s".into(),
+                harness: "cosmostui".into(), kind: kind.into(), data,
+            };
+            let call = |id: &str, name: &str, input: Value| serde_json::json!({"text": "", "tool_calls": [{"id": id, "name": name, "input": input}]});
+            let done = |id: &str, name: &str, content: &str| serde_json::json!({"tool_use_id": id, "name": name, "content": content, "is_error": false});
+            a.on_msg(Msg::Event(ev("assistant", call("r1", "read", serde_json::json!({"path": "a.rs"})))));
+            a.on_msg(Msg::Event(ev("tool_result", done("r1", "read", "one
+two
+"))));
+            a.on_msg(Msg::Event(ev("assistant", call("g1", "grep", serde_json::json!({"pattern": "fn"})))));
+            let long: String = (1..=40).map(|i| format!("a.rs:{i}:fn x{i}
+")).collect();
+            a.on_msg(Msg::Event(ev("tool_result", done("g1", "grep", &long))));
+            assert!(a.out.is_empty(), "reads and searches wait to be grouped");
+            assert_eq!(a.explore.len(), 2);
+            let live: Vec<String> = view::live(&a).0.iter().map(text).collect();
+            assert!(live.iter().any(|r| r.contains("Explored 1 file · 1 search")), "{live:?}");
+
+            // anything else commits the group first, in order
+            a.on_msg(Msg::Event(ev("assistant", call("b1", "bash", serde_json::json!({"command": "ls"})))));
+            a.on_msg(Msg::Event(ev("tool_result", done("b1", "bash", "exit_code=0 log_path=x omitted_chars=0
+<<<UNTRUSTED_SHELL
+ok
+>>>"))));
+            let rows: Vec<String> = a.out.iter().map(text).collect();
+            let g = rows.iter().position(|r| r.contains("Explored")).expect("group committed");
+            let b = rows.iter().position(|r| r.contains("Bash ls")).expect("bash committed");
+            assert!(g < b, "{rows:?}");
+            assert!(a.explore.is_empty());
+
+            // ctrl+o opens the newest output; ← walks back to the grep
+            a.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), &cmd, &stop);
+            assert!(matches!(a.popup, Some(Popup::Pager { idx: 0, .. })));
+            let page: Vec<String> = view::live(&a).0.iter().map(text).collect();
+            assert!(page.iter().any(|r| r.contains("Bash ls")) && page.iter().any(|r| r.trim_start().starts_with("1  ok")), "{page:?}");
+            a.on_key(key(KeyCode::Left), &cmd, &stop);
+            a.on_key(key(KeyCode::End), &cmd, &stop);
+            let page: Vec<String> = view::live(&a).0.iter().map(text).collect();
+            assert!(page.iter().any(|r| r.contains("fn x40")), "scrolled to the end: {page:?}");
+            assert!(page.iter().any(|r| r.contains("23–40 of 40")), "{page:?}");
+            a.on_key(key(KeyCode::Esc), &cmd, &stop);
+            assert!(a.popup.is_none());
+        });
+    }
+
+    #[test]
     fn status_line_shows_the_cost_ledger() {
         let _env = crate::env_lock();
         let mut a = app();
@@ -2189,7 +2368,7 @@ mod tests {
         let line: String = view::busy_line(&a, 0).spans.iter().map(|s| s.content.to_string()).collect();
         assert!(line.contains("Cooking…") && line.contains("14s") && line.contains("esc to interrupt"), "{line}");
         // a running tool names what it is doing
-        a.tools.push(PendingTool { id: "t".into(), name: "grep".into(), input: Value::Null });
+        a.tools.push(PendingTool { id: "t".into(), name: "grep".into(), input: Value::Null, started: Instant::now() });
         let line: String = view::busy_line(&a, 0).spans.iter().map(|s| s.content.to_string()).collect();
         assert!(line.contains("Searching…"), "{line}");
         a.tools.clear();

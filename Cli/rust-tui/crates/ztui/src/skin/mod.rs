@@ -108,6 +108,67 @@ impl Default for MotionCfg {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ToolsCfg {
+    /// "cosmos" (status glyph, meta, grouping) or "classic"
+    pub style: String,
+    /// result rows kept under a finished tool (searches keep `keep_rows_search`)
+    pub keep_rows: usize,
+    pub keep_rows_search: usize,
+    /// collapse runs of read/search tools into one "Explored …" block
+    pub group: bool,
+    pub show_elapsed: bool,
+}
+
+impl Default for ToolsCfg {
+    fn default() -> Self {
+        ToolsCfg { style: "cosmos".into(), keep_rows: 4, keep_rows_search: 3, group: true, show_elapsed: true }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DiffCfg {
+    /// "cosmos" (word highlights, syntax colour, wrapping) or "classic"
+    pub style: String,
+    /// "unified", "split", or "auto" (split when the terminal is ≥ 140 wide)
+    pub layout: String,
+    /// rows shown before "N more lines" (ctrl+o shows the whole diff)
+    pub max_rows: usize,
+    /// unchanged lines around each change
+    pub context: usize,
+    pub word_diff: bool,
+    pub syntax: bool,
+    /// wrap long lines with ↳ instead of cutting them
+    pub wrap: bool,
+}
+
+impl Default for DiffCfg {
+    fn default() -> Self {
+        DiffCfg { style: "cosmos".into(), layout: "auto".into(), max_rows: 40, context: 2, word_diff: true, syntax: true, wrap: true }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GlyphsCfg {
+    /// the dot before a tool (coloured by its status)
+    pub tool: String,
+    /// a collapsed group of reads/searches
+    pub group: String,
+    /// the elbow before a tool's result rows
+    pub elbow: String,
+    /// continuation of a wrapped line
+    pub wrap: String,
+}
+
+impl Default for GlyphsCfg {
+    fn default() -> Self {
+        GlyphsCfg { tool: "◆".into(), group: "◇".into(), elbow: "⎿".into(), wrap: "↳".into() }
+    }
+}
+
 /// The whole `ui.toml`. Unknown keys are ignored on load (a file written
 /// for a newer cosmostui still loads) but rejected by `/customise`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -116,6 +177,22 @@ pub struct Skin {
     pub theme: ThemeCfg,
     pub spinner: SpinnerCfg,
     pub motion: MotionCfg,
+    pub tools: ToolsCfg,
+    pub diff: DiffCfg,
+    pub glyphs: GlyphsCfg,
+}
+
+impl Skin {
+    /// The look cosmostui had before skins: classic colours and layouts.
+    #[cfg_attr(not(test), allow(dead_code))] // `/customise reset classic` (phase 6)
+    pub fn classic() -> Skin {
+        let mut s = Skin::default();
+        s.theme.name = "classic".into();
+        s.tools.style = "classic".into();
+        s.diff.style = "classic".into();
+        s.glyphs.tool = "●".into();
+        s
+    }
 }
 
 impl Skin {
@@ -162,6 +239,8 @@ fn with<T>(f: impl FnOnce(&State) -> T) -> T {
 thread_local! {
     /// A palette for this thread only (tests render themes side by side).
     static SCOPED: std::cell::Cell<Option<Palette>> = const { std::cell::Cell::new(None) };
+    /// A whole skin for this thread only (tests).
+    static SCOPED_SKIN: std::cell::RefCell<Option<Arc<Skin>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The palette every style function reads.
@@ -181,7 +260,20 @@ pub fn scoped<T>(p: Palette, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Run `f` with `skin` (and its palette) as this thread's skin.
+#[cfg(test)]
+pub fn scoped_skin<T>(skin: Skin, f: impl FnOnce() -> T) -> T {
+    let p = skin.palette().0;
+    let prev = SCOPED_SKIN.with(|c| c.replace(Some(Arc::new(skin))));
+    let out = scoped(p, f);
+    SCOPED_SKIN.with(|c| *c.borrow_mut() = prev);
+    out
+}
+
 pub fn current() -> Arc<Skin> {
+    if let Some(s) = SCOPED_SKIN.with(|c| c.borrow().clone()) {
+        return s;
+    }
     with(|s| s.skin.clone())
 }
 

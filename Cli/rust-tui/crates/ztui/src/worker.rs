@@ -45,6 +45,8 @@ pub struct DiffLine {
     pub kind: char,
     /// line number in the new file (old file for removals)
     pub no: Option<usize>,
+    /// line number in the old file (context and removals)
+    pub old: Option<usize>,
     pub text: String,
 }
 
@@ -171,8 +173,9 @@ fn install_delta(agent: &mut Agent, tx: &Sender<Msg>) {
     }));
 }
 
-/// Most diff rows shown per call — enough to review, never a wall.
-const MAX_DIFF_ROWS: usize = 40;
+/// Most diff rows kept per call. The skin shows fewer (`[diff] max_rows`);
+/// the rest wait in the ctrl+o pager.
+const MAX_DIFF_ROWS: usize = 2000;
 
 /// Unified-style rows (2 lines of context) between two file versions.
 pub fn diff_rows(old: &str, new: &str) -> (Vec<DiffLine>, usize, usize) {
@@ -182,11 +185,12 @@ pub fn diff_rows(old: &str, new: &str) -> (Vec<DiffLine>, usize, usize) {
     let mut rows = Vec::new();
     for (gi, group) in d.grouped_ops(2).iter().enumerate() {
         if gi > 0 {
-            rows.push(DiffLine { kind: '…', no: None, text: String::new() });
+            rows.push(DiffLine { kind: '…', no: None, old: None, text: String::new() });
         }
         for op in group {
             for ch in d.iter_changes(op) {
                 let text = ch.value().trim_end_matches(['\n', '\r']).to_string();
+                let old = ch.old_index().map(|i| i + 1);
                 let (kind, no) = match ch.tag() {
                     ChangeTag::Insert => {
                         added += 1;
@@ -194,18 +198,18 @@ pub fn diff_rows(old: &str, new: &str) -> (Vec<DiffLine>, usize, usize) {
                     }
                     ChangeTag::Delete => {
                         removed += 1;
-                        ('-', ch.old_index().map(|i| i + 1))
+                        ('-', old)
                     }
                     ChangeTag::Equal => (' ', ch.new_index().map(|i| i + 1)),
                 };
-                rows.push(DiffLine { kind, no, text });
+                rows.push(DiffLine { kind, no, old, text });
             }
         }
     }
     if rows.len() > MAX_DIFF_ROWS {
         let more = rows.len() - MAX_DIFF_ROWS;
         rows.truncate(MAX_DIFF_ROWS);
-        rows.push(DiffLine { kind: '…', no: None, text: format!("{more} more lines") });
+        rows.push(DiffLine { kind: '…', no: None, old: None, text: format!("{more} more lines") });
     }
     (rows, added, removed)
 }
@@ -499,17 +503,17 @@ mod tests {
         let new = "a\nb\nC\nd\ne\nf\n";
         let (rows, added, removed) = diff_rows(old, new);
         assert_eq!((added, removed), (2, 1));
-        assert!(rows.contains(&DiffLine { kind: '-', no: Some(3), text: "c".into() }));
-        assert!(rows.contains(&DiffLine { kind: '+', no: Some(3), text: "C".into() }));
-        assert!(rows.contains(&DiffLine { kind: '+', no: Some(6), text: "f".into() }));
+        assert!(rows.contains(&DiffLine { kind: '-', no: Some(3), old: Some(3), text: "c".into() }));
+        assert!(rows.contains(&DiffLine { kind: '+', no: Some(3), old: None, text: "C".into() }));
+        assert!(rows.contains(&DiffLine { kind: '+', no: Some(6), old: None, text: "f".into() }));
     }
 
     #[test]
     fn diff_rows_are_capped() {
         let old = String::new();
-        let new: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let new: String = (0..2500).map(|i| format!("line {i}\n")).collect();
         let (rows, added, _) = diff_rows(&old, &new);
-        assert_eq!(added, 200);
+        assert_eq!(added, 2500);
         assert_eq!(rows.len(), MAX_DIFF_ROWS + 1);
         assert_eq!(rows.last().unwrap().kind, '…');
     }
