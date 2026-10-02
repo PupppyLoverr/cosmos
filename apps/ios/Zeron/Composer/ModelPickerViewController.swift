@@ -117,7 +117,6 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
 
         renderSections()
         updatePreferredContentSize()
-        updatePreferredContentSize()
     }
 
     override func viewDidAppear(_ animated: Bool) {
