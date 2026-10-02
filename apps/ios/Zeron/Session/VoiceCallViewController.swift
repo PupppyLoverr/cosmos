@@ -1,6 +1,22 @@
 import AVFoundation
 import UIKit
 
+private enum VoiceCallColors {
+    static let ink = UIColor { traits in
+        traits.userInterfaceStyle == .dark ? .white : .black
+    }
+    static let paper = UIColor { traits in
+        traits.userInterfaceStyle == .dark ? .black : .white
+    }
+
+    static func inkWithAlpha(_ alpha: CGFloat) -> UIColor {
+        UIColor { traits in
+            (traits.userInterfaceStyle == .dark ? UIColor.white : UIColor.black)
+                .withAlphaComponent(alpha)
+        }
+    }
+}
+
 @MainActor
 final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechSynthesizerDelegate {
     private enum Phase: Equatable {
@@ -31,8 +47,6 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
     private let modelMark = UIImageView()
     private let modelChip = UIView()
     private let status = UILabel()
-    private let statusDot = UIView()
-    private let statusPill = UIStackView()
     private let caption = UILabel()
     private let hint = UILabel()
     private let captionStack = UIStackView()
@@ -42,7 +56,6 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
     private let muteLabel = UILabel()
     private let endLabel = UILabel()
     private let controls = UIStackView()
-    private let screenGlow = CAGradientLayer()
     private var listenTask: Task<Void, Never>?
     private var replyTask: Task<Void, Never>?
     private var demoTask: Task<Void, Never>?
@@ -77,10 +90,9 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .overFullScreen
         modalPresentationCapturesStatusBarAppearance = true
-        overrideUserInterfaceStyle = .dark
     }
 
-    override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+    override var preferredStatusBarStyle: UIStatusBarStyle { .default }
 
     required init?(coder: NSCoder) { fatalError() }
 
@@ -89,32 +101,19 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
         speech.delegate = self
         previousIdleTimerState = UIApplication.shared.isIdleTimerDisabled
         UIApplication.shared.isIdleTimerDisabled = true
-        view.backgroundColor = UIColor(hex: 0x08080B)
-
-        screenGlow.type = .radial
-        screenGlow.startPoint = CGPoint(x: 0.5, y: 0.5)
-        screenGlow.endPoint = CGPoint(x: 1, y: 0.5)
-        screenGlow.colors = [
-            Palette.accent.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
-                .withAlphaComponent(0.10).cgColor,
-            UIColor.clear.cgColor,
-        ]
-        view.layer.insertSublayer(screenGlow, at: 0)
+        view.backgroundColor = VoiceCallColors.paper
 
         titleLabel.text = initialTitle
-        titleLabel.textColor = .white
+        titleLabel.textColor = VoiceCallColors.ink
         titleLabel.font = Fonts.ui(.sansSemibold, 17)
         titleLabel.textAlignment = .center
         titleLabel.numberOfLines = 1
 
-        modelChip.backgroundColor = UIColor.white.withAlphaComponent(0.08)
-        modelChip.layer.cornerRadius = 15
-        modelChip.layer.borderWidth = 1
-        modelChip.layer.borderColor = UIColor.white.withAlphaComponent(0.10).cgColor
         modelChip.translatesAutoresizingMaskIntoConstraints = false
         modelMark.contentMode = .scaleAspectFit
+        modelMark.tintColor = VoiceCallColors.inkWithAlpha(0.5)
         modelMark.setContentHuggingPriority(.required, for: .horizontal)
-        model.textColor = UIColor.white.withAlphaComponent(0.75)
+        model.textColor = VoiceCallColors.inkWithAlpha(0.5)
         model.font = Fonts.ui(.sans, 13)
         model.numberOfLines = 1
         let modelContents = UIStackView(arrangedSubviews: [modelMark, model])
@@ -133,31 +132,12 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
         ])
         updateModelLabel()
 
-        status.textColor = UIColor.white.withAlphaComponent(0.85)
+        status.textColor = VoiceCallColors.inkWithAlpha(0.55)
         status.font = Fonts.ui(.sansMedium, 14)
         status.numberOfLines = 1
-        statusDot.layer.cornerRadius = 3
-        statusDot.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            statusDot.widthAnchor.constraint(equalToConstant: 6),
-            statusDot.heightAnchor.constraint(equalToConstant: 6),
-        ])
-        statusPill.axis = .horizontal
-        statusPill.alignment = .center
-        statusPill.spacing = 8
-        statusPill.isLayoutMarginsRelativeArrangement = true
-        statusPill.layoutMargins = UIEdgeInsets(top: 7, left: 12, bottom: 7, right: 12)
-        statusPill.backgroundColor = UIColor.white.withAlphaComponent(0.08)
-        statusPill.layer.cornerRadius = 16
-        statusPill.layer.borderWidth = 1
-        statusPill.layer.borderColor = UIColor.white.withAlphaComponent(0.10).cgColor
-        statusPill.addArrangedSubview(statusDot)
-        statusPill.addArrangedSubview(status)
-        statusPill.translatesAutoresizingMaskIntoConstraints = false
-        statusPill.setContentHuggingPriority(.required, for: .vertical)
-        statusPill.setContentCompressionResistancePriority(.required, for: .vertical)
+        status.translatesAutoresizingMaskIntoConstraints = false
 
-        caption.textColor = UIColor.white.withAlphaComponent(0.9)
+        caption.textColor = VoiceCallColors.inkWithAlpha(0.9)
         caption.font = Fonts.ui(.sans, 17)
         caption.textAlignment = .center
         caption.numberOfLines = 4
@@ -165,7 +145,7 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
         caption.adjustsFontForContentSizeCategory = true
         caption.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         hint.text = "Tap the orb to interrupt"
-        hint.textColor = UIColor.white.withAlphaComponent(0.45)
+        hint.textColor = VoiceCallColors.inkWithAlpha(0.4)
         hint.font = Fonts.ui(.sans, 12)
         hint.textAlignment = .center
         hint.isHidden = true
@@ -183,8 +163,18 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
         let centerTap = UITapGestureRecognizer(target: self, action: #selector(orbTapped))
         orb.addGestureRecognizer(centerTap)
 
-        configureButton(muteButton, symbol: "mic", background: UIColor.white.withAlphaComponent(0.10), tint: .white)
-        configureButton(endButton, symbol: "phone.down.fill", background: Palette.danger, tint: .white)
+        configureButton(
+            muteButton,
+            symbol: "mic",
+            background: VoiceCallColors.inkWithAlpha(0.08),
+            tint: VoiceCallColors.ink
+        )
+        configureButton(
+            endButton,
+            symbol: "phone.down.fill",
+            background: VoiceCallColors.ink,
+            tint: VoiceCallColors.paper
+        )
         muteButton.accessibilityIdentifier = "voice-mute"
         muteButton.accessibilityLabel = "Mute"
         muteButton.addAction(UIAction { [weak self] _ in self?.toggleMute() }, for: .touchUpInside)
@@ -195,7 +185,7 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
         endLabel.text = "End"
         [muteLabel, endLabel].forEach {
             $0.font = Fonts.ui(.sans, 12)
-            $0.textColor = UIColor.white.withAlphaComponent(0.6)
+            $0.textColor = VoiceCallColors.inkWithAlpha(0.5)
             $0.textAlignment = .center
         }
         let muteControl = UIStackView(arrangedSubviews: [muteButton, muteLabel])
@@ -217,20 +207,19 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
         header.alignment = .center
         header.spacing = 8
         header.translatesAutoresizingMaskIntoConstraints = false
-        [header, statusPill, orb, captionStack, controls].forEach(view.addSubview)
+        [header, status, orb, captionStack, controls].forEach(view.addSubview)
 
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 20),
             header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
             header.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
-            statusPill.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            statusPill.topAnchor.constraint(equalTo: orb.bottomAnchor, constant: 28),
-            statusPill.heightAnchor.constraint(equalToConstant: 32),
+            status.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            status.topAnchor.constraint(equalTo: orb.bottomAnchor, constant: 28),
             orb.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             orb.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -40),
             orb.widthAnchor.constraint(equalToConstant: 280),
             orb.heightAnchor.constraint(equalTo: orb.widthAnchor),
-            captionStack.topAnchor.constraint(equalTo: statusPill.bottomAnchor, constant: 14),
+            captionStack.topAnchor.constraint(equalTo: status.bottomAnchor, constant: 14),
             captionStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 28),
             captionStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -28),
             captionStack.bottomAnchor.constraint(lessThanOrEqualTo: controls.topAnchor, constant: -22),
@@ -262,13 +251,6 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
         } else {
             startListening()
         }
-    }
-
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        let size = min(view.bounds.width * 1.35, 520)
-        screenGlow.bounds = CGRect(x: 0, y: 0, width: size, height: size)
-        screenGlow.position = CGPoint(x: view.bounds.midX, y: view.bounds.midY - 40)
     }
 
     override func viewDidDisappear(_ animated: Bool) {
@@ -508,27 +490,6 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
         status.text = statusText
         orb.accessibilityValue = statusText
         hint.isHidden = phase != .speaking
-        statusDot.layer.removeAnimation(forKey: "listening-pulse")
-        statusDot.alpha = 1
-        switch phase {
-        case .listening:
-            statusDot.backgroundColor = Palette.accent.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
-            if !UIAccessibility.isReduceMotionEnabled {
-                let pulse = CABasicAnimation(keyPath: "opacity")
-                pulse.fromValue = 0.4
-                pulse.toValue = 1
-                pulse.duration = 0.45
-                pulse.autoreverses = true
-                pulse.repeatCount = .infinity
-                statusDot.layer.add(pulse, forKey: "listening-pulse")
-            }
-        case .paused:
-            statusDot.backgroundColor = Palette.tertiary.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
-        case .unavailable:
-            statusDot.backgroundColor = Palette.danger.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
-        case .sending, .working, .speaking:
-            statusDot.backgroundColor = Palette.accent.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
-        }
     }
 
     private func setCaption(_ text: String?) {
@@ -548,7 +509,7 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
 
     private func updateModelLabel() {
         model.text = modelLabel
-        modelMark.image = BrandMarks.image(for: harness, side: 14)
+        modelMark.image = BrandMarks.image(for: harness, side: 14)?.withRenderingMode(.alwaysTemplate)
         modelMark.isHidden = modelMark.image == nil
     }
 
@@ -574,9 +535,9 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
             systemName: muted ? "mic.slash" : "mic",
             withConfiguration: UIImage.SymbolConfiguration(pointSize: 20, weight: .medium)
         )
-        configuration.baseForegroundColor = muted ? UIColor.black : UIColor.white
+        configuration.baseForegroundColor = muted ? VoiceCallColors.paper : VoiceCallColors.ink
         muteButton.configuration = configuration
-        muteButton.backgroundColor = muted ? UIColor.white.withAlphaComponent(0.9) : UIColor.white.withAlphaComponent(0.10)
+        muteButton.backgroundColor = muted ? VoiceCallColors.ink : VoiceCallColors.inkWithAlpha(0.08)
         muteLabel.text = muted ? "Unmute" : "Mute"
         muteButton.accessibilityLabel = muted ? "Unmute" : "Mute"
     }

@@ -136,7 +136,7 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         search.borderStyle = .none
         search.font = scaled(.sans, size: 14, style: .body)
         search.textColor = Palette.text
-        search.tintColor = Palette.accent
+        search.tintColor = Palette.text
         search.placeholder = "Search models…"
         search.accessibilityLabel = "Search models"
         search.accessibilityIdentifier = "model-search"
@@ -223,7 +223,11 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         if harnesses.count > 1 {
             for harness in harnesses {
                 chipStack.addArrangedSubview(
-                    filterChip(title: harnessLabel(harness), image: BrandMarks.image(for: harness, side: 15), selection: .harness(harness))
+                    filterChip(
+                        title: harnessLabel(harness),
+                        image: BrandMarks.image(for: harness, side: 15)?.withRenderingMode(.alwaysTemplate),
+                        selection: .harness(harness)
+                    )
                 )
             }
         }
@@ -233,7 +237,7 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
     private func filterChip(title: String, image: UIImage?, selection: Filter) -> UIButton {
         var configuration = UIButton.Configuration.plain()
         configuration.title = title
-        configuration.image = image
+        configuration.image = image?.withRenderingMode(.alwaysTemplate)
         configuration.imagePadding = 6
         configuration.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12)
         let chipFont = scaled(.sansMedium, size: 13, style: .subheadline)
@@ -244,8 +248,8 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         }
         configuration.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
         let isSelected = filter == selection
-        configuration.baseForegroundColor = isSelected ? Palette.accent : Palette.secondary
-        configuration.background.backgroundColor = isSelected ? Palette.accentSoft : Palette.controlFill
+        configuration.baseForegroundColor = isSelected ? Palette.elevated : Palette.secondary
+        configuration.background.backgroundColor = isSelected ? Palette.text : Palette.controlFill
         configuration.background.cornerRadius = 17
         let button = UIButton(configuration: configuration)
         button.accessibilityLabel = title
@@ -476,7 +480,7 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
             completion(true)
         }
         action.image = UIImage(systemName: favorited ? "star.slash" : "star.fill")
-        action.backgroundColor = favorited ? Palette.tertiary : Palette.accent
+        action.backgroundColor = favorited ? Palette.tertiary : Palette.text
         let configuration = UISwipeActionsConfiguration(actions: [action])
         configuration.performsFirstActionWithFullSwipe = false
         return configuration
@@ -537,6 +541,7 @@ private final class ModelPickerCell: UITableViewCell {
         ])
 
         mark.contentMode = .scaleAspectFit
+        mark.tintColor = Palette.text
         mark.setContentHuggingPriority(.required, for: .horizontal)
         title.font = dynamicFont(.sansMedium, size: 15, style: .body)
         title.textColor = Palette.text
@@ -554,10 +559,10 @@ private final class ModelPickerCell: UITableViewCell {
         labels.addArrangedSubview(detail)
         labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        favoriteMark.tintColor = Palette.accent
+        favoriteMark.tintColor = Palette.secondary
         favoriteMark.contentMode = .scaleAspectFit
         favoriteMark.setContentHuggingPriority(.required, for: .horizontal)
-        checkmark.tintColor = Palette.accent
+        checkmark.tintColor = Palette.text
         checkmark.contentMode = .scaleAspectFit
         checkmark.setContentHuggingPriority(.required, for: .horizontal)
         rowContent.axis = .horizontal
@@ -593,10 +598,10 @@ private final class ModelPickerCell: UITableViewCell {
     }
 
     func configure(model: ModelChoice, selected: Bool, favorite: Bool, onToggleFavorite: @escaping () -> Void) {
-        mark.image = BrandMarks.image(for: model.harness, side: 20)
+        mark.image = BrandMarks.image(for: model.harness, side: 20)?.withRenderingMode(.alwaysTemplate)
         mark.isHidden = mark.image == nil
         title.text = model.label
-        title.textColor = selected ? Palette.accent : Palette.text
+        title.textColor = Palette.text
         title.font = dynamicFont(selected ? .sansSemibold : .sansMedium, size: 15, style: .body)
         detail.text = model.description
         detail.isHidden = model.description?.isEmpty ?? true
@@ -625,7 +630,7 @@ private final class ModelPickerCell: UITableViewCell {
     private func updateSelectionBackground() {
         selectionBackground.backgroundColor = isHighlighted
             ? Palette.controlFill
-            : (selectedModel ? Palette.accentSoft : .clear)
+            : (selectedModel ? Palette.controlFill : .clear)
     }
 
     private func dynamicFont(_ face: FaceRole, size: CGFloat, style: UIFont.TextStyle) -> UIFont {
