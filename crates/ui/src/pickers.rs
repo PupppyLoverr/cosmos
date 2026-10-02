@@ -5355,7 +5355,7 @@ impl Pickers {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_cloud_seat(seat.clone(), cx);
                             }))
-                            .child(crate::cloud::status_dot(&theme, probe.as_ref()))
+                            .child(crate::cloud::status_dot(&theme, probe.as_ref(), false))
                             .child(div().flex_1().min_w_0().truncate().child(label))
                             .when_some(note, |el, note| {
                                 el.child(
