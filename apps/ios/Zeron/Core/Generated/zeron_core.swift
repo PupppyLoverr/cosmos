@@ -1956,6 +1956,8 @@ public protocol LayoutFrameProtocol: AnyObject, Sendable {
     
     func buildMicros()  -> UInt64
     
+    func changes()  -> SessionChanges
+    
     func display(index: UInt32)  -> RowDisplay?
     
     /**
@@ -2060,6 +2062,15 @@ open func buildMicros() -> UInt64  {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
         uniffiCallStatus in
     uniffi_zeron_mobile_fn_method_layoutframe_build_micros(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+open func changes() -> SessionChanges  {
+    return try!  FfiConverterTypeSessionChanges_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_layoutframe_changes(
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
@@ -4127,6 +4138,64 @@ public func FfiConverterTypeBoxPrim_lift(_ buf: RustBuffer) throws -> BoxPrim {
 #endif
 public func FfiConverterTypeBoxPrim_lower(_ value: BoxPrim) -> RustBuffer {
     return FfiConverterTypeBoxPrim.lower(value)
+}
+
+
+public struct ChangedFile: Equatable, Hashable {
+    public var path: String
+    public var additions: UInt64
+    public var deletions: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(path: String, additions: UInt64, deletions: UInt64) {
+        self.path = path
+        self.additions = additions
+        self.deletions = deletions
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ChangedFile: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeChangedFile: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ChangedFile {
+        return
+            try ChangedFile(
+                path: FfiConverterString.read(from: &buf), 
+                additions: FfiConverterUInt64.read(from: &buf), 
+                deletions: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ChangedFile, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterUInt64.write(value.additions, into: &buf)
+        FfiConverterUInt64.write(value.deletions, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChangedFile_lift(_ buf: RustBuffer) throws -> ChangedFile {
+    return try FfiConverterTypeChangedFile.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChangedFile_lower(_ value: ChangedFile) -> RustBuffer {
+    return FfiConverterTypeChangedFile.lower(value)
 }
 
 
@@ -7301,6 +7370,64 @@ public func FfiConverterTypeSendRequest_lift(_ buf: RustBuffer) throws -> SendRe
 #endif
 public func FfiConverterTypeSendRequest_lower(_ value: SendRequest) -> RustBuffer {
     return FfiConverterTypeSendRequest.lower(value)
+}
+
+
+public struct SessionChanges: Equatable, Hashable {
+    public var files: [ChangedFile]
+    public var additions: UInt64
+    public var deletions: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(files: [ChangedFile], additions: UInt64, deletions: UInt64) {
+        self.files = files
+        self.additions = additions
+        self.deletions = deletions
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionChanges: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionChanges: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionChanges {
+        return
+            try SessionChanges(
+                files: FfiConverterSequenceTypeChangedFile.read(from: &buf), 
+                additions: FfiConverterUInt64.read(from: &buf), 
+                deletions: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionChanges, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeChangedFile.write(value.files, into: &buf)
+        FfiConverterUInt64.write(value.additions, into: &buf)
+        FfiConverterUInt64.write(value.deletions, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionChanges_lift(_ buf: RustBuffer) throws -> SessionChanges {
+    return try FfiConverterTypeSessionChanges.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionChanges_lower(_ value: SessionChanges) -> RustBuffer {
+    return FfiConverterTypeSessionChanges.lower(value)
 }
 
 
@@ -12064,6 +12191,31 @@ fileprivate struct FfiConverterSequenceTypeBoxPrim: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeChangedFile: FfiConverterRustBuffer {
+    typealias SwiftType = [ChangedFile]
+
+    public static func write(_ value: [ChangedFile], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeChangedFile.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ChangedFile] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ChangedFile]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeChangedFile.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeDebugEntry: FfiConverterRustBuffer {
     typealias SwiftType = [DebugEntry]
 
@@ -13457,6 +13609,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_layoutframe_build_micros() != 17231) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_layoutframe_changes() != 35784) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_layoutframe_display() != 61509) {

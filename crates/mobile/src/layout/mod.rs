@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
 
-use zeron_doc::parts::MessagePart;
 use zeron_doc::parts::MessageStatus;
+use zeron_doc::parts::{MessagePart, ToolDiffStat, diff_stat};
 use zeron_doc::schema::{MessageRole, SessionMessageEntry};
 use zeron_text::WidthCache;
 
@@ -121,6 +121,20 @@ pub struct RowPlacement {
     pub kind: RowKind,
 }
 
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Default)]
+pub struct ChangedFile {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Default)]
+pub struct SessionChanges {
+    pub files: Vec<ChangedFile>,
+    pub additions: u64,
+    pub deletions: u64,
+}
+
 struct FrameRow {
     core: Arc<RowCore>,
     gap: Gap,
@@ -143,6 +157,7 @@ pub struct LayoutFrame {
     rows: Vec<FrameRow>,
     total: f32,
     styles: Arc<Vec<StyleDesc>>,
+    changes: Arc<SessionChanges>,
     index: OnceLock<HashMap<u64, u32>>,
     /// Worker time for the pass that produced this frame (µs).
     build_micros: u64,
@@ -170,6 +185,9 @@ impl LayoutFrame {
     }
     pub fn style_count(&self) -> u32 {
         self.styles.len() as u32
+    }
+    pub fn changes(&self) -> SessionChanges {
+        self.changes.as_ref().clone()
     }
 
     /// Approximate heap held by prepared text across all rows (diagnostics).
@@ -294,6 +312,7 @@ impl LayoutFrame {
             rows: Vec::new(),
             total: 0.0,
             styles: Arc::new(Vec::new()),
+            changes: Arc::new(SessionChanges::default()),
             index: OnceLock::new(),
             build_micros: 0,
         }
@@ -530,6 +549,7 @@ pub(crate) struct Worker {
     cache: WidthCache,
     builder: RowBuilder,
     heights: HashMap<u64, HeightMemo>,
+    changes: Arc<SessionChanges>,
     input: TranscriptInput,
     width: f32,
     revision: u64,
@@ -551,12 +571,27 @@ impl Worker {
             cache: WidthCache::new(),
             builder: RowBuilder::default(),
             heights: HashMap::new(),
+            changes: Arc::new(SessionChanges::default()),
             input: TranscriptInput::default(),
             width: 0.0,
             revision: 0,
             shared,
             listener: Some(listener),
         }
+    }
+
+    fn set_input(&mut self, input: TranscriptInput) {
+        let entries_unchanged = self.input.entries.len() == input.entries.len()
+            && self
+                .input
+                .entries
+                .iter()
+                .zip(&input.entries)
+                .all(|(old, new)| Arc::ptr_eq(old, new));
+        if !entries_unchanged {
+            self.changes = Arc::new(session_changes(&input.entries));
+        }
+        self.input = input;
     }
 
     fn run(mut self, rx: Receiver<Msg>) {
@@ -567,7 +602,7 @@ impl Worker {
                 match msg {
                     Msg::Shutdown => return,
                     Msg::Input(input) => {
-                        self.input = input;
+                        self.set_input(input);
                         dirty = true;
                     }
                     Msg::Compact(compact) => {
@@ -687,6 +722,7 @@ impl Worker {
             rows,
             total,
             styles: Arc::new(self.typo.table().to_vec()),
+            changes: self.changes.clone(),
             index: OnceLock::new(),
             build_micros: started.elapsed().as_micros() as u64,
         });
@@ -695,6 +731,58 @@ impl Worker {
             l.frame_ready(self.revision);
         }
         frame
+    }
+}
+
+fn session_changes(entries: &[Arc<SessionMessageEntry>]) -> SessionChanges {
+    let mut by_path: HashMap<String, (u64, u64, u64)> = HashMap::new();
+    let mut sequence = 0u64;
+
+    let mut record = |stat: &ToolDiffStat| {
+        sequence += 1;
+        let aggregate = by_path.entry(stat.path.clone()).or_default();
+        aggregate.0 += stat.additions;
+        aggregate.1 += stat.deletions;
+        aggregate.2 = sequence;
+    };
+
+    for entry in entries {
+        for part in &entry.parts {
+            let MessagePart::Tool {
+                diff_stats, diff, ..
+            } = part
+            else {
+                continue;
+            };
+            if let Some(stats) = diff_stats.as_ref().filter(|stats| !stats.is_empty()) {
+                for stat in stats {
+                    record(stat);
+                }
+            } else if let Some(diff) = diff {
+                record(&diff_stat(diff));
+            }
+        }
+    }
+
+    let mut files: Vec<_> = by_path
+        .into_iter()
+        .map(|(path, (additions, deletions, sequence))| {
+            (
+                sequence,
+                ChangedFile {
+                    path,
+                    additions,
+                    deletions,
+                },
+            )
+        })
+        .collect();
+    files.sort_by(|(a, _), (b, _)| b.cmp(a));
+    let files: Vec<_> = files.into_iter().map(|(_, file)| file).collect();
+    SessionChanges {
+        additions: files.iter().map(|file| file.additions).sum(),
+        deletions: files.iter().map(|file| file.deletions).sum(),
+        files,
     }
 }
 

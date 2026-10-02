@@ -986,3 +986,136 @@ fn expanding_compact_work_group_shows_tool_thought_and_narration_lines() {
     assert!(!group.text.contains("Here is the reply."));
     assert!(group.height > folded.display(0).unwrap().height);
 }
+
+#[test]
+fn session_changes_aggregate_paths_by_recency_and_fall_back_to_diff() {
+    use zeron_doc::parts::{MessagePart, MessageStatus, ToolDiffStat};
+    use zeron_doc::schema::{MessageRole, SessionMessageEntry};
+    use zeron_proto::{ToolCall, ToolDiff};
+
+    let tool = |id: &str,
+                call: ToolCall,
+                diff_stats: Option<Vec<ToolDiffStat>>,
+                diff: Option<ToolDiff>| MessagePart::Tool {
+        id: id.into(),
+        call,
+        is_error: false,
+        resolved: true,
+        output: None,
+        diff,
+        output_ref: None,
+        output_bytes: None,
+        diff_ref: None,
+        diff_stats,
+        subagent_ref: None,
+        subagent_status: None,
+        subagent_tail: None,
+    };
+    let edit = |path: &str| ToolCall::EditFile {
+        path: path.into(),
+        old_string: None,
+        new_string: None,
+    };
+    let entry = |id: &str, parts: Vec<MessagePart>| {
+        Arc::new(SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts,
+            created_at: 0,
+            device_id: String::new(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })
+    };
+    let entries = vec![
+        entry(
+            "a1",
+            vec![
+                tool(
+                    "t1",
+                    edit("src/a.rs"),
+                    Some(vec![ToolDiffStat {
+                        path: "src/a.rs".into(),
+                        additions: 3,
+                        deletions: 1,
+                    }]),
+                    None,
+                ),
+                tool(
+                    "t2",
+                    edit("src/b.rs"),
+                    Some(vec![ToolDiffStat {
+                        path: "src/b.rs".into(),
+                        additions: 2,
+                        deletions: 0,
+                    }]),
+                    None,
+                ),
+                tool(
+                    "t3",
+                    ToolCall::Exec {
+                        command: "cargo test".into(),
+                    },
+                    None,
+                    None,
+                ),
+            ],
+        ),
+        entry(
+            "a2",
+            vec![
+                tool(
+                    "t4",
+                    edit("src/a.rs"),
+                    Some(vec![ToolDiffStat {
+                        path: "src/a.rs".into(),
+                        additions: 4,
+                        deletions: 2,
+                    }]),
+                    None,
+                ),
+                tool(
+                    "t5",
+                    edit("src/c.rs"),
+                    None,
+                    Some(ToolDiff {
+                        path: "src/c.rs".into(),
+                        old_text: Some("old\nkeep\n".into()),
+                        new_text: "new\nkeep\nadded\n".into(),
+                    }),
+                ),
+            ],
+        ),
+    ];
+    let mut worker = worker(390.0);
+    worker.set_input(TranscriptInput {
+        entries,
+        ..Default::default()
+    });
+
+    assert_eq!(
+        worker.pass().changes(),
+        SessionChanges {
+            files: vec![
+                ChangedFile {
+                    path: "src/c.rs".into(),
+                    additions: 2,
+                    deletions: 1,
+                },
+                ChangedFile {
+                    path: "src/a.rs".into(),
+                    additions: 7,
+                    deletions: 3,
+                },
+                ChangedFile {
+                    path: "src/b.rs".into(),
+                    additions: 2,
+                    deletions: 0,
+                },
+            ],
+            additions: 11,
+            deletions: 4,
+        }
+    );
+}
