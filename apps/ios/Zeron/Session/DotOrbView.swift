@@ -31,7 +31,7 @@ final class DotOrbView: UIView {
     }
 
     private static let dots: [Dot] = {
-        let count = 640
+        let count = 480
         let goldenAngle = CGFloat.pi * (3 - sqrt(5))
         return (0..<count).map { index in
             let y = 1 - 2 * (CGFloat(index) + 0.5) / CGFloat(count)
@@ -45,6 +45,13 @@ final class DotOrbView: UIView {
             )
         }
     }()
+    private static let tilt = CGFloat.pi * 18 / 180
+    private static let tiltCosine = cos(tilt)
+    private static let tiltSine = sin(tilt)
+    private static let baseBucketOpacities: [Float] = (0..<8).map { index in
+        let depth01 = CGFloat(index) / 7
+        return Float(0.06 + 0.94 * CGFloat(pow(Double(depth01), 1.6)))
+    }
 
     private let buckets: [CAShapeLayer] = (0..<8).map { _ in CAShapeLayer() }
     private let displayProxy = DisplayLinkProxy()
@@ -59,6 +66,7 @@ final class DotOrbView: UIView {
     var mode: Mode = .idle {
         didSet {
             guard oldValue != mode else { return }
+            updateDisplayLinkFrameRate()
             if UIAccessibility.isReduceMotionEnabled {
                 parameters = targetParameters(for: mode, energy: max(level, pulseEnergy))
                 renderFrame(at: CACurrentMediaTime())
@@ -178,9 +186,22 @@ final class DotOrbView: UIView {
         guard displayLink == nil, window != nil, !UIAccessibility.isReduceMotionEnabled else { return }
         lastTimestamp = nil
         let link = CADisplayLink(target: displayProxy, selector: #selector(DisplayLinkProxy.step(_:)))
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+        link.preferredFrameRateRange = frameRateRange
         link.add(to: .main, forMode: .common)
         displayLink = link
+    }
+
+    private var frameRateRange: CAFrameRateRange {
+        switch mode {
+        case .listening, .speaking:
+            CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+        case .idle, .thinking, .paused:
+            CAFrameRateRange(minimum: 20, maximum: 30, preferred: 30)
+        }
+    }
+
+    private func updateDisplayLinkFrameRate() {
+        displayLink?.preferredFrameRateRange = frameRateRange
     }
 
     private func stopDisplayLink() {
@@ -211,17 +232,14 @@ final class DotOrbView: UIView {
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
         let cosine = cos(time * parameters.rotation)
         let sine = sin(time * parameters.rotation)
-        let tilt = CGFloat.pi * 18 / 180
-        let tiltCosine = cos(tilt)
-        let tiltSine = sin(tilt)
         let scale = window?.screen.scale ?? traitCollection.displayScale
         let paths = (0..<buckets.count).map { _ in CGMutablePath() }
 
         for dot in Self.dots {
             let rotatedX = dot.x * cosine + dot.z * sine
             let rotatedZ = -dot.x * sine + dot.z * cosine
-            let rotatedY = dot.y * tiltCosine - rotatedZ * tiltSine
-            let depth = dot.y * tiltSine + rotatedZ * tiltCosine
+            let rotatedY = dot.y * Self.tiltCosine - rotatedZ * Self.tiltSine
+            let depth = dot.y * Self.tiltSine + rotatedZ * Self.tiltCosine
             let noise = sin(2.1 * rotatedX + 1.3 * time)
                 * sin(1.7 * rotatedY - 0.9 * time)
                 * sin(2.6 * rotatedZ + 0.7 * time)
@@ -243,9 +261,7 @@ final class DotOrbView: UIView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for (index, bucket) in buckets.enumerated() {
-            let depth01 = CGFloat(index) / CGFloat(buckets.count - 1)
-            let depthOpacity = 0.06 + 0.94 * CGFloat(pow(Double(depth01), 1.6))
-            bucket.opacity = Float(depthOpacity * parameters.opacity)
+            bucket.opacity = Self.baseBucketOpacities[index] * Float(parameters.opacity)
             bucket.path = paths[index]
         }
         CATransaction.commit()
