@@ -114,7 +114,22 @@ composer, the status line, and `/` menus that open below it.
   (`ztui/src/markdown.rs`). Tables, lists, quotes and links are rendered, and
   fenced code is highlighted by a built-in highlighter (tree-sitter with 13
   grammars is still available via the `highlight` cargo feature).
-- `edit`/`write` calls show a real before/after diff with line numbers.
+- `edit`/`write` calls show a real before/after diff: line numbers, syntax
+  colour, the changed words highlighted, long lines wrapped with `↳`, and old
+  and new side by side on wide terminals.
+- Tool calls carry their facts in the header (`◆ Read src/a.rs · 412 lines ·
+  0.2s`, `◆ Bash cargo test · exit 101 · 3.4s`). Runs of reads and searches fold
+  into one `◇ Explored 3 files · 2 searches` block. `ctrl+o` opens the full
+  output of the last 50 tool calls in a pager.
+- The thinking line is an orb that breathes, a verb that shimmers ("Cosmosing…",
+  "Plotting…", "Cooking…"), and a "✻ Cooked for 14s" footer when the turn ends.
+  Streamed text fades in.
+- Markdown gets framed code blocks, callouts (`> [!NOTE]`), bordered tables
+  that wrap, nested quotes and lists, and clickable OSC 8 links where the
+  terminal supports them.
+- A buddy sits beside the composer and reacts as you work (see below). When a
+  turn ends or needs you while you're in another window, cosmostui sets the
+  terminal title, rings the bell, and shows a desktop notification.
 - `/model` opens a fuzzy picker. `←`/`→` sets reasoning effort, which is sent as
   `reasoning_effort` to OpenAI-compatible providers.
 - `/usage`, `/context`, `/mode`, `/approve`, `/session`, `/tree`, `/compact`,
@@ -152,6 +167,169 @@ nucleo-matcher and similar, and paints the UI with its own
 The release binary is ~6 MiB and Devin's is 180 MB. The renderer's scrollback
 behaviour is tested against the alacritty terminal emulator.
 
+## Make it yours
+
+Everything cosmostui looks like, and the harmless parts of how it behaves, come
+from one file: `~/.cosmos-cli/ui.toml`, with a project's `.cosmos/ui.toml`
+layered on top. Edit it while cosmostui runs. The new look swaps in between two
+frames, and a file that doesn't parse keeps the old look and says why. Every
+write cosmostui makes keeps the previous file in a ring of ten backups
+(`ui.toml.bak.1`…).
+
+```toml
+[theme]
+name = "nebula"                 # cosmos, classic, nebula, mono, solar, light, high-contrast
+[theme.colors]
+accent = "#c792ea"
+
+[spinner]
+style = "comet"
+verbs = ["Warping:Warped", "Folding space:Folded space"]
+
+[diff]
+layout = "split"
+
+[buddy]
+species = "axolotl"
+name = "Pip"
+
+[notify]
+desktop = "always"
+sound = true
+```
+
+Quick commands write the same file: `/theme`, `/spinner`,
+`/verbs add Present:Past`, `/buddy …`, `/notify [test]`.
+`/customise reset classic` brings back the look cosmostui had before skins (a
+test checks that it renders exactly as before).
+
+### /customise
+
+`/customise` on its own opens a picker of the settings people change most
+(theme, spinner, tool calls, diffs, markdown, links, buddy, species, motion,
+notifications). Each `←`/`→` applies at once.
+
+`/customise <anything>` hands the request to a model, for example "make it
+purple and use Dune verbs", "add Groq with llama 3.3", or "a /standup command".
+It uses the session's model by default; `/customise model <alias>` picks a
+cheaper one. The customiser:
+
+- **Runs in the background.** It has its own thread, conversation and prompt
+  cache, so you keep typing and running turns. A strip above the composer shows
+  what it's doing. `/customise log` lists every step, `/customise stop` ends it,
+  and its spend is shown separately in the ledger (`· mod $…`).
+- **Has a narrow tool set and nothing else:** `ui_get`, `ui_set`, `ui_preview`,
+  `ui_apply`, `ui_reset`, `theme_save`, `provider_add`, `model_add`,
+  `subscription_enable`, `command_add`.
+- **Writes a draft (`ui.draft.toml`).** When it finishes you see the draft
+  rendered in its own colours. `ctrl+y` applies it and `ctrl+n` discards it.
+  Applying is a per-key three-way merge: if you changed a key yourself while it
+  worked, your value is kept. `/customise undo` steps back through the backups.
+  `[customise] auto_apply = true` applies each change as it validates.
+- **Can't cross hard boundaries.** Every write is checked against the schema
+  below (path, type, allowed values, range, colour, width). Permissions,
+  sandbox, approvals, hooks, MCP, credentials and the customiser's own
+  `[customise]` limits are refused in code. New providers and models only add
+  their own table to `config.toml` and name the environment variable for a key;
+  you add keys yourself with `/connect`.
+- **Works with any model.** Subscription agents (Cursor, Devin, Codex) run their
+  own tools, so they are asked for the finished file from an empty scratch
+  folder, and that file goes through the same checks. With no model connected,
+  you get the picker.
+
+### Buddy and notifications
+
+Your buddy hatches from your name: one of 16 cosmic species, with a rarity tier
+and stats, shown with `/buddy`. It looks focused while a turn runs and pleased
+when the turn lands. It frowns at failed tools, worries at red tests and cheers
+when they go green. It waits with you at permission prompts and falls asleep
+when you're away. Quips are canned and cost no tokens; set your own in
+`[buddy.lines]`.
+
+`/buddy pet | name <n> | reroll | mini | full | quiet | off`.
+
+Notifications only interrupt when the terminal reports it has lost focus.
+Terminals that never report focus notify only for turns of at least
+`min_secs`. The desktop notification is a WinRT toast through PowerShell,
+`osascript` on macOS, or `notify-send` on Linux. `sound = true` plays a short
+chime (with the `voice` feature). The `stop` hook (alias `turn_end`) fires at
+the end of every turn for anything else.
+
+### ui.toml reference
+
+Generated from the code (`cargo test -p ztui dump_schema -- --ignored
+--nocapture`). `/customise schema` prints the same list.
+
+```text
+[theme]
+  colors.<token>: colour; tokens: text, accent, success, warn, error, shell, dim, rule, ghost, user_bg, diff_add_bg, diff_del_bg, diff_add_word, diff_del_word, code, code_bg, heading, heading_sub, link, quote, badge_fg, logo_bright, logo_mid, logo_dim, syntax.base, syntax.comment, syntax.keyword, syntax.string, syntax.escape, syntax.number, syntax.function, syntax.type, syntax.tag, syntax.attribute, syntax.operator, syntax.variable, syntax.punctuation — override one colour token: "#rrggbb", "#rgb" or an ANSI name
+  name: string = "cosmos" — one of "cosmos" | "classic" | "nebula" | "mono" | "solar" | "light" | "high-contrast" — colour theme (built-in or saved with theme_save)
+[spinner]
+  footer: bool = true — "✻ Cooked for 12s" after each turn
+  footer_glyph: string = "✻" — glyph before that footer
+  fps: integer = 12 — 1..=60 — spinner frames per second
+  frames: list of strings = [] — custom spinner frames; non-empty replaces style
+  hint: string = "esc to interrupt" — hint at the end of the busy line
+  shimmer: bool = true — a highlight sweeping across the verb
+  show_elapsed: bool = true — seconds in the busy line
+  show_tokens: bool = true — streamed tokens in the busy line
+  style: string = "orb" — one of "orb" | "twinkle" | "braille" | "moon" | "comet" | "pulse" | "galaxy" | "dots" | "line" — the thinking spinner
+  tool_verbs.<tool>: string — verb shown while a tool runs (read, grep, glob, ls, bash, edit, write, task, …)
+  verbs: list of strings = ["Cosmosing:Cosmosed","Plotting:Plotted","Cooking:Cooked","Orbiting:Orbited","Stargazin… — "Present:Past" thinking verbs, one picked per turn ("Cooking:Cooked")
+[motion]
+  reduce: bool = false — no animation at all
+  reveal: bool = true — streamed text fades in
+  reveal_ms: integer = 160 — 0..=2000 — how long the fade-in takes
+[tools]
+  group: bool = true — fold runs of reads/searches into one "Explored" block
+  keep_rows: integer = 4 — 0..=50 — output rows shown under a finished tool (ctrl+o shows all)
+  keep_rows_search: integer = 3 — 0..=50 — rows shown under search tools
+  show_elapsed: bool = true — how long each tool took
+  style: string = "cosmos" — one of "cosmos" | "classic" — tool-call layout
+[diff]
+  context: integer = 2 — 0..=20 — unchanged lines around each change
+  layout: string = "auto" — one of "auto" | "unified" | "split" — split = side by side; auto splits on wide terminals
+  max_rows: integer = 40 — 1..=2000 — diff rows shown before "N more lines"
+  style: string = "cosmos" — one of "cosmos" | "classic" — diff layout
+  syntax: bool = true — syntax colour in diffs
+  word_diff: bool = true — highlight the changed words
+  wrap: bool = true — wrap long diff lines instead of cutting them
+[markdown]
+  bullets: list of strings = ["•","◦","▸","▹"] — list bullets by nesting depth
+  callouts: bool = true — render > [!NOTE] / TIP / WARNING blocks
+  code_bg: bool = true — tint code blocks
+  code_frame: bool = true — box code blocks with a language label
+  code_numbers: bool = false — line numbers in code blocks
+  h1_rule: bool = true — a rule under top-level headings
+  links: string = "auto" — one of "auto" | "osc8" | "inline" — osc8 = clickable hyperlinks; inline = show the URL
+  style: string = "cosmos" — one of "cosmos" | "classic" — markdown rendering
+  table_borders: bool = true — box-drawn tables with wrapped cells
+[glyphs]
+  elbow: string = "⎿" — glyph before tool output
+  group: string = "◇" — glyph before a folded group
+  tool: string = "◆" — glyph before each tool call
+  wrap: string = "↳" — glyph on wrapped diff lines
+[buddy]
+  enabled: bool = true — show the companion
+  lines.<kind>: list of strings; kinds: hello, done, long_done, error, tests_pass, tests_fail, waiting, compact, pet, sleep, degraded — custom quips for a moment ({name} = the buddy)
+  name: string = "" — "" = a generated name
+  quip_secs: integer = 6 — 1..=60 — how long a quip stays up
+  quips: string = "builtin" — one of "builtin" | "off" — one-liners when things happen
+  seed: integer = 0 — 0..=1000000 — change to hatch a different buddy
+  size: string = "full" — one of "full" | "mini" | "off" — full = sprite beside the input; mini = face in the status line
+  species: string = "" — one of "" | "comet" | "octopus" | "astrocat" | "owl" | "axolotl" | "robot" | "jellyfish" | "fox" | "ghost" | "moth" | "penguin" | "slime" | "dragon" | "alien" | "snail" | "star" — "" = hatched from the user's name
+[notify]
+  bell: string = "unfocused" — one of "unfocused" | "always" | "never" — terminal bell
+  desktop: string = "unfocused" — one of "unfocused" | "always" | "never" — desktop notification
+  events: list of strings = ["done","waiting","error"] — one of "done" | "waiting" | "error" — which moments notify
+  min_secs: integer = 15 — 0..=3600 — turns shorter than this never notify
+  sound: bool = false — a short chime instead of the bell
+  title: bool = true — turn state in the terminal title
+```
+
+`[customise]` (`model`, `auto_apply`, `max_turns` = 12, `max_usd` = 0.25) is
+yours to set. The customiser can't write it.
+
 ## Shared state
 
 All harnesses read `COSMOS_CLI_HOME` (default `~/.cosmos-cli`):
@@ -184,7 +362,7 @@ or runs commands asks first. `write`/`edit` refuse cosmostui's own binary,
 ```
 powershell -File eval\conformance.ps1   # 19 checks across all harnesses
 powershell -File eval\run.ps1           # eval tasks (fixture, deterministic)
-powershell -File eval\size-gate.ps1     # cosmostui.exe ≤ 8 MiB
+powershell -File eval\size-gate.ps1     # cosmostui.exe ≤ 8 MiB and ≤ +1 MiB over 5.71
 powershell -File eval\startup.ps1       # --version latency vs a baseline exe
 cargo test --workspace                  # in rust-tui/
 bun test                                # in zdev/

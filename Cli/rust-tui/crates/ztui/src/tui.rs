@@ -1392,12 +1392,12 @@ impl App {
             }
             "theme" => {
                 let name = args.trim();
-                let themes = crate::skin::palette::THEMES;
+                let themes = crate::skin::themes();
                 let now = crate::skin::current().theme.name.clone();
                 if name.is_empty() {
                     let list = themes.iter().map(|t| if *t == now { format!("{t} ✓") } else { t.to_string() }).collect::<Vec<_>>().join(" · ");
                     self.note(format!("Themes: {list} — /theme <name> switches; ~/.cosmos-cli/ui.toml holds the rest"));
-                } else if !themes.contains(&name) {
+                } else if !themes.iter().any(|t| t == name) {
                     self.error(format!("No theme {name:?} — try {}", themes.join(", ")));
                 } else {
                     let path = zcore::cli_home().join("ui.toml");

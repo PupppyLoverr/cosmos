@@ -1629,6 +1629,7 @@ mod tests {
         let mut sk = crate::skin::Skin::default();
         sk.buddy.species = "fox".into();
         sk.buddy.name = "Pip".into();
+        sk.motion.reduce = true; // no blinking mid-assert
         crate::skin::scoped_skin(sk.clone(), || {
             let mut app = test_app();
             app.width = 80;

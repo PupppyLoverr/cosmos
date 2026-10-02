@@ -403,6 +403,13 @@ mod tests {
         assert!(check_text("not toml [").is_err());
     }
 
+    /// The reference for the README — `cargo test -p ztui dump_schema -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_schema() {
+        print!("{}", text());
+    }
+
     #[test]
     fn schema_text_lists_every_section_and_choice() {
         let t = text();

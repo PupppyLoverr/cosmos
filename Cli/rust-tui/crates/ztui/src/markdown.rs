@@ -345,22 +345,25 @@ fn is_sep_row(cells: &[String]) -> bool {
         })
 }
 
-/// The last line of `code`, coloured with a short window of context (the
-/// whole fence each line made long blocks quadratic).
-fn last_line(lang: &str, code: &str) -> Vec<Span<'static>> {
-    let mut start = 0;
+/// The last `HL_WINDOW` lines of `code` — all the highlighter ever sees.
+fn window(code: &str) -> &str {
     let mut seen = 0;
     for (i, b) in code.bytes().enumerate().rev() {
         if b == b'\n' {
             seen += 1;
             if seen == HL_WINDOW {
-                start = i + 1;
-                break;
+                return &code[i + 1..];
             }
         }
     }
+    code
+}
+
+/// The last line of `code`, coloured with a short window of context (the
+/// whole fence each line made long blocks quadratic).
+fn last_line(lang: &str, code: &str) -> Vec<Span<'static>> {
     let line = code.rsplit('\n').next().unwrap_or("");
-    highlight::highlight(lang, &code[start..])
+    highlight::highlight(lang, window(code))
         .and_then(|mut l| l.pop())
         .unwrap_or_else(|| vec![Span::styled(line.to_string(), CODE_INLINE())])
 }
@@ -978,13 +981,15 @@ mod tests {
     }
 
     #[test]
-    fn long_fences_highlight_in_linear_time() {
+    fn long_fences_highlight_a_bounded_window() {
         classic(|| {
-            let src = format!("```rust\n{}```", "let x = \"s\"; // c\n".repeat(3000));
-            let t = std::time::Instant::now();
+            // the highlighter only ever sees a bounded tail, however long the fence
+            let code = "let x = \"s\"; // c\n".repeat(3000);
+            assert_eq!(window(&code).lines().count(), HL_WINDOW - 1);
+            assert_eq!(window("a\nb"), "a\nb");
+            let src = format!("```rust\n{code}```");
             let l = render(&src, 80);
             assert_eq!(l.len(), 3000);
-            assert!(t.elapsed() < std::time::Duration::from_secs(3), "{:?}", t.elapsed());
             assert!(l[2999].spans.iter().any(|s| s.content.contains("// c") && s.style != CODE_INLINE()));
         });
     }

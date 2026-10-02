@@ -500,3 +500,101 @@ startup.ps1                     PASS  --version 16.5 ms (+0.2 over baseline),
 conformance.ps1                 19/19 PASS
 run.ps1 (eval)                  9/9 PASS
 ```
+
+## 2026-10-02 — cosmostui skins: a look you can change, and a TUI that changes itself
+
+Branch `cosmostui-skins`, seven commits (one per phase). Same machine. Nothing
+was removed: the `classic` skin renders byte-for-byte what cosmostui rendered
+before. `tests/golden/classic.txt` holds 85 styled lines recorded from the
+pre-skins code (banner, info, user turn, markdown, tool ok/error/interrupted,
+diff, shell, live region, `/` menu, model picker), and
+`view::tests::classic_matches_golden` checks every build against them.
+
+### Gates
+
+```
+cargo test --workspace          227 passed, 0 failed, 6 ignored — six runs in a
+                                row (two timing-based tests were made
+                                deterministic first: the buddy's blink and a
+                                wall-clock bound on fence highlighting)
+size-gate (new -BaseMiB/-MaxGrowthMiB)
+                                PASS  6.48 MiB (6795776 bytes) <= 8 MiB,
+                                +0.77 MiB over 5.71 (<= 1)
+conformance.ps1                 19/19 PASS
+run.ps1 (eval)                  9/9 PASS
+clippy -p ztui                  only the existing `cost_lines` too_many_arguments
+```
+
+Size by phase (release, `opt-level`/LTO unchanged): phases 1–3 6.09 MiB,
+phase 4 6.13, phase 5 6.23, phase 6 6.64 → 6.48 after routing every Skin parse
+through one `toml::Table` path (`skin::parse`), converting TOML→JSON by hand,
+and dropping toml's serializer feature (−0.16 MiB in total). No new crates.
+
+`startup.ps1` doesn't pass on this machine today, for the old binary or the
+new one. The baseline itself (`zsandbox --help`) is 33–35 ms against 12.2 ms on
+2026-10-01, and back-to-back runs move by ±15 ms:
+
+```
+                         --version (over baseline)   fixture ping (over baseline)
+installed pre-skins exe  +35.6 ms                     +202 ms
+new build                +11.7 / +26.8 ms (2 runs)    +126 / +204 ms
+```
+
+Skins load only inside the TUI (`skin::Watcher::start` in `tui::try_run`).
+`--version` and headless `-p` never touch skin code.
+
+### What shipped per phase
+
+- **1 skin foundation.** `~/.cosmos-cli/ui.toml` plus the project's
+  `.cosmos/ui.toml`, hot-reloaded between frames; a bad file keeps the old look.
+  37 colour tokens. Themes: cosmos (default), classic, nebula, mono, solar,
+  light, high-contrast. A comment-preserving editor with a 10-file backup ring.
+  `/theme`.
+- **2 motion.** The orb spinner breathes; 8 more styles or custom frames.
+  "Cosmosing / Plotting / Cooking…" verbs with past tenses for the
+  "✻ Cooked for 14s" footer. The verb shimmers, streamed text fades in, and
+  `[motion] reduce` turns it all off. `/spinner`.
+- **3 tools + diffs.** `◆ Read src/a.rs · 412 lines · 0.2s` headers with a bash
+  exit-code pill. Reads and searches fold into `◇ Explored 3 files · 2 searches`.
+  `ctrl+o` opens a pager over the last 50 outputs. Diffs get syntax colour,
+  word-level marks, `⋯ L40` hunk markers, `↳` wrapping, and a split view at
+  ≥140 columns. The row cap moved from the worker to the renderer.
+- **4 markdown.** Framed, tinted code blocks (closed even when a reply ends
+  mid-fence). Fence highlighting sees a 40-line window; it was quadratic.
+  Callouts, nested quotes, depth bullets, list continuation, setext
+  underlines, bordered tables with wrapped cells and right-aligned numbers.
+  Bare URLs are autolinked, and links become OSC 8 hyperlinks: zero-width tag
+  markers survive wrapping and are emitted by `term::write_line`.
+- **5 buddy + notify.** 16 species hatched from the user's name, with rarity
+  and stats. Moods follow the task (focused, pleased, worried, waiting,
+  asleep, loved) with canned quips. `/buddy`. Terminal title (OSC 0), bell,
+  desktop toast (WinRT via PowerShell, osascript, notify-send) and an optional
+  cpal chime, gated on focus reports. The contract's `stop` hook now fires at
+  each turn end (`turn_end` alias).
+- **6 /customise.** A background runner on any model, with its own
+  conversation and cache, and ten narrow tools. Every write is checked by
+  `skin::schema::check`; boundaries (permissions, sandbox, approvals, hooks,
+  MCP, credentials, `[customise]`) are refused in code. Drafts are previewed in
+  their own colours, applied with `ctrl+y` as a per-key three-way merge where
+  your edits win, and `/customise undo` reverts. ACP agents return a whole file
+  that is checked the same way. A picker covers no-model use. `/verbs`; saved
+  themes.
+- **7 docs.** README "Make it yours" with the `ui.toml` reference generated
+  from the schema; this entry.
+
+### Live checks on this machine
+
+- A WinRT toast through the exact `-EncodedCommand` path
+  (`notify::tests::toast_smoke`, ignored by default) exited 0.
+- `/customise` end to end with the fixture model
+  (`tui::tests::customise_end_to_end_while_you_work`):
+  1. The picker writes ui.toml.
+  2. The runner sets `spinner.style` and is refused `hooks.cmd`.
+  3. Typing is untouched while it runs.
+  4. The draft preview is committed.
+  5. `ctrl+y` merges it with the earlier picker change.
+  6. `/customise undo` restores the old file.
+- Not run here: a customiser turn against a live model. router9 wasn't running,
+  and the default model (Devin) would spend plan quota. The runner uses the same
+  `zproviders::complete` path as normal turns; the ACP path uses
+  `Agent::turn`.
