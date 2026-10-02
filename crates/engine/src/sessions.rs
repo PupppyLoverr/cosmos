@@ -3439,6 +3439,7 @@ async fn tail_remote_log(
     // The run's harness command — picks how its output renders.
     command: &str,
 ) {
+    let strip_headers = is_opencode_command(command);
     let mut render = StreamJsonRenderer::for_command(command);
     let (entry_id, mut segment) = match resume_entry.and_then(|id| {
         doc.find_entry(id).map(|(index, written)| {
@@ -3462,7 +3463,7 @@ async fn tail_remote_log(
                 s.finish(
                     &[MessagePart::Text {
                         id: "t0".into(),
-                        text: preserve_line_breaks(&text),
+                        text: cloud_run_doc_text(&text, strip_headers),
                     }],
                     zeron_doc::MessageStatus::Aborted,
                 )
@@ -3495,7 +3496,8 @@ async fn tail_remote_log(
                     || out.stderr.contains("Permission denied")
                     || out.stdout.contains("Permission denied")
                 {
-                    terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, &text);
+                    let text = cloud_run_output(&text, strip_headers);
+                    terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, text.as_ref());
                     return;
                 }
                 let (chunk, alive, remote_exit) =
@@ -3525,7 +3527,7 @@ async fn tail_remote_log(
                     if let Some(segment) = segment.as_mut() {
                         let _ = segment.sync(&[MessagePart::Text {
                             id: "t0".into(),
-                            text: preserve_line_breaks(&text),
+                            text: cloud_run_doc_text(&text, strip_headers),
                         }]);
                     }
                     store.update_run(run_id, |run| run.mirrored_bytes = mirrored);
@@ -3552,7 +3554,7 @@ async fn tail_remote_log(
                         s.finish(
                             &[MessagePart::Text {
                                 id: "t0".into(),
-                                text: preserve_line_breaks(&text),
+                                text: cloud_run_doc_text(&text, strip_headers),
                             }],
                             if done {
                                 zeron_doc::MessageStatus::Complete
@@ -3590,7 +3592,8 @@ async fn tail_remote_log(
                     || (matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Railway))
                         && e.contains("Railway"))
                 {
-                    terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, &text);
+                    let text = cloud_run_output(&text, strip_headers);
+                    terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, text.as_ref());
                     return;
                 }
                 tracing::warn!(seat = %seat.id, error = %e, "cloud run log tail failed");
@@ -3660,6 +3663,78 @@ fn preserve_line_breaks(text: &str) -> String {
         }
     }
     out
+}
+
+fn is_opencode_command(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .next()
+        .and_then(|executable| std::path::Path::new(executable).file_name())
+        .and_then(|basename| basename.to_str())
+        == Some("opencode")
+}
+
+fn is_opencode_header_line(line: &str) -> bool {
+    line.strip_prefix("> ").is_some_and(|header| {
+        let Some((a, b)) = header.split_once(" · ") else {
+            return false;
+        };
+        let token = |part: &str| {
+            !part.is_empty() && !part.chars().any(|ch| ch.is_whitespace() || ch == '·')
+        };
+        token(a) && token(b)
+    })
+}
+
+fn strip_opencode_headers(text: &str) -> std::borrow::Cow<'_, str> {
+    let has_header = text.split_inclusive('\n').any(|raw_line| {
+        if !raw_line.ends_with('\n') {
+            return false;
+        }
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        is_opencode_header_line(line)
+    });
+    if !has_header {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    let mut skip_empty_line = false;
+    let mut out = String::with_capacity(text.len());
+
+    for raw_line in text.split_inclusive('\n') {
+        let terminated = raw_line.ends_with('\n');
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+
+        if skip_empty_line {
+            skip_empty_line = false;
+            if terminated && line.is_empty() {
+                continue;
+            }
+        }
+
+        if terminated && is_opencode_header_line(line) {
+            skip_empty_line = true;
+            continue;
+        }
+
+        out.push_str(raw_line);
+    }
+
+    std::borrow::Cow::Owned(out)
+}
+
+fn cloud_run_output(text: &str, strip_headers: bool) -> std::borrow::Cow<'_, str> {
+    if strip_headers {
+        strip_opencode_headers(text)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+fn cloud_run_doc_text(text: &str, strip_headers: bool) -> String {
+    preserve_line_breaks(cloud_run_output(text, strip_headers).as_ref())
 }
 
 /// An honest error line in the transcript when a remote run can't even start.
@@ -3737,6 +3812,41 @@ mod line_break_tests {
             "x\n```\nl1\nl2\n```\ny"
         );
         assert_eq!(preserve_line_breaks("done"), "done");
+    }
+}
+
+#[cfg(test)]
+mod opencode_header_tests {
+    use super::{
+        cloud_run_doc_text, is_opencode_command, preserve_line_breaks, strip_opencode_headers,
+    };
+
+    #[test]
+    fn removes_complete_opencode_headers_and_the_following_blank_line() {
+        assert_eq!(
+            strip_opencode_headers("\n> build · big-pickle\n\nHey!\n").as_ref(),
+            "\nHey!\n"
+        );
+    }
+
+    #[test]
+    fn keeps_quotes_and_incomplete_trailing_headers() {
+        let quote = "> note: this is quoted\n";
+        let incomplete = "Hello\n> build · big-pickle";
+        assert_eq!(strip_opencode_headers(quote).as_ref(), quote);
+        assert_eq!(strip_opencode_headers(incomplete).as_ref(), incomplete);
+    }
+
+    #[test]
+    fn command_detection_uses_the_executable_not_the_model_id() {
+        assert!(is_opencode_command("opencode run -m opencode/big-pickle"));
+        assert!(is_opencode_command(
+            "/usr/local/bin/opencode run -m opencode/big-pickle"
+        ));
+        assert!(!is_opencode_command("claude --model opencode/big-pickle"));
+
+        let text = "> build · big-pickle\n\nHey!\n";
+        assert_eq!(cloud_run_doc_text(text, false), preserve_line_breaks(text));
     }
 }
 
