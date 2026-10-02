@@ -366,7 +366,7 @@ impl App {
             mod_status: String::new(),
             mod_log: Vec::new(),
             mod_usd: 0.0,
-            draft_ready: crate::customise::Paths::new(&zcore::cli_home()).has_draft(),
+            draft_ready: crate::customise::tidy(&crate::customise::Paths::new(&zcore::cli_home())),
             toggle_held: false,
             toggle_last: None,
         }
@@ -1723,6 +1723,8 @@ impl App {
             }
             Err(e) => {
                 self.mod_log.push(format!("✗ {e}"));
+                // keep whatever it managed before failing; drop an empty draft
+                self.draft_ready = crate::customise::tidy(&Self::customise_paths());
                 self.error(format!("Customise: {e}"));
             }
         }
@@ -2998,6 +3000,106 @@ FAILED
             let ui = std::fs::read_to_string(home.path().join("ui.toml")).unwrap();
             assert!(!ui.contains("comet"), "{ui}");
         });
+    }
+
+    /// Live: a real model customises the real `COSMOS_CLI_HOME`, driven
+    /// through the App exactly as typed. Ignored — run with
+    /// `COSMOS_LIVE_MODEL=<alias> COSMOS_LIVE_PROMPT=<file> cargo test -p ztui live_customise -- --ignored --nocapture`
+    /// (`COSMOS_LIVE_HAND_EDIT="/spinner pulse"` edits ui.toml mid-run;
+    /// `COSMOS_LIVE_FINISH=apply|discard|keep`, default apply).
+    #[test]
+    #[ignore]
+    fn live_customise() {
+        let _env = crate::env_lock();
+        let model = std::env::var("COSMOS_LIVE_MODEL").expect("set COSMOS_LIVE_MODEL");
+        let prompt = std::fs::read_to_string(std::env::var("COSMOS_LIVE_PROMPT").expect("set COSMOS_LIVE_PROMPT")).unwrap();
+        let hand_edit = std::env::var("COSMOS_LIVE_HAND_EDIT").ok();
+        let finish = std::env::var("COSMOS_LIVE_FINISH").unwrap_or_else(|_| "apply".into());
+        let home = zcore::cli_home();
+        let cwd = std::env::current_dir().unwrap();
+        let (mut watch, notes) = crate::skin::Watcher::start(&cwd);
+        println!("home {} · skin notes {notes:?}", home.display());
+        let mut a = App::new(&cwd, model_rows(), 100);
+        let (cmd, _rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let enter = |a: &mut App, s: &str| {
+            a.input = s.chars().collect();
+            a.cursor = a.input.len();
+            a.on_key(key(KeyCode::Enter), &cmd, &stop);
+        };
+        let reload = |a: &mut App, w: &mut crate::skin::Watcher| {
+            if std::mem::take(&mut a.skin_reload) {
+                for n in w.force() {
+                    println!("  skin note: {n}");
+                }
+            }
+        };
+        let text_of = |l: &Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+
+        enter(&mut a, &format!("/customise model {model}"));
+        reload(&mut a, &mut watch);
+        println!("{:?}", a.notice.as_ref().map(|n| n.0.clone()));
+        a.out.clear();
+        enter(&mut a, &format!("/customise {}", prompt.trim()));
+        assert!(a.customise.is_some(), "runner started: {:?}", a.out.iter().map(text_of).collect::<Vec<_>>());
+        // you keep working meanwhile
+        a.input = "still typing while it works".chars().collect();
+        a.cursor = a.input.len();
+        let t0 = Instant::now();
+        let (mut seen, mut edited, mut strip_seen) = (0, false, false);
+        while a.customise.is_some() && t0.elapsed() < Duration::from_secs(900) {
+            a.poll_customise();
+            reload(&mut a, &mut watch);
+            for l in &a.mod_log[seen..] {
+                println!("[{:>5.1}s] {l}", t0.elapsed().as_secs_f32());
+            }
+            seen = a.mod_log.len();
+            if !strip_seen {
+                if let Some(s) = view::live(&a).0.iter().map(text_of).find(|r| r.contains("customising with")) {
+                    println!("strip: {}", s.trim());
+                    strip_seen = true;
+                }
+            }
+            if !edited && a.draft_ready {
+                if let Some(h) = &hand_edit {
+                    let typed = std::mem::take(&mut a.input);
+                    enter(&mut a, h);
+                    reload(&mut a, &mut watch);
+                    println!("[{:>5.1}s] (operator) {h} → {:?}", t0.elapsed().as_secs_f32(), a.notice.as_ref().map(|n| n.0.clone()));
+                    a.input = typed;
+                    a.cursor = a.input.len();
+                    edited = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        a.poll_customise();
+        for l in &a.mod_log[seen..] {
+            println!("[{:>5.1}s] {l}", t0.elapsed().as_secs_f32());
+        }
+        assert!(a.customise.is_none(), "finished within 15 min");
+        assert_eq!(a.input.iter().collect::<String>(), "still typing while it works", "the composer was never touched");
+        println!("\n==== committed to scrollback ====");
+        for l in &a.out {
+            println!("{}", text_of(l));
+        }
+        a.out.clear();
+        a.input.clear();
+        a.cursor = 0;
+        enter(&mut a, "/customise diff");
+        println!("\n==== /customise diff ====");
+        for l in &a.out {
+            println!("{}", text_of(l));
+        }
+        match finish.as_str() {
+            "apply" => a.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL), &cmd, &stop),
+            "discard" => a.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL), &cmd, &stop),
+            _ => {}
+        }
+        reload(&mut a, &mut watch);
+        println!("\n==== {finish}: {:?} ====", a.notice.as_ref().map(|n| n.0.clone()));
+        println!("{}", std::fs::read_to_string(home.join("ui.toml")).unwrap_or_default());
+        println!("mod spend: ${:.4}", a.mod_usd);
     }
 
     #[test]

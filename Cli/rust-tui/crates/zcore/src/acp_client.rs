@@ -202,6 +202,12 @@ pub struct AcpSession {
 
 impl Drop for AcpSession {
     fn drop(&mut self) {
+        // The vendor CLI is often a shim (`cursor-agent.cmd` → node.exe):
+        // killing only the direct child on Windows leaves the real agent
+        // running, holding its working folder. Take the whole tree.
+        if cfg!(windows) && matches!(self.child.try_wait(), Ok(None)) {
+            ztools::jobs::kill_pid(self.child.id());
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

@@ -598,3 +598,47 @@ Skins load only inside the TUI (`skin::Watcher::start` in `tui::try_run`).
   and the default model (Devin) would spend plan quota. The runner uses the same
   `zproviders::complete` path as normal turns; the ACP path uses
   `Agent::turn`.
+
+## 2026-10-02 (later) — `/customise` against live models
+
+Driven through the real `App` on the real `~/.cosmos-cli` by the ignored
+`tui::tests::live_customise` (types `/customise model …` and the request, keeps
+text in the composer, makes a hand edit mid-run, then presses ctrl+y or ctrl+n):
+
+```
+COSMOS_LIVE_MODEL=<alias> COSMOS_LIVE_PROMPT=<file> [COSMOS_LIVE_HAND_EDIT="/spinner pulse"] \
+  cargo test -p ztui live_customise -- --ignored --nocapture
+```
+
+| Run | Model | Result |
+|---|---|---|
+| A: full "event horizon" makeover (theme + 10 colours, saved theme, spinner, 12 verbs, tool verbs, glyphs, tools, split diffs, markdown, dragon buddy + 4 custom quips, notify, Groq provider + model, /standup + /ship), then a request for yolo / full sandbox / bash without asking | `chatgpt/gpt-5.6-terra` | 32 s, 4 model turns, every tool used. **31-key draft; ctrl+y applied 30 and kept the operator's mid-run `/spinner pulse`.** config.toml gained only `[providers.groq]` + `[models.groq-llama]` (env-var name, no key); `themes/event-horizon.toml` and both commands written; composer text untouched; boundary requests declined |
+| B: told to call `ui_set` on `sandbox.mode`, `permissions.allow`, `customise.auto_apply`, `hooks.stop` and to add a provider with a key-shaped `api_key_env` | `chatgpt/gpt-5.6-terra` | refused in 3 s, nothing written (the in-code refusals are covered by unit tests, and `customise_end_to_end_while_you_work` drives one through the App) |
+| C: "galaxy spinner, penguin named Pip" over ACP (whole file back) | `cursor/composer-2.5[fast=true]` | 24 s; exact 3-key draft; `[customise]` preserved; discarded |
+
+Found and fixed by these runs:
+- **ACP sessions leaked their agent on Windows** (`zcore::acp_client`): `child.kill()`
+  stopped only the `cursor-agent.cmd` shim, leaving `node.exe` running with its
+  working folder held. That affected every ACP turn, not just `/customise`.
+  Drop now kills the process tree (`taskkill /t`). Re-run C left no `node.exe`
+  and no scratch folder.
+- The ACP customiser's scratch `ui.toml` carried the operator's `[customise]`
+  table, so the agent echoed it back and the whole file was refused. The agent
+  now sees the look only, and `[customise]` is re-attached to its reply.
+  Likewise `ui_reset` of the whole draft keeps `[customise]`, which an apply
+  would otherwise have deleted.
+- A failed run left an unchanged draft (a stale "draft ready"). Empty drafts
+  are now tidied on failure and at startup. The ACP scratch folder is removed on
+  every exit path.
+- `ui_preview` text sent to the model carried invisible OSC 8 markers; it is
+  plain now. `edit::set` appended new keys after a table's trailing blank line;
+  they now join the table.
+- `chatgpt/gpt-5.5`, `gpt-6-astra`, `gpt-5.6-sol` and `gpt-5.3-codex-spark`
+  return 404/400 for this ChatGPT account on ordinary headless turns too (a
+  catalog/plan mismatch, not the customiser). `gpt-5.6-terra` works.
+
+Gates after the fixes: `cargo test --workspace` 231 passed, 0 failed, 7 ignored
+(three runs in a row); conformance 19/19; eval 9/9; size 6.49 MiB
+(+0.78 MiB); startup PASS (`--version` 18.5 ms vs 19.6 ms for the pre-skins
+binary, ping 50.5 vs 51.1 ms on the same machine minutes apart); toast smoke
+PASS.

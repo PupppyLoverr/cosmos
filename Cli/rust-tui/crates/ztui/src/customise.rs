@@ -74,6 +74,28 @@ pub fn begin(p: &Paths) -> Result<(), String> {
     std::fs::write(&p.draft, &cur).map_err(|e| e.to_string())
 }
 
+/// Carry the operator's `[customise]` table from `from` onto `onto` — the
+/// customiser never sees, writes or drops it.
+fn keep_leash(from: &str, onto: &str) -> String {
+    let mut out = edit::remove_table(onto, "customise");
+    for ((t, k), v) in edit::flatten(from) {
+        if t == "customise" {
+            if let Some(v) = Val::from_toml(&v) {
+                out = edit::set(&out, &t, &k, &v);
+            }
+        }
+    }
+    out
+}
+
+/// Drop the draft when it doesn't change anything. True when one remains.
+pub fn tidy(p: &Paths) -> bool {
+    if p.draft.exists() && changes(p).is_empty() {
+        discard(p);
+    }
+    p.draft.exists()
+}
+
 pub fn discard(p: &Paths) {
     let _ = std::fs::remove_file(&p.draft);
     let _ = std::fs::remove_file(&p.base);
@@ -312,7 +334,9 @@ fn run_tool(p: &Paths, auto_apply: bool, name: &str, input: &Value) -> Result<(S
             begin(p)?;
             let skin = crate::skin::parse(&read(&p.draft))?;
             let lines = preview(&skin, 72);
-            let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+            // plain text for the model: no invisible hyperlink markers
+            let plain = |s: &str| s.chars().filter(|c| !('\u{E0000}'..='\u{E007F}').contains(c)).collect::<String>();
+            let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| plain(&s.content)).collect()).collect();
             let pal = skin.palette().0;
             let colours: Vec<String> = ["text", "accent", "success", "warn", "error", "dim", "code", "link", "heading"]
                 .iter()
@@ -329,7 +353,8 @@ fn run_tool(p: &Paths, auto_apply: bool, name: &str, input: &Value) -> Result<(S
         "ui_reset" => {
             begin(p)?;
             let text = match input["section"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
-                None => String::new(),
+                // everything back to defaults — except the operator's own limits
+                None => keep_leash(&read(&p.draft), ""),
                 Some(s) if schema::SECTIONS.contains(&s) => edit::remove_table(&read(&p.draft), s),
                 Some(s) => return Err(format!("unknown section {s:?} (sections: {})", schema::SECTIONS.join(", "))),
             };
@@ -820,7 +845,16 @@ fn run_acp(request: &str, alias: &str, p: &Paths, cancel: &AtomicBool, tx: &Send
     let id = zproto::new_id();
     let scratch = p.home.join("customise").join(format!("scratch-{id}"));
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
-    std::fs::write(scratch.join("ui.toml"), read(&p.draft)).map_err(|e| e.to_string())?;
+    // removed however this returns (errors and stops included)
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(scratch.clone());
+    // the agent sees the look only; the operator's [customise] limits stay here
+    std::fs::write(scratch.join("ui.toml"), edit::remove_table(&read(&p.draft), "customise")).map_err(|e| e.to_string())?;
     std::fs::write(scratch.join("SCHEMA.md"), schema::text()).map_err(|e| e.to_string())?;
     let _ = tx.send(Up::Status(format!("asking {alias}")));
     let opts = zproto::RunOpts { model: Some(alias.to_string()), cwd: Some(scratch.display().to_string()), ..Default::default() };
@@ -849,7 +883,6 @@ fn run_acp(request: &str, alias: &str, p: &Paths, cancel: &AtomicBool, tx: &Send
         .find(|m| m.role == Role::Assistant)
         .map(|m| m.content.iter().filter_map(|b| if let Block::Text { text } = b { Some(text.as_str()) } else { None }).collect::<Vec<_>>().join("\n"))
         .unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&scratch);
     let file = toml_block(&reply).ok_or_else(|| format!("{alias} didn't reply with a ```toml block"))?;
     schema::check_text(&file).map_err(|e| format!("{alias}'s file was refused: {e}"))?;
     let skin = crate::skin::parse(&file)?;
@@ -857,7 +890,7 @@ fn run_acp(request: &str, alias: &str, p: &Paths, cancel: &AtomicBool, tx: &Send
     if !warn.is_empty() {
         return Err(format!("{alias}'s file was refused: {}", warn.join("; ")));
     }
-    std::fs::write(&p.draft, &file).map_err(|e| e.to_string())?;
+    std::fs::write(&p.draft, keep_leash(&read(&p.draft), &file)).map_err(|e| e.to_string())?;
     let _ = tx.send(Up::Effect(Effect::Draft));
     Ok(reply.split("```toml").next().unwrap_or("").trim().to_string())
 }
@@ -895,6 +928,43 @@ mod tests {
         assert_eq!(exec(&p, true, "ui_apply", &json!({})).2, Some(Effect::Apply));
         let ch = changes(&p);
         assert!(ch.iter().any(|c| c.starts_with("theme.name: \"nebula\"")), "{ch:?}");
+    }
+
+    #[test]
+    fn previews_for_the_model_are_plain_text() {
+        let (_d, p) = home();
+        exec(&p, false, "ui_set", &json!({"path": "markdown.links", "value": "osc8"}));
+        let (out, err, _) = exec(&p, false, "ui_preview", &json!({}));
+        assert!(!err, "{out}");
+        assert!(out.contains("a link.") && !out.chars().any(|c| ('\u{E0000}'..='\u{E007F}').contains(&c)), "{out:?}");
+    }
+
+    #[test]
+    fn the_operators_limits_survive_resets_and_whole_files() {
+        let (_d, p) = home();
+        std::fs::write(&p.ui, "[customise]\nmax_turns = 30\nmax_usd = 1.0\n\n[spinner]\nstyle = \"moon\"\n").unwrap();
+        exec(&p, false, "ui_reset", &json!({}));
+        let draft = std::fs::read_to_string(&p.draft).unwrap();
+        assert!(draft.contains("max_turns = 30") && !draft.contains("moon"), "{draft}");
+        // an ACP agent's whole file comes back without [customise]
+        let file = "[theme]\nname = \"mono\"\n";
+        assert!(schema::check_text(file).is_ok());
+        let merged = keep_leash(&std::fs::read_to_string(&p.ui).unwrap(), file);
+        assert!(merged.contains("name = \"mono\"") && merged.contains("max_usd = 1.0"), "{merged}");
+        std::fs::write(&p.draft, merged).unwrap();
+        apply(&p).unwrap();
+        let ui = std::fs::read_to_string(&p.ui).unwrap();
+        assert!(ui.contains("max_turns = 30") && ui.contains("name = \"mono\"") && !ui.contains("moon"), "{ui}");
+    }
+
+    #[test]
+    fn empty_drafts_are_tidied_away() {
+        let (_d, p) = home();
+        std::fs::write(&p.ui, "[theme]\nname = \"mono\"\n").unwrap();
+        begin(&p).unwrap();
+        assert!(!tidy(&p) && !p.draft.exists() && !p.base.exists(), "an untouched draft goes");
+        exec(&p, false, "ui_set", &json!({"path": "spinner.fps", "value": 9}));
+        assert!(tidy(&p), "a real one stays");
     }
 
     #[test]

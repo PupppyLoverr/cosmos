@@ -124,7 +124,10 @@ pub fn set(text: &str, table: &str, key: &str, value: &Val) -> String {
             continue;
         }
         if cur == table {
-            table_end = Some(i + 1);
+            // new keys go after the table's last line, not after its trailing blank
+            if !l.trim().is_empty() {
+                table_end = Some(i + 1);
+            }
             if key_of(l).as_deref() == Some(key) {
                 // keep a trailing comment on the line
                 let n = span(&lines, i);
@@ -278,6 +281,13 @@ pub fn set_in_file(path: &Path, table: &str, key: &str, value: &Val) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_keys_join_their_table_not_the_gap_after_it() {
+        let src = "[spinner]\nstyle = \"pulse\"\n\n[buddy]\nname = \"Nova\"\n";
+        let out = set(src, "spinner", "fps", &Val::Int(14));
+        assert_eq!(out, "[spinner]\nstyle = \"pulse\"\nfps = 14\n\n[buddy]\nname = \"Nova\"\n");
+    }
 
     #[test]
     fn multi_line_values_tables_and_flatten() {
