@@ -383,6 +383,7 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
             image: UIImage(systemName: "star.fill"),
             label: "Favorites",
             identifier: "model-rail-favorites",
+            foregroundColor: selectedFilter == .favorites ? Palette.text : Palette.secondary,
             selected: selectedFilter == .favorites
         ) { [weak self] in
             self?.filter = .favorites
@@ -392,9 +393,10 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         })
         for harness in harnesses {
             railStack.addArrangedSubview(railButton(
-                image: BrandMarks.image(for: harness, side: 16)?.withRenderingMode(.alwaysTemplate),
+                image: BrandMarks.image(for: harness, side: 16),
                 label: harnessLabel(harness),
                 identifier: "model-rail-\(harness)",
+                foregroundColor: Palette.text,
                 selected: selectedFilter == .harness(harness)
             ) { [weak self] in
                 self?.filter = .harness(harness)
@@ -411,13 +413,14 @@ final class ModelPickerViewController: UIViewController, UITableViewDataSource, 
         image: UIImage?,
         label: String,
         identifier: String,
+        foregroundColor: UIColor,
         selected: Bool,
         action: @escaping () -> Void
     ) -> UIButton {
         let buttonSize = min(44, UIFontMetrics(forTextStyle: .body).scaledValue(for: 32))
         var configuration = UIButton.Configuration.plain()
-        configuration.image = image?.withRenderingMode(.alwaysTemplate)
-        configuration.baseForegroundColor = selected ? Palette.text : Palette.secondary
+        configuration.image = image
+        configuration.baseForegroundColor = foregroundColor
         configuration.background.backgroundColor = selected ? Palette.controlFill : .clear
         configuration.background.cornerRadius = 8
         configuration.contentInsets = .zero
@@ -743,7 +746,7 @@ private final class ModelPickerCell: UITableViewCell {
         selectionBackground.layer.cornerRadius = 10
         selectionBackground.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(selectionBackground)
-        minimumHeightConstraint = contentView.heightAnchor.constraint(greaterThanOrEqualToConstant: 48)
+        minimumHeightConstraint = contentView.heightAnchor.constraint(greaterThanOrEqualToConstant: 44)
         NSLayoutConstraint.activate([
             selectionBackground.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 6),
             selectionBackground.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -6),
@@ -793,8 +796,8 @@ private final class ModelPickerCell: UITableViewCell {
         NSLayoutConstraint.activate([
             rowContent.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
             rowContent.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
-            rowContent.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 5),
-            rowContent.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -5),
+            rowContent.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 4),
+            rowContent.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -4),
             mark.widthAnchor.constraint(equalToConstant: 18),
             mark.heightAnchor.constraint(equalToConstant: 18),
             favoriteButton.widthAnchor.constraint(equalToConstant: 28),
@@ -821,7 +824,7 @@ private final class ModelPickerCell: UITableViewCell {
         onToggleFavorite: @escaping () -> Void
     ) {
         let category = contentSizeCategory ?? traitCollection.preferredContentSizeCategory
-        mark.image = BrandMarks.image(for: model.harness, side: 18)?.withRenderingMode(.alwaysTemplate)
+        mark.image = BrandMarks.image(for: model.harness, side: 18)
         mark.isHidden = mark.image == nil
         title.text = model.label
         title.textColor = Palette.text
@@ -836,7 +839,7 @@ private final class ModelPickerCell: UITableViewCell {
         detail.font = dynamicFont(.sans, size: 12.5, style: .caption1, contentSizeCategory: category)
         detail.numberOfLines = category.isAccessibilityCategory ? 0 : 1
         detail.isHidden = model.description?.isEmpty ?? true
-        minimumHeightConstraint.constant = detail.isHidden ? 48 : 56
+        minimumHeightConstraint.constant = detail.isHidden ? 44 : 52
         favoriteButton.setImage(
             UIImage(
                 systemName: favorite ? "star.fill" : "star",
