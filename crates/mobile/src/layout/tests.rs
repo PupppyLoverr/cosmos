@@ -1126,23 +1126,22 @@ fn session_changes_lists_pending_file_mutations_and_aggregates_later_stats() {
     use zeron_doc::schema::{MessageRole, SessionMessageEntry};
     use zeron_proto::ToolCall;
 
-    let tool = |id: &str,
-                call: ToolCall,
-                is_error: bool,
-                diff_stats: Option<Vec<ToolDiffStat>>| MessagePart::Tool {
-        id: id.into(),
-        call,
-        is_error,
-        resolved: false,
-        output: None,
-        diff: None,
-        output_ref: None,
-        output_bytes: None,
-        diff_ref: None,
-        diff_stats,
-        subagent_ref: None,
-        subagent_status: None,
-        subagent_tail: None,
+    let tool = |id: &str, call: ToolCall, is_error: bool, diff_stats: Option<Vec<ToolDiffStat>>| {
+        MessagePart::Tool {
+            id: id.into(),
+            call,
+            is_error,
+            resolved: false,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        }
     };
     let edit = |path: &str| ToolCall::EditFile {
         path: path.into(),
@@ -1183,12 +1182,7 @@ fn session_changes_lists_pending_file_mutations_and_aggregates_later_stats() {
                 false,
                 None,
             ),
-            tool(
-                "t5",
-                ToolCall::ApplyPatch { path: None },
-                false,
-                None,
-            ),
+            tool("t5", ToolCall::ApplyPatch { path: None }, false, None),
             tool("t6", edit("src/aggregate.rs"), false, None),
             tool(
                 "t7",
