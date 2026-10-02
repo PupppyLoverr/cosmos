@@ -626,6 +626,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             source: source,
             title: shown.title,
             model: model,
+            harness: app.row(chatId)?.harness ?? "claude-code",
             latestReply: { [weak self] in self?.latestReply() }
         )
         voiceCall = vc

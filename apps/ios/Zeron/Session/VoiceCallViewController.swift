@@ -2,11 +2,22 @@ import AVFoundation
 import UIKit
 
 @MainActor
-final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelegate {
+final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechSynthesizerDelegate {
+    private enum Phase: Equatable {
+        case listening
+        case sending
+        case working
+        case speaking
+        case paused
+        case unavailable(String)
+    }
+
     private let source: SessionSource
     private let latestReply: () -> String?
     private let initialTitle: String
+    private let harness: String
     private var modelLabel: String
+    private let demoPreview: Bool
     private let capture = SpeechCapture(
         mode: .voiceChat,
         silenceTimeout: 1.4,
@@ -17,13 +28,25 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
     private let speech = AVSpeechSynthesizer()
     private let titleLabel = UILabel()
     private let model = UILabel()
+    private let modelMark = UIImageView()
+    private let modelChip = UIView()
     private let status = UILabel()
+    private let statusDot = UIView()
+    private let statusPill = UIStackView()
     private let caption = UILabel()
-    private let orb = UIView()
-    private let muteButton = Glass.circleButton(symbol: "mic", size: 58, pointSize: 19)
-    private let endButton = Glass.circleButton(symbol: "phone.down.fill", size: 58, pointSize: 19)
+    private let hint = UILabel()
+    private let captionStack = UIStackView()
+    private let orb = DotOrbView()
+    private let muteButton = UIButton(type: .system)
+    private let endButton = UIButton(type: .system)
+    private let muteLabel = UILabel()
+    private let endLabel = UILabel()
+    private let controls = UIStackView()
+    private let screenGlow = CAGradientLayer()
     private var listenTask: Task<Void, Never>?
     private var replyTask: Task<Void, Never>?
+    private var demoTask: Task<Void, Never>?
+    private var phase: Phase = .paused
     private var muted = false
     private var ended = false
     private var listening = false
@@ -37,11 +60,20 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
     private var lastUtterance = ""
     private var previousIdleTimerState = false
 
-    init(source: SessionSource, title: String, model: String, latestReply: @escaping () -> String?) {
+    init(
+        source: SessionSource,
+        title: String,
+        model: String,
+        harness: String,
+        latestReply: @escaping () -> String?
+    ) {
         self.source = source
         self.initialTitle = title
         self.modelLabel = model
+        self.harness = harness
         self.latestReply = latestReply
+        let arguments = ProcessInfo.processInfo.arguments
+        demoPreview = arguments.contains("-demo") && arguments.contains("-voicePhases")
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .overFullScreen
         modalPresentationCapturesStatusBarAppearance = true
@@ -57,92 +89,179 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
         speech.delegate = self
         previousIdleTimerState = UIApplication.shared.isIdleTimerDisabled
         UIApplication.shared.isIdleTimerDisabled = true
-        view.backgroundColor = UIColor.black.withAlphaComponent(0.82)
+        view.backgroundColor = UIColor(hex: 0x08080B)
 
-        let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterialDark))
-        blur.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(blur)
+        screenGlow.type = .radial
+        screenGlow.startPoint = CGPoint(x: 0.5, y: 0.5)
+        screenGlow.endPoint = CGPoint(x: 1, y: 0.5)
+        screenGlow.colors = [
+            Palette.accent.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
+                .withAlphaComponent(0.10).cgColor,
+            UIColor.clear.cgColor,
+        ]
+        view.layer.insertSublayer(screenGlow, at: 0)
 
         titleLabel.text = initialTitle
         titleLabel.textColor = .white
-        titleLabel.font = Fonts.ui(.sansSemibold, 18)
+        titleLabel.font = Fonts.ui(.sansSemibold, 17)
         titleLabel.textAlignment = .center
-        model.textColor = UIColor.white.withAlphaComponent(0.68)
+        titleLabel.numberOfLines = 1
+
+        modelChip.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+        modelChip.layer.cornerRadius = 15
+        modelChip.layer.borderWidth = 1
+        modelChip.layer.borderColor = UIColor.white.withAlphaComponent(0.10).cgColor
+        modelChip.translatesAutoresizingMaskIntoConstraints = false
+        modelMark.contentMode = .scaleAspectFit
+        modelMark.setContentHuggingPriority(.required, for: .horizontal)
+        model.textColor = UIColor.white.withAlphaComponent(0.75)
         model.font = Fonts.ui(.sans, 13)
-        model.textAlignment = .center
+        model.numberOfLines = 1
+        let modelContents = UIStackView(arrangedSubviews: [modelMark, model])
+        modelContents.axis = .horizontal
+        modelContents.alignment = .center
+        modelContents.spacing = 7
+        modelContents.translatesAutoresizingMaskIntoConstraints = false
+        modelChip.addSubview(modelContents)
+        NSLayoutConstraint.activate([
+            modelContents.leadingAnchor.constraint(equalTo: modelChip.leadingAnchor, constant: 10),
+            modelContents.trailingAnchor.constraint(equalTo: modelChip.trailingAnchor, constant: -10),
+            modelContents.topAnchor.constraint(equalTo: modelChip.topAnchor, constant: 6),
+            modelContents.bottomAnchor.constraint(equalTo: modelChip.bottomAnchor, constant: -6),
+            modelMark.widthAnchor.constraint(equalToConstant: 14),
+            modelMark.heightAnchor.constraint(equalToConstant: 14),
+        ])
         updateModelLabel()
-        status.textColor = UIColor.white.withAlphaComponent(0.8)
-        status.font = Fonts.ui(.sansMedium, 16)
-        status.textAlignment = .center
-        caption.textColor = UIColor.white.withAlphaComponent(0.78)
-        caption.font = Fonts.ui(.sans, 16)
+
+        status.textColor = UIColor.white.withAlphaComponent(0.85)
+        status.font = Fonts.ui(.sansMedium, 14)
+        status.numberOfLines = 1
+        statusDot.layer.cornerRadius = 3
+        statusDot.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            statusDot.widthAnchor.constraint(equalToConstant: 6),
+            statusDot.heightAnchor.constraint(equalToConstant: 6),
+        ])
+        statusPill.axis = .horizontal
+        statusPill.alignment = .center
+        statusPill.spacing = 8
+        statusPill.isLayoutMarginsRelativeArrangement = true
+        statusPill.layoutMargins = UIEdgeInsets(top: 7, left: 12, bottom: 7, right: 12)
+        statusPill.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+        statusPill.layer.cornerRadius = 16
+        statusPill.layer.borderWidth = 1
+        statusPill.layer.borderColor = UIColor.white.withAlphaComponent(0.10).cgColor
+        statusPill.addArrangedSubview(statusDot)
+        statusPill.addArrangedSubview(status)
+        statusPill.translatesAutoresizingMaskIntoConstraints = false
+
+        caption.textColor = UIColor.white.withAlphaComponent(0.9)
+        caption.font = Fonts.ui(.sans, 17)
         caption.textAlignment = .center
-        caption.numberOfLines = 3
-        caption.adjustsFontSizeToFitWidth = true
-        caption.minimumScaleFactor = 0.8
+        caption.numberOfLines = 4
+        caption.lineBreakMode = .byTruncatingTail
+        caption.adjustsFontForContentSizeCategory = true
+        hint.text = "Tap the orb to interrupt"
+        hint.textColor = UIColor.white.withAlphaComponent(0.45)
+        hint.font = Fonts.ui(.sans, 12)
+        hint.textAlignment = .center
+        hint.isHidden = true
+        captionStack.axis = .vertical
+        captionStack.alignment = .fill
+        captionStack.spacing = 5
+        captionStack.addArrangedSubview(caption)
+        captionStack.addArrangedSubview(hint)
+        captionStack.translatesAutoresizingMaskIntoConstraints = false
 
-        orb.backgroundColor = Palette.accent.withAlphaComponent(0.8)
-        orb.layer.cornerRadius = 78
-        orb.layer.shadowColor = Palette.accent.cgColor
-        orb.layer.shadowOpacity = 0.55
-        orb.layer.shadowRadius = 32
-        orb.layer.shadowOffset = .zero
-        orb.translatesAutoresizingMaskIntoConstraints = false
-        orb.isAccessibilityElement = true
         orb.accessibilityLabel = "Voice activity"
+        orb.translatesAutoresizingMaskIntoConstraints = false
+        orb.isUserInteractionEnabled = true
+        let centerTap = UITapGestureRecognizer(target: self, action: #selector(orbTapped))
+        orb.addGestureRecognizer(centerTap)
 
+        configureButton(muteButton, symbol: "mic", background: UIColor.white.withAlphaComponent(0.10), tint: .white)
+        configureButton(endButton, symbol: "phone.down.fill", background: Palette.danger, tint: .white)
         muteButton.accessibilityIdentifier = "voice-mute"
         muteButton.accessibilityLabel = "Mute"
         muteButton.addAction(UIAction { [weak self] _ in self?.toggleMute() }, for: .touchUpInside)
         endButton.accessibilityIdentifier = "voice-end"
         endButton.accessibilityLabel = "End voice mode"
-        endButton.tintColor = Palette.danger
         endButton.addAction(UIAction { [weak self] _ in self?.endCall() }, for: .touchUpInside)
-
-        status.translatesAutoresizingMaskIntoConstraints = false
-        caption.translatesAutoresizingMaskIntoConstraints = false
-
-        let header = UIStackView(arrangedSubviews: [titleLabel, model])
-        header.axis = .vertical
-        header.alignment = .center
-        header.spacing = 3
-        header.translatesAutoresizingMaskIntoConstraints = false
-        let controls = UIStackView(arrangedSubviews: [muteButton, endButton])
+        muteLabel.text = "Mute"
+        endLabel.text = "End"
+        [muteLabel, endLabel].forEach {
+            $0.font = Fonts.ui(.sans, 12)
+            $0.textColor = UIColor.white.withAlphaComponent(0.6)
+            $0.textAlignment = .center
+        }
+        let muteControl = UIStackView(arrangedSubviews: [muteButton, muteLabel])
+        let endControl = UIStackView(arrangedSubviews: [endButton, endLabel])
+        [muteControl, endControl].forEach {
+            $0.axis = .vertical
+            $0.alignment = .center
+            $0.spacing = 9
+        }
         controls.axis = .horizontal
         controls.alignment = .center
-        controls.spacing = 18
+        controls.spacing = 44
+        controls.addArrangedSubview(muteControl)
+        controls.addArrangedSubview(endControl)
         controls.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(header)
-        view.addSubview(status)
-        view.addSubview(orb)
-        view.addSubview(caption)
-        view.addSubview(controls)
+
+        let header = UIStackView(arrangedSubviews: [titleLabel, modelChip])
+        header.axis = .vertical
+        header.alignment = .center
+        header.spacing = 8
+        header.translatesAutoresizingMaskIntoConstraints = false
+        [header, statusPill, orb, captionStack, controls].forEach(view.addSubview)
+
         NSLayoutConstraint.activate([
-            blur.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            blur.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            blur.topAnchor.constraint(equalTo: view.topAnchor),
-            blur.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             header.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 20),
             header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
             header.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
-            status.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            status.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 28),
+            statusPill.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            statusPill.topAnchor.constraint(equalTo: orb.bottomAnchor, constant: 28),
             orb.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            orb.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -10),
-            orb.widthAnchor.constraint(equalToConstant: 156),
+            orb.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -40),
+            orb.widthAnchor.constraint(equalToConstant: 280),
             orb.heightAnchor.constraint(equalTo: orb.widthAnchor),
-            caption.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 28),
-            caption.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -28),
-            caption.topAnchor.constraint(equalTo: orb.bottomAnchor, constant: 30),
+            captionStack.topAnchor.constraint(equalTo: statusPill.bottomAnchor, constant: 14),
+            captionStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 28),
+            captionStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -28),
+            captionStack.bottomAnchor.constraint(lessThanOrEqualTo: controls.topAnchor, constant: -22),
             controls.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             controls.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -24),
+            muteButton.widthAnchor.constraint(equalToConstant: 64),
+            muteButton.heightAnchor.constraint(equalToConstant: 64),
+            endButton.widthAnchor.constraint(equalToConstant: 64),
+            endButton.heightAnchor.constraint(equalToConstant: 64),
         ])
 
-        let centerTap = UITapGestureRecognizer(target: self, action: #selector(orbTapped))
-        orb.addGestureRecognizer(centerTap)
-        NotificationCenter.default.addObserver(self, selector: #selector(interruption(_:)), name: AVAudioSession.interruptionNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(backgrounded), name: UIApplication.didEnterBackgroundNotification, object: nil)
-        startListening()
+        setPhase(.paused)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(interruption(_:)),
+            name: AVAudioSession.interruptionNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(backgrounded),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        if demoPreview {
+            startDemoPreview()
+        } else {
+            startListening()
+        }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let size = min(view.bounds.width * 1.35, 520)
+        screenGlow.bounds = CGRect(x: 0, y: 0, width: size, height: size)
+        screenGlow.position = CGPoint(x: view.bounds.midX, y: view.bounds.midY - 40)
     }
 
     override func viewDidDisappear(_ animated: Bool) {
@@ -154,6 +273,7 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
         NotificationCenter.default.removeObserver(self)
         listenTask?.cancel()
         replyTask?.cancel()
+        demoTask?.cancel()
     }
 
     func sessionDidUpdate(chrome: SessionChrome, frame: LayoutFrame) {
@@ -165,22 +285,30 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
             modelLabel = model
             updateModelLabel()
         }
-        guard !ended else { return }
+        guard !ended, !demoPreview else { return }
         if chrome.running {
             observedRunning = true
-            if listening == false, speech.isSpeaking == false { setStatus("\(modelLabel) is working…") }
+            if !listening, !speech.isSpeaking { setPhase(.working) }
         } else if observedRunning || frameChangedSinceSend {
             scheduleReplyCheck()
         }
-        if case .failed = chrome.banner, (status.text?.hasSuffix("is working…") == true || status.text == "Sending…") {
+        if case .failed = chrome.banner, phase == .sending || phase == .working {
             speak("Something went wrong — check the chat.")
         }
     }
 
     @objc private func orbTapped() {
+        guard phase == .speaking else { return }
+        if demoPreview {
+            demoTask?.cancel()
+            demoTask = nil
+            setCaption(nil)
+            startDemoPreview()
+            return
+        }
         guard speech.isSpeaking else { return }
         speech.stopSpeaking(at: .immediate)
-        caption.text = nil
+        setCaption(nil)
         startListening()
     }
 
@@ -189,7 +317,8 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
         replyTask?.cancel()
         replyTask = nil
         lastUtterance = ""
-        setStatus("Listening…")
+        setCaption(nil)
+        setPhase(.listening)
         listenTask?.cancel()
         listenTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -198,8 +327,7 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
                     onText: { [weak self] text in
                         guard let self else { return }
                         self.lastUtterance = text
-                        self.caption.text = text
-                        self.orb.accessibilityLabel = "Barge in"
+                        self.setCaption(text)
                     },
                     onEnd: { [weak self] error in self?.listeningEnded(error) },
                     onLevel: { [weak self] level in self?.updateOrb(level: level) }
@@ -209,9 +337,10 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
             } catch {
                 guard !Task.isCancelled, !self.ended else { return }
                 if (error as? DictationError) == .permissionDenied {
+                    self.setPhase(.unavailable("Microphone access is off"))
                     self.presentSpeechSettingsAlert()
                 } else {
-                    self.setStatus((error as? DictationError)?.message ?? "Voice isn't available right now")
+                    self.setPhase(.unavailable((error as? DictationError)?.message ?? "Voice isn't available right now"))
                 }
             }
         }
@@ -220,8 +349,8 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
     private func listeningEnded(_ error: Error?) {
         listening = false
         guard !ended, !muted, !interrupted else { return }
-        if let error, lastUtterance.isEmpty {
-            setStatus("Paused")
+        if error != nil, lastUtterance.isEmpty {
+            setPhase(.paused)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.startListening() }
             return
         }
@@ -238,10 +367,11 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
         sentRows = currentFrameRows
         observedRunning = false
         lastUtterance = ""
-        setStatus("Sending…")
+        setCaption(text)
+        setPhase(.sending)
         let mode: DeliveryMode = currentChrome.running && currentChrome.canSteer ? .steer : .queue
         guard source.send(text: text, images: [], mode: mode) else {
-            setStatus("Paused")
+            setPhase(.paused)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.startListening() }
             return
         }
@@ -276,9 +406,8 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
         guard !cleaned.isEmpty else { startListening(); return }
         capture.stop()
         listening = false
-        caption.text = cleaned
-        setStatus("Speaking…")
-        orb.accessibilityLabel = "Barge in"
+        setCaption(cleaned)
+        setPhase(.speaking)
         let utterance = AVSpeechUtterance(string: cleaned)
         utterance.rate = 0.5
         utterance.voice = preferredVoice()
@@ -301,49 +430,187 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
         }
     }
 
+    func speechSynthesizer(
+        _ synthesizer: AVSpeechSynthesizer,
+        willSpeakRangeOfSpeechString characterRange: NSRange,
+        utterance: AVSpeechUtterance
+    ) {
+        orb.pulse()
+    }
+
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         guard !ended else { return }
-        caption.text = nil
+        setCaption(nil)
         startListening()
     }
 
     private func updateOrb(level: Float) {
-        let normalized = min(1, max(0, level * 8))
-        if UIAccessibility.isReduceMotionEnabled {
-            orb.alpha = 0.7 + CGFloat(normalized) * 0.3
-        } else {
-            orb.alpha = 0.72 + CGFloat(normalized) * 0.28
-            let scale = 1 + CGFloat(normalized) * 0.24
-            UIView.animate(withDuration: 0.12, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
-                self.orb.transform = CGAffineTransform(scaleX: scale, y: scale)
-            }
-        }
+        orb.setLevel(min(1, CGFloat(level) * 8))
     }
 
     private func toggleMute() {
         muted.toggle()
+        updateMuteButton()
         if muted {
             lastUtterance = ""
             capture.stop()
             speech.stopSpeaking(at: .immediate)
             listening = false
-            setStatus("Paused")
-            muteButton.setImage(UIImage(systemName: "mic.slash"), for: .normal)
-            muteButton.accessibilityLabel = "Unmute"
+            setCaption(nil)
+            setPhase(.paused)
+            if demoPreview {
+                demoTask?.cancel()
+                demoTask = nil
+            }
+        } else if demoPreview {
+            startDemoPreview()
         } else {
-            muteButton.setImage(UIImage(systemName: "mic"), for: .normal)
-            muteButton.accessibilityLabel = "Mute"
             startListening()
         }
     }
 
-    private func setStatus(_ text: String) {
-        status.text = text
-        orb.accessibilityValue = text
+    private func setPhase(_ phase: Phase) {
+        self.phase = phase
+        let statusText: String
+        switch phase {
+        case .listening:
+            statusText = "Listening"
+            orb.mode = .listening
+            orb.accessibilityLabel = "Voice activity"
+        case .sending:
+            statusText = "Sending"
+            orb.mode = .thinking
+            orb.accessibilityLabel = "Voice activity"
+        case .working:
+            statusText = "Thinking"
+            orb.mode = .thinking
+            orb.accessibilityLabel = "Voice activity"
+        case .speaking:
+            statusText = "Speaking"
+            orb.mode = .speaking
+            orb.accessibilityLabel = "Barge in"
+        case .paused:
+            statusText = "Paused"
+            orb.mode = .paused
+            orb.accessibilityLabel = "Voice activity"
+        case let .unavailable(message):
+            statusText = message
+            orb.mode = .paused
+            orb.accessibilityLabel = "Voice activity"
+        }
+        status.text = statusText
+        orb.accessibilityValue = statusText
+        hint.isHidden = phase != .speaking
+        statusDot.layer.removeAnimation(forKey: "listening-pulse")
+        statusDot.alpha = 1
+        switch phase {
+        case .listening:
+            statusDot.backgroundColor = Palette.accent.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
+            if !UIAccessibility.isReduceMotionEnabled {
+                let pulse = CABasicAnimation(keyPath: "opacity")
+                pulse.fromValue = 0.4
+                pulse.toValue = 1
+                pulse.duration = 0.45
+                pulse.autoreverses = true
+                pulse.repeatCount = .infinity
+                statusDot.layer.add(pulse, forKey: "listening-pulse")
+            }
+        case .paused:
+            statusDot.backgroundColor = Palette.tertiary.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
+        case .unavailable:
+            statusDot.backgroundColor = Palette.danger.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
+        case .sending, .working, .speaking:
+            statusDot.backgroundColor = Palette.accent.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
+        }
+    }
+
+    private func setCaption(_ text: String?) {
+        guard caption.text != text else { return }
+        guard !UIAccessibility.isReduceMotionEnabled, viewIfLoaded?.window != nil else {
+            caption.text = text
+            return
+        }
+        UIView.transition(
+            with: caption,
+            duration: 0.18,
+            options: [.transitionCrossDissolve, .beginFromCurrentState, .allowUserInteraction]
+        ) {
+            self.caption.text = text
+        }
     }
 
     private func updateModelLabel() {
         model.text = modelLabel
+        modelMark.image = BrandMarks.image(for: harness, side: 14)
+        modelMark.isHidden = modelMark.image == nil
+    }
+
+    private func configureButton(_ button: UIButton, symbol: String, background: UIColor, tint: UIColor) {
+        var configuration = UIButton.Configuration.plain()
+        configuration.image = UIImage(
+            systemName: symbol,
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 20, weight: .medium)
+        )
+        configuration.baseForegroundColor = tint
+        configuration.contentInsets = .zero
+        configuration.cornerStyle = .capsule
+        button.configuration = configuration
+        button.backgroundColor = background
+        button.layer.cornerRadius = 32
+        button.clipsToBounds = true
+        button.translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    private func updateMuteButton() {
+        var configuration = muteButton.configuration ?? UIButton.Configuration.plain()
+        configuration.image = UIImage(
+            systemName: muted ? "mic.slash" : "mic",
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 20, weight: .medium)
+        )
+        configuration.baseForegroundColor = muted ? UIColor.black : UIColor.white
+        muteButton.configuration = configuration
+        muteButton.backgroundColor = muted ? UIColor.white.withAlphaComponent(0.9) : UIColor.white.withAlphaComponent(0.10)
+        muteLabel.text = muted ? "Unmute" : "Mute"
+        muteButton.accessibilityLabel = muted ? "Unmute" : "Mute"
+    }
+
+    private func startDemoPreview() {
+        guard !ended, !muted else { return }
+        demoTask?.cancel()
+        demoTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled, !self.ended, !self.muted {
+                self.listening = true
+                self.setCaption("Listening for your next prompt…")
+                self.setPhase(.listening)
+                let listeningUntil = CACurrentMediaTime() + 3
+                var sample = 0
+                while CACurrentMediaTime() < listeningUntil, !Task.isCancelled, !self.ended, !self.muted {
+                    let t = CGFloat(sample) * 0.31
+                    let noisyLevel = abs(sin(t)) * (0.35 + 0.65 * abs(sin(t * 2.37)))
+                    self.orb.setLevel(noisyLevel)
+                    sample += 1
+                    try? await Task.sleep(nanoseconds: 80_000_000)
+                }
+                guard !Task.isCancelled, !self.ended, !self.muted else { return }
+                self.orb.setLevel(0)
+                self.listening = false
+                self.setCaption("Can you summarize the latest changes?")
+                self.setPhase(.sending)
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled, !self.ended, !self.muted else { return }
+                self.setPhase(.working)
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard !Task.isCancelled, !self.ended, !self.muted else { return }
+                self.setCaption(self.latestReply() ?? "The latest changes are ready to review.")
+                self.setPhase(.speaking)
+                for _ in 0..<16 {
+                    guard !Task.isCancelled, !self.ended, !self.muted else { return }
+                    self.orb.pulse()
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                }
+            }
+        }
     }
 
     private func endCall() {
@@ -357,6 +624,7 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
         ended = true
         listenTask?.cancel()
         replyTask?.cancel()
+        demoTask?.cancel()
         capture.stop()
         speech.stopSpeaking(at: .immediate)
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
@@ -375,7 +643,8 @@ final class VoiceCallViewController: UIViewController, AVSpeechSynthesizerDelega
             capture.stop()
             speech.stopSpeaking(at: .immediate)
             listening = false
-            setStatus("Paused")
+            setCaption(nil)
+            setPhase(.paused)
         } else if type == .ended, !muted {
             interrupted = false
             startListening()
