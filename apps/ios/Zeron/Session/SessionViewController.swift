@@ -21,6 +21,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
     private let titleView = SessionTitleView()
     private var shown = SessionChrome()
     private var latestChanges: SessionChanges?
+    private weak var changesSheet: ChangesViewController?
     private weak var voiceCall: VoiceCallViewController?
     private let openedAt = CACurrentMediaTime()
     private var reportedOpen = false
@@ -467,6 +468,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         if latestChanges != changes {
             latestChanges = changes
             changesPill.configure(changes)
+            changesSheet?.update(changes)
             updateAccessoryVisibility(animated: true)
         }
         if !reportedOpen, frame.rowCount() > 0 {
@@ -611,6 +613,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             presentation.detents = [.medium(), .large()]
             presentation.prefersGrabberVisible = true
         }
+        changesSheet = sheet
         present(sheet, animated: true)
     }
 

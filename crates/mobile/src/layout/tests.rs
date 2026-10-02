@@ -1119,3 +1119,122 @@ fn session_changes_aggregate_paths_by_recency_and_fall_back_to_diff() {
         }
     );
 }
+
+#[test]
+fn session_changes_lists_pending_file_mutations_and_aggregates_later_stats() {
+    use zeron_doc::parts::{MessagePart, MessageStatus, ToolDiffStat};
+    use zeron_doc::schema::{MessageRole, SessionMessageEntry};
+    use zeron_proto::ToolCall;
+
+    let tool = |id: &str,
+                call: ToolCall,
+                is_error: bool,
+                diff_stats: Option<Vec<ToolDiffStat>>| MessagePart::Tool {
+        id: id.into(),
+        call,
+        is_error,
+        resolved: false,
+        output: None,
+        diff: None,
+        output_ref: None,
+        output_bytes: None,
+        diff_ref: None,
+        diff_stats,
+        subagent_ref: None,
+        subagent_status: None,
+        subagent_tail: None,
+    };
+    let edit = |path: &str| ToolCall::EditFile {
+        path: path.into(),
+        old_string: None,
+        new_string: None,
+    };
+    let entry = |id: &str, parts: Vec<MessagePart>| {
+        Arc::new(SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts,
+            created_at: 0,
+            device_id: String::new(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })
+    };
+    let entries = vec![entry(
+        "pending-edits",
+        vec![
+            tool("t1", edit("src/pending.rs"), false, None),
+            tool("t2", edit("src/error.rs"), true, None),
+            tool(
+                "t3",
+                ToolCall::WriteFile {
+                    path: "src/write.rs".into(),
+                    content: None,
+                },
+                false,
+                None,
+            ),
+            tool(
+                "t4",
+                ToolCall::ApplyPatch {
+                    path: Some("src/patch.rs".into()),
+                },
+                false,
+                None,
+            ),
+            tool(
+                "t5",
+                ToolCall::ApplyPatch { path: None },
+                false,
+                None,
+            ),
+            tool("t6", edit("src/aggregate.rs"), false, None),
+            tool(
+                "t7",
+                edit("src/aggregate.rs"),
+                false,
+                Some(vec![ToolDiffStat {
+                    path: "src/aggregate.rs".into(),
+                    additions: 4,
+                    deletions: 2,
+                }]),
+            ),
+        ],
+    )];
+    let mut worker = worker(390.0);
+    worker.set_input(TranscriptInput {
+        entries,
+        ..Default::default()
+    });
+
+    assert_eq!(
+        worker.pass().changes(),
+        SessionChanges {
+            files: vec![
+                ChangedFile {
+                    path: "src/aggregate.rs".into(),
+                    additions: 4,
+                    deletions: 2,
+                },
+                ChangedFile {
+                    path: "src/patch.rs".into(),
+                    additions: 0,
+                    deletions: 0,
+                },
+                ChangedFile {
+                    path: "src/write.rs".into(),
+                    additions: 0,
+                    deletions: 0,
+                },
+                ChangedFile {
+                    path: "src/pending.rs".into(),
+                    additions: 0,
+                    deletions: 0,
+                },
+            ],
+            additions: 4,
+            deletions: 2,
+        }
+    );
+}
