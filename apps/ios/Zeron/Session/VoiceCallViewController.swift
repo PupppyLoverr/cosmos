@@ -154,6 +154,8 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
         statusPill.addArrangedSubview(statusDot)
         statusPill.addArrangedSubview(status)
         statusPill.translatesAutoresizingMaskIntoConstraints = false
+        statusPill.setContentHuggingPriority(.required, for: .vertical)
+        statusPill.setContentCompressionResistancePriority(.required, for: .vertical)
 
         caption.textColor = UIColor.white.withAlphaComponent(0.9)
         caption.font = Fonts.ui(.sans, 17)
@@ -161,11 +163,13 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
         caption.numberOfLines = 4
         caption.lineBreakMode = .byTruncatingTail
         caption.adjustsFontForContentSizeCategory = true
+        caption.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         hint.text = "Tap the orb to interrupt"
         hint.textColor = UIColor.white.withAlphaComponent(0.45)
         hint.font = Fonts.ui(.sans, 12)
         hint.textAlignment = .center
         hint.isHidden = true
+        hint.setContentCompressionResistancePriority(.required, for: .vertical)
         captionStack.axis = .vertical
         captionStack.alignment = .fill
         captionStack.spacing = 5
@@ -221,6 +225,7 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
             header.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
             statusPill.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             statusPill.topAnchor.constraint(equalTo: orb.bottomAnchor, constant: 28),
+            statusPill.heightAnchor.constraint(equalToConstant: 32),
             orb.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             orb.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -40),
             orb.widthAnchor.constraint(equalToConstant: 280),
@@ -229,6 +234,8 @@ final class VoiceCallViewController: UIViewController, @preconcurrency AVSpeechS
             captionStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 28),
             captionStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -28),
             captionStack.bottomAnchor.constraint(lessThanOrEqualTo: controls.topAnchor, constant: -22),
+            hint.topAnchor.constraint(greaterThanOrEqualTo: caption.bottomAnchor, constant: 5),
+            hint.bottomAnchor.constraint(lessThanOrEqualTo: controls.topAnchor, constant: -22),
             controls.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             controls.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -24),
             muteButton.widthAnchor.constraint(equalToConstant: 64),
