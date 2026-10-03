@@ -719,6 +719,14 @@ fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface
     }
 }
 
+fn chat_archive_menu_item(archived: bool) -> (&'static str, &'static str) {
+    if archived {
+        (icons::ARCHIVE_UP_MINIMALISTIC, "Unarchive")
+    } else {
+        (icons::ARCHIVE_MINIMALISTIC, "Archive")
+    }
+}
+
 /// The latest plan-shaped tool part in a transcript — a todo list or a
 /// `Plan` document call, whichever is newest (every adapter feeds the same
 /// dock: ACP `plan`, cursor `createPlan`/`updateTodos`, claude
@@ -3299,6 +3307,13 @@ impl Shell {
         }
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
+        if let Some(ix) = self
+            .right_surface_rows(cx)
+            .iter()
+            .position(|(row_surface, _, _, _)| *row_surface == surface)
+        {
+            self.right_tab_scroll.scroll_to_item(ix);
+        }
         match surface {
             RightSurface::File(id) => {
                 if let Some(file) = self.file_surfaces.get(&id).cloned() {
@@ -10195,6 +10210,12 @@ impl Shell {
             let rename_id = chat_id.clone();
             let pin_id = chat_id.clone();
             let archive_id = chat_id.clone();
+            let chat_archived = self
+                .state
+                .read(cx)
+                .chat_row(&chat_id)
+                .is_some_and(|chat| chat.archived);
+            let (archive_icon, archive_label) = chat_archive_menu_item(chat_archived);
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
                 .w(px(216.0))
@@ -10227,14 +10248,18 @@ impl Shell {
                         popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                             .id("chat-menu-archive")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.archive_chat(archive_id.clone(), cx)
+                                if chat_archived {
+                                    this.set_chat_archived(archive_id.clone(), false, cx)
+                                } else {
+                                    this.archive_chat(archive_id.clone(), cx)
+                                }
                             }))
                             .child(
-                                icon(icons::ARCHIVE_MINIMALISTIC)
+                                icon(archive_icon)
                                     .size(px(16.0))
                                     .text_color(theme.text_muted),
                             )
-                            .child(SharedString::from("Archive")),
+                            .child(SharedString::from(archive_label)),
                     )
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
@@ -12132,6 +12157,7 @@ impl Shell {
         let plus_fade = "right-surface-add-fade";
         let mut plus = div()
             .id("right-surface-add")
+            .debug_selector(|| "right-surface-add".into())
             .size(px(24.0))
             .flex_none()
             .flex()
@@ -12303,17 +12329,16 @@ impl Shell {
         }
         // The empty-state picker already offers every surface. Show a single
         // Chrome-style add-tab affordance only after at least one tab exists.
-        strip = strip.when(count > 0, |strip| strip.child(plus));
         // Edge fades on whichever side hides tabs (flags computed above).
         // Glass: per-glyph EdgeFade scope over the chips' own opacity ramps;
         // opaque: painted gradients in the shell surface tone.
         let glass = theme.is_glass();
         let bar_bg = theme.surface;
-        let region = div()
+        let scroll_region = div()
             .relative()
+            .debug_selector(|| "right-surface-scroll-region".into())
             .min_w_0()
-            .size_full()
-            .flex()
+            .flex_initial()
             .items_center()
             .child(strip)
             .when(fade_left && !glass, |el| {
@@ -12346,6 +12371,15 @@ impl Shell {
                         )),
                 )
             });
+        let region = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .min_w_0()
+            .size_full()
+            .child(scroll_region)
+            .when(count > 0, |el| el.child(plus));
         if glass {
             crate::edge_fade::edge_faded(FADE_WIDTH, false, false, region)
                 .fade_left(fade_left)
@@ -16457,7 +16491,11 @@ mod right_tab_mouse_regressions {
                 let tabs = shell.render_right_tab_strip(cx);
                 shell.titlebar_drag_region(
                     "right-tab-test-titlebar",
-                    div().w(px(400.)).h(px(40.)).child(tabs),
+                    div()
+                        .w(px(400.))
+                        .h(px(40.))
+                        .debug_selector(|| "right-surface-tab-host".into())
+                        .child(tabs),
                     cx,
                 )
             })
@@ -16503,6 +16541,18 @@ mod right_tab_mouse_regressions {
         (shell, cx)
     }
 
+    #[test]
+    fn archived_chat_menu_uses_unarchive_action() {
+        assert_eq!(
+            chat_archive_menu_item(false),
+            (icons::ARCHIVE_MINIMALISTIC, "Archive")
+        );
+        assert_eq!(
+            chat_archive_menu_item(true),
+            (icons::ARCHIVE_UP_MINIMALISTIC, "Unarchive")
+        );
+    }
+
     #[gpui::test]
     fn subagent_close_press_does_not_start_parent_drag(cx: &mut TestAppContext) {
         let (shell, cx) = setup(cx);
@@ -16546,6 +16596,82 @@ mod right_tab_mouse_regressions {
                 "tab strip did not scroll"
             );
         });
+    }
+
+    #[gpui::test]
+    fn right_tab_add_button_follows_last_chip_when_tabs_fit(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        let plus = cx.debug_bounds("right-surface-add").unwrap();
+        let last = cx.debug_bounds("right-surface-tab-1").unwrap();
+        let pane = cx.debug_bounds("right-surface-tab-host").unwrap();
+        let gap = plus.left() - last.right();
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.right_tab_scroll.offset().x, px(0.));
+        });
+        assert!(
+            gap >= px(0.) && gap <= px(8.),
+            "+ should immediately follow the last tab, gap was {gap:?}"
+        );
+        assert!(
+            plus.right() <= pane.right(),
+            "+ should fit inside the pane when the tabs fit"
+        );
+    }
+
+    #[gpui::test]
+    fn active_right_tab_scrolls_into_view_and_add_button_stays_pinned(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        shell.update(cx, |shell, cx| {
+            for suffix in ["third", "fourth", "fifth", "sixth", "seventh", "eighth"] {
+                shell.add_subagent_surface(
+                    "parent".into(),
+                    suffix.into(),
+                    suffix.into(),
+                    false,
+                    cx,
+                );
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let initial_plus = cx.debug_bounds("right-surface-add").unwrap();
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell.right_tab_scroll.offset().x < px(0.),
+                "adding tabs should overflow the strip before changing the active tab"
+            );
+        });
+        shell.update(cx, |shell, cx| {
+            shell.set_right_active(RightSurface::Subagent(1), cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+
+        let plus = cx.debug_bounds("right-surface-add").unwrap();
+        let pane = cx.debug_bounds("right-surface-tab-host").unwrap();
+        let scroll_region = cx.debug_bounds("right-surface-scroll-region").unwrap();
+        let active = cx.debug_bounds("right-surface-tab-0").unwrap();
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell.right_tab_scroll.offset().x == px(0.),
+                "activating the first tab should scroll it fully into view"
+            );
+        });
+        assert!(
+            (plus.left() - initial_plus.left()).abs() <= px(1.),
+            "+ should stay pinned while the tab strip scrolls: initial {:?}, current {:?}, pane {:?}, scroll {:?}, active {:?}",
+            initial_plus,
+            plus,
+            pane,
+            scroll_region,
+            active
+        );
+        assert!(
+            active.left() >= scroll_region.left() && active.right() <= scroll_region.right(),
+            "the newly active tab should be visible in the scroll region"
+        );
+        assert!(
+            plus.left() >= pane.left() && plus.right() <= pane.right(),
+            "+ should remain within the right tab pane"
+        );
     }
 
     #[gpui::test]
