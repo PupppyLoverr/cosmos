@@ -12330,8 +12330,8 @@ impl Shell {
         // The empty-state picker already offers every surface. Show a single
         // Chrome-style add-tab affordance only after at least one tab exists.
         // Edge fades on whichever side hides tabs (flags computed above).
-        // Glass: per-glyph EdgeFade scope over the chips' own opacity ramps;
-        // opaque: painted gradients in the shell surface tone.
+        // Glass fades only the scrolling strip, leaving the pinned + visible.
+        // Opaque themes paint gradients inside that same scroll region.
         let glass = theme.is_glass();
         let bar_bg = theme.surface;
         let scroll_region = div()
@@ -12371,6 +12371,14 @@ impl Shell {
                         )),
                 )
             });
+        let scroll_region: AnyElement = if glass {
+            crate::edge_fade::edge_faded(FADE_WIDTH, false, false, scroll_region)
+                .fade_left(fade_left)
+                .fade_right(fade_right)
+                .into_any_element()
+        } else {
+            scroll_region.into_any_element()
+        };
         let region = div()
             .flex()
             .flex_row()
@@ -12380,14 +12388,7 @@ impl Shell {
             .size_full()
             .child(scroll_region)
             .when(count > 0, |el| el.child(plus));
-        if glass {
-            crate::edge_fade::edge_faded(FADE_WIDTH, false, false, region)
-                .fade_left(fade_left)
-                .fade_right(fade_right)
-                .into_any_element()
-        } else {
-            region.into_any_element()
-        }
+        region.into_any_element()
     }
 
     /// Toggle the changes-panel takeover (the header's expand button, t3code
@@ -16671,6 +16672,76 @@ mod right_tab_mouse_regressions {
         assert!(
             plus.left() >= pane.left() && plus.right() <= pane.right(),
             "+ should remain within the right tab pane"
+        );
+    }
+
+    #[gpui::test]
+    fn glass_right_tab_add_button_stays_outside_fade_region(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        let variant = zeron_theme::ThemeRegistry::builtin()
+            .variant("zeron-light")
+            .unwrap()
+            .clone();
+        let glass_theme = crate::theme::Theme::from_variant(
+            &variant,
+            zeron_theme::AccentSelection::ThemeDefault,
+            zeron_theme::SurfacePreference::Frosted,
+        );
+        assert!(glass_theme.is_glass());
+        cx.update(|window, cx| {
+            cx.set_global(glass_theme);
+            window.draw(cx).clear();
+        });
+
+        shell.update(cx, |shell, cx| {
+            for suffix in ["third", "fourth", "fifth", "sixth", "seventh", "eighth"] {
+                shell.add_subagent_surface(
+                    "parent".into(),
+                    suffix.into(),
+                    suffix.into(),
+                    false,
+                    cx,
+                );
+            }
+            shell.set_right_active(RightSurface::Subagent(1), cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+
+        let scroll_region = cx.debug_bounds("right-surface-scroll-region").unwrap();
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                    position: scroll_region.center(),
+                    delta: gpui::ScrollDelta::Pixels(gpui::point(px(-40.), px(0.))),
+                    modifiers: gpui::Modifiers::default(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                }),
+                cx,
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+
+        let plus = cx.debug_bounds("right-surface-add").unwrap();
+        let scroll_region = cx.debug_bounds("right-surface-scroll-region").unwrap();
+        let pane = cx.debug_bounds("right-surface-tab-host").unwrap();
+        let (scrolled, max_scroll) = shell.read_with(cx, |shell, _| {
+            (
+                -f32::from(shell.right_tab_scroll.offset().x),
+                f32::from(shell.right_tab_scroll.max_offset().x),
+            )
+        });
+        assert!(scrolled > 0.0, "the tab strip should be scrolled");
+        assert!(
+            scrolled < max_scroll - 1.0,
+            "the strip should remain before its right edge so fade_right is on"
+        );
+        assert!(
+            plus.left() >= scroll_region.right(),
+            "+ should be fully right of the fading scroll region: plus {plus:?}, scroll {scroll_region:?}"
+        );
+        assert!(
+            plus.left() >= pane.left() && plus.right() <= pane.right(),
+            "+ should remain inside the right tab pane: plus {plus:?}, pane {pane:?}"
         );
     }
 
