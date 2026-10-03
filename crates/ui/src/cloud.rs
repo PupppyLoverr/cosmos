@@ -320,6 +320,28 @@ mod tests {
         railway.config.expires_at = Some(Utc::now() - Duration::minutes(1));
         assert!(CloudView::preferred_seat(&[railway]).is_none());
     }
+
+    #[test]
+    fn available_panes_follow_the_seat_capabilities_in_pane_order() {
+        assert_eq!(
+            available_panes_for(&SeatCapabilities::default()),
+            vec![
+                CloudPane::Computer,
+                CloudPane::Files,
+                CloudPane::Changes,
+                CloudPane::Shell,
+                CloudPane::Progress,
+                CloudPane::Context,
+                CloudPane::Tasks,
+            ]
+        );
+        let caps = SeatCapabilities {
+            simulator: true,
+            pull_requests: true,
+            ..Default::default()
+        };
+        assert_eq!(available_panes_for(&caps), CloudPane::ALL);
+    }
 }
 
 pub(crate) fn seat_pane_icon(pane: CloudPane) -> &'static str {
@@ -334,6 +356,17 @@ pub(crate) fn seat_pane_icon(pane: CloudPane) -> &'static str {
         CloudPane::Tasks => icons::CHECKLIST,
         CloudPane::PullRequests => icons::PULL_REQUEST,
     }
+}
+
+fn available_panes_for(caps: &SeatCapabilities) -> Vec<CloudPane> {
+    CloudPane::ALL
+        .into_iter()
+        .filter(|pane| match pane {
+            CloudPane::Simulator => caps.simulator,
+            CloudPane::PullRequests => caps.pull_requests,
+            _ => true,
+        })
+        .collect()
 }
 
 pub(crate) fn seat_pane_detail(pane: CloudPane) -> &'static str {
@@ -801,7 +834,9 @@ impl PrTab {
 
 /// The one action the rail delegates to the shell — a side chat opens in the
 /// existing right-pane host, never inside the rail itself.
+#[allow(clippy::enum_variant_names)]
 pub enum RailEvent {
+    OpenPane(CloudPane),
     OpenSideChat,
     /// "Attach Boat token" on the keep card → Settings → Cloud computer.
     OpenCloudSettings,
@@ -1121,6 +1156,10 @@ impl CloudRail {
             .unwrap_or_default()
     }
 
+    pub(crate) fn available_panes(&self) -> Vec<CloudPane> {
+        available_panes_for(&self.capabilities())
+    }
+
     fn engine(&self, cx: &App) -> Option<crate::state::EngineHandle> {
         self.state.read(cx).engine().cloned()
     }
@@ -1145,7 +1184,6 @@ impl CloudRail {
 
     fn load_seat(&mut self, cx: &mut Context<Self>) {
         let seat_id = self.binding.seat_id.clone();
-        let scope = self.scope();
         let Some(engine) = self.engine(cx) else {
             self.seat = Loadable::Error("Engine not connected".into());
             return;
@@ -1197,6 +1235,9 @@ impl CloudRail {
     /// Switch the rail's active pane — the only pane visible, per the "one
     /// pane at a time" rule.
     pub fn set_pane(&mut self, pane: CloudPane, cx: &mut Context<Self>) {
+        if self.pane == pane && !self.picking {
+            return;
+        }
         let confirmation_changed = self.confirm_destroy || self.confirm_task.is_some();
         self.confirm_destroy = false;
         self.confirm_task = None;
@@ -1207,11 +1248,6 @@ impl CloudRail {
             self.picking = false;
             cx.notify();
         }
-        if self.pane == pane {
-            self.close_pane_menu(cx);
-            self.ensure_loaded(cx);
-            return;
-        }
         self.pane = pane;
         self.close_pane_menu(cx);
         self.ensure_loaded(cx);
@@ -1219,22 +1255,17 @@ impl CloudRail {
     }
 
     pub fn show_picker(&mut self, cx: &mut Context<Self>) {
-        self.close_pane_menu(cx);
-        if !self.picking {
-            self.picking = true;
-            cx.notify();
+        if self.picking {
+            return;
         }
-    }
-
-    /// The active pane's label, or `None` while the launcher is showing.
-    pub fn active_pane_label(&self) -> Option<&'static str> {
-        (!self.picking).then(|| self.pane.label())
+        self.close_pane_menu(cx);
+        self.picking = true;
+        cx.notify();
     }
 
     /// The pane launcher — the same centered list the local right pane
     /// shows when empty, listing what this seat can actually back.
     fn render_picker(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let caps = self.capabilities();
         let row = |id: SharedString, icon_path, title, detail| {
             surface_pick_row(theme, id, icon_path, title, detail)
         };
@@ -1244,15 +1275,7 @@ impl CloudRail {
             .flex()
             .flex_col()
             .gap(px(2.0));
-        for pane in CloudPane::ALL {
-            let available = match pane {
-                CloudPane::Simulator => caps.simulator,
-                CloudPane::PullRequests => caps.pull_requests,
-                _ => true,
-            };
-            if !available {
-                continue;
-            }
+        for pane in self.available_panes() {
             list = list.child(
                 row(
                     SharedString::from(format!("rail-pick-{}", pane.label())),
@@ -1260,7 +1283,7 @@ impl CloudRail {
                     pane.label(),
                     seat_pane_detail(pane),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.set_pane(pane, cx))),
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(RailEvent::OpenPane(pane)))),
             );
         }
         list = list.child(
@@ -2282,52 +2305,6 @@ impl CloudRail {
             )
             .into_any_element();
         }
-        let header = div()
-            .flex_none()
-            .h(px(36.0))
-            .px(px(10.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(
-                div()
-                    .id("rail-files-up")
-                    .flex_none()
-                    .cursor_pointer()
-                    .when(!self.parents.is_empty(), |el| {
-                        el.on_click(cx.listener(|this, _, _, cx| this.files_up(cx)))
-                    })
-                    .opacity(if self.parents.is_empty() { 0.35 } else { 1.0 })
-                    .child(
-                        icon(icons::ALT_ARROW_UP)
-                            .size(px(13.0))
-                            .text_color(theme.text_muted),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(crate::typography::ui_rems(11.5))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(self.cwd.clone())),
-            )
-            .child(
-                div()
-                    .id("rail-files-refresh")
-                    .flex_none()
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.load_files(cx)))
-                    .child(
-                        icon(icons::REFRESH)
-                            .size(px(13.0))
-                            .text_color(theme.text_muted),
-                    ),
-            );
         let body = match &self.listing {
             Loadable::Ready(entries) => {
                 let mut list = div().flex().flex_col();
@@ -2342,24 +2319,34 @@ impl CloudRail {
                 }
                 for (ix, entry) in entries.iter().enumerate() {
                     let entry = entry.clone();
-                    let icon_path = if entry.is_dir {
-                        icons::FOLDER
+                    let file_icon = if entry.is_dir {
+                        crate::file_icons::icon(
+                            crate::file_icons::FileIconIdentity::directory(&entry.name, false),
+                            theme.appearance,
+                        )
                     } else {
-                        icons::DOCUMENT
+                        crate::file_icons::icon(
+                            crate::file_icons::FileIconIdentity::file(&entry.name),
+                            theme.appearance,
+                        )
                     };
                     let fade = SharedString::from(format!("rail-file-{ix}"));
                     list = list.child(
                         div()
                             .id(("rail-file", ix))
                             .w_full()
-                            .h(px(28.0))
-                            .px(px(10.0))
+                            .h(px(crate::files::tree::TREE_ROW_HEIGHT))
+                            .px(px(8.0))
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(8.0))
+                            .gap(px(6.0))
                             .cursor_pointer()
-                            .bg(motion_row_bg(&fade, theme))
+                            .bg(crate::motion::hover_blend(
+                                &fade,
+                                gpui::transparent_black(),
+                                crate::theme::wash(0.055),
+                            ))
                             .on_hover(crate::motion::hover_listener(fade.clone()))
                             .on_click({
                                 let entry = entry.clone();
@@ -2367,19 +2354,15 @@ impl CloudRail {
                                     this.open_entry(entry.clone(), cx)
                                 })
                             })
-                            .child(
-                                icon(icon_path)
-                                    .size(px(13.0))
-                                    .flex_none()
-                                    .text_color(theme.text_muted),
-                            )
+                            .child(file_icon.size(px(14.0)).flex_none())
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(crate::typography::ui_rems(12.5))
-                                    .text_color(theme.text)
+                                    .font_family(theme.font_sans.clone())
+                                    .text_size(px(11.5))
+                                    .text_color(theme.text_muted)
                                     .child(SharedString::from(entry.name)),
                             )
                             .when_some(entry.size.filter(|_| !entry.is_dir), |el, size| {
@@ -2493,13 +2476,12 @@ impl CloudRail {
             .size_full()
             .flex()
             .flex_col()
-            .child(header)
             .child(body)
             .children(file_viewer)
             .into_any_element()
     }
 
-    fn render_changes(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_changes(&mut self, theme: &Theme, _cx: &mut Context<Self>) -> AnyElement {
         if !self.capabilities().git {
             return pane_empty(
                 theme,
@@ -2510,48 +2492,6 @@ impl CloudRail {
             )
             .into_any_element();
         }
-        let header = div()
-            .flex_none()
-            .h(px(36.0))
-            .px(px(10.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(
-                icon(icons::GIT_BRANCH)
-                    .size(px(13.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(crate::typography::ui_rems(11.5))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(
-                        self.status
-                            .ready()
-                            .and_then(|v| v.get("branch").and_then(|b| b.as_str()))
-                            .unwrap_or("…")
-                            .to_string(),
-                    )),
-            )
-            .child(
-                div()
-                    .id("rail-changes-refresh")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.load_changes(cx)))
-                    .child(
-                        icon(icons::REFRESH)
-                            .size(px(13.0))
-                            .text_color(theme.text_muted),
-                    ),
-            );
         let body = match &self.status {
             Loadable::Ready(value) => {
                 let mut list = div().flex().flex_col();
@@ -2655,16 +2595,31 @@ impl CloudRail {
             Loadable::Ready(diff) if !diff.trim().is_empty() => Some(
                 div()
                     .id("rail-diff")
-                    .flex_none()
-                    .max_h(px(240.0))
+                    .flex_1()
+                    .min_h_0()
                     .border_t_1()
                     .border_color(theme.border)
                     .overflow_y_scroll()
                     .p(px(10.0))
-                    .text_size(crate::typography::ui_rems(10.5))
-                    .font_family(theme.font_mono.clone())
-                    .text_color(theme.text)
-                    .child(SharedString::from(diff.clone()))
+                    .child({
+                        let mut lines = div().flex().flex_col();
+                        for (kind, text) in diff_lines(diff) {
+                            let color = match kind {
+                                '+' => theme.diff_add,
+                                '-' => theme.diff_del,
+                                '@' => theme.accent,
+                                _ => theme.text_muted,
+                            };
+                            lines = lines.child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .font_family(theme.font_mono.clone())
+                                    .text_color(color)
+                                    .child(SharedString::from(text)),
+                            );
+                        }
+                        lines
+                    })
                     .into_any_element(),
             ),
             _ => None,
@@ -2673,7 +2628,6 @@ impl CloudRail {
             .size_full()
             .flex()
             .flex_col()
-            .child(header)
             .child(body)
             .children(diff_view)
             .into_any_element()
@@ -2690,7 +2644,12 @@ impl CloudRail {
             )
             .into_any_element();
         }
-        let mut log = div().flex().flex_col().gap(px(2.0)).p(px(8.0));
+        let mut log = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .p(px(8.0))
+            .font_family(theme.font_mono.clone());
         for line in &self.shell_log {
             log = log.child(
                 div()
@@ -2755,10 +2714,26 @@ impl CloudRail {
                     .flex_none()
                     .border_t_1()
                     .border_color(theme.border)
-                    .p(px(8.0))
-                    .child(popover::dialog_field(
-                        self.shell_input.clone().into_any_element(),
-                    )),
+                    .h(px(crate::surface_chrome::HEADER_HEIGHT))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .text_color(theme.text_muted)
+                            .child("$"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_family(theme.font_mono.clone())
+                            .child(self.shell_input.clone().into_any_element()),
+                    ),
             )
             .into_any_element()
     }
@@ -2777,47 +2752,6 @@ impl CloudRail {
         if let Some((number, detail)) = self.pr_detail.clone() {
             return self.render_pr_detail(number, &detail, theme, cx);
         }
-        let header = div()
-            .flex_none()
-            .h(px(36.0))
-            .px(px(10.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(
-                icon(icons::PULL_REQUEST)
-                    .size(px(13.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(crate::typography::ui_rems(11.5))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(
-                        self.binding
-                            .repo
-                            .clone()
-                            .unwrap_or_else(|| "repository".into()),
-                    )),
-            )
-            .child(
-                div()
-                    .id("rail-prs-refresh")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.load_prs(cx)))
-                    .child(
-                        icon(icons::REFRESH)
-                            .size(px(13.0))
-                            .text_color(theme.text_muted),
-                    ),
-            );
         let body = match &self.prs {
             Loadable::Ready(prs) => {
                 let mut list = div().flex().flex_col();
@@ -2910,7 +2844,6 @@ impl CloudRail {
             .size_full()
             .flex()
             .flex_col()
-            .child(header)
             .child(body)
             .into_any_element()
     }
@@ -3692,7 +3625,6 @@ impl CloudRail {
 
     fn render_computer(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let caps = self.capabilities();
-        let can_watch = caps.computer || caps.shell;
         let has_image = matches!(self.shot, Loadable::Ready(Some(_)));
         let desktop_status = self
             .vm_info
@@ -3701,113 +3633,7 @@ impl CloudRail {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let mode: SharedString = match &self.shot {
-            Loadable::Ready(Some(_)) if self.controlling => {
-                "You're in control — clicks, scrolls and keys go to the seat".into()
-            }
-            Loadable::Ready(Some(_)) => match self.shot_size {
-                Some((w, h)) => format!("Live desktop · {w}×{h} · every 4s").into(),
-                None => "Live desktop · every 4s".into(),
-            },
-            _ if self.desktop_starting => "Starting the seat's desktop…".into(),
-            Loadable::Ready(None) if self.vm_info.is_some() => "Linux console · no display".into(),
-            Loadable::Error(_) => "Not reachable".into(),
-            Loadable::Ready(None) => "No display".into(),
-            _ => "Connecting…".into(),
-        };
-        let live = has_image || self.vm_info.is_some();
-        let control_id = "rail-take-control";
-        let take_control = div()
-            .id(control_id)
-            .flex_none()
-            .px(px(8.0))
-            .h(px(22.0))
-            .flex()
-            .items_center()
-            .gap(px(5.0))
-            .rounded(px(6.0))
-            .text_size(crate::typography::ui_rems(11.0))
-            .when(has_image, |el| el.cursor_pointer())
-            .opacity(if has_image { 1.0 } else { 0.4 })
-            .text_color(if self.controlling {
-                theme.accent
-            } else {
-                theme.text_muted
-            })
-            .bg(if self.controlling {
-                theme.accent.opacity(0.12)
-            } else {
-                theme.element_hover.opacity(0.0)
-            })
-            .hover(|s| s.bg(theme.element_hover))
-            .tooltip(widgets::text_tooltip(if has_image {
-                "Drive the seat's desktop yourself — the agent keeps its own control"
-            } else {
-                "Start the desktop to take control"
-            }))
-            .child(
-                icon(icons::MONITOR)
-                    .size(px(12.0))
-                    .text_color(if self.controlling {
-                        theme.accent
-                    } else {
-                        theme.text_muted
-                    }),
-            )
-            .child(if self.controlling {
-                "Release"
-            } else {
-                "Take control"
-            })
-            .when(has_image, |el| {
-                el.on_click(cx.listener(|this, _, _, cx| {
-                    this.controlling = !this.controlling;
-                    this.act_error = None;
-                    cx.notify();
-                }))
-            });
         let mut col = div().size_full().flex().flex_col();
-        col = col.child(
-            div()
-                .flex_none()
-                .h(px(36.0))
-                .px(px(12.0))
-                .border_b_1()
-                .border_color(theme.border)
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .child(div().size(px(6.0)).rounded_full().bg(if live {
-                    theme.success
-                } else {
-                    theme.text_muted
-                }))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(crate::typography::ui_rems(11.5))
-                        .text_color(theme.text_muted)
-                        .child(mode),
-                )
-                .child(take_control)
-                .child(
-                    div()
-                        .id("rail-shot-refresh")
-                        .cursor_pointer()
-                        .when(can_watch, |el| {
-                            el.on_click(cx.listener(|this, _, _, cx| this.capture_shot(cx)))
-                        })
-                        .opacity(if can_watch { 1.0 } else { 0.35 })
-                        .child(
-                            icon(icons::REFRESH)
-                                .size(px(13.0))
-                                .text_color(theme.text_muted),
-                        ),
-                ),
-        );
         let start_button = |label: &'static str, this: &Self, cx: &mut Context<Self>| {
             popover::btn_primary(theme, label)
                 .id("rail-start-desktop")
@@ -4047,7 +3873,7 @@ impl CloudRail {
                     CloudRunStatus::Error | CloudRunStatus::Stopped => {
                         (icons::DANGER_TRIANGLE, theme.danger)
                     }
-                    _ => (icons::CLOCK_CIRCLE, theme.accent),
+                    _ => (icons::CLOCK_CIRCLE, theme.text_muted),
                 };
                 let end = run.finished_at.unwrap_or_else(chrono::Utc::now);
                 let elapsed =
@@ -4617,11 +4443,8 @@ fn tool_paths(call: &zeron_proto::ToolCall) -> Vec<String> {
 }
 
 impl CloudRail {
-    /// The seat header — the agent-mode right pane's idiom: one quiet row
-    /// with the seat's live dot, its name, a muted status line, and size-7
-    /// icon buttons (tooltips carry the words). Every button rides an engine
-    /// RPC the seat actually backs; nothing here is decorative.
-    fn render_bot_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// One shared surface toolbar with seat controls and pane-specific content.
+    fn render_toolbar(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let caps = self.capabilities();
         let seat = self.seat.ready();
         let seat_label = seat
@@ -4714,7 +4537,7 @@ impl CloudRail {
                         "approve",
                         icons::CHECK_CIRCLE,
                         "Approve",
-                        theme.success,
+                        theme.text_muted,
                         busy,
                     )
                     .on_click(cx.listener(|this, _, _, cx| this.seat_control("approve", cx))),
@@ -4722,150 +4545,429 @@ impl CloudRail {
             }
             _ => {}
         }
-        // Boat lifecycle — Sleep archives the box (billing off); Wake resumes.
-        if is_boat && seat.is_some_and(|s| s.config.box_id.is_some()) {
-            let (id, glyph, tip, op) = if sleeping {
-                ("wake", icons::SUN, "Wake box", "wake")
-            } else {
-                ("sleep", icons::MOON, "Sleep box — billing off", "sleep")
-            };
-            buttons = buttons.child(
-                rail_icon_button(id, glyph, tip, theme.text_muted, busy)
-                    .on_click(cx.listener(move |this, _, _, cx| this.seat_control(op, cx))),
-            );
-        }
-        // Preview: a provider-stamped URL opens in the browser; else the
-        // Computer pane carries the seat's live screen.
-        buttons = buttons.child(match seat.and_then(|s| s.config.preview_url.clone()) {
-            Some(url) => rail_icon_button(
-                "preview",
-                icons::GLOBE,
-                "Open preview",
-                theme.text_muted,
-                false,
-            )
-            .on_click(move |_, _, cx| cx.open_url(&url)),
-            None => rail_icon_button(
-                "preview",
-                icons::MONITOR,
-                "Show the seat's screen",
-                theme.text_muted,
-                false,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.set_pane(CloudPane::Computer, cx))),
-        });
-        buttons = buttons.child(
-            rail_icon_button(
-                "probe",
-                icons::REFRESH,
-                "Check seat",
-                theme.text_muted,
-                busy,
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.probe_seat(cx))),
-        );
-        let destroy = if self.confirm_destroy {
-            rail_icon_button(
-                "destroy-yes",
-                icons::TRASH_BIN_MINIMALISTIC,
-                "Click again to destroy this seat",
-                theme.danger,
-                busy,
-            )
-            .bg(theme.danger.opacity(0.14))
-            .on_click(cx.listener(|this, _, _, cx| this.seat_control("destroy", cx)))
-        } else {
-            rail_icon_button(
-                "destroy",
-                icons::TRASH_BIN_MINIMALISTIC,
-                "Destroy seat",
-                theme.text_muted,
-                !caps.exec,
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.confirm_destroy = true;
-                this.confirm_task = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_secs(4))
-                        .await;
-                    this.update(cx, |rail, cx| {
-                        rail.confirm_destroy = false;
-                        rail.confirm_task = None;
-                        cx.notify();
-                    })
-                    .ok();
-                }));
-                cx.notify();
-            }))
-        };
-        buttons = buttons.child(destroy);
-
-        div()
-            .flex_none()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .h(px(44.0))
-            .pl(px(14.0))
-            .pr(px(8.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .size(px(26.0))
+        let left: AnyElement = match self.pane {
+            CloudPane::Files => div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    rail_icon_button(
+                        "files-up",
+                        icons::ALT_ARROW_UP,
+                        "Go up",
+                        theme.text_muted,
+                        self.parents.is_empty(),
+                    )
+                    .when(!self.parents.is_empty(), |button| {
+                        button.on_click(cx.listener(|this, _, _, cx| this.files_up(cx)))
+                    }),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(self.cwd.clone())),
+                )
+                .into_any_element(),
+            CloudPane::Changes => div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    icon(icons::GIT_BRANCH)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(
+                            self.status
+                                .ready()
+                                .and_then(|v| v.get("branch").and_then(|b| b.as_str()))
+                                .unwrap_or("…")
+                                .to_string(),
+                        )),
+                )
+                .into_any_element(),
+            CloudPane::Computer => {
+                let has_image = matches!(self.shot, Loadable::Ready(Some(_)));
+                let mode: SharedString = match &self.shot {
+                    Loadable::Ready(Some(_)) if self.controlling => "You're in control".into(),
+                    Loadable::Ready(Some(_)) => match self.shot_size {
+                        Some((w, h)) => format!("Live desktop · {w}×{h} · every 4s").into(),
+                        None => "Live desktop · every 4s".into(),
+                    },
+                    _ if self.desktop_starting => "Starting the seat's desktop…".into(),
+                    Loadable::Ready(None) if self.vm_info.is_some() => {
+                        "Linux console · no display".into()
+                    }
+                    Loadable::Error(_) => "Not reachable".into(),
+                    Loadable::Ready(None) => "No display".into(),
+                    _ => "Connecting…".into(),
+                };
+                let take_control = div()
+                    .id("rail-take-control")
+                    .h(px(24.0))
+                    .px(px(8.0))
                     .flex_none()
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .rounded(px(7.0))
-                    .bg(crate::theme::wash(0.06))
-                    .child(
-                        icon(if is_boat {
-                            icons::MONITOR
-                        } else {
-                            icons::CLOUD
-                        })
-                        .size(px(14.0))
-                        .text_color(theme.text_muted),
-                    ),
-            )
-            .child(
+                    .gap(px(5.0))
+                    .rounded(px(6.0))
+                    .cursor_pointer()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text)
+                    .bg(if self.controlling {
+                        crate::theme::wash(0.12)
+                    } else {
+                        crate::theme::wash(0.0)
+                    })
+                    .hover(|el| el.bg(crate::theme::wash(0.12)))
+                    .tooltip(widgets::text_tooltip(if has_image {
+                        "Drive the seat's desktop yourself — the agent keeps its own control"
+                    } else {
+                        "Start the desktop to take control"
+                    }))
+                    .child(icon(icons::MONITOR).size(px(14.0)).text_color(theme.text))
+                    .child(if self.controlling {
+                        "Release"
+                    } else {
+                        "Take control"
+                    })
+                    .when(has_image, |el| {
+                        el.on_click(cx.listener(|this, _, _, cx| {
+                            this.controlling = !this.controlling;
+                            this.act_error = None;
+                            cx.notify();
+                        }))
+                    });
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
-                    .flex_col()
-                    .gap(px(1.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(6.0))
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(crate::typography::ui_rems(12.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text)
-                                    .child(SharedString::from(seat_label)),
-                            )
-                            .child(status_dot(theme, probe.as_ref(), trial_ended)),
-                    )
+                    .items_center()
+                    .gap(px(6.0))
                     .child(
                         div()
                             .min_w_0()
+                            .flex_1()
                             .truncate()
-                            .text_size(crate::typography::ui_rems(10.5))
-                            .text_color(meta_color)
-                            .child(SharedString::from(meta)),
-                    ),
-            )
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .text_color(theme.text_muted)
+                            .child(mode),
+                    )
+                    .child(take_control)
+                    .into_any_element()
+            }
+            CloudPane::Shell => div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(crate::typography::ui_rems(11.5))
+                .text_color(theme.text_muted)
+                .font_family(theme.font_mono.clone())
+                .child(SharedString::from(
+                    self.binding
+                        .workspace_path
+                        .as_deref()
+                        .unwrap_or("seat workspace")
+                        .to_string(),
+                ))
+                .into_any_element(),
+            _ => div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(SharedString::from(seat_label.clone())),
+                )
+                .child(status_dot(theme, probe.as_ref(), trial_ended))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(crate::typography::ui_rems(10.5))
+                        .text_color(meta_color)
+                        .child(SharedString::from(format!("· {meta}"))),
+                )
+                .into_any_element(),
+        };
+        let refresh = match self.pane {
+            CloudPane::Files => Some(
+                rail_icon_button(
+                    "files-refresh",
+                    icons::REFRESH,
+                    "Refresh files",
+                    theme.text_muted,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.load_files(cx)))
+                .into_any_element(),
+            ),
+            CloudPane::Changes => Some(
+                rail_icon_button(
+                    "changes-refresh",
+                    icons::REFRESH,
+                    "Refresh changes",
+                    theme.text_muted,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.load_changes(cx)))
+                .into_any_element(),
+            ),
+            CloudPane::PullRequests => Some(
+                rail_icon_button(
+                    "prs-refresh",
+                    icons::REFRESH,
+                    "Refresh pull requests",
+                    theme.text_muted,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.load_prs(cx)))
+                .into_any_element(),
+            ),
+            CloudPane::Computer if caps.computer || caps.shell => Some(
+                rail_icon_button(
+                    "computer-refresh",
+                    icons::REFRESH,
+                    "Refresh screen",
+                    theme.text_muted,
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.capture_shot(cx)))
+                .into_any_element(),
+            ),
+            _ => None,
+        };
+        let status = matches!(
+            self.pane,
+            CloudPane::Files | CloudPane::Changes | CloudPane::Computer | CloudPane::Shell
+        )
+        .then(|| {
+            div()
+                .id("rail-toolbar-status")
+                .flex_none()
+                .child(status_dot(theme, probe.as_ref(), trial_ended))
+                .tooltip(widgets::text_tooltip(format!("{seat_label} · {meta}")))
+                .into_any_element()
+        });
+        let mut trailing = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .children(refresh)
             .child(buttons)
-            .into_any_element()
+            .children(status);
+        let menu_open = self.pane_menu.get().is_some();
+        let menu_trigger = div()
+            .id("rail-pane-menu-trigger")
+            .size(px(crate::surface_chrome::CONTROL_SIZE))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
+            .cursor_pointer()
+            .bg(if menu_open {
+                crate::theme::wash(0.11)
+            } else {
+                crate::theme::wash(0.0)
+            })
+            .hover(|el| el.bg(crate::theme::wash(0.11)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.pane_menu.note_trigger_press()),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.pane_menu.take_press_was_open() {
+                    this.close_pane_menu(cx);
+                } else {
+                    this.pane_menu.open(());
+                    cx.notify();
+                }
+            }))
+            .tooltip(widgets::text_tooltip("Seat actions"))
+            .child(
+                icon(icons::MORE_HORIZONTAL)
+                    .size(px(crate::surface_chrome::ICON_SIZE))
+                    .text_color(theme.text_muted),
+            );
+        if menu_open {
+            let closing = self.pane_menu.closing_since();
+            let mut menu = div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(8.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(SharedString::from(seat_label)),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(meta)),
+                        ),
+                )
+                .child(popover::menu_separator())
+                .child(
+                    popover::menu_row(theme, false, "rail-menu-probe")
+                        .id("rail-menu-probe")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_pane_menu(cx);
+                            this.probe_seat(cx);
+                        }))
+                        .child(
+                            icon(icons::REFRESH)
+                                .size(px(13.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child("Check seat"),
+                );
+            match seat.and_then(|s| s.config.preview_url.clone()) {
+                Some(url) => {
+                    menu = menu.child(
+                        popover::menu_row(theme, false, "rail-menu-preview")
+                            .id("rail-menu-preview")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_pane_menu(cx);
+                                cx.open_url(&url);
+                            }))
+                            .child(
+                                icon(icons::GLOBE)
+                                    .size(px(13.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child("Open preview"),
+                    );
+                }
+                None => {
+                    menu = menu.child(
+                        popover::menu_row(theme, false, "rail-menu-screen")
+                            .id("rail-menu-screen")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_pane_menu(cx);
+                                cx.emit(RailEvent::OpenPane(CloudPane::Computer));
+                            }))
+                            .child(
+                                icon(icons::MONITOR)
+                                    .size(px(13.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child("Show screen"),
+                    );
+                }
+            }
+            if is_boat && seat.is_some_and(|s| s.config.box_id.is_some()) {
+                let (label, glyph, op) = if sleeping {
+                    ("Wake box", icons::SUN, "wake")
+                } else {
+                    ("Sleep box", icons::MOON, "sleep")
+                };
+                menu = menu.child(
+                    popover::menu_row(theme, false, "rail-menu-box")
+                        .id("rail-menu-box")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_pane_menu(cx);
+                            this.seat_control(op, cx);
+                        }))
+                        .child(icon(glyph).size(px(13.0)).text_color(theme.text_muted))
+                        .child(label),
+                );
+            }
+            if self.confirm_destroy {
+                menu = menu.child(
+                    popover::menu_row(theme, false, "rail-menu-destroy-confirm")
+                        .id("rail-menu-destroy-confirm")
+                        .text_color(theme.danger)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_pane_menu(cx);
+                            this.seat_control("destroy", cx);
+                        }))
+                        .child(
+                            icon(icons::TRASH_BIN_MINIMALISTIC)
+                                .size(px(13.0))
+                                .text_color(theme.danger),
+                        )
+                        .child("Click again to destroy"),
+                );
+            } else {
+                menu = menu.child(
+                    popover::menu_row(theme, false, "rail-menu-destroy")
+                        .id("rail-menu-destroy")
+                        .when(!caps.exec, |row| row.opacity(0.45))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.control_busy || !this.capabilities().exec {
+                                return;
+                            }
+                            this.confirm_destroy = true;
+                            this.confirm_task = Some(cx.spawn(async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_secs(4))
+                                    .await;
+                                this.update(cx, |rail, cx| {
+                                    rail.confirm_destroy = false;
+                                    rail.confirm_task = None;
+                                    cx.notify();
+                                })
+                                .ok();
+                            }));
+                            cx.notify();
+                        }))
+                        .child(
+                            icon(icons::TRASH_BIN_MINIMALISTIC)
+                                .size(px(13.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child("Destroy seat"),
+                );
+            }
+            let menu = popover::popover_card(theme)
+                .w(px(220.0))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.close_pane_menu(cx);
+                }))
+                .child(menu)
+                .into_any_element();
+            trailing = trailing.child(menu_trigger.relative().child(
+                popover::anchored_menu_below_gap("rail-pane-menu", menu, closing, 10.0),
+            ));
+        } else {
+            trailing = trailing.child(menu_trigger);
+        }
+        let toolbar = crate::surface_chrome::toolbar(theme)
+            .child(left)
+            .child(trailing);
+        toolbar.into_any_element()
     }
 
     /// The rail's one notice card — the single most important thing the user
@@ -5096,8 +5198,7 @@ impl CloudRail {
     }
 }
 
-/// A size-7 rail icon button — the shell's `header_icon_button` look
-/// (28px, rounded-md, wash hover, 16px glyph) with a tooltip for the words.
+/// A toolbar icon button with the shared surface-control metrics.
 fn rail_icon_button(
     id: &'static str,
     glyph: &'static str,
@@ -5108,12 +5209,12 @@ fn rail_icon_button(
     let fade = format!("rail-icon-{id}");
     div()
         .id(SharedString::from(fade.clone()))
-        .size(px(28.0))
+        .size(px(crate::surface_chrome::CONTROL_SIZE))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(6.0))
+        .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
         .cursor_pointer()
         .bg(crate::motion::hover_blend(
             &fade,
@@ -5123,7 +5224,11 @@ fn rail_icon_button(
         .on_hover(crate::motion::hover_listener(fade))
         .when(dimmed, |el| el.opacity(0.45))
         .tooltip(widgets::text_tooltip(tip))
-        .child(icon(glyph).size(px(16.0)).text_color(color))
+        .child(
+            icon(glyph)
+                .size(px(crate::surface_chrome::ICON_SIZE))
+                .text_color(color),
+        )
 }
 
 #[derive(Clone, Copy)]
@@ -5251,21 +5356,20 @@ impl Render for CloudRail {
             CloudPane::Context => self.render_context(&theme, cx),
             CloudPane::Tasks => self.render_tasks(&theme, cx),
         };
-        let bot_bar = self.render_bot_bar(&theme, cx);
         let notices = self.render_notices(&theme, cx);
-        let mut col = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(bot_bar)
-            .children(notices);
+        let mut col = div().size_full().flex().flex_col();
+        let show_picker = self.picking && !matches!(&self.seat, Loadable::Error(_));
+        if !show_picker {
+            col = col.child(self.render_toolbar(&theme, cx));
+        }
+        col = col.children(notices);
         match &self.seat {
             Loadable::Error(err) => {
                 col = col.child(div().flex_1().min_h_0().child(
                     pane_empty(&theme, icons::CLOUD, "Cloud seat", err.as_str()).into_any_element(),
                 ));
             }
-            _ if self.picking => {
+            _ if show_picker => {
                 col = col.child(
                     div()
                         .flex_1()

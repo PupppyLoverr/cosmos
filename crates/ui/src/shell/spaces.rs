@@ -5170,6 +5170,7 @@ impl Shell {
                 // Spawned children stay out of the Archived section too — the
                 // same top-level rule as `visible_chats`.
                 .filter(|c| c.archived && c.parent_chat_id.is_none())
+                .filter(|chat| state.chat_in_mode(chat))
                 .filter(|chat| match &filter {
                     Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
                     None => true,

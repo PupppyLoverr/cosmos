@@ -405,6 +405,7 @@ pub fn context_seed(source: &zeron_proto::Chat, entries: &[SessionMessageEntry])
 #[derive(Debug, Clone)]
 pub enum SideChatEvent {
     DocReleased { doc_id: String },
+    OpenMainChat { chat_id: String },
 }
 
 impl gpui::EventEmitter<SideChatEvent> for SideChat {}
@@ -532,9 +533,7 @@ impl Render for SideChat {
                     .on_hover(motion::hover_listener("side-chat-open-fade"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(chat_id) = this.chat_id.clone() {
-                            this.state.update(cx, |s, cx| {
-                                s.select_chat(Some(chat_id), cx);
-                            });
+                            cx.emit(SideChatEvent::OpenMainChat { chat_id });
                         }
                     }))
                     .child(
