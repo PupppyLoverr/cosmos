@@ -1917,12 +1917,17 @@ impl AppState {
         display_status(chat, self.session_for(&chat.id), now)
     }
 
+    pub fn chat_in_mode(&self, chat: &Chat) -> bool {
+        chat.cloud_seat.is_some() == self.cloud_mode
+    }
+
     /// The sidebar's Sessions list: every non-archived chat of a LIVE space,
     /// on any device — idle included — in pure recency order (status drives
     /// the dot, never the position; see [`sort_active`]).
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
+            .filter(|c| self.chat_in_mode(c))
             .filter(|c| match c.space_id.as_deref() {
                 // Project-less sessions are first-class rows.
                 None => true,
@@ -3970,6 +3975,21 @@ mod tests {
         }
     }
 
+    fn cloud_chat(id: &str, created_min: i64, last_msg_min: Option<i64>) -> Chat {
+        let mut chat = chat(id, created_min, last_msg_min);
+        chat.cloud_seat = Some(zeron_proto::CloudSeatBinding {
+            seat_id: "seat".into(),
+            kind: zeron_proto::CloudSeatKind::Ssh,
+            label: "Seat".into(),
+            repo: None,
+            workspace_path: None,
+            branch: None,
+            model_label: None,
+            expires_at: None,
+        });
+        chat
+    }
+
     fn space(id: &str, device_id: &str, path: &str, created_min: i64) -> Space {
         let base = DateTime::parse_from_rfc3339("2026-07-19T12:00:00Z")
             .unwrap()
@@ -4774,6 +4794,63 @@ mod tests {
             .map(|(_, c)| c.id.as_str())
             .collect();
         assert_eq!(overview, ["old", "new", "dangling"]);
+    }
+
+    #[test]
+    fn overview_chats_are_scoped_to_local_or_cloud_mode() {
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat("local", 0, None), cloud_chat("cloud", 1, None)]);
+        let ids = |state: &AppState| {
+            state
+                .overview_chats(Utc::now())
+                .into_iter()
+                .map(|(_, chat)| chat.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(&state), [String::from("local")]);
+        state.cloud_mode = true;
+        assert_eq!(ids(&state), [String::from("cloud")]);
+    }
+
+    #[test]
+    fn overview_mode_filter_composes_with_space_and_visibility_filters() {
+        let mut state = AppState::new();
+        state.apply_spaces(vec![space("live", "dev", "/live", 0)]);
+        let mut local = chat("local-live", 0, None);
+        local.space_id = Some("live".into());
+        let mut cloud = cloud_chat("cloud-live", 1, None);
+        cloud.space_id = Some("live".into());
+        let mut cloud_unknown = cloud_chat("cloud-unknown", 2, None);
+        cloud_unknown.space_id = Some("missing".into());
+        let mut archived = cloud_chat("cloud-archived", 3, None);
+        archived.archived = true;
+        let mut child = cloud_chat("cloud-child", 4, None);
+        child.parent_chat_id = Some("cloud-live".into());
+        state.apply_chats(vec![local, cloud, cloud_unknown, archived, child]);
+
+        state.cloud_mode = true;
+        let cloud_rows: Vec<&str> = state
+            .sidebar_chats(Utc::now(), None)
+            .into_iter()
+            .map(|(_, chat)| chat.id.as_str())
+            .collect();
+        assert_eq!(cloud_rows, ["cloud-live"]);
+
+        let filtered: Vec<&str> = state
+            .sidebar_chats(Utc::now(), Some("missing"))
+            .into_iter()
+            .map(|(_, chat)| chat.id.as_str())
+            .collect();
+        assert!(filtered.is_empty());
+
+        state.cloud_mode = false;
+        let local_rows: Vec<&str> = state
+            .overview_chats(Utc::now())
+            .into_iter()
+            .map(|(_, chat)| chat.id.as_str())
+            .collect();
+        assert_eq!(local_rows, ["local-live"]);
     }
 
     #[test]

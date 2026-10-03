@@ -229,8 +229,22 @@ impl Shell {
         }
     }
 
+    pub(crate) fn sync_mode_to_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let cloud_mode = self
+            .state
+            .read(cx)
+            .chat_row(chat_id)
+            .is_some_and(|chat| chat.cloud_seat.is_some());
+        if self.state.read(cx).cloud_mode != cloud_mode
+            && self.state.read(cx).chat_row(chat_id).is_some()
+        {
+            self.set_cloud_mode(cloud_mode, cx);
+        }
+    }
+
     /// Open a session from the sidebar: select it, the main area follows.
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.sync_mode_to_chat(&chat_id, cx);
         self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);
