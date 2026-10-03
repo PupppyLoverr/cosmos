@@ -18,6 +18,7 @@
 //!   tokens are cached with dual-clock expiry (see [`AccessEntry`]).
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -32,7 +33,7 @@ use crate::http_error::describe_http_error;
 use zeron_rpc::TokenError;
 
 const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
-/// Loopback address the browser is sent to after Woozlit login.
+/// Preferred loopback address the browser is sent to after Woozlit login.
 ///
 /// Woozlit's `/login?desktop=1` page shows "You're all set", then delivers the
 /// token differently based on the callback host: `127.0.0.1` and `localhost`
@@ -40,9 +41,9 @@ const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
 /// navigation (`window.location`). Chrome and Edge block that iframe under
 /// Local Network Access — the frame is created without
 /// `allow="local-network-access"` — so the request never reaches us and the
-/// app stays on the signed-out screen. `127.0.0.2` is still inside
-/// `127.0.0.0/8` (loopback on Windows, macOS, and Linux) but is not one of
-/// the two hosts Woozlit iframes, so the browser navigates here for real.
+/// app stays on the signed-out screen. `127.0.0.2` is not one of the hosts
+/// Woozlit iframes; macOS may not have that address assigned to `lo0`, so
+/// binding falls back to IPv6 loopback `::1`, which also triggers navigation.
 const SIGN_IN_CALLBACK_HOST: &str = "127.0.0.2";
 /// Refresh when the cached token has less than this much life left.
 const TOKEN_SLACK: Duration = Duration::from_secs(30);
@@ -306,8 +307,8 @@ struct AuthInner {
     /// just delayed by the background loop. Resettable without waiting on HTTP.
     refresh_retry: Mutex<RefreshRetry>,
     retry_tx: watch::Sender<u64>,
-    /// Loopback callback listener port, bound lazily on the first headed sign-in.
-    loopback: tokio::sync::Mutex<Option<u16>>,
+    /// Bound loopback callback port and address, set on the first headed sign-in.
+    loopback: tokio::sync::Mutex<Option<(u16, IpAddr)>>,
 }
 
 #[derive(Default)]
@@ -555,8 +556,8 @@ impl Auth {
         if self.inner.workos.is_none() {
             return Ok(String::new()); // dev mode: nothing to do
         }
-        let port = self.ensure_loopback().await?;
-        Ok(self.begin_woozlit_sign_in(&format!("http://{SIGN_IN_CALLBACK_HOST}:{port}/callback")))
+        let (port, ip) = self.ensure_loopback().await?;
+        Ok(self.begin_woozlit_sign_in(&callback_url(ip, port)))
     }
 
     /// Same Woozlit login URL as headed sign-in. CLI uses the loopback callback
@@ -1073,25 +1074,45 @@ impl Auth {
 
     // -- loopback callback server ------------------------------------------
 
-    /// Bind the loopback callback listener (idempotent); returns its port.
-    async fn ensure_loopback(&self) -> Result<u16, EngineError> {
+    /// Bind the loopback callback listener (idempotent); returns its port and address.
+    async fn ensure_loopback(&self) -> Result<(u16, IpAddr), EngineError> {
         let mut slot = self.inner.loopback.lock().await;
-        if let Some(port) = *slot {
-            return Ok(port);
+        if let Some(bound) = *slot {
+            return Ok(bound);
         }
         let requested = self.inner.config.callback_port.unwrap_or(0);
-        let listener = tokio::net::TcpListener::bind((SIGN_IN_CALLBACK_HOST, requested))
-            .await
-            .map_err(|e| EngineError::Other(format!("sign-in callback bind failed: {e}")))?;
-        let port = listener
+        let listener = match tokio::net::TcpListener::bind((SIGN_IN_CALLBACK_HOST, requested)).await
+        {
+            Ok(listener) => listener,
+            Err(ipv4_error) => {
+                match tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, requested))
+                    .await
+                {
+                    Ok(listener) => listener,
+                    Err(ipv6_error) => {
+                        return Err(EngineError::Other(format!(
+                            "sign-in callback bind failed: {SIGN_IN_CALLBACK_HOST}: {ipv4_error}; [::1]: {ipv6_error}"
+                        )));
+                    }
+                }
+            }
+        };
+        let address = listener
             .local_addr()
-            .map_err(|e| EngineError::Other(format!("sign-in callback addr: {e}")))?
-            .port();
-        *slot = Some(port);
+            .map_err(|e| EngineError::Other(format!("sign-in callback addr: {e}")))?;
+        let bound = (address.port(), address.ip());
+        *slot = Some(bound);
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(loopback_loop(listener, weak));
-        tracing::info!(port, "auth: sign-in callback listening");
-        Ok(port)
+        tracing::info!(port = bound.0, host = %bound.1, "auth: sign-in callback listening");
+        Ok(bound)
+    }
+}
+
+fn callback_url(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("http://{ip}:{port}/callback"),
+        IpAddr::V6(ip) => format!("http://[{ip}]:{port}/callback"),
     }
 }
 
@@ -1364,6 +1385,18 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callback_url_formats_ipv4_and_ipv6() {
+        assert_eq!(
+            callback_url(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)), 4321),
+            "http://127.0.0.2:4321/callback"
+        );
+        assert_eq!(
+            callback_url(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 4321),
+            "http://[::1]:4321/callback"
+        );
+    }
 
     #[tokio::test]
     async fn concurrent_dns_failure_is_shared_with_http_and_room_consumers() {

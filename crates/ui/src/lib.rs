@@ -148,7 +148,12 @@ pub fn run_app(config: UiConfig) {
     }
     // Retain ownership for the whole application lifetime. The bridge's
     // default runtime has only two workers, insufficient for a desktop engine.
-    let runtime = tokio::runtime::Runtime::new().expect("desktop Tokio runtime");
+    // Debug frames of the diff RPCs exceed Tokio's 2 MiB worker-stack default.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 << 20)
+        .build()
+        .expect("desktop Tokio runtime");
     let runtime_handle = runtime.handle().clone();
     let app = gpui_platform::application().with_assets(icons::Assets);
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<String>();
