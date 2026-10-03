@@ -4762,7 +4762,10 @@ impl CloudRail {
             CloudPane::Files | CloudPane::Changes | CloudPane::Computer | CloudPane::Shell
         )
         .then(|| {
-            status_dot(theme, probe.as_ref(), trial_ended)
+            div()
+                .id("rail-toolbar-status")
+                .flex_none()
+                .child(status_dot(theme, probe.as_ref(), trial_ended))
                 .tooltip(widgets::text_tooltip(format!("{seat_label} · {meta}")))
                 .into_any_element()
         });
