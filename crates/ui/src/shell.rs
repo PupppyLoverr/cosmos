@@ -1762,6 +1762,49 @@ enum PendingExit {
     InstallUpdate(PathBuf),
 }
 
+const CLOUD_RAIL_CACHE: usize = 3;
+
+fn touch_mru(order: &mut Vec<String>, id: &str, cap: usize) -> Vec<String> {
+    order.retain(|entry| entry != id);
+    order.push(id.to_string());
+
+    let cap = cap.max(1);
+    let excess = order.len().saturating_sub(cap);
+    order.drain(..excess).collect()
+}
+
+#[cfg(test)]
+mod cloud_rail_mru_tests {
+    use super::touch_mru;
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).into()).collect()
+    }
+
+    #[test]
+    fn touching_inserts_and_moves_an_id_to_the_mru_end() {
+        let mut order = vec!["a".into(), "b".into()];
+        assert!(touch_mru(&mut order, "c", 3).is_empty());
+        assert_eq!(order, ids(&["a", "b", "c"]));
+        assert!(touch_mru(&mut order, "a", 3).is_empty());
+        assert_eq!(order, ids(&["b", "c", "a"]));
+    }
+
+    #[test]
+    fn touching_evicts_oldest_ids_without_evicting_the_touched_id() {
+        let mut order = vec!["a".into(), "b".into(), "c".into()];
+        let evicted = touch_mru(&mut order, "d", 3);
+        assert_eq!(evicted, ids(&["a"]));
+        assert_eq!(order, ids(&["b", "c", "d"]));
+
+        let evicted = touch_mru(&mut order, "b", 2);
+        assert_eq!(evicted, ids(&["c"]));
+        assert_eq!(order, ids(&["d", "b"]));
+        assert!(order.contains(&"b".to_string()));
+        assert!(order.len() <= 2);
+    }
+}
+
 pub struct Shell {
     state: Entity<AppState>,
     sidebar_pane: Entity<SidebarPane>,
@@ -1893,6 +1936,10 @@ pub struct Shell {
     /// survives navigation (per-session persistence).
     cloud_rails: std::collections::HashMap<String, Entity<crate::cloud::CloudRail>>,
     cloud_rail_subs: std::collections::HashMap<String, Subscription>,
+    cloud_rail_order: Vec<String>,
+    /// Cloud chats whose right pane has already been opened once.
+    cloud_rail_shown: std::collections::HashSet<String>,
+    active_cloud_rail: Option<String>,
     /// Rail Event::OpenSideChat — surface creation needs `window`, so the
     /// subscription queues it and render() drains it.
     pending_side_chat: bool,
@@ -2391,6 +2438,9 @@ impl Shell {
             automations_sub: None,
             cloud_rails: std::collections::HashMap::new(),
             cloud_rail_subs: std::collections::HashMap::new(),
+            cloud_rail_order: Vec::new(),
+            cloud_rail_shown: std::collections::HashSet::new(),
+            active_cloud_rail: None,
             pending_side_chat: false,
             cloud_side_chat: std::collections::HashSet::new(),
             tools_page: None,
@@ -4867,51 +4917,104 @@ impl Shell {
 
     /// Mount the seat panes for a cloud-bound chat.
     fn ensure_cloud_rail(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.route, Route::Chat) {
-            return;
-        }
-        let Some(chat) = self.state.read(cx).selected_chat_row() else {
-            return;
-        };
-        let Some(binding) = chat.cloud_seat.clone() else {
-            return;
-        };
-        let chat_id = chat.id.clone();
-        if !self.cloud_rails.contains_key(&chat_id) {
-            let state = self.state.clone();
-            let rail = cx.new(|cx| {
-                crate::cloud::CloudRail::new(
-                    state,
-                    chat_id.clone(),
-                    binding,
-                    zeron_proto::CloudPane::Files,
-                    cx,
+        let (active, live_chats) = {
+            let state = self.state.read(cx);
+            let selected = if matches!(self.route, Route::Chat) {
+                state
+                    .selected_chat_row()
+                    .filter(|chat| !chat.archived && chat.cloud_seat.is_some())
+            } else {
+                None
+            };
+            if self.active_cloud_rail.as_deref() == selected.map(|chat| chat.id.as_str()) {
+                return;
+            }
+            let active = selected.map(|chat| {
+                (
+                    chat.id.clone(),
+                    chat.cloud_seat
+                        .clone()
+                        .expect("selected cloud chat has a seat"),
                 )
             });
-            let sub = cx.subscribe(
-                &rail,
-                |this: &mut Shell, _, event: &crate::cloud::RailEvent, cx| match event {
-                    // Surface creation needs `window` — queue it; render()
-                    // drains `pending_side_chat` like `pending_workspace_command`.
-                    crate::cloud::RailEvent::OpenSideChat => {
-                        if let Some(chat) = this.state.read(cx).selected_chat_row() {
-                            this.cloud_side_chat.insert(chat.id.clone());
-                        }
-                        this.pending_side_chat = true;
-                        cx.notify();
-                    }
-                    // The keep card's CTA lands on Settings → Cloud computer.
-                    crate::cloud::RailEvent::OpenCloudSettings => {
-                        this.open_settings(SettingsSection::CloudComputer, cx);
-                    }
-                },
-            );
-            self.cloud_rail_subs.insert(chat_id.clone(), sub);
-            self.cloud_rails.insert(chat_id.clone(), rail);
-            // A cloud chat's seat panes live in the right pane — open it
-            // the first time the chat is shown.
-            self.set_surfaces_open(true, cx);
+            let live_chats = state
+                .chats
+                .iter()
+                .filter(|chat| !chat.archived)
+                .map(|chat| chat.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            (active, live_chats)
+        };
+
+        if let Some(previous) = self.active_cloud_rail.take()
+            && let Some(rail) = self.cloud_rails.get(&previous)
+        {
+            rail.update(cx, |rail, cx| rail.set_active(false, cx));
         }
+
+        if let Some((chat_id, binding)) = active {
+            if !self.cloud_rails.contains_key(&chat_id) {
+                let state = self.state.clone();
+                let rail = cx.new(|cx| {
+                    crate::cloud::CloudRail::new(
+                        state,
+                        chat_id.clone(),
+                        binding,
+                        zeron_proto::CloudPane::Files,
+                        cx,
+                    )
+                });
+                let sub = cx.subscribe(
+                    &rail,
+                    |this: &mut Shell, _, event: &crate::cloud::RailEvent, cx| match event {
+                        // Surface creation needs `window` — queue it; render()
+                        // drains `pending_side_chat` like `pending_workspace_command`.
+                        crate::cloud::RailEvent::OpenSideChat => {
+                            if let Some(chat) = this.state.read(cx).selected_chat_row() {
+                                this.cloud_side_chat.insert(chat.id.clone());
+                            }
+                            this.pending_side_chat = true;
+                            cx.notify();
+                        }
+                        // The keep card's CTA lands on Settings → Cloud computer.
+                        crate::cloud::RailEvent::OpenCloudSettings => {
+                            this.open_settings(SettingsSection::CloudComputer, cx);
+                        }
+                    },
+                );
+                self.cloud_rail_subs.insert(chat_id.clone(), sub);
+                self.cloud_rails.insert(chat_id.clone(), rail);
+                // A cloud chat's seat panes live in the right pane — open it
+                // the first time the chat is shown.
+                if self.cloud_rail_shown.insert(chat_id.clone()) {
+                    self.set_surfaces_open(true, cx);
+                }
+            }
+            if let Some(rail) = self.cloud_rails.get(&chat_id) {
+                rail.update(cx, |rail, cx| rail.set_active(true, cx));
+            }
+            self.active_cloud_rail = Some(chat_id.clone());
+            let evicted = touch_mru(&mut self.cloud_rail_order, &chat_id, CLOUD_RAIL_CACHE);
+            for id in evicted {
+                self.cloud_rails.remove(&id);
+                self.cloud_rail_subs.remove(&id);
+                self.cloud_side_chat.remove(&id);
+            }
+        }
+
+        let stale = self
+            .cloud_rails
+            .keys()
+            .filter(|id| !live_chats.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in stale {
+            self.cloud_rails.remove(&id);
+            self.cloud_rail_subs.remove(&id);
+            self.cloud_side_chat.remove(&id);
+        }
+        self.cloud_rail_subs.retain(|id, _| live_chats.contains(id));
+        self.cloud_rail_order.retain(|id| live_chats.contains(id));
     }
 
     /// The seat panes for the active chat — `Some` only on cloud-bound
@@ -8347,7 +8450,7 @@ impl Shell {
                     div()
                         .flex_none()
                         .text_size(crate::typography::ui_rems(9.5))
-                        .text_color(theme.warning)
+                        .text_color(theme.text_muted)
                         .child(status),
                 );
             }
@@ -8360,7 +8463,7 @@ impl Shell {
                         .id(SharedString::from(format!("sidebar-seat-claim-{ix}")))
                         .flex_none()
                         .text_size(crate::typography::ui_rems(9.5))
-                        .text_color(theme.accent)
+                        .text_color(theme.text)
                         .cursor_pointer()
                         .child("Claim")
                         .on_click(move |_, _, cx| {

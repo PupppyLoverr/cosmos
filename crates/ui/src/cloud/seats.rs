@@ -746,7 +746,7 @@ impl CloudSeatsPage {
                             .gap(px(8.0))
                             .child(widgets::row_title(theme, seat.config.label.clone()))
                             .child(widgets::badge(theme, kind_label))
-                            .child(status_dot(theme, probe.as_ref())),
+                            .child(status_dot(theme, probe.as_ref(), false)),
                     )
                     .child(
                         div()

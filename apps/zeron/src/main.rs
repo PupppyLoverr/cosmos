@@ -171,6 +171,13 @@ fn spawn_malloc_trimmer() {
     }
 }
 
+fn engine_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 << 20)
+        .build()
+}
+
 fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     attach_parent_console();
@@ -266,7 +273,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Headless) => {
-            let runtime = tokio::runtime::Runtime::new()?;
+            let runtime = engine_runtime()?;
             runtime.block_on(async {
                 let engine = zeron_engine::Engine::new(engine_config_from_env());
                 engine.run().await

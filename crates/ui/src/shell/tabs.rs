@@ -31,6 +31,116 @@ pub(super) fn cycle_target(
     Some(order[next].clone())
 }
 
+fn seat_chip_label(
+    binding: &zeron_proto::CloudSeatBinding,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (String, bool) {
+    match binding.kind {
+        zeron_proto::CloudSeatKind::GitHub => (
+            format!(
+                "GitHub · {}",
+                binding
+                    .repo
+                    .as_deref()
+                    .filter(|repo| !repo.is_empty())
+                    .unwrap_or(&binding.label)
+            ),
+            false,
+        ),
+        zeron_proto::CloudSeatKind::Railway => match binding.expires_at {
+            Some(expires_at) => {
+                let secs = expires_at.signed_duration_since(now).num_seconds();
+                if secs <= 0 {
+                    ("Trial ended".into(), false)
+                } else if secs < 60 {
+                    ("Trial · <1m".into(), true)
+                } else {
+                    (format!("Trial · {}m", secs / 60), secs < 10 * 60)
+                }
+            }
+            None => ("Trial".into(), false),
+        },
+        _ => (format!("Cloud · {}", binding.label), false),
+    }
+}
+
+#[cfg(test)]
+mod seat_chip_tests {
+    use super::seat_chip_label;
+    use chrono::{Duration, Utc};
+    use zeron_proto::{CloudSeatBinding, CloudSeatKind};
+
+    fn binding(kind: CloudSeatKind, expires_at: Option<chrono::DateTime<Utc>>) -> CloudSeatBinding {
+        CloudSeatBinding {
+            seat_id: "seat".into(),
+            kind,
+            label: "my seat".into(),
+            repo: None,
+            workspace_path: None,
+            branch: None,
+            model_label: None,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn railway_chip_labels_track_the_trial_deadline() {
+        let now = Utc::now();
+        assert_eq!(
+            seat_chip_label(
+                &binding(CloudSeatKind::Railway, Some(now + Duration::minutes(12)),),
+                now,
+            ),
+            ("Trial · 12m".to_string(), false)
+        );
+        assert_eq!(
+            seat_chip_label(
+                &binding(CloudSeatKind::Railway, Some(now + Duration::minutes(5)),),
+                now,
+            ),
+            ("Trial · 5m".to_string(), true)
+        );
+        assert_eq!(
+            seat_chip_label(
+                &binding(CloudSeatKind::Railway, Some(now + Duration::seconds(59)),),
+                now,
+            ),
+            ("Trial · <1m".to_string(), true)
+        );
+        assert_eq!(
+            seat_chip_label(
+                &binding(CloudSeatKind::Railway, Some(now - Duration::seconds(1)),),
+                now,
+            ),
+            ("Trial ended".to_string(), false)
+        );
+        assert_eq!(
+            seat_chip_label(&binding(CloudSeatKind::Railway, None), now),
+            ("Trial".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn github_and_generic_seat_labels_keep_their_identity() {
+        let now = Utc::now();
+        let mut github = binding(CloudSeatKind::GitHub, None);
+        github.repo = Some("owner/repo".into());
+        assert_eq!(
+            seat_chip_label(&github, now),
+            ("GitHub · owner/repo".to_string(), false)
+        );
+        github.repo = None;
+        assert_eq!(
+            seat_chip_label(&github, now),
+            ("GitHub · my seat".to_string(), false)
+        );
+        assert_eq!(
+            seat_chip_label(&binding(CloudSeatKind::Box, None), now),
+            ("Cloud · my seat".to_string(), false)
+        );
+    }
+}
+
 pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
     if expanded {
         icons::COLLAPSE_ARROWS
@@ -231,32 +341,9 @@ impl Shell {
                     let device = state
                         .device_name(&chat.device_id)
                         .unwrap_or("Unknown device");
-                    // The seat chip on the session header: `Cloud · seat`,
-                    // `GitHub · repo`, or `Railway · Nm` while a trial counts
-                    // down — warning tint in the last 10 minutes / expired.
-                    let seat_chip = chat.cloud_seat.as_ref().map(|b| {
-                        let (prefix, label) = match b.kind {
-                            zeron_proto::CloudSeatKind::GitHub => {
-                                ("GitHub", b.repo.clone().unwrap_or_else(|| b.label.clone()))
-                            }
-                            zeron_proto::CloudSeatKind::Railway => {
-                                let left = b
-                                    .expires_at
-                                    .map(|at| {
-                                        at.signed_duration_since(chrono::Utc::now()).num_minutes()
-                                    })
-                                    .unwrap_or(0);
-                                ("Railway", format!("{} · {}m", b.label, left.max(0)))
-                            }
-                            _ => ("Cloud", b.label.clone()),
-                        };
-                        let urgent = b
-                            .expires_at
-                            .map(|at| {
-                                at.signed_duration_since(chrono::Utc::now()).num_minutes() < 10
-                            })
-                            .unwrap_or(false);
-                        (SharedString::from(format!("{prefix} · {label}")), urgent)
+                    let seat_chip = chat.cloud_seat.as_ref().map(|binding| {
+                        let (label, urgent) = seat_chip_label(binding, chrono::Utc::now());
+                        (SharedString::from(label), urgent)
                     });
                     (
                         SharedString::from(transcript::single_line(
@@ -523,8 +610,7 @@ impl Shell {
                                             .child(target),
                                     )
                                 })
-                                // The session-kind chip — one accent, 8px
-                                // radius, never decorative: it names where
+                                // The session-kind chip names where
                                 // the run actually executes.
                                 .when_some(seat_chip, |el, (chip, urgent)| {
                                     el.child(
@@ -534,17 +620,17 @@ impl Shell {
                                             .px(px(7.0))
                                             .py(px(2.0))
                                             .rounded(px(8.0))
-                                            .bg(if urgent {
-                                                theme.warning.opacity(0.15)
+                                            .bg(crate::theme::wash(if urgent {
+                                                0.10
                                             } else {
-                                                theme.accent.opacity(0.12)
-                                            })
+                                                0.06
+                                            }))
                                             .text_size(crate::typography::ui_rems(10.0))
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                             .text_color(if urgent {
-                                                theme.warning
+                                                theme.text
                                             } else {
-                                                theme.accent
+                                                theme.text_muted
                                             })
                                             .child(chip),
                                     )

@@ -160,6 +160,57 @@ mod tests {
     }
 
     #[test]
+    fn countdown_ticks_at_the_next_minute_boundary() {
+        assert_eq!(
+            countdown_tick(3600),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            countdown_tick(3599),
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(countdown_tick(61), Some(std::time::Duration::from_secs(2)));
+        assert_eq!(countdown_tick(59), Some(std::time::Duration::from_secs(60)));
+        assert_eq!(countdown_tick(0), None);
+        assert_eq!(countdown_tick(-5), None);
+    }
+
+    #[gpui::test]
+    fn cloud_rail_timers_follow_active_state(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let state = cx.new(|_| AppState::new());
+            let binding = CloudSeatBinding {
+                seat_id: "trial".into(),
+                kind: CloudSeatKind::Railway,
+                label: "Trial".into(),
+                repo: None,
+                workspace_path: None,
+                branch: None,
+                model_label: None,
+                expires_at: Some(Utc::now() + Duration::minutes(30)),
+            };
+            let rail = cx.new(|cx| {
+                CloudRail::new(state.clone(), "chat".into(), binding, CloudPane::Files, cx)
+            });
+            rail.update(cx, |rail, cx| {
+                assert!(rail._countdown.is_some());
+                assert!(rail._refresh.is_some());
+                rail.screen_task = Some(cx.spawn(async move |_, _| {
+                    std::future::pending::<()>().await;
+                }));
+                assert!(rail.screen_task.is_some());
+                rail.set_active(false, cx);
+                assert!(rail._countdown.is_none());
+                assert!(rail._refresh.is_none());
+                assert!(rail.screen_task.is_none());
+                rail.set_active(true, cx);
+                assert!(rail._countdown.is_some());
+                assert!(rail._refresh.is_some());
+            });
+        });
+    }
+
+    #[test]
     fn seat_readiness_matches_credential_and_probe_requirements() {
         let mut ssh = seat(CloudSeatKind::Ssh);
         assert!(!CloudView::seat_ready(&ssh));
@@ -411,13 +462,21 @@ pub(crate) fn seat_chip_label(seat: Option<&SeatRow>, trial_failed: bool) -> Str
     }
 }
 
-/// The green/red/sleeping dot used by the bot bar and seat rows.
-pub(crate) fn status_dot(theme: &Theme, probe: Option<&SeatProbe>) -> gpui::Stateful<gpui::Div> {
-    let (color, label) = match probe {
-        Some(p) if p.sleeping => (theme.warning, "sleeping"),
-        Some(p) if p.online => (theme.success, "online"),
-        Some(_) => (theme.danger, "offline"),
-        None => (theme.text_faint, "not probed"),
+/// The monochrome status dot used by the bot bar and seat rows.
+pub(crate) fn status_dot(
+    theme: &Theme,
+    probe: Option<&SeatProbe>,
+    ended: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let (color, label) = if ended {
+        (theme.text_faint, "ended")
+    } else {
+        match probe {
+            Some(p) if p.sleeping => (theme.text_faint, "sleeping"),
+            Some(p) if p.online => (theme.text_muted, "online"),
+            Some(_) => (theme.text_faint, "offline"),
+            None => (theme.text_faint, "not probed"),
+        }
     };
     div()
         .id(SharedString::from(format!("seat-dot-{label}")))
@@ -426,6 +485,10 @@ pub(crate) fn status_dot(theme: &Theme, probe: Option<&SeatProbe>) -> gpui::Stat
         .rounded_full()
         .bg(color)
         .tooltip(widgets::text_tooltip(label))
+}
+
+fn countdown_tick(secs_left: i64) -> Option<std::time::Duration> {
+    (secs_left > 0).then(|| std::time::Duration::from_secs((secs_left % 60) as u64 + 1))
 }
 
 /// A headless Linux seat's live console: a monitor frame with the box's
@@ -806,7 +869,9 @@ pub struct CloudRail {
     /// The pane launcher (the empty right-pane list) is showing instead of
     /// a pane body.
     picking: bool,
+    active: bool,
     confirm_destroy: bool,
+    confirm_task: Option<Task<()>>,
     control_busy: bool,
     control_error: Option<String>,
     /// The chat's session stamp at the last ledger refresh — the state
@@ -820,7 +885,7 @@ pub struct CloudRail {
     _input_sub: Subscription,
     _type_sub: Subscription,
     _state_sub: Subscription,
-    /// Railway countdown ticker — 1s re-render while a deadline is live.
+    /// Railway countdown ticker — re-renders at the next minute boundary.
     _countdown: Option<Task<()>>,
     _refresh: Option<Task<()>>,
 }
@@ -951,7 +1016,9 @@ impl CloudRail {
             model_label: None,
             pane_menu: popover::Popup::default(),
             picking: true,
+            active: true,
             confirm_destroy: false,
+            confirm_task: None,
             control_busy: false,
             control_error: None,
             session_stamp: None,
@@ -963,16 +1030,26 @@ impl CloudRail {
             _countdown: None,
             _refresh: None,
         };
-        // Live countdown: while a Railway deadline is ahead of the clock the
-        // rail re-renders once a second so the chip/banner stay honest.
-        if rail.binding.expires_at.is_some() {
-            rail._countdown = Some(cx.spawn(async move |this, cx| {
+        rail.start_timers(cx);
+        rail.load_seat(cx);
+        rail.ensure_loaded(cx);
+        rail
+    }
+
+    fn start_timers(&mut self, cx: &mut Context<Self>) {
+        self._countdown = None;
+        self._refresh = None;
+        if !self.active {
+            return;
+        }
+        if self.binding.expires_at.is_some() {
+            self._countdown = Some(cx.spawn(async move |this, cx| {
                 loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_secs(1))
-                        .await;
-                    let alive = this
+                    let delay = this
                         .update(cx, |rail, cx| {
+                            if !rail.active {
+                                return None;
+                            }
                             let left = rail
                                 .binding
                                 .expires_at
@@ -980,23 +1057,29 @@ impl CloudRail {
                                 .map(|d| d.num_seconds())
                                 .unwrap_or(-1);
                             cx.notify();
-                            left > 0
+                            countdown_tick(left)
                         })
-                        .unwrap_or(false);
-                    if !alive {
-                        break;
+                        .unwrap_or(None);
+                    match delay {
+                        None => break,
+                        Some(delay) => {
+                            cx.background_executor().timer(delay).await;
+                        }
                     }
                 }
             }));
         }
-        let state_for_refresh = rail.state.clone();
-        rail._refresh = Some(cx.spawn(async move |this, cx| {
+        let state_for_refresh = self.state.clone();
+        self._refresh = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(30))
                     .await;
                 let alive = this
-                    .update(cx, |_, cx| {
+                    .update(cx, |rail, cx| {
+                        if !rail.active {
+                            return false;
+                        }
                         state_for_refresh.update(cx, |state, cx| {
                             state.refresh_cloud(Some(std::time::Duration::from_secs(30)), cx);
                         });
@@ -1008,9 +1091,27 @@ impl CloudRail {
                 }
             }
         }));
-        rail.load_seat(cx);
-        rail.ensure_loaded(cx);
-        rail
+    }
+
+    pub(crate) fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+        if active {
+            self.start_timers(cx);
+            if self.pane == CloudPane::Computer && !self.picking {
+                self.capture_shot(cx);
+            }
+            self.state.update(cx, |state, cx| {
+                state.refresh_cloud(Some(std::time::Duration::from_secs(30)), cx);
+            });
+        } else {
+            self._countdown = None;
+            self._refresh = None;
+            self.screen_task = None;
+        }
+        cx.notify();
     }
 
     fn capabilities(&self) -> SeatCapabilities {
@@ -1096,6 +1197,12 @@ impl CloudRail {
     /// Switch the rail's active pane — the only pane visible, per the "one
     /// pane at a time" rule.
     pub fn set_pane(&mut self, pane: CloudPane, cx: &mut Context<Self>) {
+        let confirmation_changed = self.confirm_destroy || self.confirm_task.is_some();
+        self.confirm_destroy = false;
+        self.confirm_task = None;
+        if confirmation_changed {
+            cx.notify();
+        }
         if self.picking {
             self.picking = false;
             cx.notify();
@@ -1201,6 +1308,8 @@ impl CloudRail {
     }
 
     fn seat_control(&mut self, op: &'static str, cx: &mut Context<Self>) {
+        self.confirm_task = None;
+        self.confirm_destroy = false;
         let Some(engine) = self.engine(cx) else {
             self.control_error = Some("Engine not connected".into());
             return;
@@ -1763,6 +1872,9 @@ impl CloudRail {
     // -- Computer --
 
     fn capture_shot(&mut self, cx: &mut Context<Self>) {
+        if !self.active {
+            return;
+        }
         let caps = self.capabilities();
         if !caps.computer && !caps.shell {
             self.shot = Loadable::Ready(None);
@@ -1823,6 +1935,7 @@ impl CloudRail {
                         cx.notify();
                         rail.pane == CloudPane::Computer
                             && !rail.picking
+                            && rail.active
                             && matches!(rail.shot, Loadable::Ready(_))
                     })
                     .unwrap_or(false);
@@ -1834,7 +1947,7 @@ impl CloudRail {
                     .await;
                 let still = this
                     .update(cx, |rail, _| {
-                        rail.pane == CloudPane::Computer && !rail.picking
+                        rail.active && rail.pane == CloudPane::Computer && !rail.picking
                     })
                     .unwrap_or(false);
                 if !still {
@@ -2322,7 +2435,7 @@ impl CloudRail {
                 Loadable::Error(err) => div()
                     .p(px(10.0))
                     .text_size(crate::typography::ui_rems(12.0))
-                    .text_color(theme.danger)
+                    .text_color(theme.text_muted)
                     .child(SharedString::from(err.clone()))
                     .into_any_element(),
                 _ => div()
@@ -3198,7 +3311,7 @@ impl CloudRail {
                                 .flex_1()
                                 .min_w_0()
                                 .text_size(crate::typography::ui_rems(10.5))
-                                .text_color(theme.danger)
+                                .text_color(theme.text_muted)
                                 .child(SharedString::from(format!("Analysis failed: {err}")))
                                 .into_any_element(),
                         }),
@@ -4262,7 +4375,7 @@ impl CloudRail {
                             Loadable::Error(err) => div()
                                 .px(px(4.0))
                                 .text_size(crate::typography::ui_rems(11.0))
-                                .text_color(theme.danger)
+                                .text_color(theme.text_muted)
                                 .child(SharedString::from(err))
                                 .into_any_element(),
                             _ => div()
@@ -4280,7 +4393,7 @@ impl CloudRail {
                     div()
                         .px(px(4.0))
                         .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.danger)
+                        .text_color(theme.text_muted)
                         .child(SharedString::from(err.clone())),
                 );
             }
@@ -4521,30 +4634,43 @@ impl CloudRail {
         let sleeping = probe.as_ref().is_some_and(|p| p.sleeping);
 
         // The status line under the name: the most useful single fact.
+        let now = chrono::Utc::now();
+        let is_railway = seat.is_some_and(|s| s.config.kind == Some(CloudSeatKind::Railway))
+            || self.binding.kind == CloudSeatKind::Railway;
         let trial_left = self
             .binding
             .expires_at
-            .map(|at| at.signed_duration_since(chrono::Utc::now()).num_seconds());
-        let (meta, meta_color) = match (trial_left, run_status) {
-            (Some(secs), _) if secs <= 0 => ("Trial ended".to_string(), theme.danger),
-            (Some(secs), _) => (
-                format!("Trial · {:02}:{:02} left", secs / 60, secs % 60),
-                if secs < 10 * 60 {
-                    theme.warning
-                } else {
-                    theme.text_muted
-                },
-            ),
-            (None, _) if sleeping => ("Sleeping · billing off".to_string(), theme.warning),
-            (None, Some(status)) => (status.label().to_string(), theme.text_muted),
-            (None, None) => (
-                match probe.as_ref() {
-                    Some(p) if p.online => "Online".to_string(),
-                    Some(_) => "Offline".to_string(),
-                    None => "Not checked yet".to_string(),
-                },
-                theme.text_muted,
-            ),
+            .map(|at| at.signed_duration_since(now).num_seconds());
+        let trial_ended = is_railway
+            && (seat.is_some_and(|s| s.config.expired())
+                || self.binding.expires_at.is_some_and(|at| at <= now));
+        let (meta, meta_color) = if trial_ended {
+            ("Trial ended".to_string(), theme.text_muted)
+        } else {
+            match (trial_left, run_status) {
+                (Some(secs), _) => (
+                    if secs < 60 {
+                        "Trial · <1m left".to_string()
+                    } else {
+                        format!("Trial · {}m left", secs / 60)
+                    },
+                    if secs < 10 * 60 {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    },
+                ),
+                (None, _) if sleeping => ("Sleeping · billing off".to_string(), theme.text_muted),
+                (None, Some(status)) => (status.label().to_string(), theme.text_muted),
+                (None, None) => (
+                    match probe.as_ref() {
+                        Some(p) if p.online => "Online".to_string(),
+                        Some(_) => "Offline".to_string(),
+                        None => "Not checked yet".to_string(),
+                    },
+                    theme.text_muted,
+                ),
+            }
         };
         let meta = match (&meta[..], run_status) {
             // A live trial still reports what the agent is doing.
@@ -4658,6 +4784,17 @@ impl CloudRail {
             )
             .on_click(cx.listener(|this, _, _, cx| {
                 this.confirm_destroy = true;
+                this.confirm_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(4))
+                        .await;
+                    this.update(cx, |rail, cx| {
+                        rail.confirm_destroy = false;
+                        rail.confirm_task = None;
+                        cx.notify();
+                    })
+                    .ok();
+                }));
                 cx.notify();
             }))
         };
@@ -4716,7 +4853,7 @@ impl CloudRail {
                                     .text_color(theme.text)
                                     .child(SharedString::from(seat_label)),
                             )
-                            .child(status_dot(theme, probe.as_ref())),
+                            .child(status_dot(theme, probe.as_ref(), trial_ended)),
                     )
                     .child(
                         div()
@@ -4862,7 +4999,7 @@ impl CloudRail {
             Some(
                 notice_card(
                     theme,
-                    NoticeTone::Danger,
+                    NoticeTone::Muted,
                     icons::CLOCK_CIRCLE,
                     "Trial ended",
                     body,
@@ -4891,7 +5028,7 @@ impl CloudRail {
             Some(
                 notice_card(
                     theme,
-                    NoticeTone::Accent,
+                    NoticeTone::Muted,
                     icons::STAR,
                     "Keep this computer?",
                     "The trial seat lasts an hour. Add a Boat token for a persistent cloud PC, or claim this one on Railway.",
@@ -4993,7 +5130,6 @@ fn rail_icon_button(
 enum NoticeTone {
     Danger,
     Warning,
-    Accent,
     Muted,
 }
 
@@ -5006,19 +5142,10 @@ fn notice_card(
     title: &'static str,
     body: impl Into<SharedString>,
 ) -> gpui::Div {
-    let tint = match tone {
-        NoticeTone::Danger => theme.danger,
-        NoticeTone::Warning => theme.warning,
-        NoticeTone::Accent => theme.accent,
-        NoticeTone::Muted => theme.text_muted,
-    };
-    let fill = match tone {
-        NoticeTone::Muted => crate::theme::wash(0.04),
-        _ => tint.opacity(0.08),
-    };
-    let edge = match tone {
-        NoticeTone::Muted => theme.border,
-        _ => tint.opacity(0.28),
+    let tint = if matches!(tone, NoticeTone::Danger) {
+        theme.danger
+    } else {
+        theme.text_muted
     };
     div()
         .flex()
@@ -5027,8 +5154,8 @@ fn notice_card(
         .p(px(10.0))
         .rounded(px(10.0))
         .border_1()
-        .border_color(edge)
-        .bg(fill)
+        .border_color(theme.border)
+        .bg(crate::theme::wash(0.04))
         .child(
             div()
                 .flex()
@@ -5076,8 +5203,8 @@ fn notice_actions() -> gpui::Div {
         .pl(px(22.0))
 }
 
-/// A notice-card button: compact rounded-md pill; `primary` takes the
-/// accent fill, the rest the agent-mode wash.
+/// A notice-card button: compact rounded-md pill; `primary` uses the solid
+/// theme fill, the rest the agent-mode wash.
 fn notice_button(
     id: &'static str,
     label: &str,
@@ -5086,11 +5213,7 @@ fn notice_button(
 ) -> gpui::Stateful<gpui::Div> {
     let fade = format!("rail-notice-{id}");
     let (rest, hover, text) = if primary {
-        (
-            theme.accent.opacity(0.16),
-            theme.accent.opacity(0.26),
-            theme.accent,
-        )
+        (theme.solid, theme.solid.opacity(0.85), theme.on_solid)
     } else {
         (
             crate::theme::wash(0.06),
