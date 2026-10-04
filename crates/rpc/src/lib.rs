@@ -320,6 +320,8 @@ pub mod methods {
     pub const CLOUD_REMOVE_SEAT: &str = "CloudRemoveSeat";
     /// `{seatId}` → `SeatProbe` (and records it as the seat's last_probe).
     pub const CLOUD_PROBE_SEAT: &str = "CloudProbeSeat";
+    /// `{seatId}` → `{pending}` — long-polls Railway signup completion.
+    pub const CLOUD_RAILWAY_SIGNUP_WAIT: &str = "CloudRailwaySignupWait";
     /// `{provider, key, baseUrl?}` → `{ok, message}` — a models/list ping.
     pub const CLOUD_VERIFY_PROVIDER: &str = "CloudVerifyProvider";
     /// `{provider, baseUrl?, model?, useForCloud, key?}` → `{ok}` — the key,

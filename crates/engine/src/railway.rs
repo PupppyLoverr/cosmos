@@ -31,10 +31,67 @@ pub struct RailwayTrial {
     pub expires_at: Option<DateTime<Utc>>,
     /// `https://railway.com/ssh-signup?code=…` — the human's claim link.
     pub claim_url: Option<String>,
+    /// `https://railway.com/ssh-signup?code=…` — the human's signup link.
+    pub signup_url: Option<String>,
+    /// Railway's long-poll URL for signup completion.
+    pub poll_url: Option<String>,
+    /// Railway refused this trial until the visitor signs up.
+    pub signup_required: bool,
     /// The box's preview URL (`https://preview-….up.railway.app`).
     pub preview_url: Option<String>,
     /// A human detail line for the probe record (e.g. "2 vCPU · 2 GB").
     pub detail: Option<String>,
+}
+
+pub fn trusted_railway_url(raw_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw_url) else {
+        return false;
+    };
+    let has_userinfo = raw_url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'));
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && !has_userinfo
+        && url
+            .host_str()
+            .is_some_and(|host| host == "railway.com" || host.ends_with(".railway.com"))
+}
+
+fn signup_poll_pending(body: &str) -> Option<bool> {
+    let reply = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let status = reply.get("status")?.as_str()?;
+    Some(matches!(status, "signup_required" | "pending" | "waiting"))
+}
+
+pub async fn signup_status(http: &reqwest::Client, poll_url: &str) -> Result<bool, String> {
+    if !trusted_railway_url(poll_url) {
+        return Err("Railway sent an untrusted signup URL".into());
+    }
+    let response = match http
+        .get(poll_url)
+        .timeout(Duration::from_secs(70))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) if error.is_timeout() => return Ok(true),
+        Err(_) => return Err("Could not check Railway signup status".into()),
+    };
+    if !response.status().is_success() {
+        return Err(format!(
+            "Railway signup check failed (HTTP {})",
+            response.status()
+        ));
+    }
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) if error.is_timeout() => return Ok(true),
+        Err(_) => return Err("Could not read Railway signup status".into()),
+    };
+    signup_poll_pending(&body).ok_or_else(|| "Railway sent an unexpected reply".into())
 }
 
 /// Extract the trial fields from whatever Railway printed on stderr — the
@@ -42,6 +99,7 @@ pub struct RailwayTrial {
 /// human-format welcome banner.
 fn parse_manifest(stdout: &str, stderr: &str, assign_fallback_deadline: bool) -> RailwayTrial {
     let mut trial = RailwayTrial::default();
+    let mut signup_refused = false;
     // The manifest is one JSON object; tolerate leading/trailing noise and
     // multi-line pretty prints by trying every brace-balanced slice.
     for line in stdout.lines().chain(stderr.lines()) {
@@ -57,6 +115,10 @@ fn parse_manifest(stdout: &str, stderr: &str, assign_fallback_deadline: bool) ->
         };
         trial.claim_required |=
             value.get("status").and_then(|v| v.as_str()) == Some("claim_required");
+        signup_refused |= value
+            .get("status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|status| matches!(status, "refused" | "signup_required"));
         let pick = |keys: &[&str]| -> Option<String> {
             keys.iter().find_map(|k| {
                 value
@@ -72,8 +134,17 @@ fn parse_manifest(stdout: &str, stderr: &str, assign_fallback_deadline: bool) ->
             "claimUrl",
             "claim_url",
             "claim",
-            "signupUrl",
         ]));
+        trial.signup_url = trial.signup_url.or(pick(&[
+            "human_signup_url",
+            "humanSignupUrl",
+            "signupUrl",
+            "signup_url",
+        ])
+        .filter(|url| trusted_railway_url(url)));
+        trial.poll_url = trial
+            .poll_url
+            .or(pick(&["poll_url", "pollUrl"]).filter(|url| trusted_railway_url(url)));
         trial.preview_url =
             trial
                 .preview_url
@@ -112,6 +183,7 @@ fn parse_manifest(stdout: &str, stderr: &str, assign_fallback_deadline: bool) ->
             .detail
             .or_else(|| pick(&["region"]).map(|r| format!("region {r}")));
     }
+    trial.signup_required = signup_refused && trial.signup_url.is_some();
     // Banner fallback — the welcome message prints `Claim:` and `Try it:`.
     for line in stdout.lines().chain(stderr.lines()) {
         for word in line.split_whitespace() {
@@ -147,7 +219,13 @@ pub fn redact_trial_banner(output: &str) -> String {
                 || line.contains("claim_url")
                 || line.contains("claimUrl")
                 || line.contains("\"claim_code\"")
-                || line.contains("\"claimCode\""))
+                || line.contains("\"claimCode\"")
+                || line.contains("human_signup_url")
+                || line.contains("humanSignupUrl")
+                || line.contains("signup_url")
+                || line.contains("signupUrl")
+                || line.contains("poll_url")
+                || line.contains("pollUrl"))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -307,7 +385,7 @@ mod tests {
     #[test]
     fn parses_claim_required_manifest_from_stdout() {
         let trial = parse_manifest(
-            r#"{"status":"claim_required","human_claim_url":"https://railway.com/ssh-signup?code=abc","poll_url":"https://example.test"}"#,
+            r#"{"status":"claim_required","human_claim_url":"https://railway.com/ssh-signup?code=abc","poll_url":"https://backboard.railway.com/ssh-signup/poll?code=abc"}"#,
             "",
             true,
         );
@@ -316,19 +394,102 @@ mod tests {
             trial.claim_url.as_deref(),
             Some("https://railway.com/ssh-signup?code=abc")
         );
+        assert_eq!(
+            trial.poll_url.as_deref(),
+            Some("https://backboard.railway.com/ssh-signup/poll?code=abc")
+        );
+
+        let untrusted = parse_manifest(
+            r#"{"status":"claim_required","poll_url":"https://example.test"}"#,
+            "",
+            false,
+        );
+        assert!(untrusted.poll_url.is_none());
+    }
+
+    #[test]
+    fn parses_signup_refusal_and_trusted_poll_url() {
+        let trial = parse_manifest(
+            "",
+            r#"{"status":"refused","human_signup_url":"https://railway.com/ssh-signup?code=abc","poll_url":"https://backboard.railway.com/ssh-signup/poll?code=abc"}"#,
+            false,
+        );
+        assert!(trial.signup_required);
+        assert_eq!(
+            trial.signup_url.as_deref(),
+            Some("https://railway.com/ssh-signup?code=abc")
+        );
+        assert_eq!(
+            trial.poll_url.as_deref(),
+            Some("https://backboard.railway.com/ssh-signup/poll?code=abc")
+        );
+
+        let aliases = parse_manifest(
+            "",
+            r#"{"status":"signup_required","signupUrl":"https://railway.com/signup?code=abc","pollUrl":"https://backboard.railway.com/poll?code=abc"}"#,
+            false,
+        );
+        assert!(aliases.signup_required);
+        assert_eq!(
+            aliases.signup_url.as_deref(),
+            Some("https://railway.com/signup?code=abc")
+        );
+        assert_eq!(
+            aliases.poll_url.as_deref(),
+            Some("https://backboard.railway.com/poll?code=abc")
+        );
+
+        let untrusted = parse_manifest(
+            "",
+            r#"{"status":"signup_required","signup_url":"https://railway.com.evil.test/sign-up","pollUrl":"https://evil.test/poll"}"#,
+            false,
+        );
+        assert!(!untrusted.signup_required);
+        assert!(untrusted.signup_url.is_none());
+        assert!(untrusted.poll_url.is_none());
+    }
+
+    #[test]
+    fn trusted_railway_url_requires_https_and_exact_domain_suffix() {
+        assert!(trusted_railway_url("https://railway.com/ssh-signup"));
+        assert!(trusted_railway_url("https://backboard.railway.com/poll"));
+        assert!(!trusted_railway_url("http://railway.com/ssh-signup"));
+        assert!(!trusted_railway_url(
+            "https://railway.com.evil.test/ssh-signup"
+        ));
+        assert!(!trusted_railway_url(
+            "https://railway.com.evil.com/ssh-signup"
+        ));
+        assert!(!trusted_railway_url(
+            "https://user:pass@railway.com/ssh-signup"
+        ));
+        assert!(!trusted_railway_url("https://@railway.com/ssh-signup"));
+    }
+
+    #[test]
+    fn signup_poll_status_recognizes_pending_states() {
+        for status in ["signup_required", "pending", "waiting"] {
+            assert_eq!(
+                signup_poll_pending(&format!(r#"{{"status":"{status}"}}"#)),
+                Some(true)
+            );
+        }
+        assert_eq!(signup_poll_pending(r#"{"status":"approved"}"#), Some(false));
+        assert_eq!(signup_poll_pending("not json"), None);
+        assert_eq!(signup_poll_pending(r#"{"state":"waiting"}"#), None);
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct RailwayFailure {
     pub detail: String,
-    pub trial: RailwayTrial,
+    pub trial: Box<RailwayTrial>,
 }
 
 fn claim_required_failure(trial: RailwayTrial) -> RailwayFailure {
     RailwayFailure {
         detail: "This machine's Railway trial box has expired — claim it on Railway to keep it, or use a Boat seat".into(),
-        trial,
+        trial: Box::new(trial),
     }
 }
 
@@ -338,7 +499,7 @@ fn ssh_failure_result(out: &crate::cloud::ExecOutcome, trial: RailwayTrial) -> R
     } else {
         RailwayFailure {
             detail: ssh_failure(out),
-            trial,
+            trial: Box::new(trial),
         }
     }
 }
@@ -355,7 +516,7 @@ pub async fn provision() -> Result<RailwayTrial, RailwayFailure> {
     .await
     .map_err(|detail| RailwayFailure {
         detail,
-        trial: RailwayTrial::default(),
+        trial: Box::default(),
     })?;
     let mut trial = parse_manifest(&out.stdout, &out.stderr, true);
     if trial.claim_required {
@@ -392,7 +553,7 @@ pub async fn probe_with_existing_deadline(
         .await
         .map_err(|detail| RailwayFailure {
             detail,
-            trial: RailwayTrial::default(),
+            trial: Box::default(),
         })?;
     let trial = parse_manifest(&out.stdout, &out.stderr, !existing_deadline);
     if trial.claim_required {
@@ -409,7 +570,7 @@ pub async fn probe_with_existing_deadline(
             } else {
                 detail
             },
-            trial,
+            trial: Box::new(trial),
         });
     }
     Ok(trial)

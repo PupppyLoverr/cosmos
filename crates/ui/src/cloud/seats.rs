@@ -1,7 +1,4 @@
-//! Settings → Cloud computer: the seat list (Box | BYO VPS | GitHub
-//! workspace), per-seat health, and the add-seat card. Private keys never
-//! touch this page — SSH rides the user's ssh-agent, tokens go straight into
-//! the engine's `cloud-keys.json`.
+//! Settings → Cloud computer: Railway trial, Boat token, and GitHub connection.
 
 use gpui::{
     AnyElement, Context, Entity, IntoElement, Render, SharedString, Task, Window, div, prelude::*,
@@ -10,9 +7,9 @@ use gpui::{
 use zeron_proto::{ByokProvider, CloudSeatKind, HarnessId};
 use zeron_rpc::methods;
 
-use zeron_engine::cloud::{RepoHit, SeatConfig};
+use zeron_engine::cloud::SeatConfig;
 
-use crate::cloud::{CloudView, SeatRow, status_dot};
+use crate::cloud::{CloudView, SeatRow};
 use crate::composer::ComposerInput;
 use crate::icons::{self, icon};
 use crate::popover::{self, Loadable};
@@ -20,22 +17,8 @@ use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
 
-/// The add-seat form's editable fields — one `ComposerInput` per row; which
-/// apply is decided by `draft_kind`.
 struct SeatForm {
-    label: Entity<ComposerInput>,
-    ssh_alias: Entity<ComposerInput>,
-    container: Entity<ComposerInput>,
-    workspace: Entity<ComposerInput>,
-    repo: Entity<ComposerInput>,
-    branch: Entity<ComposerInput>,
-    box_endpoint: Entity<ComposerInput>,
-    cua_endpoint: Entity<ComposerInput>,
-    harness_command: Entity<ComposerInput>,
     box_token: Entity<ComposerInput>,
-    github_pat: Entity<ComposerInput>,
-    cua_token: Entity<ComposerInput>,
-    detached: bool,
 }
 
 impl SeatForm {
@@ -43,25 +26,99 @@ impl SeatForm {
         let mut field =
             |placeholder: &'static str| cx.new(|cx| ComposerInput::new(placeholder, cx));
         Self {
-            label: field("Seat name"),
-            ssh_alias: field("SSH config alias (from ~/.ssh/config)"),
-            container: field("Container name — default cosmos-cloud-<id>"),
-            workspace: field("Workspace path on the seat"),
-            repo: field("GitHub repo — owner/name"),
-            branch: field("Default branch"),
-            box_endpoint: field("Box API endpoint (https://…)"),
-            cua_endpoint: field("CUA endpoint URL (remote cua-driver, optional)"),
-            harness_command: field("Harness command (e.g. claude -p)"),
-            box_token: field("Box token"),
-            github_pat: field("GitHub PAT (repo + workflow scope)"),
-            cua_token: field("CUA token (optional)"),
-            detached: false,
+            box_token: field("Boat token (boat_…)"),
         }
     }
 
     fn text(input: &Entity<ComposerInput>, cx: &gpui::App) -> String {
         input.read(cx).text().trim().to_string()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloudSeatsEvent {
+    StartTrial,
+    ContinueWithRailway,
+}
+
+impl gpui::EventEmitter<CloudSeatsEvent> for CloudSeatsPage {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RailwayCard {
+    Start,
+    Starting,
+    AwaitingSignup,
+    SignIn,
+    Live {
+        minutes_left: Option<i64>,
+        can_keep: bool,
+    },
+    Ended {
+        can_keep: bool,
+    },
+    Failed(String),
+}
+
+pub(crate) fn railway_card(
+    seat: Option<&SeatRow>,
+    starting: bool,
+    waiting: bool,
+    failure: Option<&str>,
+) -> RailwayCard {
+    if waiting {
+        return RailwayCard::AwaitingSignup;
+    }
+    if starting {
+        return RailwayCard::Starting;
+    }
+    let Some(seat) = seat else {
+        return RailwayCard::Start;
+    };
+    if seat.config.signup_url.is_some() {
+        return RailwayCard::SignIn;
+    }
+    if seat.config.expired() {
+        return RailwayCard::Ended {
+            can_keep: seat.config.claim_url.is_some(),
+        };
+    }
+    let minutes_left = seat.config.expires_at.map(|at| {
+        at.signed_duration_since(chrono::Utc::now())
+            .num_minutes()
+            .max(0)
+    });
+    if minutes_left.is_some()
+        || seat
+            .config
+            .last_probe
+            .as_ref()
+            .is_some_and(|probe| probe.online)
+    {
+        return RailwayCard::Live {
+            minutes_left,
+            can_keep: seat.config.claim_url.is_some(),
+        };
+    }
+    if failure.is_some()
+        || seat
+            .config
+            .last_probe
+            .as_ref()
+            .is_some_and(|probe| !probe.online)
+    {
+        let reason = failure
+            .filter(|reason| !reason.trim().is_empty())
+            .or_else(|| {
+                seat.config
+                    .last_probe
+                    .as_ref()
+                    .and_then(|probe| probe.detail.as_deref())
+                    .filter(|reason| !reason.trim().is_empty())
+            })
+            .unwrap_or("Railway didn't answer");
+        return RailwayCard::Failed(reason.to_string());
+    }
+    RailwayCard::Start
 }
 
 struct GitHubDevice {
@@ -74,9 +131,6 @@ pub struct CloudSeatsPage {
     scroll: widgets::PageScroll,
     view: Loadable<CloudView>,
     load_generation: u64,
-    /// `Some(kind)` while the add-seat card is open.
-    draft_kind: Option<CloudSeatKind>,
-    editing_seat: Option<SeatConfig>,
     runner_seat_id: Option<String>,
     runner_device_id: Option<String>,
     runner_info: Option<serde_json::Value>,
@@ -90,53 +144,27 @@ pub struct CloudSeatsPage {
     /// The shared GitHub PAT input — the repo picker's token when a seat has
     /// none of its own. Saved to `cloud-keys.json` under the reserved key.
     shared_pat: Entity<ComposerInput>,
-    /// The GitHub draft card's repo picker: debounced search hits rendered
-    /// under the repo field; picking one writes `owner/name` into it.
-    repo_hits: Vec<RepoHit>,
-    repo_orgs: Vec<String>,
-    repo_truncated: bool,
-    repo_orgs_error: Option<String>,
-    /// Generation counter kills stale debounced searches (300ms).
-    repo_search_gen: u64,
-    /// `pick_repo` writes the field programmatically — suppress the search
-    /// that write would otherwise trigger.
-    suppress_repo_edit: bool,
     /// The Cosmos GitHub App device flow while it waits on the user.
     gh_device: Option<GitHubDevice>,
     gh_login: Option<String>,
     gh_task: Option<Task<()>>,
     show_pat: bool,
-    probing: Option<String>,
     error: Option<String>,
     note: Option<String>,
     load_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
-    _repo_sub: gpui::Subscription,
+    _state_sub: gpui::Subscription,
 }
 
 impl CloudSeatsPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let form = SeatForm::new(cx);
-        // Repo picker: typing in the repo field debounces a search.
-        let repo_input = form.repo.clone();
-        let repo_sub = cx.subscribe(&repo_input, |this, _, event, cx| {
-            if matches!(event, crate::composer::ComposerInputEvent::Edited)
-                && this.draft_kind == Some(CloudSeatKind::GitHub)
-            {
-                if this.suppress_repo_edit {
-                    this.suppress_repo_edit = false;
-                } else {
-                    this.search_repos(cx);
-                }
-            }
-        });
+        let state_sub = cx.observe(&state, |_, _, cx| cx.notify());
         let mut page = Self {
             state,
             scroll: widgets::PageScroll::default(),
             view: Loadable::Idle,
             load_generation: 0,
-            draft_kind: None,
-            editing_seat: None,
             runner_seat_id: None,
             runner_device_id: None,
             runner_info: None,
@@ -150,22 +178,15 @@ impl CloudSeatsPage {
             form,
             shared_pat: cx
                 .new(|cx| ComposerInput::new("GitHub PAT — shared (repo + workflow scope)", cx)),
-            repo_hits: Vec::new(),
-            repo_orgs: Vec::new(),
-            repo_truncated: false,
-            repo_orgs_error: None,
-            repo_search_gen: 0,
-            suppress_repo_edit: false,
             gh_device: None,
             gh_login: None,
             gh_task: None,
             show_pat: false,
-            probing: None,
             error: None,
             note: None,
             load_task: None,
             action_task: None,
-            _repo_sub: repo_sub,
+            _state_sub: state_sub,
         };
         page.load(cx);
         page
@@ -200,6 +221,8 @@ impl CloudSeatsPage {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
+                page.state
+                    .update(cx, |state, cx| state.refresh_cloud(None, cx));
                 cx.notify();
             })
             .ok();
@@ -407,91 +430,6 @@ impl CloudSeatsPage {
         );
     }
 
-    fn edit_harness(&mut self, seat: SeatConfig, cx: &mut Context<Self>) {
-        let command = seat.harness_command.clone().unwrap_or_default();
-        self.form
-            .harness_command
-            .update(cx, |input, cx| input.set_text(command, cx));
-        self.editing_seat = Some(seat);
-        self.draft_kind = None;
-        cx.notify();
-    }
-
-    fn save_harness(&mut self, cx: &mut Context<Self>) {
-        let Some(mut seat) = self.editing_seat.clone() else {
-            return;
-        };
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let command = SeatForm::text(&self.form.harness_command, cx);
-        seat.harness_command = (!command.is_empty()).then_some(command);
-        self.error = None;
-        self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::CLOUD_SAVE_SEAT,
-                    serde_json::json!({ "seat": seat, "secrets": {} }),
-                )
-                .await;
-            this.update(cx, |page, cx| {
-                match result {
-                    Ok(_) => {
-                        page.editing_seat = None;
-                        page.note = Some("Harness command saved.".into());
-                    }
-                    Err(err) => page.error = Some(err.to_string()),
-                }
-                page.load(cx);
-                page.state
-                    .update(cx, |state, cx| state.refresh_cloud(None, cx));
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    fn probe(&mut self, seat_id: String, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        self.probing = Some(seat_id.clone());
-        self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::CLOUD_PROBE_SEAT,
-                    serde_json::json!({ "seatId": seat_id }),
-                )
-                .await;
-            this.update(cx, |page, cx| {
-                page.probing = None;
-                match result {
-                    Ok(probe) => {
-                        let online = probe
-                            .get("online")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let detail = probe
-                            .get("detail")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or(if online { "online" } else { "offline" });
-                        page.note = Some(format!("{seat_id} — {detail}"));
-                    }
-                    Err(err) => page.error = Some(err.to_string()),
-                }
-                page.load(cx);
-                page.state
-                    .update(cx, |state, cx| state.refresh_cloud(None, cx));
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    /// Seat-level lifecycle op (`sleep` archives a Boat box — billing off;
-    /// `wake` resumes it). No chat needed — `chatId` rides empty.
     fn seat_control(&mut self, seat_id: &str, op: &str, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -518,89 +456,6 @@ impl CloudSeatsPage {
             })
             .ok();
         }));
-    }
-
-    /// Debounced repo search — 300ms after the last keystroke wins; stale
-    /// replies drop on the generation counter. Empty query = recents +
-    /// orgs, per the spec's picker shape.
-    fn search_repos(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        self.repo_search_gen += 1;
-        let generation = self.repo_search_gen;
-        let query = SeatForm::text(&self.form.repo, cx);
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(300))
-                .await;
-            let stale = this
-                .update(cx, |page, _| page.repo_search_gen != generation)
-                .unwrap_or(true);
-            if stale {
-                return;
-            }
-            let result = engine
-                .client()
-                .call(
-                    methods::CLOUD_GITHUB_REPOS,
-                    serde_json::json!({ "query": query }),
-                )
-                .await;
-            this.update(cx, |page, cx| {
-                if page.repo_search_gen != generation {
-                    return;
-                }
-                match result {
-                    Ok(v) => {
-                        page.repo_hits =
-                            serde_json::from_value(v.get("repos").cloned().unwrap_or_default())
-                                .unwrap_or_default();
-                        page.repo_orgs =
-                            serde_json::from_value(v.get("orgs").cloned().unwrap_or_default())
-                                .unwrap_or_default();
-                        page.repo_truncated = v
-                            .get("truncated")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        page.repo_orgs_error = v
-                            .get("orgsError")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                    }
-                    Err(_) => {
-                        page.repo_hits.clear();
-                        page.repo_orgs.clear();
-                        page.repo_truncated = false;
-                        page.repo_orgs_error = None;
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Pick a repo row — the field takes `owner/name`, hits close.
-    fn pick_repo(&mut self, full_name: String, cx: &mut Context<Self>) {
-        let default_branch = self
-            .repo_hits
-            .iter()
-            .find(|r| r.full_name == full_name)
-            .map(|r| r.default_branch.clone());
-        self.repo_hits.clear();
-        self.repo_search_gen += 1;
-        self.suppress_repo_edit = true;
-        self.form
-            .repo
-            .update(cx, |input, cx| input.set_text(full_name, cx));
-        if let Some(branch) = default_branch.filter(|b| !b.is_empty()) {
-            self.form
-                .branch
-                .update(cx, |input, cx| input.set_text(branch, cx));
-        }
-        cx.notify();
     }
 
     /// Verify + save the shared GitHub PAT — the repo picker and every
@@ -803,268 +658,76 @@ impl CloudSeatsPage {
         }));
     }
 
-    fn save_draft(&mut self, cx: &mut Context<Self>) {
-        let Some(kind) = self.draft_kind else { return };
+    fn save_boat(&mut self, cx: &mut Context<Self>) {
+        let token = SeatForm::text(&self.form.box_token, cx);
+        if token.is_empty() {
+            self.error = Some("Paste your Boat token first.".into());
+            cx.notify();
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let text = |input: &Entity<ComposerInput>| SeatForm::text(input, cx);
-        let label = text(&self.form.label);
-        let non_empty = |s: String| (!s.is_empty()).then_some(s);
-        let id = format!("seat-{}", uuid::Uuid::new_v4().simple());
+        let existing_id = self
+            .state
+            .read(cx)
+            .cloud_seats()
+            .iter()
+            .find(|seat| seat.config.kind == Some(CloudSeatKind::Box))
+            .map(|seat| seat.config.id.clone());
+        let seat_id =
+            existing_id.unwrap_or_else(|| format!("seat-{}", uuid::Uuid::new_v4().simple()));
         let seat = serde_json::json!({
-            "id": id,
-            "kind": kind,
-            "label": if label.is_empty() { kind.label() } else { label.as_str() },
-            "sshAlias": non_empty(text(&self.form.ssh_alias)),
-            "container": non_empty(text(&self.form.container)),
-            "workspacePath": non_empty(text(&self.form.workspace)),
-            "repo": non_empty(text(&self.form.repo)),
-            "branch": non_empty(text(&self.form.branch)),
-            "boxEndpoint": non_empty(text(&self.form.box_endpoint)),
-            "cuaEndpoint": non_empty(text(&self.form.cua_endpoint)),
-            "harnessCommand": non_empty(text(&self.form.harness_command)),
-            "detached": self.form.detached,
+            "id": seat_id.clone(),
+            "kind": CloudSeatKind::Box,
+            "label": "Boat",
         });
-        let secrets = serde_json::json!({
-            "boxToken": non_empty(text(&self.form.box_token)),
-            "githubPat": non_empty(text(&self.form.github_pat)),
-            "cuaToken": non_empty(text(&self.form.cua_token)),
-        });
-        // A persistent computer the user just configured becomes the seat
-        // new cloud chats use (Boat token / VPS alias beat the trial).
-        let prefer = matches!(kind, CloudSeatKind::Box | CloudSeatKind::Ssh)
-            .then(|| seat.get("id").and_then(|v| v.as_str()).map(str::to_string))
-            .flatten();
+        let secrets = serde_json::json!({ "boxToken": token });
         self.error = None;
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
+            let saved = engine
                 .client()
                 .call(
                     methods::CLOUD_SAVE_SEAT,
                     serde_json::json!({ "seat": seat, "secrets": secrets }),
                 )
                 .await;
-            this.update(cx, |page, cx| {
-                match result {
-                    Ok(_) => {
-                        if let Some(prefer) = prefer.clone() {
-                            page.state
-                                .update(cx, |state, _| state.cloud_prefer_seat = Some(prefer));
-                        }
-                        page.draft_kind = None;
-                        page.form = SeatForm::new(cx);
-                        page.note = Some(
-                            "Seat saved — probe it to confirm reachability before starting a run."
-                                .into(),
-                        );
-                    }
+            if let Err(err) = saved {
+                let _ = this.update(cx, |page, cx| {
+                    page.error = Some(err.to_string());
+                    cx.notify();
+                });
+                return;
+            }
+            let _ = this.update(cx, |page, cx| {
+                page.state.update(cx, |state, cx| {
+                    state.cloud_prefer_seat = Some(seat_id.clone());
+                    state.persist_cloud_picks(cx);
+                    state.refresh_cloud(None, cx);
+                });
+                page.form
+                    .box_token
+                    .update(cx, |input, cx| input.set_text("", cx));
+                cx.notify();
+            });
+            let probe = engine
+                .client()
+                .call(
+                    methods::CLOUD_PROBE_SEAT,
+                    serde_json::json!({ "seatId": seat_id }),
+                )
+                .await;
+            let _ = this.update(cx, |page, cx| {
+                match probe {
+                    Ok(_) => page.note = Some("Boat token saved.".into()),
                     Err(err) => page.error = Some(err.to_string()),
                 }
                 page.load(cx);
-                // The shared view feeds the composer's seat picker — force it.
                 page.state
                     .update(cx, |state, cx| state.refresh_cloud(None, cx));
                 cx.notify();
-            })
-            .ok();
+            });
         }));
-    }
-
-    fn seat_row(
-        &self,
-        seat: &SeatRow,
-        first: bool,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let probe = seat.config.last_probe.clone();
-        let capabilities = &seat.capabilities;
-        let seat_id = seat.config.id.clone();
-        let edit_harness_id = format!("seat-edit-harness-{seat_id}");
-        let kind_label = seat
-            .config
-            .kind
-            .map(|k| k.label())
-            .unwrap_or("Unknown")
-            .to_string();
-        let detail: String = match seat.config.kind {
-            Some(CloudSeatKind::Ssh) => seat
-                .config
-                .ssh_alias
-                .clone()
-                .unwrap_or_else(|| "no ssh alias".into()),
-            Some(CloudSeatKind::Railway) => {
-                // Status + time left per spec; the claim URL surfaces on the
-                // seat's card actions when one was minted. A saved snapshot
-                // (pulled ~10 min before expiry) is what a Boat seat restores.
-                let backup = if seat.config.backup_at.is_some() {
-                    " · workspace backed up locally"
-                } else {
-                    ""
-                };
-                match seat.config.expires_at {
-                    Some(at) => {
-                        let left = at.signed_duration_since(chrono::Utc::now());
-                        if left.num_seconds() <= 0 {
-                            format!("trial ended{backup}")
-                        } else {
-                            format!("trial · {}m left{backup}", left.num_minutes())
-                        }
-                    }
-                    None => "railway.new trial — probe to provision".into(),
-                }
-            }
-            Some(CloudSeatKind::Box) => seat
-                .config
-                .box_id
-                .clone()
-                .or_else(|| seat.config.box_endpoint.clone())
-                .unwrap_or_else(|| "token-only seat".into()),
-            Some(CloudSeatKind::GitHub) => {
-                seat.config.repo.clone().unwrap_or_else(|| "no repo".into())
-            }
-            None => String::new(),
-        };
-        let mut caps: Vec<&'static str> = Vec::new();
-        if capabilities.exec {
-            caps.push("exec");
-        }
-        if capabilities.shell {
-            caps.push("shell");
-        }
-        if capabilities.files {
-            caps.push("files");
-        }
-        if capabilities.git {
-            caps.push("git");
-        }
-        if capabilities.pull_requests {
-            caps.push("prs");
-        }
-        if capabilities.computer {
-            caps.push("computer");
-        }
-        if capabilities.keeps_running {
-            caps.push("24/7");
-        }
-        let probing = self.probing.as_deref() == Some(seat_id.as_str());
-        widgets::card_row(theme, first)
-            .child(widgets::row_tile(theme, icons::CLOUD))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(widgets::row_title(theme, seat.config.label.clone()))
-                            .child(widgets::badge(theme, kind_label))
-                            .child(status_dot(theme, probe.as_ref(), false)),
-                    )
-                    .child(
-                        div()
-                            .text_size(crate::typography::ui_rems(11.5))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from(if detail.is_empty() {
-                                "Not configured".to_string()
-                            } else {
-                                detail
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_size(crate::typography::ui_rems(10.5))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(if caps.is_empty() {
-                                "no capabilities yet — add credentials and probe".to_string()
-                            } else {
-                                caps.join(" · ")
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .flex_row()
-                    .gap(px(6.0))
-                    // Railway seats carry a claim link — opens in the user's
-                    // browser, never embedded.
-                    .when_some(seat.config.claim_url.clone(), |el, url| {
-                        el.child(
-                            popover::btn_ghost(theme, "Claim", format!("seat-claim-{seat_id}"))
-                                .id(SharedString::from(format!("seat-claim-{seat_id}")))
-                                .on_click(move |_, _, cx| cx.open_url(&url)),
-                        )
-                    })
-                    // Boat seats with a live box expose Sleep (billing off).
-                    .when(
-                        seat.config.kind == Some(CloudSeatKind::Box)
-                            && seat.config.box_id.is_some()
-                            && !probe.as_ref().is_some_and(|p| p.sleeping),
-                        |el| {
-                            let seat_id = seat_id.clone();
-                            el.child(
-                                popover::btn_ghost(theme, "Sleep", format!("seat-sleep-{seat_id}"))
-                                    .id(SharedString::from(format!("seat-sleep-{seat_id}")))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.seat_control(&seat_id, "sleep", cx)
-                                    })),
-                            )
-                        },
-                    )
-                    .when(probe.as_ref().is_some_and(|p| p.sleeping), |el| {
-                        let seat_id = seat_id.clone();
-                        el.child(
-                            popover::btn_ghost(theme, "Wake", format!("seat-wake-{seat_id}"))
-                                .id(SharedString::from(format!("seat-wake-{seat_id}")))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.seat_control(&seat_id, "wake", cx)
-                                })),
-                        )
-                    })
-                    .child({
-                        let probe_seat_id = seat_id.clone();
-                        popover::btn_ghost(theme, "Probe", format!("seat-probe-{seat_id}"))
-                            .id(SharedString::from(format!("seat-probe-{seat_id}")))
-                            .when(probing, |el| el.opacity(0.5))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.probe(probe_seat_id.clone(), cx)
-                            }))
-                    })
-                    .child({
-                        let seat = seat.config.clone();
-                        popover::btn_ghost(theme, "Edit harness", edit_harness_id.clone())
-                            .id(SharedString::from(edit_harness_id))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.edit_harness(seat.clone(), cx)
-                            }))
-                    })
-                    .child({
-                        let seat = seat.config.clone();
-                        popover::btn_ghost(theme, "Runner", format!("seat-runner-{seat_id}"))
-                            .id(SharedString::from(format!("seat-runner-{seat_id}")))
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.open_runner(&seat, cx)),
-                            )
-                    })
-                    .child({
-                        let seat_id = seat.config.id.clone();
-                        popover::btn_ghost(theme, "Remove", format!("seat-remove-{seat_id}"))
-                            .id(SharedString::from(format!("seat-remove-{seat_id}")))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.remove_seat(seat_id.clone(), cx)
-                            }))
-                    }),
-            )
-            .into_any_element()
     }
 
     fn runner_editor(
@@ -1367,276 +1030,6 @@ impl CloudSeatsPage {
         card.into_any_element()
     }
 
-    fn draft_card(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let Some(kind) = self.draft_kind else {
-            return div().into_any_element();
-        };
-        let mut card = widgets::section_card(theme);
-        card = card.child(widgets::card_row(theme, true).child(widgets::row_title(
-            theme,
-            format!("New {} seat", kind.label()),
-        )));
-        card = card.child(
-            div()
-                .px(px(20.0))
-                .pb(px(12.0))
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .child(popover::dialog_field(
-                    self.form.label.clone().into_any_element(),
-                ))
-                // Railway needs nothing but the user's ssh key — the first
-                // probe provisions the trial VM and stamps the countdown.
-                .when(kind == CloudSeatKind::Railway, |el| {
-                    el.child(
-                        div()
-                            .text_size(crate::typography::ui_rems(11.5))
-                            .text_color(theme.text_muted)
-                            .child(
-                                "Provisions on first probe via `ssh railway.new` — your ssh key \
-                                 is the trial identity. 60 minutes unless you claim it.",
-                            ),
-                    )
-                })
-                .when(kind == CloudSeatKind::Ssh, |el| {
-                    el.child(popover::dialog_field(
-                        self.form.ssh_alias.clone().into_any_element(),
-                    ))
-                    .child(popover::dialog_field(
-                        self.form.container.clone().into_any_element(),
-                    ))
-                    .child(popover::dialog_field(
-                        self.form.workspace.clone().into_any_element(),
-                    ))
-                })
-                .when(kind == CloudSeatKind::Box, |el| {
-                    el.child(popover::dialog_field(
-                        self.form.box_token.clone().into_any_element(),
-                    ))
-                    .child(popover::dialog_field(
-                        self.form.box_endpoint.clone().into_any_element(),
-                    ))
-                })
-                .when(kind == CloudSeatKind::GitHub, |el| {
-                    let mut col = el
-                        .child(popover::dialog_field(
-                            self.form.repo.clone().into_any_element(),
-                        ))
-                        .child(popover::dialog_field(
-                            self.form.branch.clone().into_any_element(),
-                        ))
-                        .when(self.show_pat, |el| {
-                            el.child(popover::dialog_field(
-                                self.form.github_pat.clone().into_any_element(),
-                            ))
-                        });
-                    // Repo picker — debounced hits (or recents on open) under
-                    // the field; a click writes `owner/name` + branch.
-                    if !self.repo_hits.is_empty() {
-                        col = col.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .rounded(px(8.0))
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.surface)
-                                .p(px(4.0))
-                                .max_h(px(200.0))
-                                .overflow_y_hidden()
-                                .children(self.repo_hits.iter().take(8).enumerate().map(
-                                    |(ix, hit)| {
-                                        let name = hit.full_name.clone();
-                                        let desc = hit.description.clone().unwrap_or_default();
-                                        let row_fade = SharedString::from(format!("repo-hit-{ix}"));
-                                        div()
-                                            .id(SharedString::from(format!("repo-hit-{ix}")))
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .px(px(8.0))
-                                            .py(px(5.0))
-                                            .rounded(px(6.0))
-                                            .cursor_pointer()
-                                            .bg(crate::motion::hover_blend(
-                                                &row_fade,
-                                                gpui::transparent_black(),
-                                                theme.element_hover,
-                                            ))
-                                            .on_hover(crate::motion::hover_listener(row_fade))
-                                            .child(
-                                                icon(icons::GIT_BRANCH)
-                                                    .size(px(12.0))
-                                                    .flex_none()
-                                                    .text_color(theme.text_muted),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .child(
-                                                        div()
-                                                            .truncate()
-                                                            .text_size(crate::typography::ui_rems(
-                                                                11.5,
-                                                            ))
-                                                            .text_color(theme.text)
-                                                            .child(SharedString::from(
-                                                                name.clone(),
-                                                            )),
-                                                    )
-                                                    .when(!desc.is_empty(), |el| {
-                                                        el.child(
-                                                            div()
-                                                                .truncate()
-                                                                .text_size(
-                                                                    crate::typography::ui_rems(9.5),
-                                                                )
-                                                                .text_color(theme.text_faint)
-                                                                .child(SharedString::from(desc)),
-                                                        )
-                                                    }),
-                                            )
-                                            .when(hit.private, |el| {
-                                                el.child(widgets::badge(theme, "private"))
-                                            })
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.pick_repo(name.clone(), cx)
-                                            }))
-                                    },
-                                )),
-                        );
-                    } else if !self.repo_orgs.is_empty() {
-                        col = col.child(
-                            div()
-                                .text_size(crate::typography::ui_rems(10.0))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from(format!(
-                                    "orgs: {}",
-                                    self.repo_orgs.join(" · ")
-                                ))),
-                        );
-                    }
-                    if self.repo_truncated {
-                        col = col.child(
-                            div()
-                                .text_size(crate::typography::ui_rems(10.0))
-                                .text_color(theme.text_muted)
-                                .child("Showing first 500 — refine search"),
-                        );
-                    }
-                    if let Some(error) = &self.repo_orgs_error {
-                        col = col.child(
-                            div()
-                                .text_size(crate::typography::ui_rems(10.0))
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from(format!("Organizations: {error}"))),
-                        );
-                    }
-                    col
-                })
-                .child(popover::dialog_field(
-                    self.form.harness_command.clone().into_any_element(),
-                ))
-                .child(popover::dialog_field(
-                    self.form.cua_endpoint.clone().into_any_element(),
-                ))
-                .child(popover::dialog_field(
-                    self.form.cua_token.clone().into_any_element(),
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            widgets::toggle_switch(theme, self.form.detached, "seat-detached")
-                                .id("seat-detached-toggle")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.form.detached = !this.form.detached;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .text_size(crate::typography::ui_rems(11.5))
-                                .text_color(theme.text_muted)
-                                .child(
-                                    "Run detached — the harness keeps going when this app closes",
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap(px(8.0))
-                        .child(
-                            popover::btn_primary(theme, "Save seat")
-                                .id("seat-save")
-                                .on_click(cx.listener(|this, _, _, cx| this.save_draft(cx))),
-                        )
-                        .child(
-                            popover::btn_ghost(theme, "Cancel", "seat-cancel")
-                                .id("seat-cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.draft_kind = None;
-                                    cx.notify();
-                                })),
-                        ),
-                ),
-        );
-        card.into_any_element()
-    }
-
-    fn harness_editor(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let Some(seat) = &self.editing_seat else {
-            return div().into_any_element();
-        };
-        widgets::section_card(theme)
-            .child(widgets::card_row(theme, true).child(widgets::row_title(
-                theme,
-                format!("Edit harness — {}", seat.label),
-            )))
-            .child(
-                div()
-                    .px(px(20.0))
-                    .pb(px(12.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(popover::dialog_field(
-                        self.form.harness_command.clone().into_any_element(),
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap(px(8.0))
-                            .child(
-                                popover::btn_primary(theme, "Save harness")
-                                    .id("seat-harness-save")
-                                    .on_click(cx.listener(|this, _, _, cx| this.save_harness(cx))),
-                            )
-                            .child(
-                                popover::btn_ghost(theme, "Cancel", "seat-harness-cancel")
-                                    .id("seat-harness-cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.editing_seat = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
     fn on_scroll_hovered(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
         if self.scroll.set_list_hovered(*hovered) {
             cx.notify();
@@ -1658,98 +1051,295 @@ impl Render for CloudSeatsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let scrollbar = popover::rail(self, "cloud-seats-scrollbar", &theme, cx);
-        let seats = self
-            .view
-            .ready()
-            .map(|v| v.seats.clone())
-            .unwrap_or_default();
+        let seats = self.state.read(cx).cloud_seats().to_vec();
         let load_error = self.view.ready().and_then(|view| view.load_error.clone());
-        let mut card = widgets::section_card(&theme);
-        if seats.is_empty() {
-            card = card.child(
-                widgets::card_row(&theme, true)
-                    .child(widgets::row_tile(&theme, icons::CLOUD))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(widgets::row_title(&theme, "No seats yet"))
+        let state = self.state.read(cx);
+        let starting = state.cloud_trial_starting;
+        let waiting = state.cloud_trial_signup_waiting;
+        let failure = state.cloud_trial_failure.clone();
+        let railway = seats
+            .iter()
+            .find(|seat| seat.config.kind == Some(CloudSeatKind::Railway));
+        let boat = seats
+            .iter()
+            .find(|seat| seat.config.kind == Some(CloudSeatKind::Box));
+        let legacy: Vec<_> = seats
+            .iter()
+            .filter(|seat| {
+                matches!(
+                    seat.config.kind,
+                    Some(CloudSeatKind::Ssh | CloudSeatKind::GitHub)
+                )
+            })
+            .collect();
+        let card_state = railway_card(railway, starting, waiting, failure.as_deref());
+        let (railway_copy, railway_action) = match &card_state {
+            RailwayCard::Start => (
+                "Free Linux computer for 60 minutes. No account needed.".to_string(),
+                Some(("Start free trial", true, CloudSeatsEvent::StartTrial)),
+            ),
+            RailwayCard::Starting => ("Starting your free computer…".into(), None),
+            RailwayCard::AwaitingSignup => (
+                "Finish signing in on Railway — Cosmos continues on its own.".into(),
+                Some(("Open Railway", false, CloudSeatsEvent::ContinueWithRailway)),
+            ),
+            RailwayCard::SignIn => (
+                "Railway wants you to sign in to keep using the free trial.".into(),
+                Some((
+                    "Continue with Railway",
+                    true,
+                    CloudSeatsEvent::ContinueWithRailway,
+                )),
+            ),
+            RailwayCard::Live {
+                minutes_left,
+                can_keep,
+            } => (
+                minutes_left
+                    .map(|minutes| format!("Running · {minutes}m left"))
+                    .unwrap_or_else(|| "Running".into()),
+                if *can_keep {
+                    Some((
+                        "Continue with Railway",
+                        false,
+                        CloudSeatsEvent::ContinueWithRailway,
+                    ))
+                } else {
+                    None
+                },
+            ),
+            RailwayCard::Ended { can_keep: true } => (
+                "Your trial hour is up. Continue on Railway within 24 hours to keep your work."
+                    .into(),
+                Some((
+                    "Continue with Railway",
+                    true,
+                    CloudSeatsEvent::ContinueWithRailway,
+                )),
+            ),
+            RailwayCard::Ended { can_keep: false } => (
+                "Your trial hour is up.".into(),
+                Some(("Start again", true, CloudSeatsEvent::StartTrial)),
+            ),
+            RailwayCard::Failed(reason) => (
+                reason.clone(),
+                Some(("Try again", true, CloudSeatsEvent::StartTrial)),
+            ),
+        };
+        let mut railway_actions = div().flex_none().flex().items_center().gap(px(6.0));
+        if let Some((label, primary, event)) = railway_action {
+            railway_actions = railway_actions.child(if primary {
+                popover::btn_primary(&theme, label)
+                    .id("railway-action")
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(event)))
+                    .into_any_element()
+            } else {
+                popover::btn_ghost(&theme, label, "railway-action")
+                    .id("railway-action")
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(event)))
+                    .into_any_element()
+            });
+        }
+        let railway_section = widgets::section_card(&theme).child(
+            widgets::card_row(&theme, true)
+                .child(widgets::row_tile(&theme, icons::CLOUD))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(widgets::row_title(&theme, "Railway"))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(railway_copy)),
+                        ),
+                )
+                .child(railway_actions),
+        );
+
+        let boat_copy = if let Some(seat) = boat.filter(|seat| seat.has_box_token) {
+            if seat
+                .config
+                .last_probe
+                .as_ref()
+                .is_some_and(|probe| probe.sleeping)
+            {
+                "Connected — cloud chats run here, sleeping"
+            } else {
+                "Connected — cloud chats run here"
+            }
+        } else {
+            "A cloud computer that stays on when you close Cosmos."
+        };
+        let mut boat_actions = div().flex_none().flex().items_center().gap(px(6.0));
+        let mut boat_section = widgets::section_card(&theme).child(
+            widgets::card_row(&theme, true)
+                .child(widgets::row_tile(&theme, icons::CLOUD))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(widgets::row_title(&theme, "Boat"))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.text_muted)
+                                .child(boat_copy),
+                        ),
+                )
+                .child({
+                    if let Some(seat) = boat.filter(|seat| seat.has_box_token) {
+                        let seat_id = seat.config.id.clone();
+                        let sleeping = seat
+                            .config
+                            .last_probe
+                            .as_ref()
+                            .is_some_and(|probe| probe.sleeping);
+                        if seat.config.box_id.is_some() {
+                            let control_seat_id = seat_id.clone();
+                            boat_actions = boat_actions.child(
+                                popover::btn_ghost(
+                                    &theme,
+                                    if sleeping { "Wake" } else { "Sleep" },
+                                    "boat-control",
+                                )
+                                .id("boat-control")
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.seat_control(
+                                            &control_seat_id,
+                                            if sleeping { "wake" } else { "sleep" },
+                                            cx,
+                                        )
+                                    },
+                                )),
+                            );
+                        }
+                        let runner_seat = seat.config.clone();
+                        boat_actions = boat_actions
                             .child(
-                                div()
-                                    .text_size(crate::typography::ui_rems(11.5))
-                                    .text_color(theme.text_muted)
-                                    .child(
-                                        "Add a Box, a BYO VPS over SSH, or a GitHub workspace \
-                                         to run agents in the cloud.",
-                                    ),
-                            ),
-                    ),
-            );
+                                popover::btn_ghost(&theme, "Runner", "boat-runner")
+                                    .id("boat-runner")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_runner(&runner_seat, cx)
+                                    })),
+                            )
+                            .child(
+                                popover::btn_ghost(&theme, "Remove", "boat-remove")
+                                    .id("boat-remove")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_seat(seat_id.clone(), cx)
+                                    })),
+                            );
+                        boat_actions.into_any_element()
+                    } else {
+                        div()
+                            .flex_none()
+                            .child(
+                                popover::btn_primary(&theme, "Add")
+                                    .id("boat-add")
+                                    .on_click(cx.listener(|this, _, _, cx| this.save_boat(cx))),
+                            )
+                            .into_any_element()
+                    }
+                }),
+        );
+        if boat.is_none_or(|seat| !seat.has_box_token) {
+            boat_section = boat_section.child(div().px(px(20.0)).pb(px(12.0)).child(
+                popover::dialog_field(self.form.box_token.clone().into_any_element()),
+            ));
         }
-        for (ix, seat) in seats.iter().enumerate() {
-            card = card.child(self.seat_row(seat, ix == 0, &theme, cx));
-        }
+
         let mut column = widgets::page_column()
             .child(widgets::page_header(&theme, "Cloud computer", None))
             .child(
                 widgets::page_subtitle(
                     &theme,
-                    "Seats Cosmos attaches to and drives — Cosmos does not host the VM. A Box \
-                     token, an SSH alias to a Linux Docker host, or a connected GitHub repo each \
-                     give an agent somewhere to run; SSH keys stay in your agent, tokens stay \
-                     in this device's keys file.",
+                    "Where cloud agents run. Use the free Railway trial, or add a Boat token for a computer that stays on.",
                 )
                 .max_w(px(560.0))
                 .line_height(px(20.0)),
             )
-            .child(card);
+            .child(railway_section)
+            .child(boat_section);
+
         if let Some(seat) = self.runner_seat_id.as_deref().and_then(|seat_id| {
-            self.view
-                .ready()
-                .and_then(|view| view.seat(seat_id))
+            seats
+                .iter()
+                .find(|row| row.config.id == seat_id)
                 .map(|row| row.config.clone())
         }) {
             column = column.child(self.runner_editor(&seat, &theme, cx));
         }
-        if let Some(error) = load_error {
-            column = column.child(widgets::error_strip(&theme, error));
-        }
-        if self.editing_seat.is_some() {
-            column = column.child(self.harness_editor(&theme, cx));
-        }
-        if self.draft_kind.is_none() && self.editing_seat.is_none() {
-            column = column.child(
-                div().flex().flex_row().gap(px(8.0)).pt(px(4.0)).children(
-                    [
-                        (CloudSeatKind::Railway, "Railway trial"),
-                        (CloudSeatKind::Box, "Boat"),
-                        (CloudSeatKind::Ssh, "BYO VPS (SSH)"),
-                        (CloudSeatKind::GitHub, "GitHub workspace"),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(ix, (kind, label))| {
-                        popover::btn_ghost(&theme, label, format!("seat-add-{ix}"))
-                            .id(("seat-add", ix))
+
+        if !legacy.is_empty() {
+            let mut other = widgets::section_card(&theme);
+            for (index, seat) in legacy.iter().enumerate() {
+                let seat_id = seat.config.id.clone();
+                let kind = seat
+                    .config
+                    .kind
+                    .map(CloudSeatKind::label)
+                    .unwrap_or("Unknown");
+                let mut actions = div().flex_none().flex().items_center().gap(px(6.0));
+                if seat.config.kind == Some(CloudSeatKind::Ssh) {
+                    let runner_seat = seat.config.clone();
+                    actions = actions.child(
+                        popover::btn_ghost(&theme, "Runner", format!("legacy-runner-{seat_id}"))
+                            .id(SharedString::from(format!("legacy-runner-{seat_id}")))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.draft_kind = Some(kind);
-                                this.note = None;
-                                // Open with recents already loaded — the
-                                // picker's empty-query path.
-                                if kind == CloudSeatKind::GitHub {
-                                    this.search_repos(cx);
-                                }
-                                cx.notify();
-                            }))
-                    }),
-                ),
+                                this.open_runner(&runner_seat, cx)
+                            })),
+                    );
+                }
+                actions =
+                    actions.child(
+                        popover::btn_ghost(&theme, "Remove", format!("legacy-remove-{seat_id}"))
+                            .id(SharedString::from(format!("legacy-remove-{seat_id}")))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_seat(seat_id.clone(), cx)
+                            })),
+                    );
+                other = other.child(
+                    widgets::card_row(&theme, index == 0)
+                        .child(widgets::row_tile(&theme, icons::CLOUD))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(widgets::row_title(&theme, seat.config.label.clone()))
+                                .child(
+                                    div()
+                                        .text_size(crate::typography::ui_rems(11.5))
+                                        .text_color(theme.text_muted)
+                                        .child(kind),
+                                ),
+                        )
+                        .child(actions),
+                );
+            }
+            column = column.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(widgets::row_title(&theme, "Other seats"))
+                    .child(other),
             );
         }
-        if self.draft_kind.is_some() {
-            column = column.child(self.draft_card(&theme, cx));
+
+        if let Some(error) = load_error {
+            column = column.child(widgets::error_strip(&theme, error));
         }
         if let Some(note) = &self.note {
             column = column.child(
@@ -1763,9 +1353,11 @@ impl Render for CloudSeatsPage {
             column = column.child(widgets::error_strip(&theme, error.clone()));
         }
 
-        // GitHub via the Cosmos GitHub App — powers the repo picker and
-        // every GitHub seat without its own token.
-        let has_pat = self.view.ready().map(|v| v.has_github_pat).unwrap_or(false);
+        let has_pat = self
+            .view
+            .ready()
+            .map(|view| view.has_github_pat)
+            .unwrap_or(false);
         let waiting = self.gh_device.as_ref();
         let status: SharedString = if let Some(device) = waiting {
             format!(
@@ -1787,7 +1379,7 @@ impl Render for CloudSeatsPage {
                 .gh_login
                 .clone()
                 .or_else(|| self.state.read(cx).cloud_github_login.clone());
-            match login.as_deref().filter(|l| !l.is_empty()) {
+            match login.as_deref().filter(|login| !login.is_empty()) {
                 Some(login) => {
                     format!("Connected as {login} — repos, pull requests and GitHub seats use it.")
                         .into()
@@ -1859,7 +1451,7 @@ impl Render for CloudSeatsPage {
                         .id("gh-install")
                         .cursor_pointer()
                         .text_color(theme.text_muted)
-                        .hover(|s| s.text_color(theme.text))
+                        .hover(|style| style.text_color(theme.text))
                         .child("Choose repositories")
                         .on_click(|_, _, cx| {
                             cx.open_url(zeron_engine::cloud::COSMOS_GITHUB_INSTALL_URL)
@@ -1870,7 +1462,7 @@ impl Render for CloudSeatsPage {
                         .id("gh-pat-toggle")
                         .cursor_pointer()
                         .text_color(theme.text_muted)
-                        .hover(|s| s.text_color(theme.text))
+                        .hover(|style| style.text_color(theme.text))
                         .child(if self.show_pat {
                             "Hide token option"
                         } else {
@@ -1917,5 +1509,107 @@ impl Render for CloudSeatsPage {
                     .child(column),
             )
             .children(scrollbar)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use zeron_proto::SeatProbe;
+
+    fn railway() -> SeatRow {
+        SeatRow {
+            config: SeatConfig {
+                kind: Some(CloudSeatKind::Railway),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn railway_card_prioritizes_waiting_and_starting() {
+        assert_eq!(
+            railway_card(None, true, true, None),
+            RailwayCard::AwaitingSignup
+        );
+        assert_eq!(railway_card(None, true, false, None), RailwayCard::Starting);
+        assert_eq!(railway_card(None, false, false, None), RailwayCard::Start);
+    }
+
+    #[test]
+    fn railway_card_covers_signup_live_and_ended_trials() {
+        let mut seat = railway();
+        seat.config.signup_url = Some("https://railway.com/signup".into());
+        seat.config.expires_at = Some(Utc::now() - Duration::minutes(1));
+        assert_eq!(
+            railway_card(Some(&seat), false, false, None),
+            RailwayCard::SignIn
+        );
+
+        seat.config.signup_url = None;
+        seat.config.expires_at = Some(Utc::now() + Duration::minutes(31));
+        assert_eq!(
+            railway_card(Some(&seat), false, false, None),
+            RailwayCard::Live {
+                minutes_left: Some(30),
+                can_keep: false,
+            }
+        );
+        seat.config.expires_at = None;
+        seat.config.last_probe = Some(SeatProbe {
+            online: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            railway_card(Some(&seat), false, false, None),
+            RailwayCard::Live {
+                minutes_left: None,
+                can_keep: false,
+            }
+        );
+
+        seat.config.expires_at = Some(Utc::now() - Duration::minutes(1));
+        seat.config.claim_url = Some("https://railway.com/claim".into());
+        assert_eq!(
+            railway_card(Some(&seat), false, false, None),
+            RailwayCard::Ended { can_keep: true }
+        );
+        seat.config.claim_url = None;
+        assert_eq!(
+            railway_card(Some(&seat), false, false, None),
+            RailwayCard::Ended { can_keep: false }
+        );
+    }
+
+    #[test]
+    fn railway_card_uses_probe_detail_for_failures() {
+        let mut seat = railway();
+        seat.config.last_probe = Some(SeatProbe {
+            online: false,
+            detail: Some("Trial unavailable".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            railway_card(Some(&seat), false, false, None),
+            RailwayCard::Failed("Trial unavailable".into())
+        );
+        assert_eq!(
+            railway_card(Some(&seat), false, false, Some("Try again")),
+            RailwayCard::Failed("Try again".into())
+        );
+        assert_eq!(
+            railway_card(None, false, false, Some("Try again")),
+            RailwayCard::Start
+        );
+        seat.config.last_probe = Some(SeatProbe {
+            online: false,
+            ..Default::default()
+        });
+        assert_eq!(
+            railway_card(Some(&seat), false, false, None),
+            RailwayCard::Failed("Railway didn't answer".into())
+        );
     }
 }

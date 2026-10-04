@@ -817,6 +817,8 @@ pub struct AppState {
     /// A Railway trial provision is in flight (single-flight guard + the
     /// "starting…" copy).
     pub cloud_trial_starting: bool,
+    /// Railway signup is being long-polled after opening its browser flow.
+    pub cloud_trial_signup_waiting: bool,
     /// The automatic first-run trial start already fired this session —
     /// entering Cloud never retry-loops a refused trial.
     pub cloud_trial_autostarted: bool,
@@ -927,6 +929,7 @@ impl AppState {
             cloud_github_login: None,
             cloud_trial_failure: None,
             cloud_trial_starting: false,
+            cloud_trial_signup_waiting: false,
             cloud_trial_autostarted: false,
             cloud_prefer_seat: None,
             auto_selected: false,
