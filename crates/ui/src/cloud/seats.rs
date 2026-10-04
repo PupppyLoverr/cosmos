@@ -1279,7 +1279,7 @@ impl Render for CloudSeatsPage {
                             div()
                                 .text_size(crate::typography::ui_rems(11.5))
                                 .text_color(theme.text_muted)
-                                .child("Cloud computers need a Cosmos account. Sign in, then start the free Railway trial or add a Boat token."),
+                                .child("Cloud computers and GitHub need a Cosmos account. Sign in, then start the free Railway trial or add a Boat token."),
                         ),
                 )
                 .child(
@@ -1305,16 +1305,18 @@ impl Render for CloudSeatsPage {
             column = column.child(railway_section).child(boat_section);
         }
 
-        if let Some(seat) = self.runner_seat_id.as_deref().and_then(|seat_id| {
-            seats
-                .iter()
-                .find(|row| row.config.id == seat_id)
-                .map(|row| row.config.clone())
-        }) {
+        if !local_profile
+            && let Some(seat) = self.runner_seat_id.as_deref().and_then(|seat_id| {
+                seats
+                    .iter()
+                    .find(|row| row.config.id == seat_id)
+                    .map(|row| row.config.clone())
+            })
+        {
             column = column.child(self.runner_editor(&seat, &theme, cx));
         }
 
-        if !legacy.is_empty() {
+        if !local_profile && !legacy.is_empty() {
             let mut other = widgets::section_card(&theme);
             for (index, seat) in legacy.iter().enumerate() {
                 let seat_id = seat.config.id.clone();
@@ -1373,19 +1375,21 @@ impl Render for CloudSeatsPage {
             );
         }
 
-        if let Some(error) = load_error {
-            column = column.child(widgets::error_strip(&theme, error));
-        }
-        if let Some(note) = &self.note {
-            column = column.child(
-                div()
-                    .text_size(crate::typography::ui_rems(11.5))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(note.clone())),
-            );
-        }
-        if let Some(error) = &self.error {
-            column = column.child(widgets::error_strip(&theme, error.clone()));
+        if !local_profile {
+            if let Some(error) = load_error {
+                column = column.child(widgets::error_strip(&theme, error));
+            }
+            if let Some(note) = &self.note {
+                column = column.child(
+                    div()
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(note.clone())),
+                );
+            }
+            if let Some(error) = &self.error {
+                column = column.child(widgets::error_strip(&theme, error.clone()));
+            }
         }
 
         let has_pat = self
@@ -1401,7 +1405,7 @@ impl Render for CloudSeatsPage {
             )
             .into()
         } else if has_pat {
-            if self.gh_login.is_none() {
+            if !local_profile && self.gh_login.is_none() {
                 let state = self.state.read(cx);
                 if state.cloud_github_login.is_none()
                     && matches!(state.cloud_repos, crate::popover::Loadable::Idle)
@@ -1528,7 +1532,9 @@ impl Render for CloudSeatsPage {
                     ),
             );
         }
-        column = column.child(pat_card);
+        if !local_profile {
+            column = column.child(pat_card);
+        }
 
         div()
             .id("seats-page-root")
