@@ -35,6 +35,29 @@ const SEED_ENTRIES: usize = 12;
 const SEED_ENTRY_MAX: usize = 400;
 const SEED_TOTAL_MAX: usize = 4000;
 
+fn temp_chat_fields(source: &zeron_proto::Chat, chat_id: &str) -> serde_json::Value {
+    let mut fields = serde_json::json!({
+        "op": "createChat",
+        "chatId": chat_id,
+        "archived": true,
+    });
+    if let Some(space_id) = source.space_id.as_deref().filter(|s| !s.is_empty()) {
+        fields["spaceId"] = serde_json::json!(space_id);
+    } else {
+        fields["deviceId"] = serde_json::json!(source.device_id);
+    }
+    if let Some(cwd) = source.cwd.as_deref().filter(|s| !s.is_empty()) {
+        fields["cwd"] = serde_json::json!(cwd);
+    }
+    if let Some(config) = &source.config {
+        fields["config"] = serde_json::to_value(config).unwrap_or_default();
+    }
+    if let Some(seat) = &source.cloud_seat {
+        fields["cloudSeat"] = serde_json::to_value(seat).unwrap_or_default();
+    }
+    fields
+}
+
 /// One side-chat tab. The bound conversation is the send target AND the
 /// transcript doc; switching conversations rebinds both.
 pub struct SideChat {
@@ -117,22 +140,7 @@ impl SideChat {
             return;
         };
         let chat_id = uuid::Uuid::new_v4().to_string();
-        let mut fields = serde_json::json!({
-            "op": "createChat",
-            "chatId": chat_id,
-            "archived": true,
-        });
-        if let Some(space_id) = source.space_id.as_deref().filter(|s| !s.is_empty()) {
-            fields["spaceId"] = serde_json::json!(space_id);
-        } else {
-            fields["deviceId"] = serde_json::json!(source.device_id);
-        }
-        if let Some(cwd) = source.cwd.as_deref().filter(|s| !s.is_empty()) {
-            fields["cwd"] = serde_json::json!(cwd);
-        }
-        if let Some(config) = &source.config {
-            fields["config"] = serde_json::to_value(config).unwrap_or_default();
-        }
+        let fields = temp_chat_fields(source, &chat_id);
         self.creating = true;
         self.failure = None;
         cx.notify();
@@ -567,5 +575,80 @@ impl Render for SideChat {
             .child(transcript)
             .child(composer)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source_chat(
+        space_id: Option<&str>,
+        cloud_seat: Option<serde_json::Value>,
+    ) -> zeron_proto::Chat {
+        let mut value = serde_json::json!({
+            "id": "source",
+            "deviceId": "source-device",
+            "archived": false,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "cwd": "/source/worktree",
+            "config": {
+                "harness": "mock",
+                "model": "test-model",
+                "reasoning": "high",
+                "modelOptions": {"temperature": 0.4},
+                "sandbox": "workspace-write"
+            }
+        });
+        if let Some(space_id) = space_id {
+            value["spaceId"] = serde_json::json!(space_id);
+        }
+        if let Some(cloud_seat) = cloud_seat {
+            value["cloudSeat"] = cloud_seat;
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn local_temp_chat_fields_preserve_device_and_source_context() {
+        let source = source_chat(None, None);
+        let fields = temp_chat_fields(&source, "temp-local");
+
+        assert_eq!(fields["chatId"], "temp-local");
+        assert!(fields["archived"].as_bool().unwrap());
+        assert_eq!(fields["deviceId"], "source-device");
+        assert!(fields.get("spaceId").is_none());
+        assert!(fields.get("cloudSeat").is_none());
+        assert_eq!(fields["cwd"], "/source/worktree");
+        assert_eq!(
+            fields["config"],
+            serde_json::to_value(source.config).unwrap()
+        );
+    }
+
+    #[test]
+    fn cloud_temp_chat_fields_preserve_seat_and_space_context() {
+        let cloud_seat = serde_json::json!({
+            "seatId": "seat-123",
+            "kind": "ssh",
+            "label": "Build seat",
+            "repo": "owner/repo",
+            "workspacePath": "/workspace",
+            "branch": "feature",
+            "modelLabel": "Claude",
+        });
+        let source = source_chat(Some("space-123"), Some(cloud_seat.clone()));
+        let fields = temp_chat_fields(&source, "temp-cloud");
+
+        assert_eq!(fields["chatId"], "temp-cloud");
+        assert!(fields["archived"].as_bool().unwrap());
+        assert_eq!(fields["cloudSeat"], cloud_seat);
+        assert_eq!(fields["spaceId"], "space-123");
+        assert!(fields.get("deviceId").is_none());
+        assert_eq!(fields["cwd"], "/source/worktree");
+        assert_eq!(
+            fields["config"],
+            serde_json::to_value(source.config).unwrap()
+        );
     }
 }
