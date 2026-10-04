@@ -77,6 +77,7 @@ mod seat_chip_tests {
             label: "my seat".into(),
             repo: None,
             workspace_path: None,
+            runner_device_id: None,
             branch: None,
             model_label: None,
             expires_at,

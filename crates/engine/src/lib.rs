@@ -37,6 +37,8 @@ pub mod registry;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
+pub mod runner_credentials;
+pub(crate) mod runner_runtime;
 pub mod seat_desktop;
 pub mod sessions;
 pub mod sister_apps;
@@ -169,6 +171,8 @@ pub struct EngineCore {
     /// Cloud/GitHub agent mode: seat config + BYOK keys + automations + the
     /// remote-run ledger, scoped to Synced and Development profile stores.
     pub cloud: Option<cloud::CloudStore>,
+    /// Device-local runner identity and sealed credential vault.
+    pub runner_credentials: Option<Arc<runner_credentials::RunnerCredentialVault>>,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -364,7 +368,9 @@ impl EngineCore {
             profile.scope(),
             WorkspaceScope::Synced | WorkspaceScope::Development
         ) {
-            cloud::migrate_legacy_cloud_files(data_dir, profile.store_root())?;
+            if let Err(error) = cloud::migrate_legacy_cloud_files(data_dir, profile.store_root()) {
+                tracing::warn!(%error, "legacy Cloud file migration failed");
+            }
             let cloud = cloud::CloudStore::load(profile.store_root());
             let registry_workspace = workspace.clone();
             let registry_root = profile.store_root().to_path_buf();
@@ -412,6 +418,17 @@ impl EngineCore {
         } else {
             None
         };
+        let runner_credentials = if cloud.is_some() {
+            Some(Arc::new(
+                runner_credentials::RunnerCredentialVault::load(profile.store_root())
+                    .map_err(EngineError::Other)?,
+            ))
+        } else {
+            None
+        };
+        if let Some(credentials) = &runner_credentials {
+            sessions.set_runner_credentials(credentials.clone());
+        }
         let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
         // Turn starts snapshot the checkout tree — the "Latest turn" diff base.
         let turn_diff = diff_sync.clone();
@@ -440,6 +457,7 @@ impl EngineCore {
             pairing,
             local_import,
             cloud,
+            runner_credentials,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
@@ -587,6 +605,9 @@ impl EngineCore {
         .with_tools(self.tools.clone());
         if let Some(cloud) = self.cloud.clone() {
             rpc = rpc.with_cloud(cloud);
+        }
+        if let Some(credentials) = self.runner_credentials.clone() {
+            rpc = rpc.with_runner_credentials(credentials);
         }
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);

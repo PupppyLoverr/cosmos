@@ -387,6 +387,7 @@ fn chat_cloud_seat_rebinding_requires_an_existing_binding() {
         label: "Seat A".into(),
         repo: None,
         workspace_path: Some("/workspace".into()),
+        runner_device_id: None,
         branch: None,
         model_label: None,
         expires_at: None,
@@ -395,6 +396,80 @@ fn chat_cloud_seat_rebinding_requires_an_existing_binding() {
     assert!(!doc.set_chat_cloud_seat("chat-1", &binding).unwrap());
     assert!(doc.chat("chat-1").unwrap().unwrap().cloud_seat.is_none());
     assert!(!doc.set_chat_cloud_seat("missing", &binding).unwrap());
+}
+
+#[test]
+fn chat_host_rebinding_updates_host_path_and_seat_together() {
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    let binding = zeron_proto::CloudSeatBinding {
+        seat_id: "seat-a".into(),
+        kind: zeron_proto::CloudSeatKind::Ssh,
+        label: "Seat A".into(),
+        repo: Some("owner/repo".into()),
+        workspace_path: Some("/runner/workspace".into()),
+        runner_device_id: Some("runner-1".into()),
+        branch: Some("feature".into()),
+        model_label: None,
+        expires_at: None,
+    };
+
+    assert!(
+        doc.set_chat_host(
+            "chat-1",
+            "runner-1",
+            Some("/runner/workspace"),
+            Some(&binding)
+        )
+        .unwrap()
+    );
+    let rebound = doc.chat("chat-1").unwrap().unwrap();
+    assert_eq!(rebound.id, "chat-1");
+    assert_eq!(rebound.device_id, "runner-1");
+    assert_eq!(rebound.cwd.as_deref(), Some("/runner/workspace"));
+    assert_eq!(rebound.cloud_seat.as_ref(), Some(&binding));
+
+    assert!(
+        doc.set_chat_host("chat-1", "dev-a", Some("/local/workspace"), None)
+            .unwrap()
+    );
+    let returned = doc.chat("chat-1").unwrap().unwrap();
+    assert_eq!(returned.id, "chat-1");
+    assert_eq!(returned.device_id, "dev-a");
+    assert_eq!(returned.cwd.as_deref(), Some("/local/workspace"));
+    assert!(returned.cloud_seat.is_none());
+}
+
+#[test]
+fn create_chat_completes_only_a_provisional_claim_with_a_cloud_seat() {
+    let binding = zeron_proto::CloudSeatBinding {
+        seat_id: "seat-a".into(),
+        kind: zeron_proto::CloudSeatKind::Ssh,
+        label: "Seat A".into(),
+        repo: None,
+        workspace_path: Some("/runner/workspace".into()),
+        runner_device_id: Some("runner-1".into()),
+        branch: None,
+        model_label: None,
+        expires_at: None,
+    };
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.claim_chat("claimed", Some("/claimed"), None, ts(1_000));
+    assert!(
+        doc.set_claimed_chat_host("claimed", "runner-1", Some("/runner/workspace"), &binding)
+            .unwrap()
+    );
+    let claimed = doc.chat("claimed").unwrap().unwrap();
+    assert_eq!(claimed.device_id, "runner-1");
+    assert_eq!(claimed.cwd.as_deref(), Some("/runner/workspace"));
+    assert_eq!(claimed.cloud_seat.as_ref(), Some(&binding));
+
+    doc.upsert_chat(&chat("existing", "dev-a")).unwrap();
+    assert!(
+        !doc.set_claimed_chat_host("existing", "runner-1", Some("/runner/workspace"), &binding)
+            .unwrap()
+    );
+    assert!(doc.chat("existing").unwrap().unwrap().cloud_seat.is_none());
 }
 
 #[test]
@@ -414,6 +489,8 @@ fn cloud_run_and_backup_fields_round_trip_and_update() {
         entry_id: Some("entry-1".into()),
         error: None,
         workspace: Some("/workspace/chat-1".into()),
+        harness: None,
+        model: None,
         harness_session: None,
         prompt: None,
         started_at: ts(1_000),

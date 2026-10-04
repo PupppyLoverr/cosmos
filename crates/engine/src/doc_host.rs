@@ -5186,7 +5186,20 @@ impl DocHost {
                 // `take()` resolves the request before dispatch, so the journal
                 // and steer→new-turn fallbacks reuse the created path instead of
                 // minting another checkout.
-                let worktree_spec = request.worktree.take();
+                let runner_bound = self
+                    .workspace()
+                    .and_then(|ws| ws.chat(chat_id).ok().flatten())
+                    .is_some_and(|chat| {
+                        chat.cloud_seat
+                            .as_ref()
+                            .is_some_and(|binding| binding.runner_device_id.is_some())
+                    });
+                let worktree_spec = if runner_bound {
+                    request.worktree = None;
+                    None
+                } else {
+                    request.worktree.take()
+                };
                 let fresh_worktree = match &worktree_spec {
                     Some(spec) => {
                         let (cwd, fresh) = self.materialize_worktree(chat_id, &spec).await?;

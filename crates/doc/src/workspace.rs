@@ -1039,6 +1039,8 @@ mod tests {
             entry_id: Some("entry-1".into()),
             error: None,
             workspace: Some("/workspace/chat-1".into()),
+            harness: None,
+            model: None,
             harness_session: None,
             prompt: None,
             started_at: ts(1_000),

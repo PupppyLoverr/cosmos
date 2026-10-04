@@ -1084,6 +1084,67 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    pub fn set_chat_host(
+        &mut self,
+        chat_id: &str,
+        device_id: &str,
+        cwd: Option<&str>,
+        cloud_seat: Option<&zeron_proto::CloudSeatBinding>,
+    ) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write_chat_host_fields(chat_id, device_id, cwd, cloud_seat)?;
+        Ok(true)
+    }
+
+    fn write_chat_host_fields(
+        &mut self,
+        chat_id: &str,
+        device_id: &str,
+        cwd: Option<&str>,
+        cloud_seat: Option<&zeron_proto::CloudSeatBinding>,
+    ) -> Result<(), DocError> {
+        let cloud_seat = cloud_seat
+            .map(serde_json::to_value)
+            .transpose()?
+            .unwrap_or(serde_json::Value::Null);
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([
+                ("deviceId", json!(device_id)),
+                ("cwd", cwd.map_or(serde_json::Value::Null, |cwd| json!(cwd))),
+                ("cloudSeat", cloud_seat),
+            ]),
+        );
+        Ok(())
+    }
+
+    pub fn set_claimed_chat_host(
+        &mut self,
+        chat_id: &str,
+        device_id: &str,
+        cwd: Option<&str>,
+        cloud_seat: &zeron_proto::CloudSeatBinding,
+    ) -> Result<bool, DocError> {
+        let Some(row) = self.overlay_row(KIND_CHATS, chat_id) else {
+            return Ok(false);
+        };
+        if row.fields.contains_key("config")
+            || row.fields.contains_key("title")
+            || row
+                .fields
+                .get("cloudSeat")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Ok(false);
+        }
+        self.write_chat_host_fields(chat_id, device_id, cwd, Some(cloud_seat))?;
+        Ok(true)
+    }
+
     pub fn set_chat_cloud_run(
         &mut self,
         chat_id: &str,

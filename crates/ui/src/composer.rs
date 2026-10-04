@@ -9601,6 +9601,7 @@ impl Composer {
             label: seat.config.label.clone(),
             repo,
             workspace_path,
+            runner_device_id: seat.config.runner_device_id.clone(),
             branch,
             model_label: self
                 .cloud_view(cx)
@@ -12296,6 +12297,7 @@ mod tests {
             label: "Build seat".into(),
             repo: None,
             workspace_path: Some("/workspace".into()),
+            runner_device_id: None,
             branch: None,
             model_label: None,
             expires_at: None,

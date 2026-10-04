@@ -384,11 +384,38 @@ impl OpencodeHarness {
         computer: Option<&str>,
         tools: Option<&str>,
     ) -> Result<Server, HarnessError> {
+        self.server_with_environment(
+            cwd,
+            bridge,
+            computer,
+            tools,
+            &crate::RunEnvironment::default(),
+        )
+        .await
+    }
+
+    async fn server_with_environment(
+        &self,
+        cwd: Option<&str>,
+        bridge: Option<&str>,
+        computer: Option<&str>,
+        tools: Option<&str>,
+        environment: &crate::RunEnvironment,
+    ) -> Result<Server, HarnessError> {
         if let Some(base) = &self.base_url {
             return Ok(Server::attached(base.clone()));
         }
         let exe = self.resolve_executable()?;
-        Server::spawn(&exe, cwd, self.startup_timeout, bridge, computer, tools).await
+        Server::spawn(
+            &exe,
+            cwd,
+            self.startup_timeout,
+            bridge,
+            computer,
+            tools,
+            environment,
+        )
+        .await
     }
 
     /// One short-lived server answers both discovery calls. Also primes the
@@ -544,11 +571,12 @@ impl Harness for OpencodeHarness {
         request.prompt = zeron_proto::invocation::harness_prompt(&request.prompt, self.id());
         let cwd = (!request.cwd.is_empty()).then(|| request.cwd.clone());
         let server = self
-            .server(
+            .server_with_environment(
                 cwd.as_deref(),
                 crate::browser_bridge_url(&request),
                 crate::computer_url(&request),
                 crate::tools_url(&request),
+                &controls.environment,
             )
             .await?;
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
@@ -699,6 +727,7 @@ impl Server {
         bridge: Option<&str>,
         computer: Option<&str>,
         tools: Option<&str>,
+        environment: &crate::RunEnvironment,
     ) -> Result<Self, HarnessError> {
         let port = free_localhost_port().ok_or_else(|| {
             HarnessError::Protocol("no free localhost port for opencode serve".into())
@@ -721,6 +750,7 @@ impl Server {
         if let Some(url) = tools {
             cmd.env(crate::TOOLS_ENV, url);
         }
+        environment.apply_to(&mut cmd);
         crate::compose_child_path(&mut cmd, exe);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
@@ -1586,6 +1616,7 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        environment: _,
     } = controls;
     let request_input = Arc::new(request_input);
     let directory = (!request.cwd.is_empty()).then(|| request.cwd.clone());

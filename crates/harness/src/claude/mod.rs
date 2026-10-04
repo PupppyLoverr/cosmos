@@ -587,6 +587,7 @@ impl ClaudeHarness {
                 "",
             ]);
         }
+        controls.environment.apply_to(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
@@ -790,6 +791,7 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        environment: _,
     } = controls;
     let request_input = Arc::new(request_input);
 

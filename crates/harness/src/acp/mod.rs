@@ -73,6 +73,15 @@ const HERMES_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(45);
 // The one-file server unpacks on launch. A local cold probe took 1.903s, but
 // slower disks need substantially more headroom than the generic 10s budget.
 const ANTIGRAVITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(90);
+
+#[derive(Default)]
+struct AcpSpawnEnv<'a> {
+    browser_url: Option<&'a str>,
+    computer_url: Option<&'a str>,
+    tools_url: Option<&'a str>,
+    run_environment: Option<&'a crate::RunEnvironment>,
+}
+
 /// Per-agent configuration: which binary to spawn and what to tell the picker.
 struct AcpAgentSpec {
     id: HarnessId,
@@ -1113,7 +1122,7 @@ impl AcpHarness {
     pub async fn sign_out(&self) -> Result<(), HarnessError> {
         let home = std::env::var("HOME").ok();
         let (_scratch, mut child, _stderr) = self
-            .spawn_agent(home.as_deref(), false, &[], None, None, None)
+            .spawn_agent(home.as_deref(), false, &[], AcpSpawnEnv::default())
             .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
@@ -1493,21 +1502,19 @@ impl AcpHarness {
         cwd: Option<&str>,
         block_on_install: bool,
         extra_args: &[String],
-        browser_url: Option<&str>,
-        computer_url: Option<&str>,
-        tools_url: Option<&str>,
+        spawn_env: AcpSpawnEnv<'_>,
     ) -> Result<(Option<ScratchDir>, Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
         cmd.args(args);
         cmd.args(extra_args);
-        if let Some(url) = browser_url {
+        if let Some(url) = spawn_env.browser_url {
             cmd.env(crate::BROWSER_BRIDGE_ENV, url);
         }
-        if let Some(url) = computer_url {
+        if let Some(url) = spawn_env.computer_url {
             cmd.env(crate::COMPUTER_ENV, url);
         }
-        if let Some(url) = tools_url {
+        if let Some(url) = spawn_env.tools_url {
             cmd.env(crate::TOOLS_ENV, url);
         }
         child::configure(&mut cmd);
@@ -1525,6 +1532,9 @@ impl AcpHarness {
         let scratch = self.adapter_scratch()?;
         if let Some(dir) = &scratch {
             dir.apply(&mut cmd);
+        }
+        if let Some(environment) = spawn_env.run_environment {
+            environment.apply_to(&mut cmd);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1563,7 +1573,12 @@ impl AcpHarness {
         cwd: Option<&std::path::Path>,
     ) -> Result<Vec<SlashCommand>, HarnessError> {
         let (_scratch, mut child, _stderr) = self
-            .spawn_agent(cwd.and_then(|p| p.to_str()), false, &[], None, None, None)
+            .spawn_agent(
+                cwd.and_then(|p| p.to_str()),
+                false,
+                &[],
+                AcpSpawnEnv::default(),
+            )
             .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
@@ -1630,8 +1645,9 @@ impl AcpHarness {
     /// initialize → `session/list`. Agents that don't implement the method
     /// answer with an error we treat as "no sessions", never a failure.
     async fn discover_sessions(&self) -> Result<Vec<zeron_proto::HarnessSession>, HarnessError> {
-        let (_scratch, mut child, _stderr) =
-            self.spawn_agent(None, false, &[], None, None, None).await?;
+        let (_scratch, mut child, _stderr) = self
+            .spawn_agent(None, false, &[], AcpSpawnEnv::default())
+            .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1684,7 +1700,7 @@ impl AcpHarness {
         cwd: &str,
     ) -> Option<Vec<zeron_proto::SessionTranscriptRow>> {
         let (_scratch, mut child, _stderr) = self
-            .spawn_agent(None, false, &[], None, None, None)
+            .spawn_agent(None, false, &[], AcpSpawnEnv::default())
             .await
             .ok()?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
@@ -1774,8 +1790,9 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (_scratch, mut child, stderr_tail) =
-            self.spawn_agent(None, false, &[], None, None, None).await?;
+        let (_scratch, mut child, stderr_tail) = self
+            .spawn_agent(None, false, &[], AcpSpawnEnv::default())
+            .await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -2358,9 +2375,12 @@ impl Harness for AcpHarness {
                 Some(&request.cwd),
                 true,
                 &[],
-                crate::browser_bridge_url(&request),
-                crate::computer_url(&request),
-                crate::tools_url(&request),
+                AcpSpawnEnv {
+                    browser_url: crate::browser_bridge_url(&request),
+                    computer_url: crate::computer_url(&request),
+                    tools_url: crate::tools_url(&request),
+                    run_environment: Some(&controls.environment),
+                },
             )
             .await?;
         let stdin = child
@@ -3409,6 +3429,7 @@ async fn run_session(session: Session) {
         request_input,
         mut steering,
         interrupt,
+        environment: _,
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
 

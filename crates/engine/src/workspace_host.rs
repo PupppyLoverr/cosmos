@@ -937,6 +937,20 @@ impl WorkspaceHost {
         }
     }
 
+    pub fn rebind_chat_host(
+        &self,
+        chat_id: &str,
+        device_id: &str,
+        cwd: Option<&str>,
+        cloud_seat: Option<&zeron_proto::CloudSeatBinding>,
+    ) -> Result<(), EngineError> {
+        if self.mutate(|doc| doc.set_chat_host(chat_id, device_id, cwd, cloud_seat))? {
+            Ok(())
+        } else {
+            Err(EngineError::Other(format!("no such chat: {chat_id}")))
+        }
+    }
+
     pub fn set_chat_cloud_run(
         &self,
         chat_id: &str,
@@ -971,7 +985,12 @@ impl WorkspaceHost {
         parent_chat_id: Option<String>,
         cloud_seat: Option<zeron_proto::CloudSeatBinding>,
     ) -> Result<(), EngineError> {
-        if self.read(|doc| doc.chat(chat_id))?.is_some() {
+        if let Some(existing) = self.read(|doc| doc.chat(chat_id))? {
+            if let Some(cloud_seat) = cloud_seat.as_ref() {
+                let device_id = device_id.unwrap_or(&existing.device_id);
+                let cwd = cwd.as_deref().or(existing.cwd.as_deref());
+                self.mutate(|doc| doc.set_claimed_chat_host(chat_id, device_id, cwd, cloud_seat))?;
+            }
             return Ok(()); // idempotent: optimistic client retries never duplicate
         }
         let space = match space_id {
@@ -1806,6 +1825,7 @@ mod tests {
             label: "Seat".into(),
             repo: None,
             workspace_path: Some("/workspace".into()),
+            runner_device_id: None,
             branch: None,
             model_label: None,
             expires_at: None,

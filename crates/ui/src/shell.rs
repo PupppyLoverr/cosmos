@@ -183,6 +183,12 @@ struct ChatMenuState {
     page: ChatMenuPage,
 }
 
+#[derive(Clone)]
+enum SidebarWipTransfer {
+    Return { chat_id: String },
+    Send { chat_id: String, seat_id: String },
+}
+
 /// Interruptible height tween for the sidebar's device/archive disclosures.
 /// The rendered element owns the frame clock; this state preserves the current
 /// interpolated height when a second click reverses an in-flight transition.
@@ -2091,6 +2097,8 @@ pub struct Shell {
     user_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
+    sidebar_wip_transfer: Option<SidebarWipTransfer>,
+    sidebar_cloud_transfer_task: Option<Task<()>>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -2563,6 +2571,8 @@ impl Shell {
             attention_sound_gate: Default::default(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
+            sidebar_wip_transfer: None,
+            sidebar_cloud_transfer_task: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
@@ -8605,6 +8615,142 @@ impl Shell {
         }));
     }
 
+    fn transfer_synced_chat(
+        &mut self,
+        chat_id: String,
+        seat_id: Option<String>,
+        push_wip: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Synced) {
+            self.sidebar_notice =
+                Some("Cloud chats need you signed in — local chats stay on this computer".into());
+            self.sidebar_wip_transfer = None;
+            cx.notify();
+            return;
+        }
+        let is_cloud_chat = self
+            .state
+            .read(cx)
+            .chat_row(&chat_id)
+            .is_some_and(|chat| chat.cloud_seat.is_some());
+        let seat_id = if is_cloud_chat {
+            None
+        } else {
+            seat_id.or_else(|| {
+                self.state
+                    .read(cx)
+                    .active_cloud_seat()
+                    .map(|seat| seat.config.id.clone())
+            })
+        };
+        if !is_cloud_chat && seat_id.is_none() {
+            self.sidebar_notice = Some("Choose a Cloud seat before sending this chat.".into());
+            self.sidebar_wip_transfer = None;
+            cx.notify();
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.sidebar_notice = Some("Engine not connected".into());
+            self.sidebar_wip_transfer = None;
+            cx.notify();
+            return;
+        };
+
+        let is_send = !is_cloud_chat;
+        let transfer = if is_cloud_chat {
+            SidebarWipTransfer::Return {
+                chat_id: chat_id.clone(),
+            }
+        } else {
+            SidebarWipTransfer::Send {
+                chat_id: chat_id.clone(),
+                seat_id: seat_id.expect("cloud send has a selected seat"),
+            }
+        };
+        self.sidebar_wip_transfer = None;
+        self.sidebar_notice = Some(
+            if is_send {
+                "Sending chat to Cloud…"
+            } else {
+                "Returning chat to this Mac…"
+            }
+            .into(),
+        );
+        self.close_chat_menu(cx);
+        self.sidebar_cloud_transfer_task = Some(cx.spawn(async move |this, cx| {
+            let result = match &transfer {
+                SidebarWipTransfer::Return { chat_id } => engine
+                    .client()
+                    .call(
+                        methods::CLOUD_RETURN_CHAT,
+                        serde_json::json!({ "chatId": chat_id, "pushWip": push_wip }),
+                    )
+                    .await,
+                SidebarWipTransfer::Send { chat_id, seat_id } => engine
+                    .client()
+                    .call(
+                        methods::CLOUD_SEND_CHAT,
+                        serde_json::json!({
+                            "chatId": chat_id,
+                            "seatId": seat_id,
+                            "pushWip": push_wip,
+                        }),
+                    )
+                    .await,
+            }
+            .map_err(|err| err.to_string());
+            this.update(cx, |shell, cx| {
+                shell.sidebar_cloud_transfer_task = None;
+                match result {
+                    Ok(_) => {
+                        shell.sidebar_wip_transfer = None;
+                        shell.sidebar_notice = Some(
+                            if is_send {
+                                "Chat sent to Cloud."
+                            } else {
+                                "Chat returned to this Mac."
+                            }
+                            .into(),
+                        );
+                        shell
+                            .state
+                            .update(cx, |state, cx| state.refresh_cloud(None, cx));
+                    }
+                    Err(err) => {
+                        if err
+                            == "uncommitted changes here — push them to a WIP branch first"
+                            || err
+                                == "uncommitted changes on the runner — push them to a WIP branch first"
+                        {
+                            shell.sidebar_wip_transfer = Some(transfer);
+                        } else {
+                            shell.sidebar_wip_transfer = None;
+                        }
+                        shell.sidebar_notice = Some(err.into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn push_sidebar_wip_and_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(transfer) = self.sidebar_wip_transfer.clone() else {
+            return;
+        };
+        match transfer {
+            SidebarWipTransfer::Return { chat_id } => {
+                self.transfer_synced_chat(chat_id, None, true, cx);
+            }
+            SidebarWipTransfer::Send { chat_id, seat_id } => {
+                self.transfer_synced_chat(chat_id, Some(seat_id), true, cx);
+            }
+        }
+    }
+
     fn render_cloud_seat_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let theme = theme.for_popup();
         let local_chat_count = self.local_chats_for_copy.as_ref().map_or(0, Vec::len);
@@ -9409,25 +9555,44 @@ impl Shell {
             })
             // Inline mutation-failure notice.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
-                el.child(
-                    div()
-                        .id("sidebar-notice")
-                        .mx(px(Theme::SPACE_SM))
-                        .mb(px(Theme::SPACE_SM))
-                        .px(px(Theme::SPACE_SM))
-                        .py(px(4.0))
-                        .rounded(px(Theme::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(theme.danger)
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.danger)
+                let mut card = div()
+                    .id("sidebar-notice")
+                    .mx(px(Theme::SPACE_SM))
+                    .mb(px(Theme::SPACE_SM))
+                    .px(px(Theme::SPACE_SM))
+                    .py(px(4.0))
+                    .rounded(px(Theme::CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(theme.danger)
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.danger);
+                if self.sidebar_wip_transfer.is_some() {
+                    card =
+                        card.flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(div().flex_1().min_w_0().child(notice))
+                            .child(
+                                popover::btn_ghost(
+                                    theme,
+                                    "Push a WIP branch and continue",
+                                    "sidebar-wip-push",
+                                )
+                                .id("sidebar-wip-push")
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| this.push_sidebar_wip_and_transfer(cx),
+                                )),
+                            );
+                } else {
+                    card = card
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.sidebar_notice = None;
                             cx.notify();
                         }))
-                        .child(notice),
-                )
+                        .child(notice);
+                }
+                el.child(card)
             })
             .child(
                 div()
@@ -10486,6 +10651,19 @@ impl Shell {
                 .read(cx)
                 .chat_row(&chat_id)
                 .is_some_and(|chat| chat.archived);
+            let is_cloud_chat = self
+                .state
+                .read(cx)
+                .chat_row(&chat_id)
+                .is_some_and(|chat| chat.cloud_seat.is_some());
+            let synced_scope = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Synced);
+            let transfer_chat_id = chat_id.clone();
+            let transfer_send_chat_id = chat_id.clone();
+            let send_seat_id = self
+                .state
+                .read(cx)
+                .active_cloud_seat()
+                .map(|seat| seat.config.id.clone());
             let (archive_icon, archive_label) = chat_archive_menu_item(chat_archived);
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
@@ -10548,6 +10726,50 @@ impl Shell {
                                     .text_color(theme.text_muted),
                             ),
                     )
+                    .when(synced_scope && is_cloud_chat, |menu| {
+                        menu.child(
+                            popover::menu_row(&theme, false, format!("chat-menu-return-{chat_id}"))
+                                .id("chat-menu-return")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.transfer_synced_chat(
+                                        transfer_chat_id.clone(),
+                                        None,
+                                        false,
+                                        cx,
+                                    )
+                                }))
+                                .child(
+                                    icon(icons::ARROW_LEFT)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Return to this Mac")),
+                        )
+                    })
+                    .when(synced_scope && !is_cloud_chat, |menu| {
+                        menu.child(
+                            popover::menu_row(
+                                &theme,
+                                false,
+                                format!("chat-menu-send-cloud-{chat_id}"),
+                            )
+                            .id("chat-menu-send-cloud")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.transfer_synced_chat(
+                                    transfer_send_chat_id.clone(),
+                                    send_seat_id.clone(),
+                                    false,
+                                    cx,
+                                )
+                            }))
+                            .child(
+                                icon(icons::CLOUD)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Send to Cloud")),
+                        )
+                    })
                     .child(popover::menu_separator())
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))

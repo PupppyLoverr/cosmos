@@ -659,7 +659,7 @@ pub(super) fn merge_json_entry(
 /// that credential's secret there. A tampered or misconfigured store must
 /// never route a refresh token or API key to an arbitrary server.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum HostPolicy {
+pub(crate) enum HostPolicy {
     /// The vendor's own domains (and their subdomains).
     Domains(&'static [&'static str]),
     /// GitHub Enterprise Cloud with data residency: a single-label subdomain
@@ -669,6 +669,8 @@ pub(super) enum HostPolicy {
     /// instead (see [`local_enterprise_identity`]): it lists and switches,
     /// without usage.
     GheCom,
+    /// A user-selected HTTPS API base on a DNS hostname.
+    AnyDns,
 }
 
 /// Grok OIDC issuers (`oidc_issuer`, refresh only).
@@ -682,11 +684,12 @@ pub(super) const NOUS_PORTALS: HostPolicy = HostPolicy::Domains(&["nousresearch.
 
 /// `raw` as a base url safe to send a secret to: `https`, a DNS host the
 /// policy allows, no userinfo, port, query or fragment, and no path beyond
-/// `/`. A bare host (how OpenCode and Pi store `enterpriseUrl`) reads as
-/// `https://host` under [`HostPolicy::GheCom`]. `allow_loopback`
-/// additionally admits `http://127.0.0.1|localhost:<port>` — tests' mock
-/// servers only, never production. `None` = don't send anything.
-pub(super) fn trusted_base(
+/// `/` except for [`HostPolicy::AnyDns`] custom API bases. A bare host (how
+/// OpenCode and Pi store `enterpriseUrl`) reads as `https://host` under
+/// [`HostPolicy::GheCom`]. `allow_loopback` additionally admits
+/// `http://127.0.0.1|localhost:<port>` — tests' mock servers only, never
+/// production. `None` = don't send anything.
+pub(crate) fn trusted_base(
     raw: &str,
     policy: HostPolicy,
     allow_loopback: bool,
@@ -702,7 +705,7 @@ pub(super) fn trusted_base(
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || !matches!(url.path(), "" | "/")
+        || (!matches!(policy, HostPolicy::AnyDns) && !matches!(url.path(), "" | "/"))
     {
         return None;
     }
@@ -722,6 +725,7 @@ pub(super) fn trusted_base(
         HostPolicy::GheCom => host
             .strip_suffix(".ghe.com")
             .is_some_and(|tenant| !tenant.is_empty() && !tenant.contains('.')),
+        HostPolicy::AnyDns => true,
     };
     allowed.then_some(url)
 }
@@ -1515,4 +1519,30 @@ pub(super) fn recorded_devin_url(url_file: &Path, logs: &Path) -> Option<String>
         }
     }
     None
+}
+
+#[cfg(test)]
+mod runner_base_url_tests {
+    use super::{HostPolicy, trusted_base};
+
+    #[test]
+    fn runner_custom_base_requires_https_dns_without_userinfo() {
+        assert_eq!(
+            trusted_base("https://gateway.example.test/v1", HostPolicy::AnyDns, false)
+                .unwrap()
+                .as_str(),
+            "https://gateway.example.test/v1"
+        );
+        for url in [
+            "http://gateway.example.test",
+            "https://user:pass@gateway.example.test",
+            "https://127.0.0.1",
+            "gateway.example.test",
+        ] {
+            assert!(
+                trusted_base(url, HostPolicy::AnyDns, false).is_none(),
+                "{url}"
+            );
+        }
+    }
 }

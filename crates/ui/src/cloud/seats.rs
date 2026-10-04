@@ -7,7 +7,7 @@ use gpui::{
     AnyElement, Context, Entity, IntoElement, Render, SharedString, Task, Window, div, prelude::*,
     px,
 };
-use zeron_proto::CloudSeatKind;
+use zeron_proto::{ByokProvider, CloudSeatKind, HarnessId};
 use zeron_rpc::methods;
 
 use zeron_engine::cloud::{RepoHit, SeatConfig};
@@ -77,6 +77,15 @@ pub struct CloudSeatsPage {
     /// `Some(kind)` while the add-seat card is open.
     draft_kind: Option<CloudSeatKind>,
     editing_seat: Option<SeatConfig>,
+    runner_seat_id: Option<String>,
+    runner_device_id: Option<String>,
+    runner_info: Option<serde_json::Value>,
+    runner_error: Option<String>,
+    runner_note: Option<String>,
+    runner_provider: Entity<ComposerInput>,
+    runner_key: Entity<ComposerInput>,
+    runner_base_url: Entity<ComposerInput>,
+    runner_task: Option<Task<()>>,
     form: SeatForm,
     /// The shared GitHub PAT input — the repo picker's token when a seat has
     /// none of its own. Saved to `cloud-keys.json` under the reserved key.
@@ -128,6 +137,16 @@ impl CloudSeatsPage {
             load_generation: 0,
             draft_kind: None,
             editing_seat: None,
+            runner_seat_id: None,
+            runner_device_id: None,
+            runner_info: None,
+            runner_error: None,
+            runner_note: None,
+            runner_provider: cx
+                .new(|cx| ComposerInput::new("Provider (anthropic, openai, github…)", cx)),
+            runner_key: cx.new(|cx| ComposerInput::new("API key / token", cx)),
+            runner_base_url: cx.new(|cx| ComposerInput::new("Base URL (optional)", cx)),
+            runner_task: None,
             form,
             shared_pat: cx
                 .new(|cx| ComposerInput::new("GitHub PAT — shared (repo + workflow scope)", cx)),
@@ -185,6 +204,207 @@ impl CloudSeatsPage {
             })
             .ok();
         }));
+    }
+
+    fn open_runner(&mut self, seat: &SeatConfig, cx: &mut Context<Self>) {
+        self.runner_seat_id = Some(seat.id.clone());
+        self.runner_device_id = seat.runner_device_id.clone();
+        self.runner_info = None;
+        self.runner_error = None;
+        self.runner_note = None;
+        if let Some(device_id) = self.runner_device_id.clone() {
+            self.load_runner_info(device_id, cx);
+        }
+        cx.notify();
+    }
+
+    fn load_runner_info(&mut self, device_id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.runner_error = Some("Engine not connected".into());
+            return;
+        };
+        self.runner_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::RUNNER_INFO,
+                    serde_json::json!({ "targetDeviceId": device_id }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                page.runner_task = None;
+                match result {
+                    Ok(info) => {
+                        page.runner_info = Some(info);
+                        page.runner_error = None;
+                    }
+                    Err(err) => {
+                        page.runner_info = None;
+                        page.runner_error = Some(err.to_string());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn assign_runner(&mut self, device_id: Option<String>, cx: &mut Context<Self>) {
+        let (Some(seat_id), Some(engine)) = (
+            self.runner_seat_id.clone(),
+            self.state.read(cx).engine().cloned(),
+        ) else {
+            self.runner_error = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        self.runner_error = None;
+        self.runner_note = None;
+        self.runner_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_SET_SEAT_RUNNER,
+                    serde_json::json!({ "seatId": seat_id, "deviceId": device_id }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                page.runner_task = None;
+                match result {
+                    Ok(_) => {
+                        page.runner_device_id = device_id.clone();
+                        page.runner_note = Some(if device_id.is_some() {
+                            "Runner assigned to this seat.".into()
+                        } else {
+                            "Runner removed from this seat.".into()
+                        });
+                        page.runner_info = None;
+                        page.load(cx);
+                        if let Some(device_id) = device_id {
+                            page.load_runner_info(device_id, cx);
+                        }
+                    }
+                    Err(err) => page.runner_error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn seal_runner_key(&mut self, cx: &mut Context<Self>) {
+        let Some(seat_id) = self.runner_seat_id.clone() else {
+            return;
+        };
+        let provider = SeatForm::text(&self.runner_provider, cx);
+        let key = SeatForm::text(&self.runner_key, cx);
+        let base_url = SeatForm::text(&self.runner_base_url, cx);
+        if provider.is_empty() || key.is_empty() {
+            self.runner_error = Some("Enter a provider and key.".into());
+            cx.notify();
+            return;
+        }
+        self.runner_key
+            .update(cx, |input, cx| input.set_text("", cx));
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.runner_error = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        self.runner_error = None;
+        self.runner_note = None;
+        self.runner_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_SEAL_FOR_RUNNER,
+                    serde_json::json!({
+                        "seatId": seat_id,
+                        "provider": provider,
+                        "key": key,
+                        "baseUrl": (!base_url.is_empty()).then_some(base_url),
+                    }),
+                )
+                .await;
+            this.update(cx, |page, cx| {
+                page.runner_task = None;
+                match result {
+                    Ok(_) => {
+                        page.runner_note = Some("Credential sealed to the runner.".into());
+                        if let Some(device_id) = page.runner_device_id.clone() {
+                            page.load_runner_info(device_id, cx);
+                        }
+                    }
+                    Err(err) => page.runner_error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn runner_action(
+        &mut self,
+        method: &'static str,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.runner_error = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let Some(device_id) = self.runner_device_id.clone() else {
+            return;
+        };
+        self.runner_error = None;
+        self.runner_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(method, params).await;
+            this.update(cx, |page, cx| {
+                page.runner_task = None;
+                match result {
+                    Ok(_) => {
+                        page.runner_note = None;
+                        page.load_runner_info(device_id, cx);
+                    }
+                    Err(err) => page.runner_error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn revoke_runner_credential(
+        &mut self,
+        provider: Option<String>,
+        kind: String,
+        cx: &mut Context<Self>,
+    ) {
+        let mut params = serde_json::json!({ "kind": kind });
+        if let Some(provider) = provider {
+            params["provider"] = provider.into();
+        }
+        if let Some(device_id) = self.runner_device_id.clone() {
+            params["targetDeviceId"] = device_id.into();
+        }
+        self.runner_action(methods::RUNNER_REVOKE_CREDENTIAL, params, cx);
+    }
+
+    fn set_runner_login(&mut self, harness: HarnessId, enabled: bool, cx: &mut Context<Self>) {
+        let Some(device_id) = self.runner_device_id.clone() else {
+            return;
+        };
+        let harness = serde_json::to_value(harness).unwrap_or_default();
+        self.runner_action(
+            methods::RUNNER_SET_LOGIN,
+            serde_json::json!({
+                "targetDeviceId": device_id,
+                "harness": harness,
+                "enabled": enabled,
+            }),
+            cx,
+        );
     }
 
     fn edit_harness(&mut self, seat: SeatConfig, cx: &mut Context<Self>) {
@@ -810,14 +1030,15 @@ impl CloudSeatsPage {
                                 })),
                         )
                     })
-                    .child(
+                    .child({
+                        let probe_seat_id = seat_id.clone();
                         popover::btn_ghost(theme, "Probe", format!("seat-probe-{seat_id}"))
                             .id(SharedString::from(format!("seat-probe-{seat_id}")))
                             .when(probing, |el| el.opacity(0.5))
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.probe(seat_id.clone(), cx)),
-                            ),
-                    )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.probe(probe_seat_id.clone(), cx)
+                            }))
+                    })
                     .child({
                         let seat = seat.config.clone();
                         popover::btn_ghost(theme, "Edit harness", edit_harness_id.clone())
@@ -825,6 +1046,14 @@ impl CloudSeatsPage {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.edit_harness(seat.clone(), cx)
                             }))
+                    })
+                    .child({
+                        let seat = seat.config.clone();
+                        popover::btn_ghost(theme, "Runner", format!("seat-runner-{seat_id}"))
+                            .id(SharedString::from(format!("seat-runner-{seat_id}")))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.open_runner(&seat, cx)),
+                            )
                     })
                     .child({
                         let seat_id = seat.config.id.clone();
@@ -836,6 +1065,306 @@ impl CloudSeatsPage {
                     }),
             )
             .into_any_element()
+    }
+
+    fn runner_editor(
+        &self,
+        seat: &SeatConfig,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let devices = self.state.read(cx).devices.clone();
+        let mut card = widgets::section_card(theme).child(widgets::card_row(theme, true).child(
+            widgets::row_title(theme, format!("Runner — {}", seat.label)),
+        ));
+        let mut assignment = div()
+            .px(px(20.0))
+            .pb(px(12.0))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .text_size(crate::typography::ui_rems(11.5))
+                    .text_color(theme.text_muted)
+                    .child("Choose a signed-in device in this profile to run this seat's chats."),
+            );
+        for device in devices {
+            let selected = self.runner_device_id.as_deref() == Some(device.id.as_str());
+            let device_id = device.id.clone();
+            let label =
+                if self.state.read(cx).local_device_id.as_deref() == Some(device.id.as_str()) {
+                    format!("{} · {} · This device", device.name, device.platform)
+                } else {
+                    format!("{} · {}", device.name, device.platform)
+                };
+            assignment = assignment.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .text_color(theme.text)
+                            .child(SharedString::from(label)),
+                    )
+                    .child(
+                        popover::btn_ghost(
+                            theme,
+                            if selected {
+                                "Assigned"
+                            } else {
+                                "Use as runner"
+                            },
+                            format!("runner-device-{}", device.id),
+                        )
+                        .id(SharedString::from(format!("runner-device-{}", device.id)))
+                        .when(selected || self.runner_task.is_some(), |el| el.opacity(0.5))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !selected && this.runner_task.is_none() {
+                                this.assign_runner(Some(device_id.clone()), cx);
+                            }
+                        })),
+                    ),
+            );
+        }
+        if self.runner_device_id.is_some() {
+            assignment = assignment.child(
+                popover::btn_ghost(theme, "Remove runner", "runner-remove")
+                    .id("runner-remove")
+                    .when(self.runner_task.is_some(), |el| el.opacity(0.5))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.runner_task.is_none() {
+                            this.assign_runner(None, cx);
+                        }
+                    })),
+            );
+        }
+        let install_command = "curl -fsSL https://raw.githubusercontent.com/PupppyLoverr/cosmos-releases/main/install-runner.sh | sh";
+        assignment = assignment.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .mt(px(4.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(crate::typography::ui_rems(9.5))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(install_command)),
+                )
+                .child(
+                    popover::btn_ghost(theme, "Copy", "runner-install-copy")
+                        .id("runner-install-copy")
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                install_command.to_owned(),
+                            ));
+                        }),
+                ),
+        );
+        card = card.child(assignment);
+
+        if self.runner_device_id.is_some() {
+            let mut detail = div()
+                .px(px(20.0))
+                .pb(px(14.0))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(widgets::row_title(theme, "Runner keys"));
+            if let Some(info) = &self.runner_info {
+                let credentials = info
+                    .get("credentials")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if credentials.is_empty() {
+                    detail = detail.child(
+                        div()
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .text_color(theme.text_muted)
+                            .child("No credentials sealed to this runner."),
+                    );
+                }
+                for (index, credential) in credentials.iter().enumerate() {
+                    let kind = credential
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("apiKey")
+                        .to_string();
+                    let provider = credential
+                        .get("provider")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let provider_label = provider
+                        .as_deref()
+                        .and_then(|value| {
+                            serde_json::from_value::<ByokProvider>(serde_json::Value::String(
+                                value.to_string(),
+                            ))
+                            .ok()
+                        })
+                        .map(ByokProvider::label)
+                        .unwrap_or_else(|| {
+                            if kind == "github" {
+                                "GitHub"
+                            } else {
+                                provider.as_deref().unwrap_or("API key")
+                            }
+                        });
+                    let sealed_at = credential
+                        .get("sealedAt")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown date");
+                    let expires_at = credential
+                        .get("expiresAt")
+                        .and_then(serde_json::Value::as_str);
+                    let row_provider = provider.clone();
+                    let row_kind = kind.clone();
+                    let mut row = div().flex().items_center().gap(px(8.0)).child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(crate::typography::ui_rems(10.5))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(format!(
+                                "{provider_label} · sealed {}{}",
+                                sealed_at.chars().take(10).collect::<String>(),
+                                expires_at
+                                    .map(|at| format!(
+                                        " · expires {}",
+                                        at.chars().take(10).collect::<String>()
+                                    ))
+                                    .unwrap_or_default()
+                            ))),
+                    );
+                    row = row.child(
+                        popover::btn_ghost(
+                            theme,
+                            "Revoke",
+                            format!("runner-credential-revoke-{index}"),
+                        )
+                        .id(SharedString::from(format!(
+                            "runner-credential-revoke-{index}"
+                        )))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.revoke_runner_credential(
+                                row_provider.clone(),
+                                row_kind.clone(),
+                                cx,
+                            );
+                        })),
+                    );
+                    detail = detail.child(row);
+                }
+
+                let runner_logins = info
+                    .get("runnerLogins")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                detail = detail.child(widgets::row_title(theme, "Use runner's own login"));
+                for harness in [
+                    HarnessId::ClaudeCode,
+                    HarnessId::Codex,
+                    HarnessId::Cursor,
+                    HarnessId::Devin,
+                    HarnessId::Grok,
+                    HarnessId::Hermes,
+                    HarnessId::Pi,
+                    HarnessId::Opencode,
+                    HarnessId::Antigravity,
+                    HarnessId::Amp,
+                    HarnessId::KimiCode,
+                ] {
+                    let encoded_harness = serde_json::to_value(harness).unwrap_or_default();
+                    let enabled = runner_logins.iter().any(|login| login == &encoded_harness);
+                    let label = match harness {
+                        HarnessId::ClaudeCode => "Claude Code",
+                        HarnessId::Codex => "Codex",
+                        HarnessId::Cursor => "Cursor",
+                        HarnessId::Devin => "Devin",
+                        HarnessId::Grok => "Grok",
+                        HarnessId::Hermes => "Hermes",
+                        HarnessId::Pi => "Pi",
+                        HarnessId::Opencode => "OpenCode",
+                        HarnessId::Antigravity => "Antigravity",
+                        HarnessId::Amp => "Amp",
+                        HarnessId::KimiCode => "Kimi Code",
+                        HarnessId::Mock => continue,
+                    };
+                    detail = detail.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                widgets::toggle_switch(
+                                    theme,
+                                    enabled,
+                                    format!("runner-login-{harness:?}"),
+                                )
+                                .id(SharedString::from(format!("runner-login-{harness:?}")))
+                                .when(self.runner_task.is_some(), |el| el.opacity(0.5))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        if this.runner_task.is_none() {
+                                            this.set_runner_login(harness, !enabled, cx);
+                                        }
+                                    },
+                                )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(label),
+                            ),
+                    );
+                }
+            }
+            detail = detail
+                .child(widgets::row_title(theme, "Seal a credential"))
+                .child(popover::dialog_field(
+                    self.runner_provider.clone().into_any_element(),
+                ))
+                .child(popover::dialog_field(
+                    self.runner_key.clone().into_any_element(),
+                ))
+                .child(popover::dialog_field(
+                    self.runner_base_url.clone().into_any_element(),
+                ))
+                .child(
+                    popover::btn_primary(theme, "Seal to runner")
+                        .id("runner-seal")
+                        .when(self.runner_task.is_some(), |el| el.opacity(0.5))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.runner_task.is_none() {
+                                this.seal_runner_key(cx);
+                            }
+                        })),
+                );
+            if let Some(note) = &self.runner_note {
+                detail = detail.child(
+                    div()
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(note.clone())),
+                );
+            }
+            if let Some(error) = &self.runner_error {
+                detail = detail.child(widgets::error_strip(theme, error.clone()));
+            }
+            card = card.child(detail);
+        }
+        card.into_any_element()
     }
 
     fn draft_card(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -1177,6 +1706,14 @@ impl Render for CloudSeatsPage {
                 .line_height(px(20.0)),
             )
             .child(card);
+        if let Some(seat) = self.runner_seat_id.as_deref().and_then(|seat_id| {
+            self.view
+                .ready()
+                .and_then(|view| view.seat(seat_id))
+                .map(|row| row.config.clone())
+        }) {
+            column = column.child(self.runner_editor(&seat, &theme, cx));
+        }
         if let Some(error) = load_error {
             column = column.child(widgets::error_strip(&theme, error));
         }

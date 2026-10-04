@@ -146,6 +146,9 @@ pub struct SeatConfig {
     /// Workspace path inside the container / on the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
+    /// Registry device id of the headless Cosmos runner assigned to this seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_device_id: Option<String>,
     /// `owner/name` (GitHub seats; SSH seats may bind one for the PR pane).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
@@ -435,7 +438,7 @@ pub struct CloudStore {
 }
 
 pub(crate) enum RegistryWrite {
-    Run(CloudRun),
+    Run(Box<CloudRun>),
     Backup(WorkspaceBackup),
 }
 
@@ -593,7 +596,7 @@ impl CloudStore {
             return;
         };
         sync.last_progress_write.insert(run.chat_id.clone(), now);
-        sink(RegistryWrite::Run(registry_safe_run(run)));
+        sink(RegistryWrite::Run(Box::new(registry_safe_run(run))));
     }
 
     fn write<T: ?Sized + Serialize>(
@@ -895,14 +898,11 @@ impl CloudStore {
         self.persist_keys()
     }
 
-    /// Provider keys a cloud run should export to the seat — only rows the
-    /// user toggled "use this key for Cloud sessions" on. With no cloud
-    /// Anthropic key, a live Claude subscription login is forwarded as
-    /// `CLAUDE_CODE_OAUTH_TOKEN` so `claude` on the seat runs under the
-    /// user's existing account — no separate BYOK setup needed.
+    /// Provider keys a legacy cloud run may export to the seat — only rows
+    /// explicitly toggled "use this key for Cloud sessions" are eligible.
     pub fn cloud_env(&self) -> Vec<(String, String)> {
         let state = self.inner.state.read().unwrap();
-        let mut env: Vec<(String, String)> = state
+        state
             .config
             .providers
             .iter()
@@ -910,26 +910,10 @@ impl CloudStore {
             .filter_map(|p| {
                 let provider = p.provider?;
                 let key = state.keys.provider_keys.get(provider.id())?;
-                let env = match provider {
-                    ByokProvider::Anthropic => "ANTHROPIC_API_KEY",
-                    ByokProvider::OpenAi => "OPENAI_API_KEY",
-                    ByokProvider::Xai => "XAI_API_KEY",
-                    ByokProvider::OpenRouter => "OPENROUTER_API_KEY",
-                    ByokProvider::DeepSeek => "DEEPSEEK_API_KEY",
-                    ByokProvider::Xiaomi => "XIAOMI_API_KEY",
-                    ByokProvider::ChatgptSub => "OPENAI_API_KEY",
-                    ByokProvider::DevinSub => "DEVIN_API_KEY",
-                    ByokProvider::Custom => "CUSTOM_API_KEY",
-                };
+                let env = provider_key_env(provider);
                 Some((env.to_string(), key.clone()))
             })
-            .collect();
-        let has_anthropic = env.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY");
-        drop(state);
-        if !has_anthropic && let Some(token) = claude_oauth_token() {
-            env.push(("CLAUDE_CODE_OAUTH_TOKEN".into(), token));
-        }
-        env
+            .collect()
     }
 
     // ── automations ──────────────────────────────────────────────────────
@@ -1274,6 +1258,32 @@ impl CloudStore {
     }
 }
 
+pub(crate) fn provider_key_env(provider: ByokProvider) -> &'static str {
+    match provider {
+        ByokProvider::Anthropic => "ANTHROPIC_API_KEY",
+        ByokProvider::OpenAi | ByokProvider::ChatgptSub => "OPENAI_API_KEY",
+        ByokProvider::Xai => "XAI_API_KEY",
+        ByokProvider::OpenRouter => "OPENROUTER_API_KEY",
+        ByokProvider::DeepSeek => "DEEPSEEK_API_KEY",
+        ByokProvider::Xiaomi => "XIAOMI_API_KEY",
+        ByokProvider::DevinSub => "DEVIN_API_KEY",
+        ByokProvider::Custom => "CUSTOM_API_KEY",
+    }
+}
+
+pub(crate) fn provider_base_env(provider: ByokProvider) -> &'static str {
+    match provider {
+        ByokProvider::Anthropic => "ANTHROPIC_BASE_URL",
+        ByokProvider::OpenAi | ByokProvider::ChatgptSub => "OPENAI_BASE_URL",
+        ByokProvider::Xai => "XAI_BASE_URL",
+        ByokProvider::OpenRouter => "OPENROUTER_BASE_URL",
+        ByokProvider::DeepSeek => "DEEPSEEK_BASE_URL",
+        ByokProvider::Xiaomi => "XIAOMI_BASE_URL",
+        ByokProvider::DevinSub => "DEVIN_BASE_URL",
+        ByokProvider::Custom => "CUSTOM_API_BASE_URL",
+    }
+}
+
 fn dedupe_railway_seats(config: &mut CloudConfigFile) -> bool {
     let mut railway_seats: Vec<(usize, SeatConfig)> = config
         .seats
@@ -1382,30 +1392,6 @@ fn dedupe_railway_seats(config: &mut CloudConfigFile) -> bool {
         config.default_seat = Some(keep_id);
     }
     true
-}
-
-/// The local Claude Code subscription token (`claudeAiOauth.accessToken`
-/// in `$CLAUDE_CONFIG_DIR/.credentials.json` / `~/.claude/.credentials.json`),
-/// skipped when expired. macOS keychain-held logins miss here — fine, the
-/// env var just isn't injected. Never stored; read fresh per dispatch.
-fn claude_oauth_token() -> Option<String> {
-    let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dirs_like_home().join(".claude"));
-    let text = std::fs::read_to_string(dir.join(".credentials.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let oauth = v.get("claudeAiOauth")?;
-    if let Some(expires_ms) = oauth.get("expiresAt").and_then(|e| e.as_i64()) {
-        if expires_ms <= Utc::now().timestamp_millis() {
-            return None;
-        }
-    }
-    oauth
-        .get("accessToken")
-        .and_then(|t| t.as_str())
-        .filter(|t| !t.trim().is_empty())
-        .map(str::to_string)
 }
 
 fn dirs_like_home() -> PathBuf {
@@ -3995,6 +3981,7 @@ pub fn create_task_chat(
             (None, Some(_)) => seat.workspace(),
             (None, None) => chat_workspace(&seat.workspace(), &chat_id),
         }),
+        runner_device_id: seat.runner_device_id.clone(),
         branch: None,
         model_label: None,
         expires_at: seat.expires_at,
@@ -4142,7 +4129,10 @@ impl Scheduler {
     async fn backup_sweep(&self) {
         let now = Utc::now();
         for seat in self.store.seats() {
-            if seat.kind != Some(CloudSeatKind::Railway) || seat.backup_path.is_some() {
+            if seat.runner_device_id.is_some()
+                || seat.kind != Some(CloudSeatKind::Railway)
+                || seat.backup_path.is_some()
+            {
                 continue;
             }
             let Some(deadline) = seat.expires_at else {
@@ -4200,6 +4190,7 @@ impl Scheduler {
                     } else {
                         automation_workspace(&seat.workspace(), &automation.id)
                     }),
+                    runner_device_id: seat.runner_device_id.clone(),
                     branch: None,
                     model_label: None,
                     expires_at: seat.expires_at,
@@ -4508,6 +4499,8 @@ mod tests {
             entry_id: None,
             error: None,
             workspace: None,
+            harness: None,
+            model: None,
             harness_session: Some("sid".into()),
             prompt: None,
             started_at: now,
@@ -4547,6 +4540,8 @@ mod tests {
             entry_id: Some("entry-1".into()),
             error: Some("private error".into()),
             workspace: Some("/workspace/chat-1".into()),
+            harness: None,
+            model: None,
             harness_session: None,
             prompt: Some("private prompt".into()),
             started_at: now,

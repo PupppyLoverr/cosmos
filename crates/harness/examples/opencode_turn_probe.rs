@@ -62,6 +62,7 @@ async fn main() {
         .run(
             request,
             RunControls {
+                environment: Default::default(),
                 request_input: Box::new(move |questions| {
                     assert!(
                         answer_yes,

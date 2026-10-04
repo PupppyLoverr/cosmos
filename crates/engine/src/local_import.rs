@@ -728,6 +728,7 @@ mod tests {
             label: "Seat".into(),
             repo: None,
             workspace_path: Some(format!("/seat/{first_id}")),
+            runner_device_id: None,
             branch: None,
             model_label: None,
             expires_at: None,

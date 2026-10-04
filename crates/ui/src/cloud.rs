@@ -185,6 +185,7 @@ mod tests {
                 label: "Trial".into(),
                 repo: None,
                 workspace_path: None,
+                runner_device_id: None,
                 branch: None,
                 model_label: None,
                 expires_at: Some(Utc::now() + Duration::minutes(30)),
@@ -195,15 +196,38 @@ mod tests {
             rail.update(cx, |rail, cx| {
                 assert!(rail._countdown.is_some());
                 assert!(rail._refresh.is_some());
+                rail.task = Some(cx.spawn(async move |_, _| {
+                    std::future::pending::<()>().await;
+                }));
+                rail.act_task = Some(cx.spawn(async move |_, _| {
+                    std::future::pending::<()>().await;
+                }));
+                rail.confirm_task = Some(cx.spawn(async move |_, _| {
+                    std::future::pending::<()>().await;
+                }));
+                rail.control_task = Some(cx.spawn(async move |_, _| {
+                    std::future::pending::<()>().await;
+                }));
                 rail.screen_task = Some(cx.spawn(async move |_, _| {
                     std::future::pending::<()>().await;
                 }));
+                rail.exec_busy = true;
+                rail.desktop_starting = true;
+                rail.backup_busy = true;
                 assert!(rail.screen_task.is_some());
                 rail.set_active(false, cx);
                 assert!(rail._countdown.is_none());
                 assert!(rail._refresh.is_none());
                 assert!(rail.screen_task.is_none());
+                assert!(rail.task.is_none());
+                assert!(rail.act_task.is_none());
+                assert!(rail.confirm_task.is_none());
+                assert!(rail.control_task.is_some());
+                assert!(!rail.exec_busy);
+                assert!(!rail.desktop_starting);
+                assert!(!rail.backup_busy);
                 rail.set_active(true, cx);
+                rail.control_task = None;
                 assert!(rail._countdown.is_some());
                 assert!(rail._refresh.is_some());
             });
@@ -517,7 +541,6 @@ pub(crate) fn status_dot(
         .flex_none()
         .rounded_full()
         .bg(color)
-        .tooltip(widgets::text_tooltip(label))
 }
 
 fn countdown_tick(secs_left: i64) -> Option<std::time::Duration> {
@@ -909,6 +932,8 @@ pub struct CloudRail {
     confirm_task: Option<Task<()>>,
     control_busy: bool,
     control_error: Option<String>,
+    control_task: Option<Task<()>>,
+    toolbar_status_tooltip: SharedString,
     /// The chat's session stamp at the last ledger refresh — the state
     /// observer reloads the run row only when this actually moves.
     session_stamp: Option<(SessionStatus, chrono::DateTime<chrono::Utc>)>,
@@ -1007,9 +1032,12 @@ impl CloudRail {
                 .map(|s| (s.status, s.updated_at));
             if stamp != this.session_stamp {
                 this.session_stamp = stamp;
-                this.load_seat(cx);
+                if !this.hosted_by_remote_runner(cx) {
+                    this.load_seat(cx);
+                }
             }
         });
+        let toolbar_status_tooltip = format!("{} · Not checked yet", binding.label).into();
         let mut rail = Self {
             state,
             chat_id,
@@ -1056,6 +1084,8 @@ impl CloudRail {
             confirm_task: None,
             control_busy: false,
             control_error: None,
+            control_task: None,
+            toolbar_status_tooltip,
             session_stamp: None,
             keep_prompted: None,
             task: None,
@@ -1091,6 +1121,7 @@ impl CloudRail {
                                 .map(|at| at.signed_duration_since(chrono::Utc::now()))
                                 .map(|d| d.num_seconds())
                                 .unwrap_or(-1);
+                            rail.refresh_toolbar_status_tooltip();
                             cx.notify();
                             countdown_tick(left)
                         })
@@ -1145,8 +1176,76 @@ impl CloudRail {
             self._countdown = None;
             self._refresh = None;
             self.screen_task = None;
+            self.task = None;
+            self.act_task = None;
+            self.confirm_task = None;
+            self.confirm_destroy = false;
+            self.act_error = None;
+            self.exec_busy = false;
+            self.desktop_starting = false;
+            self.backup_busy = false;
+            self.controlling = false;
+            self.control_busy = self.control_task.is_some();
         }
         cx.notify();
+    }
+
+    fn hosted_by_remote_runner(&self, cx: &App) -> bool {
+        self.binding
+            .runner_device_id
+            .as_ref()
+            .is_some_and(|runner_id| {
+                self.state.read(cx).local_device_id.as_deref() != Some(runner_id.as_str())
+            })
+    }
+
+    fn refresh_toolbar_status_tooltip(&mut self) {
+        let seat = self.seat.ready();
+        let seat_label = seat
+            .map(|seat| seat.config.label.as_str())
+            .unwrap_or(self.binding.label.as_str());
+        let probe = seat.and_then(|seat| seat.config.last_probe.as_ref());
+        let run_status = self.run.as_ref().map(|run| run.status);
+        let sleeping = probe.is_some_and(|probe| probe.sleeping);
+        let railway = seat.is_some_and(|seat| seat.config.kind == Some(CloudSeatKind::Railway))
+            || self.binding.kind == CloudSeatKind::Railway;
+        let trial_left = self
+            .binding
+            .expires_at
+            .map(|at| at.signed_duration_since(chrono::Utc::now()).num_seconds());
+        let trial_ended = railway
+            && (seat.is_some_and(|seat| seat.config.expired())
+                || self
+                    .binding
+                    .expires_at
+                    .is_some_and(|at| at <= chrono::Utc::now()));
+        let meta = if trial_ended {
+            "Trial ended".to_string()
+        } else {
+            match (trial_left, run_status) {
+                (Some(secs), _) => {
+                    if secs < 60 {
+                        "Trial · <1m left".to_string()
+                    } else {
+                        format!("Trial · {}m left", secs / 60)
+                    }
+                }
+                (None, _) if sleeping => "Sleeping · billing off".to_string(),
+                (None, Some(status)) => status.label().to_string(),
+                (None, None) => match probe {
+                    Some(probe) if probe.online => "Online".to_string(),
+                    Some(_) => "Offline".to_string(),
+                    None => "Not checked yet".to_string(),
+                },
+            }
+        };
+        let meta = match (&meta[..], run_status) {
+            (meta, Some(status)) if meta.starts_with("Trial ·") => {
+                format!("{meta} · {}", status.label())
+            }
+            _ => meta,
+        };
+        self.toolbar_status_tooltip = format!("{seat_label} · {meta}").into();
     }
 
     fn capabilities(&self) -> SeatCapabilities {
@@ -1184,6 +1283,7 @@ impl CloudRail {
 
     fn load_seat(&mut self, cx: &mut Context<Self>) {
         let seat_id = self.binding.seat_id.clone();
+        let runner_hosted_remotely = self.hosted_by_remote_runner(cx);
         let Some(engine) = self.engine(cx) else {
             self.seat = Loadable::Error("Engine not connected".into());
             return;
@@ -1194,21 +1294,34 @@ impl CloudRail {
                 .call(methods::CLOUD_GET_CONFIG, serde_json::json!({}))
                 .await;
             this.update(cx, |rail, cx| {
+                if runner_hosted_remotely {
+                    rail.runs.clear();
+                    rail.run = None;
+                }
                 let mut run_finished = false;
                 rail.seat = match result {
                     Ok(value) => match serde_json::from_value::<CloudView>(value) {
                         Ok(view) => {
-                            rail.runs = view
-                                .runs
-                                .iter()
-                                .filter(|run| run.chat_id == rail.chat_id)
-                                .cloned()
-                                .collect();
-                            let run = view.run_for_chat(&rail.chat_id).cloned();
+                            let run = if runner_hosted_remotely {
+                                rail.runs.clear();
+                                None
+                            } else {
+                                rail.runs = view
+                                    .runs
+                                    .iter()
+                                    .filter(|run| run.chat_id == rail.chat_id)
+                                    .cloned()
+                                    .collect();
+                                view.run_for_chat(&rail.chat_id).cloned()
+                            };
                             run_finished = run
                                 .as_ref()
                                 .is_some_and(|next| cloud_run_finished(rail.run.as_ref(), next));
-                            rail.run = run.or_else(|| rail.run.take());
+                            rail.run = if runner_hosted_remotely {
+                                None
+                            } else {
+                                run.or_else(|| rail.run.take())
+                            };
                             rail.model_label = Some(view.cloud_model_label());
                             match view.seat(&seat_id) {
                                 Some(row) => Loadable::Ready(row.clone()),
@@ -1221,6 +1334,7 @@ impl CloudRail {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
+                rail.refresh_toolbar_status_tooltip();
                 if run_finished
                     || (rail.pane == CloudPane::Files && matches!(rail.listing, Loadable::Idle))
                 {
@@ -1417,7 +1531,7 @@ impl CloudRail {
         self.control_busy = true;
         self.control_error = None;
         let chat_id = self.chat_id.clone();
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.control_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(
@@ -1426,6 +1540,7 @@ impl CloudRail {
                 )
                 .await;
             this.update(cx, |rail, cx| {
+                rail.control_task = None;
                 rail.control_busy = false;
                 match result.map(|v| v.get("binding").cloned()) {
                     Ok(Some(value)) => match serde_json::from_value::<CloudSeatBinding>(value) {
@@ -1434,6 +1549,36 @@ impl CloudRail {
                     },
                     Ok(None) => rail.control_error = Some("the engine didn't return a seat".into()),
                     Err(err) => rail.control_error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn return_chat(&mut self, push_wip: bool, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            self.control_error = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        self.control_busy = true;
+        self.control_error = None;
+        let chat_id = self.chat_id.clone();
+        self.control_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::CLOUD_RETURN_CHAT,
+                    serde_json::json!({ "chatId": chat_id, "pushWip": push_wip }),
+                )
+                .await;
+            this.update(cx, |rail, cx| {
+                rail.control_task = None;
+                rail.control_busy = false;
+                if let Err(err) = result {
+                    rail.control_error = Some(err.to_string());
                 }
                 cx.notify();
             })
@@ -1459,6 +1604,7 @@ impl CloudRail {
         self.controlling = false;
         self.evidence = Loadable::Idle;
         self.run = None;
+        self.refresh_toolbar_status_tooltip();
         self.keep_prompted = None;
         self.state
             .update(cx, |state, cx| state.refresh_cloud(None, cx));
@@ -4774,7 +4920,7 @@ impl CloudRail {
                 .id("rail-toolbar-status")
                 .flex_none()
                 .child(status_dot(theme, probe.as_ref(), trial_ended))
-                .tooltip(widgets::text_tooltip(format!("{seat_label} · {meta}")))
+                .tooltip(widgets::text_tooltip(self.toolbar_status_tooltip.clone()))
                 .into_any_element()
         });
         let mut trailing = div()
@@ -4861,6 +5007,26 @@ impl CloudRail {
                         )
                         .child("Check seat"),
                 );
+            if self.state.read(cx).workspace_scope == Some(zeron_proto::WorkspaceScope::Synced) {
+                menu = menu.child(
+                    popover::menu_row(theme, false, "rail-menu-return")
+                        .id("rail-menu-return")
+                        .when(self.control_busy, |row| row.opacity(0.45))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.control_busy {
+                                return;
+                            }
+                            this.close_pane_menu(cx);
+                            this.return_chat(false, cx);
+                        }))
+                        .child(
+                            icon(icons::ARROW_LEFT)
+                                .size(px(13.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child("Return to this Mac"),
+                );
+            }
             match seat.and_then(|s| s.config.preview_url.clone()) {
                 Some(url) => {
                     menu = menu.child(
@@ -5043,24 +5209,41 @@ impl CloudRail {
 
         let mut cards: Vec<AnyElement> = Vec::new();
         if let Some(err) = self.control_error.clone() {
-            cards.push(
-                notice_card(
+            let error_card = notice_card(
                     theme,
                     NoticeTone::Danger,
                     icons::DANGER_TRIANGLE,
                     "Seat error",
                     err,
                 )
-                .child(notice_actions().child(
-                    notice_button("notice-dismiss", "Dismiss", theme, false).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.control_error = None;
-                            cx.notify();
-                        },
-                    )),
-                ))
-                .into_any_element(),
-            );
+                .child(notice_actions()
+                    .when(
+                        self.control_error.as_deref()
+                            == Some("uncommitted changes on the runner — push them to a WIP branch first"),
+                        |actions| actions.child(
+                            notice_button(
+                                "runner-push-wip",
+                                "Push a WIP branch and continue",
+                                theme,
+                                true,
+                            )
+                            .when(self.control_busy, |el| el.opacity(0.5))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.control_busy {
+                                    this.return_chat(true, cx);
+                                }
+                            })),
+                        ),
+                    )
+                    .child(
+                        notice_button("notice-dismiss", "Dismiss", theme, false).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.control_error = None;
+                                cx.notify();
+                            },
+                        )),
+                    ));
+            cards.push(error_card.into_any_element());
         }
 
         let card = if railway_expired {

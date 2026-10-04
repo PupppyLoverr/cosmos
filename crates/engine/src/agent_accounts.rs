@@ -97,7 +97,7 @@ use crate::{EngineError, new_id, now_ms};
 mod oauth;
 #[cfg(test)]
 mod provider_tests;
-mod stores;
+pub(crate) mod stores;
 mod usage;
 
 // Claude Code's public OAuth client (the one the CLI itself uses for the manual

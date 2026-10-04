@@ -682,7 +682,16 @@ async fn target_device_id_routes_over_the_relay() {
     let dirs = tempfile::tempdir().expect("tempdir");
 
     // Engine B hosts its device room on the fake relay.
-    let core_b = assemble(&dirs.path().join("b"), "device-b");
+    let b_dir = dirs.path().join("b");
+    std::fs::create_dir_all(&b_dir).expect("create runner data dir");
+    std::fs::write(b_dir.join("device-id"), "device-b").expect("write runner device id");
+    let core_b = EngineCore::assemble_with_profile(
+        zeron_engine::EngineProfile::development(&b_dir, "dev-org", "dev-user"),
+        registry(),
+        HarnessId::Mock,
+        None,
+    )
+    .expect("assemble runner engine");
     let _host = core_b.start_host_relay(&relay_url);
 
     // Engine A dials peers through the same relay.
@@ -1695,9 +1704,41 @@ async fn queue_watch_and_single_consumption_route_to_the_remote_chat_host() {
     // That keeps B's automatic drain from consuming the fixture before the
     // remote client has subscribed to it.
     let core_b = assemble(&dirs.path().join("b"), "device-b");
+    let runner_workspace = dirs.path().join("runner-workspace");
+    let binding = zeron_proto::CloudSeatBinding {
+        seat_id: "runner-seat".into(),
+        kind: zeron_proto::CloudSeatKind::Ssh,
+        label: "Runner".into(),
+        repo: None,
+        workspace_path: Some(runner_workspace.display().to_string()),
+        runner_device_id: Some("device-b".into()),
+        branch: None,
+        model_label: None,
+        expires_at: None,
+    };
+    core_b
+        .cloud
+        .as_ref()
+        .expect("runner profile CloudStore")
+        .save_seat(zeron_engine::cloud::SeatConfig {
+            id: "runner-seat".into(),
+            kind: Some(zeron_proto::CloudSeatKind::Ssh),
+            label: "Runner".into(),
+            runner_device_id: Some("device-b".into()),
+            ..Default::default()
+        })
+        .expect("save runner seat");
     core_b
         .workspace
-        .create_chat("chat-queue-remote", None, Some("device-a"), None, None)
+        .create_chat_with_parent(
+            "chat-queue-remote",
+            None,
+            Some("device-a"),
+            None,
+            binding.workspace_path.clone(),
+            None,
+            Some(binding),
+        )
         .expect("create remote queue chat");
     core_b
         .workspace
@@ -1716,11 +1757,16 @@ async fn queue_watch_and_single_consumption_route_to_the_remote_chat_host() {
 
     let core_a = assemble(&dirs.path().join("a"), "device-a");
     let mut link_config =
-        LinkCacheConfig::new(relay_url, Arc::new(StaticToken("test-user".into())));
+        LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
     link_config.probe_timeout = Duration::from_secs(5);
     core_a.set_links(LinkCache::new(link_config));
     let remote_client = zeron_rpc::memory_client(core_a.rpc_service());
-    let local_client = zeron_rpc::memory_client(core_b.rpc_service());
+    let core_c = assemble(&dirs.path().join("c"), "device-c");
+    let mut second_link_config =
+        LinkCacheConfig::new(relay_url, Arc::new(StaticToken("test-user".into())));
+    second_link_config.probe_timeout = Duration::from_secs(5);
+    core_c.set_links(LinkCache::new(second_link_config));
+    let second_viewport_client = zeron_rpc::memory_client(core_c.rpc_service());
 
     // The opening stream frame is the authoritative whole-list snapshot a
     // remote Desktop/iOS client uses to repair or initialize its queue.
@@ -1792,6 +1838,28 @@ async fn queue_watch_and_single_consumption_route_to_the_remote_chat_host() {
             .is_empty(),
         "the forwarding engine must not execute the queued prompt"
     );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let entries = core_b
+            .doc_host
+            .open("chat-queue-remote")
+            .expect("B chat")
+            .doc()
+            .read_entries()
+            .expect("B transcript");
+        if entries.iter().any(|entry| {
+            entry.parts.iter().any(
+                |part| matches!(part, zeron_doc::MessagePart::Text { text, .. } if text == "remote reply"),
+            )
+        }) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "runner host did not execute the queued turn"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     // Two clients racing the same synchronized row still produce exactly one
     // consumer. The loser gets `sent: false` and can reconcile its projection.
@@ -1830,10 +1898,11 @@ async fn queue_watch_and_single_consumption_route_to_the_remote_chat_host() {
     let local_params = serde_json::json!({
         "chatId": "chat-queue-remote",
         "id": second_id,
+        "targetDeviceId": "device-b",
     });
     let (remote_result, local_result) = tokio::join!(
         remote_client.call(methods::SEND_QUEUED_MESSAGE_NOW, remote_params),
-        local_client.call(methods::SEND_QUEUED_MESSAGE_NOW, local_params),
+        second_viewport_client.call(methods::SEND_QUEUED_MESSAGE_NOW, local_params),
     );
     let acknowledgements = [
         remote_result.expect("remote contender")["sent"] == true,
@@ -1844,7 +1913,33 @@ async fn queue_watch_and_single_consumption_route_to_the_remote_chat_host() {
         1,
         "the host must atomically take a queue row once"
     );
+    assert!(
+        core_b
+            .cloud
+            .as_ref()
+            .expect("runner CloudStore")
+            .runs()
+            .is_empty(),
+        "runner-hosted execution must not create legacy CloudRun rows"
+    );
+    assert!(
+        !dirs
+            .path()
+            .join("b/orgs/dev-org/dev-user/cloud-runs.json")
+            .exists(),
+        "runner-hosted execution must not write cloud-runs.json"
+    );
+    assert!(
+        core_a
+            .cloud
+            .as_ref()
+            .expect("viewport CloudStore")
+            .runs()
+            .is_empty(),
+        "a viewport must not reattach or ledger a runner-hosted turn"
+    );
 
     core_a.shutdown().await;
     core_b.shutdown().await;
+    core_c.shutdown().await;
 }

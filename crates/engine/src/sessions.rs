@@ -28,7 +28,7 @@ use zeron_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
     SessionMessageEntry, fold_event_into_parts, sanitize_tool_call,
 };
-use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
+use zeron_harness::{CancellationToken, Harness, RunControls, RunEnvironment, SteerMessage};
 use zeron_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion,
@@ -169,6 +169,7 @@ struct Inner {
     /// the remote-run ledger. A chat whose row carries `cloudSeat` dispatches
     /// to the seat instead of a local harness. Absent in bare tests.
     cloud: OnceLock<crate::cloud::CloudStore>,
+    runner_credentials: OnceLock<Arc<crate::runner_credentials::RunnerCredentialVault>>,
     /// Harness-native session ids per chat (resume continuity across turns) —
     /// the live-process cache over the durable copy on the workspace chat row
     /// (zeron kept the same pair on `chats.harness_session_id`). An empty
@@ -263,6 +264,7 @@ impl SessionsEngine {
                 sessions_tx,
                 last_requests: Mutex::new(HashMap::new()),
                 cloud: OnceLock::new(),
+                runner_credentials: OnceLock::new(),
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
@@ -327,6 +329,13 @@ impl SessionsEngine {
         let _ = self.inner.cloud.set(store);
     }
 
+    pub fn set_runner_credentials(
+        &self,
+        vault: Arc<crate::runner_credentials::RunnerCredentialVault>,
+    ) {
+        let _ = self.inner.runner_credentials.set(vault);
+    }
+
     /// After a restart, pick up the cloud runs the ledger still calls live.
     /// Detached seat runs and Boat runs kept working while Cosmos was closed
     /// — their output resumes mirroring into the chat from where it stopped.
@@ -353,19 +362,34 @@ impl SessionsEngine {
             for run in store.runs().into_iter().filter(cloud_run_is_live) {
                 insert_cloud_run_candidate(&mut live, run);
             }
-            match workspace.read_chats() {
-                Ok(chats) => {
-                    for run in chats
-                        .into_iter()
-                        .filter_map(|chat| chat.cloud_run)
-                        .filter(cloud_run_is_live)
-                    {
-                        insert_cloud_run_candidate(&mut live, run);
-                    }
+            let chats = match workspace.read_chats() {
+                Ok(chats) => chats,
+                Err(error) => {
+                    tracing::warn!(%error, "could not read cloud runs from registry");
+                    Vec::new()
                 }
-                Err(error) => tracing::warn!(%error, "could not read cloud runs from registry"),
+            };
+            let runner_chats = chats
+                .iter()
+                .filter(|chat| {
+                    chat.cloud_seat
+                        .as_ref()
+                        .is_some_and(|binding| binding.runner_device_id.is_some())
+                })
+                .map(|chat| chat.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            for chat in chats {
+                if runner_chats.contains(&chat.id) {
+                    continue;
+                }
+                if let Some(run) = chat.cloud_run.filter(cloud_run_is_live) {
+                    insert_cloud_run_candidate(&mut live, run);
+                }
             }
-            for run in live.into_values() {
+            for (chat_id, run) in live {
+                if runner_chats.contains(&chat_id) {
+                    continue;
+                }
                 store.upsert_run(run.clone());
                 if lock(&sessions.inner.runs).contains_key(&run.chat_id) {
                     continue;
@@ -389,6 +413,12 @@ impl SessionsEngine {
             .workspace()
             .and_then(|ws| ws.chat(&chat_id).ok().flatten())
             .and_then(|chat| chat.cloud_seat);
+        if binding
+            .as_ref()
+            .is_some_and(|binding| binding.runner_device_id.is_some())
+        {
+            return;
+        }
         let seat = binding
             .as_ref()
             .and_then(|binding| store.seat_for(binding))
@@ -471,15 +501,6 @@ impl SessionsEngine {
         tokio::spawn(async move {
             let http = reqwest::Client::new();
             let command = run.command.clone().unwrap_or_default();
-            let credential_paths: Vec<&'static str> =
-                crate::cloud::harness_credentials(if box_id.is_some() {
-                    seat.harness_command.as_deref().unwrap_or("claude")
-                } else {
-                    &command
-                })
-                .into_iter()
-                .map(|(_, remote)| remote)
-                .collect();
             let session_id = crate::cloud::harness_session_id(&chat_id);
             let turn = RemoteTurn {
                 prompt: run.prompt.clone().unwrap_or_default(),
@@ -487,6 +508,8 @@ impl SessionsEngine {
                 session_tag: (box_id.is_none()
                     && crate::cloud::continuation_flags(&command, &session_id, true).is_some())
                 .then(|| format!("{}:{session_id}", crate::cloud::command_bin(&command))),
+                harness: run.harness.unwrap_or(HarnessId::ClaudeCode),
+                model: run.model.clone(),
                 install: String::new(),
             };
             let persist_seat = match box_id {
@@ -567,13 +590,6 @@ impl SessionsEngine {
                     seat.clone()
                 }
             };
-            crate::cloud::cleanup_staged_credentials(
-                &http,
-                &store,
-                &persist_seat,
-                &credential_paths,
-            )
-            .await;
             persist_remote_turn(
                 &inner,
                 &store,
@@ -718,20 +734,58 @@ impl SessionsEngine {
         // cross-harness delivery before recording or routing the user turn.
         zeron_proto::invocation::validate_harness_invocations(&request.prompt, harness_id)
             .map_err(EngineError::Other)?;
-        // Cloud-seat chats never spawn a local harness: the run goes to the
-        // seat's exec surface with its own ledger row, streamed back into the
-        // same doc. Checked BEFORE any local-run routing or MCP stamping —
-        // none of the device-local seams apply to a seat.
-        if let Some(store) = self.inner.cloud.get()
-            && let Some(binding) = self
-                .inner
-                .workspace()
-                .and_then(|ws| ws.chat(chat_id).ok().flatten())
-                .and_then(|chat| chat.cloud_seat)
+        let mut runner_environment = RunEnvironment::default();
+        if let Some(binding) = self
+            .inner
+            .workspace()
+            .and_then(|ws| ws.chat(chat_id).ok().flatten())
+            .and_then(|chat| chat.cloud_seat)
         {
-            return self
-                .dispatch_remote(store, chat_id, &binding, harness_id, request, message_id)
-                .await;
+            if let Some(runner_id) = binding.runner_device_id.as_deref() {
+                if runner_id != self.inner.device_id {
+                    return Err(EngineError::Other(
+                        "this Cloud chat runs on its runner".into(),
+                    ));
+                }
+                let vault = self.inner.runner_credentials.get().map(Arc::as_ref);
+                runner_environment = match crate::runner_runtime::harness_environment(
+                    vault,
+                    harness_id,
+                    request.model.as_deref(),
+                ) {
+                    Ok(environment) => environment,
+                    Err(message) => {
+                        return self.runner_dispatch_failure(
+                            chat_id,
+                            &request.prompt,
+                            message_id,
+                            &message,
+                        );
+                    }
+                };
+                let workspace =
+                    match crate::runner_runtime::prepare_workspace(&binding, vault).await {
+                        Ok(path) => path,
+                        Err(message) => {
+                            return self.runner_dispatch_failure(
+                                chat_id,
+                                &request.prompt,
+                                message_id,
+                                &message,
+                            );
+                        }
+                    };
+                request.cwd = workspace.to_string_lossy().into_owned();
+                request.worktree = None;
+            } else if let Some(store) = self.inner.cloud.get() {
+                return self
+                    .dispatch_remote(store, chat_id, &binding, harness_id, request, message_id)
+                    .await;
+            } else {
+                return Err(EngineError::Other(
+                    "Cloud seat is unavailable on this profile".into(),
+                ));
+            }
         }
         lock(&self.inner.browsers).prepare(&mut request, std::time::Instant::now());
         // Cosmos Computer rides the same seam: engine-stamped only, only while
@@ -899,6 +953,7 @@ impl SessionsEngine {
             request_input,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
+            environment: runner_environment,
         };
 
         lock(&self.inner.runs).insert(
@@ -946,6 +1001,22 @@ impl SessionsEngine {
             },
         ));
         Ok(run_id)
+    }
+
+    fn runner_dispatch_failure(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        message_id: Option<String>,
+        message: &str,
+    ) -> Result<String, EngineError> {
+        let handle = self.doc_handle(chat_id)?;
+        let message_id = message_id.unwrap_or_else(new_id);
+        handle.write_user_message(&message_id, prompt, now_ms())?;
+        write_transcript_note(&handle.writer(), &self.inner.device_id, message);
+        self.set_status(chat_id, SessionStatus::Errored, false);
+        self.inner.note_message(chat_id, prompt);
+        Ok(new_id())
     }
 
     /// Cloud-seat dispatch (Cloud/GitHub agent mode): the chat's `cloudSeat`
@@ -1086,6 +1157,8 @@ impl SessionsEngine {
             entry_id: None,
             error: None,
             workspace: Some(seat.workspace()),
+            harness: Some(harness_id),
+            model: request.model.clone(),
             harness_session: None,
             prompt: request
                 .prompt
@@ -1112,6 +1185,8 @@ impl SessionsEngine {
                 prompt: request.prompt,
                 recap,
                 session_tag,
+                harness: harness_id,
+                model: request.model.clone(),
                 install,
             },
             handle.writer(),
@@ -1278,6 +1353,14 @@ impl SessionsEngine {
                 continue; // a live run owns this journal
             }
             let handle = self.doc_handle(&chat_id)?;
+            let runner_bound = self
+                .inner
+                .workspace()
+                .and_then(|workspace| workspace.chat(&chat_id).ok().flatten())
+                .and_then(|chat| chat.cloud_seat)
+                .is_some_and(|binding| {
+                    binding.runner_device_id.as_deref() == Some(&self.inner.device_id)
+                });
             // Harness continuity first: the crashed run's session id may only
             // exist in the journal (the debounced workspace-row write may
             // never have landed) — remember it so the revived run resumes the
@@ -1314,9 +1397,12 @@ impl SessionsEngine {
                         .map(|e| now_ms() - e.created_at < RESUME_FRESH_MS)
                 })
                 .unwrap_or(false);
-            let will_resume = fresh && prompt.is_some() && attempts < MAX_AUTO_RESUME;
+            let will_resume =
+                !runner_bound && fresh && prompt.is_some() && attempts < MAX_AUTO_RESUME;
 
-            let note = if will_resume {
+            let note = if runner_bound {
+                "Runner restarted mid-turn — send your message again to continue"
+            } else if will_resume {
                 "Run interrupted by engine restart — resuming"
             } else {
                 "Run interrupted by engine restart"
@@ -2100,8 +2186,34 @@ struct RemoteTurn {
     prompt: String,
     recap: String,
     session_tag: Option<String>,
+    harness: HarnessId,
+    model: Option<String>,
     /// Best-effort install of the harness CLI when the seat lacks it.
     install: String,
+}
+
+fn boat_provider(harness: HarnessId) -> Option<&'static str> {
+    match harness {
+        HarnessId::ClaudeCode => Some("claude"),
+        _ => None,
+    }
+}
+
+fn harness_display_name(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::ClaudeCode => "Claude Code",
+        HarnessId::Codex => "Codex",
+        HarnessId::Cursor => "Cursor",
+        HarnessId::Devin => "Devin",
+        HarnessId::Grok => "Grok",
+        HarnessId::Hermes => "Hermes",
+        HarnessId::Pi => "Pi",
+        HarnessId::Opencode => "OpenCode",
+        HarnessId::Antigravity => "Antigravity",
+        HarnessId::Amp => "Amp",
+        HarnessId::KimiCode => "Kimi Code",
+        HarnessId::Mock => "Mock",
+    }
 }
 
 /// A compact recap of the thread so far — the continuity fallback for
@@ -2374,12 +2486,6 @@ async fn drive_remote_run(
         .cloud_env()
         .into_iter()
         .map(|(k, v)| format!("{k}={}", crate::cloud::shell_word(&v)))
-        .chain(
-            store
-                .github_pat(&seat.id)
-                .into_iter()
-                .map(|pat| format!("GITHUB_TOKEN={}", crate::cloud::shell_word(&pat))),
-        )
         .collect::<Vec<_>>()
         .join(" ");
     // `{prompt}` in the configured command names where the prompt goes;
@@ -2429,27 +2535,6 @@ async fn drive_remote_run(
     // opencode/grok/pi/hermes stores — staged per run so the harness auths
     // on the box and keeps working after the laptop closes. A staging miss
     // only warns; BYOK env keys may still cover the harness.
-    let staged_remotes = crate::cloud::harness_credentials(&command)
-        .into_iter()
-        .map(|(local, remote)| (local, remote))
-        .collect::<Vec<_>>();
-    for (local, remote) in &staged_remotes {
-        if let Err(e) = crate::cloud::stage_credential(&http, &store, &seat, &local, remote).await {
-            tracing::warn!(seat = %seat.id, file = %local.display(), error = %e, "credential staging failed");
-            write_transcript_note(
-                &doc,
-                &inner.device_id,
-                &format!(
-                    "Couldn't stage {} login on the seat: {e}",
-                    local
-                        .file_stem()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("harness")
-                ),
-            );
-        }
-    }
-
     if seat.detached {
         // Detached: nohup into a per-run log on the seat, then tail it. The
         // process belongs to the seat's init tree, so closing this app (or
@@ -2492,16 +2577,6 @@ async fn drive_remote_run(
                     &command,
                 )
                 .await;
-                crate::cloud::cleanup_staged_credentials(
-                    &http,
-                    &store,
-                    &seat,
-                    &staged_remotes
-                        .iter()
-                        .map(|(_, path)| *path)
-                        .collect::<Vec<_>>(),
-                )
-                .await;
                 persist_remote_turn(&inner, &store, &http, &seat, &chat_id, &run_id, &turn, &doc)
                     .await;
             }
@@ -2530,16 +2605,6 @@ async fn drive_remote_run(
                     zeron_proto::CloudRunStatus::Error,
                     Some(e),
                 );
-                crate::cloud::cleanup_staged_credentials(
-                    &http,
-                    &store,
-                    &seat,
-                    &staged_remotes
-                        .iter()
-                        .map(|(_, path)| *path)
-                        .collect::<Vec<_>>(),
-                )
-                .await;
             }
         }
         return;
@@ -2557,16 +2622,6 @@ async fn drive_remote_run(
                 zeron_proto::CloudRunStatus::Error,
                 Some(e),
             );
-            crate::cloud::cleanup_staged_credentials(
-                &http,
-                &store,
-                &seat,
-                &staged_remotes
-                    .iter()
-                    .map(|(_, path)| *path)
-                    .collect::<Vec<_>>(),
-            )
-            .await;
             return;
         }
     };
@@ -2734,16 +2789,6 @@ async fn drive_remote_run(
             Some(message),
         );
     }
-    crate::cloud::cleanup_staged_credentials(
-        &http,
-        &store,
-        &seat,
-        &staged_remotes
-            .iter()
-            .map(|(_, path)| *path)
-            .collect::<Vec<_>>(),
-    )
-    .await;
     if !expired {
         persist_remote_turn(&inner, &store, &http, &seat, &chat_id, &run_id, &turn, &doc).await;
     }
@@ -2815,12 +2860,20 @@ async fn drive_boat_turn(
             lock(&inner.runs).remove(&chat_id);
         };
     let fail = |e: String| {
-        write_remote_error(&doc, &inner.device_id, &e);
+        write_remote_error(doc, &inner.device_id, &e);
         finish(
             SessionStatus::Errored,
             zeron_proto::CloudRunStatus::Error,
             Some(e),
         );
+    };
+
+    let Some(provider) = boat_provider(turn.harness) else {
+        fail(format!(
+            "Boat's built-in agent runs Claude Code only — install a Cosmos runner on this box to use {}",
+            harness_display_name(turn.harness)
+        ));
+        return;
     };
 
     let Some(token) = store.box_token(&seat.id) else {
@@ -2981,39 +3034,6 @@ async fn drive_boat_turn(
         }
     }
 
-    let staged_remotes =
-        crate::cloud::harness_credentials(seat.harness_command.as_deref().unwrap_or("claude"))
-            .into_iter()
-            .collect::<Vec<_>>();
-    for (local, remote) in &staged_remotes {
-        if let Err(e) = crate::cloud::stage_credential(&http, &store, &seat, local, remote).await {
-            tracing::warn!(seat = %seat.id, file = %local.display(), error = %e, "credential staging failed");
-            write_transcript_note(
-                &doc,
-                &inner.device_id,
-                &format!(
-                    "Couldn't stage {} login on the seat: {e}",
-                    local
-                        .file_stem()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("harness")
-                ),
-            );
-        }
-    }
-    let cleanup = || async {
-        crate::cloud::cleanup_staged_credentials(
-            &http,
-            &store,
-            &seat,
-            &staged_remotes
-                .iter()
-                .map(|(_, path)| *path)
-                .collect::<Vec<_>>(),
-        )
-        .await;
-    };
-
     // Kick the integrated agent. The prompt response carries the
     // conversation handle; events stream the transcript we mirror.
     let live_seat = {
@@ -3022,8 +3042,10 @@ async fn drive_boat_turn(
         live
     };
     let prompt = prepare_remote_turn(&inner, &store, &http, &live_seat, &chat_id, turn, doc).await;
-    if let Err(e) = api.prompt(&box_id, "claude", &prompt, None).await {
-        cleanup().await;
+    if let Err(e) = api
+        .prompt(&box_id, provider, &prompt, turn.model.as_deref())
+        .await
+    {
         fail(format!("Boat couldn't start the agent: {e}"));
         return;
     }
@@ -3041,7 +3063,6 @@ async fn drive_boat_turn(
         None,
     )
     .await;
-    cleanup().await;
     match outcome {
         BoatOutcome::Done => finish(SessionStatus::Idle, zeron_proto::CloudRunStatus::Done, None),
         BoatOutcome::Stopped => finish(
@@ -3995,7 +4016,7 @@ async fn drive_run(
     chat_id: String,
     run_id: String,
     harness: Arc<dyn Harness>,
-    mut request: RunRequest,
+    request: RunRequest,
     doc: crate::doc_host::DocWriter,
     controls: RunControls,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
@@ -5028,7 +5049,57 @@ async fn drive_run(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+    use futures::stream::BoxStream;
+    use zeron_doc::{SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
+    use zeron_harness::HarnessError;
+    use zeron_proto::{Model, ReasoningLevel, SteeringMode};
+
+    struct SpawnCounter(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Harness for SpawnCounter {
+        fn id(&self) -> HarnessId {
+            HarnessId::ClaudeCode
+        }
+
+        fn display_name(&self) -> &str {
+            "Spawn counter"
+        }
+
+        fn supports_steering(&self) -> bool {
+            false
+        }
+
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::TurnBoundary
+        }
+
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(Vec::new())
+        }
+
+        async fn run(
+            &self,
+            _request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Ok(futures::stream::iter([Ok(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+            })])
+            .boxed())
+        }
+    }
 
     fn cloud_run_candidate(bytes: u64, cursor: Option<&str>) -> zeron_proto::CloudRun {
         let now = Utc::now();
@@ -5045,6 +5116,8 @@ mod tests {
             entry_id: None,
             error: None,
             workspace: None,
+            harness: None,
+            model: None,
             harness_session: None,
             prompt: None,
             started_at: now,
@@ -5071,6 +5144,236 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn runner_bound_turn_without_sealed_key_fails_in_transcript_without_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::development(dir.path(), "org", "user");
+        let store_root = profile.store_root().to_path_buf();
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(SpawnCounter(spawn_count.clone())));
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            registry,
+            HarnessId::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let binding = zeron_proto::CloudSeatBinding {
+            seat_id: "runner-seat".into(),
+            kind: zeron_proto::CloudSeatKind::Ssh,
+            label: "Runner".into(),
+            repo: None,
+            workspace_path: Some(dir.path().join("runner-workspace").display().to_string()),
+            runner_device_id: Some(core.device_id.clone()),
+            branch: None,
+            model_label: None,
+            expires_at: None,
+        };
+        core.workspace
+            .create_chat_with_parent(
+                "runner-chat",
+                None,
+                Some(&core.device_id),
+                None,
+                Some("/viewport/cwd".into()),
+                None,
+                Some(binding),
+            )
+            .unwrap();
+        let mut run = request();
+        run.harness = Some(HarnessId::ClaudeCode);
+        run.model = None;
+        run.cwd = "/viewport/cwd".into();
+
+        core.sessions
+            .dispatch(
+                "runner-chat",
+                HarnessId::ClaudeCode,
+                run,
+                Some("user-1".into()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(spawn_count.load(Ordering::Acquire), 0);
+        assert!(!core.sessions.is_running("runner-chat"));
+        assert_eq!(
+            core.sessions.session_status("runner-chat").unwrap().status,
+            SessionStatus::Errored
+        );
+        let handle = core.doc_host.open("runner-chat").unwrap();
+        let entries = handle.doc().read_entries().unwrap();
+        assert!(entries.iter().any(|entry| {
+            entry
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::Text { text, .. } if text.contains("No key sealed for this runner")))
+        }));
+        assert!(core.cloud.as_ref().unwrap().runs().is_empty());
+        assert!(!store_root.join("cloud-runs.json").exists());
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn runner_bound_stale_turn_is_not_resumed_and_has_runner_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::development(dir.path(), "org", "user");
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(SpawnCounter(spawn_count.clone())));
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            registry,
+            HarnessId::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let binding = zeron_proto::CloudSeatBinding {
+            seat_id: "runner-seat".into(),
+            kind: zeron_proto::CloudSeatKind::Ssh,
+            label: "Runner".into(),
+            repo: None,
+            workspace_path: Some("/runner/workspace".into()),
+            runner_device_id: Some(core.device_id.clone()),
+            branch: None,
+            model_label: None,
+            expires_at: None,
+        };
+        core.workspace
+            .create_chat_with_parent(
+                "runner-stale",
+                None,
+                Some(&core.device_id),
+                None,
+                Some("/runner/workspace".into()),
+                None,
+                Some(binding),
+            )
+            .unwrap();
+        let handle = core.doc_host.open("runner-stale").unwrap();
+        handle
+            .doc()
+            .queue_command(&SessionCommandEntry {
+                id: "runner-stale-command".into(),
+                payload: SessionCommandPayload::Run {
+                    request: request(),
+                    message_id: "runner-stale-user".into(),
+                },
+                issued_by: "viewport".into(),
+                issued_at: now_ms(),
+                based_on: None,
+                expires_at: None,
+                status: SessionCommandStatus::Applied,
+                resolution: None,
+            })
+            .unwrap();
+        handle
+            .doc()
+            .push_message(&SessionMessageEntry {
+                id: "runner-stale-assistant".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "partial response".into(),
+                }],
+                created_at: now_ms(),
+                device_id: core.device_id.clone(),
+                status: Some(MessageStatus::Streaming),
+                continuation_of: None,
+                duration_ms: None,
+            })
+            .unwrap();
+        core.sessions
+            .inner
+            .journal
+            .append(
+                "runner-stale",
+                &AgentEvent::TextDelta {
+                    text: "partial response".into(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(core.sessions.recover_stale().unwrap(), 1);
+
+        assert_eq!(spawn_count.load(Ordering::Acquire), 0);
+        let entries = handle.doc().read_entries().unwrap();
+        let assistant = entries
+            .iter()
+            .find(|entry| entry.id == "runner-stale-assistant")
+            .unwrap();
+        assert_eq!(assistant.status, Some(MessageStatus::Aborted));
+        assert!(assistant.parts.iter().any(|part| {
+            matches!(part, MessagePart::Error { message, .. } if message == "Runner restarted mid-turn — send your message again to continue")
+        }));
+        assert_eq!(
+            core.sessions.inner.journal.resume_attempts("runner-stale"),
+            0
+        );
+        assert_eq!(
+            handle
+                .doc()
+                .read_commands()
+                .unwrap()
+                .into_iter()
+                .find(|command| command.id == "runner-stale-command")
+                .unwrap()
+                .status,
+            SessionCommandStatus::Applied
+        );
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn runner_bound_cloud_runs_are_not_reattached_on_a_viewport() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::development(dir.path(), "org", "user");
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            Arc::new(crate::default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let binding = zeron_proto::CloudSeatBinding {
+            seat_id: "runner-seat".into(),
+            kind: zeron_proto::CloudSeatKind::Ssh,
+            label: "Runner".into(),
+            repo: None,
+            workspace_path: Some("/runner/workspace".into()),
+            runner_device_id: Some("other-device".into()),
+            branch: None,
+            model_label: None,
+            expires_at: None,
+        };
+        core.workspace
+            .create_chat_with_parent(
+                "runner-chat",
+                None,
+                Some("other-device"),
+                None,
+                binding.workspace_path.clone(),
+                None,
+                Some(binding),
+            )
+            .unwrap();
+        let cloud = core.cloud.as_ref().unwrap();
+        let mut run = cloud_run_candidate(24, Some("4"));
+        run.chat_id = "runner-chat".into();
+        run.seat_id = "runner-seat".into();
+        cloud.upsert_run(run);
+
+        core.sessions.resume_cloud_runs();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(!core.sessions.is_running("runner-chat"));
+        assert_eq!(
+            cloud.run_for_chat("runner-chat").unwrap().status,
+            zeron_proto::CloudRunStatus::Working
+        );
+        core.shutdown().await;
+    }
     fn remote_tail_frame(run_id: &str, bytes: &[u8], metadata: &str) -> String {
         use base64::Engine as _;
 

@@ -492,6 +492,7 @@ fn urlencoding(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn command_timeout_is_capped_and_has_network_grace() {
@@ -503,5 +504,53 @@ mod tests {
             command_http_timeout(Duration::from_secs(900)),
             Duration::from_secs(605)
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_posts_provider_and_model() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            let (header_end, content_length) = loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|length| length.parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    break (header_end + 4, content_length);
+                }
+            };
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+            let response = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+            stream.write_all(response).await.unwrap();
+            body
+        });
+        let http = reqwest::Client::new();
+        let api = boat(&http, "test-token", Some(&endpoint));
+
+        api.prompt("box-1", "claude", "hello", Some("sonnet-4"))
+            .await
+            .unwrap();
+        let body = server.await.unwrap();
+        assert_eq!(body["provider"], "claude");
+        assert_eq!(body["model"], "sonnet-4");
+        assert_eq!(body["prompt"], "hello");
     }
 }

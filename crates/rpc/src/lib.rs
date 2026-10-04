@@ -386,6 +386,24 @@ pub mod methods {
     /// (a dead trial's thread continuing on Boat); its workspace backup
     /// restores there on the next run.
     pub const CLOUD_MOVE_CHAT: &str = "CloudMoveChat";
+    /// `{chatId, cwd?, pushWip?}` → `{ok, wipBranch?}` — return a Cloud
+    /// conversation to this signed-in device without copying runner files.
+    pub const CLOUD_RETURN_CHAT: &str = "CloudReturnChat";
+    /// `{chatId, seatId, pushWip?}` → `{ok, binding, wipBranch?}` — bind a
+    /// Synced seatless chat to an existing Cloud computer seat.
+    pub const CLOUD_SEND_CHAT: &str = "CloudSendChat";
+    /// Runner-local workspace dirt check; forwarded to the host device.
+    pub const RUNNER_WORKSPACE_STATUS: &str = "RunnerWorkspaceStatus";
+    /// Commit and push runner-local work on a one-off WIP branch.
+    pub const RUNNER_PUSH_WIP: &str = "RunnerPushWip";
+    /// `{seatId, deviceId|null}` → `{ok, seat}` — attach or detach a headless
+    /// Cosmos runner already registered in this profile.
+    pub const CLOUD_SET_SEAT_RUNNER: &str = "CloudSetSeatRunner";
+    pub const RUNNER_INFO: &str = "RunnerInfo";
+    pub const RUNNER_SEAL_CREDENTIAL: &str = "RunnerSealCredential";
+    pub const RUNNER_REVOKE_CREDENTIAL: &str = "RunnerRevokeCredential";
+    pub const RUNNER_SET_LOGIN: &str = "RunnerSetLogin";
+    pub const CLOUD_SEAL_FOR_RUNNER: &str = "CloudSealForRunner";
     /// `{id}` → `{ok, chatId?}` — fire an automation now, off-schedule.
     pub const CLOUD_AUTOMATION_RUN_NOW: &str = "CloudAutomationRunNow";
     /// `{chatId}` → `{ok, backup}` — snapshot a chat's seat workspace to this

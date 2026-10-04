@@ -3993,6 +3993,7 @@ mod tests {
             label: "Seat".into(),
             repo: None,
             workspace_path: None,
+            runner_device_id: None,
             branch: None,
             model_label: None,
             expires_at: None,
