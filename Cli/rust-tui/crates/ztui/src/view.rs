@@ -581,6 +581,55 @@ fn status_line(app: &App, w: usize) -> Line<'static> {
 
 // ---- buddy -------------------------------------------------------------------
 
+/// `❯ you → Pip: how's it going?`
+pub fn pet_heard(app: &App, msg: &str, w: usize) -> Vec<Line<'static>> {
+    let name = buddy_identity(app).name;
+    wrap::wrap(&[Span::styled(msg.to_string(), Style::new())], w, &[dim("❯ you → "), Span::styled(format!("{name}: "), theme::bold(Style::new()))], &[sp("  ")])
+}
+
+/// The pet's reply: its picture on the left (a real image where the
+/// terminal can show one), what it said on the right.
+pub fn pet_reply(app: &App, text: &str, w: usize) -> Vec<Line<'static>> {
+    let sk = crate::skin::current();
+    let id = buddy_identity(app);
+    let pose = crate::pixel::Pose { eyes: crate::pixel::Eyes::Happy, dy: 1, ..app.buddy.pose(&id, false, 1000, true) };
+    let room = w.saturating_sub(22).max(20);
+    let mut words: Vec<Line<'static>> = vec![Line::from(Span::styled(id.name.clone(), theme::bold(Style::new()).fg(ACCENT())))];
+    for para in text.lines() {
+        words.extend(markdown::inline_wrapped(para, room));
+    }
+    let mut out = Vec::new();
+    match crate::image::block(&id, &sk.buddy, pose, 4, words.len()) {
+        Some(img) => {
+            let gutter = img.cols + 2;
+            for i in 0..img.rows.max(words.len()) {
+                let mut spans = vec![sp(" ".repeat(gutter))];
+                if let Some(l) = words.get(i) {
+                    spans.extend(l.spans.iter().cloned());
+                }
+                let line = Line::from(spans);
+                out.push(if i + 1 == img.rows { img.mark(line) } else { line });
+            }
+        }
+        None => {
+            let art = crate::buddy::sprite(&id, &sk.buddy, pose);
+            for i in 0..art.len().max(words.len()) {
+                let mut spans = vec![sp(" ")];
+                match art.get(i) {
+                    Some(r) => spans.extend(r.iter().cloned()),
+                    None => spans.push(sp(" ".repeat(crate::pixel::W))),
+                }
+                spans.push(sp("   "));
+                if let Some(l) = words.get(i) {
+                    spans.extend(l.spans.iter().cloned());
+                }
+                out.push(Line::from(spans));
+            }
+        }
+    }
+    out
+}
+
 /// Whose buddy it is (hatching is seeded by this).
 fn buddy_who(app: &App) -> String {
     app.user
@@ -619,30 +668,37 @@ pub fn input_width(app: &App) -> usize {
     }
 }
 
-/// What changes the buddy's look — repaint when this does.
-pub fn buddy_key(app: &App) -> (u8, bool, bool) {
+/// What changes the pet's look — repaint when this does.
+pub fn buddy_key(app: &App) -> String {
     let sk = crate::skin::current();
     if !sk.buddy.enabled {
-        return (0, false, false);
+        return String::new();
     }
-    let mood = app.buddy.mood(app.busy) as u8;
-    let blink = !sk.motion.reduce && crate::motion::now_ms() % 4200 < 150;
-    (mood, blink, app.buddy.current_quip(&sk.buddy).is_some())
+    let id = buddy_identity(app);
+    let pose = app.buddy.pose(&id, app.busy, crate::motion::now_ms(), sk.motion.reduce);
+    format!("{pose:?}{:?}", app.buddy.current_quip(&sk.buddy))
+}
+
+/// The pet's speech: a quip, hearts, zZz, or "…" while it thinks.
+fn bubble_text(app: &App) -> Option<(String, Style)> {
+    let sk = crate::skin::current();
+    let mood = app.buddy.mood(app.busy);
+    Some(match app.buddy.current_quip(&sk.buddy) {
+        Some(q) => (format!("‹ {q} ›"), Style::new().fg(ACCENT()).add_modifier(Modifier::ITALIC)),
+        None if mood == crate::buddy::Mood::Listening => ("‹ … ›".to_string(), DIM()),
+        None if mood == crate::buddy::Mood::Loved => ("♥ ♥ ♥".to_string(), theme::fg(RED())),
+        None if mood == crate::buddy::Mood::Sleeping => ("z Z z".to_string(), DIM()),
+        None => return None,
+    })
 }
 
 /// The quip (or hearts, or zZz) above the buddy, right-aligned.
 fn buddy_bubble(app: &App, w: usize) -> Option<Line<'static>> {
     let sk = crate::skin::current();
-    let mood = app.buddy.mood(app.busy);
-    let (text, style) = match app.buddy.current_quip(&sk.buddy) {
-        Some(q) => (format!("‹ {q} ›"), Style::new().fg(ACCENT()).add_modifier(Modifier::ITALIC)),
-        None if mood == crate::buddy::Mood::Loved => ("♥ ♥ ♥".to_string(), theme::fg(RED())),
-        None if mood == crate::buddy::Mood::Sleeping => ("z Z z".to_string(), DIM()),
-        None => return None,
-    };
-    if !buddy_full(app) && sk.buddy.size != "mini" {
+    if sk.buddy.size != "mini" {
         return None;
     }
+    let (text, style) = bubble_text(app)?;
     let text = ellipsize(&text, w.saturating_sub(4));
     let pad = w.saturating_sub(width_of(&text) + 1);
     Some(Line::from(vec![sp(" ".repeat(pad)), Span::styled(text, style)]))
@@ -677,11 +733,13 @@ fn cut(line: &Line<'static>, max: usize) -> Vec<Span<'static>> {
     out
 }
 
-/// Draw the sprite over the right end of the composer's first three rows.
+/// Draw the pet over the right end of five rows from `top` (its head row,
+/// the composer's rules and input, the status line).
 fn overlay_buddy(app: &App, out: &mut [Line<'static>], top: usize, w: usize, ms: u128) {
     let sk = crate::skin::current();
     let id = buddy_identity(app);
-    let rows = crate::buddy::sprite(&id, app.buddy.mood(app.busy), ms, sk.motion.reduce);
+    let pose = app.buddy.pose(&id, app.busy, ms, sk.motion.reduce);
+    let rows = crate::buddy::sprite(&id, &sk.buddy, pose);
     let sw = crate::buddy::sprite_width(&id);
     let left = w.saturating_sub(sw + 1);
     for (k, row) in rows.into_iter().enumerate() {
@@ -722,6 +780,10 @@ pub fn ledger(app: &App) -> (String, String) {
         // what /customise spent, kept apart from the conversation's ledger
         full.push_str(&format!(" · mod ${:.4}", app.mod_usd));
         short.push_str(&format!(" · mod ${:.4}", app.mod_usd));
+    }
+    if app.pet_usd > 0.0 {
+        full.push_str(&format!(" · pet ${:.4}", app.pet_usd));
+        short.push_str(&format!(" · pet ${:.4}", app.pet_usd));
     }
     (full, short)
 }
@@ -1301,13 +1363,26 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
     if let Some(strip) = customise_strip(app, w, ms) {
         out.push(strip);
     }
-    let pal = crate::skin::current();
-    if pal.buddy.enabled {
+    let full = buddy_full(app);
+    let pet_w = if full { crate::buddy::sprite_width(&buddy_identity(app)) + 1 } else { 0 };
+    let mut head = 0;
+    if full {
+        // the pet's head row (reuse a trailing blank); its speech sits to the left
+        if !out.last().is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty())) {
+            out.push(Line::default());
+        }
+        head = out.len() - 1;
+        if let Some((text, style)) = bubble_text(app) {
+            let room = w.saturating_sub(pet_w + 2);
+            let text = ellipsize(&text, room);
+            let pad = room.saturating_sub(width_of(&text));
+            out[head] = Line::from(vec![sp(" ".repeat(pad)), Span::styled(text, style)]);
+        }
+    } else if crate::skin::current().buddy.enabled {
         if let Some(b) = buddy_bubble(app, w) {
             out.push(b);
         }
     }
-    let top_rule = out.len();
     out.push(rule(w));
     let tw = input_width(app);
     let masked: Vec<char>;
@@ -1365,10 +1440,10 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
         cursor = Some(((input_top + crow - skip) as u16, (2 + col) as u16));
     }
     out.push(rule(w));
-    if buddy_full(app) {
-        overlay_buddy(app, &mut out, top_rule, w, ms);
+    out.push(status_line(app, w.saturating_sub(pet_w)));
+    if full {
+        overlay_buddy(app, &mut out, head, w, ms);
     }
-    out.push(status_line(app, w));
 
     match &app.popup {
         Some(Popup::Slash { sel }) => out.extend(slash_rows(app, *sel, w)),
@@ -1636,9 +1711,15 @@ mod tests {
             let (lines, _) = live(&app);
             let rows: Vec<String> = lines.iter().map(text).collect();
             let top = rows.iter().position(|r| r.starts_with('─')).unwrap();
-            assert!(rows[top].ends_with(r"/\   /\"), "{rows:#?}");
-            assert!(rows[top + 1].starts_with("❯ ") && rows[top + 1].ends_with("( • • )"), "{rows:#?}");
+            // five rows of solid pixel art at the right edge: head, rules, input, status
+            let pixels = |r: &str| r.chars().rev().take(17).filter(|c| "▀▄█".contains(*c)).count();
+            for r in &rows[top - 1..top + 4] {
+                assert!(pixels(r) >= 2, "{rows:#?}");
+            }
+            assert!(rows[top + 1].starts_with("❯ "), "{rows:#?}");
             assert!(rows[top + 2].starts_with('─'), "{rows:#?}");
+            let orange = ratatui_core::style::Color::Rgb(0xf0, 0x8a, 0x3c);
+            assert!(lines.iter().flat_map(|l| &l.spans).any(|s| s.style.fg == Some(orange) || s.style.bg == Some(orange)), "fox orange");
             assert!(lines.iter().all(|l| crate::wrap::line_width(l) <= 80), "{rows:#?}");
             assert!(input_width(&app) < 78, "typing room leaves space for it");
             // a quip floats above it
@@ -1649,7 +1730,7 @@ mod tests {
             // narrow terminals get the face in the status line instead
             app.width = 50;
             let rows: Vec<String> = live(&app).0.iter().map(text).collect();
-            assert!(rows.iter().any(|r| r.contains("(°ᴥ°)")), "{rows:#?}");
+            assert!(rows.iter().any(|r| r.contains("(•ᴥ•)")), "{rows:#?}");
             assert_eq!(input_width(&app), 48);
         });
         let mut off = sk;
@@ -1657,7 +1738,7 @@ mod tests {
         crate::skin::scoped_skin(off, || {
             let app = test_app();
             let rows: Vec<String> = live(&app).0.iter().map(text).collect();
-            assert!(!rows.iter().any(|r| r.contains('•') || r.contains('ᴥ')), "{rows:#?}");
+            assert!(!rows.iter().any(|r| r.contains('▀') || r.contains('ᴥ')), "{rows:#?}");
         });
     }
 

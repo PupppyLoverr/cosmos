@@ -271,6 +271,16 @@ pub struct App {
     pub titled: bool,
     /// an error arrived during this turn
     turn_err: Option<String>,
+    /// /pettalk waiting for the pet's answer
+    pet_talk: Option<crate::pettalk::Talk>,
+    /// the chat with the pet so far (it remembers)
+    pet_chat: Vec<zproto::Message>,
+    /// what pet chats have cost this session
+    pub pet_usd: f64,
+    /// (when, what) reminders the pet keeps
+    pub reminders: Vec<(Instant, String)>,
+    /// (left at, turns then, fixes then) while the terminal is unfocused
+    away: Option<(Instant, u64, u64)>,
     /// `/customise <request>` running in the background
     pub customise: Option<crate::customise::Runner>,
     /// what the customiser is doing (status strip)
@@ -365,6 +375,11 @@ impl App {
             term_out: Vec::new(),
             titled: false,
             turn_err: None,
+            pet_talk: None,
+            pet_chat: Vec::new(),
+            pet_usd: 0.0,
+            reminders: Vec::new(),
+            away: None,
             customise: None,
             mod_status: String::new(),
             mod_log: Vec::new(),
@@ -478,7 +493,204 @@ impl App {
         }
         let name = view::buddy_identity(self).name;
         self.buddy.on(m, &sk.buddy, &name);
+        self.pet_progress();
         self.dirty = true;
+    }
+
+    /// Save the pet's progress and announce a level-up.
+    fn pet_progress(&mut self) {
+        if std::mem::take(&mut self.buddy.progress_dirty) && !cfg!(test) {
+            self.buddy.progress.save(&zcore::cli_home());
+        }
+        if let Some(level) = self.buddy.leveled.take() {
+            let sk = crate::skin::current();
+            let id = view::buddy_identity(self);
+            self.buddy.say_kind("level", &sk.buddy, &id.name);
+            self.buddy.trick(crate::buddy::Trick::Sparkle);
+            let unlock = crate::buddy::UNLOCKS.iter().find(|(at, _)| *at == level).map(|(_, what)| format!(" — unlocked {what}")).unwrap_or_default();
+            self.flash(format!("✦ {} reached level {level}{unlock}", id.name), theme::ACCENT());
+        }
+    }
+
+    /// Reminders, break nudges and the pet's chat (once per loop turn).
+    fn poll_pet(&mut self) {
+        let sk = crate::skin::current();
+        if !sk.buddy.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let due: Vec<String> = self.reminders.iter().filter(|(t, _)| *t <= now).map(|(_, s)| s.clone()).collect();
+        if !due.is_empty() {
+            self.reminders.retain(|(t, _)| *t > now);
+            let name = view::buddy_identity(self).name;
+            for d in due {
+                self.buddy.speak(format!("⏰ {d}"), 30);
+                self.buddy.trick(crate::buddy::Trick::Hop);
+                self.note(format!("⏰ {name}: {d}"));
+                let a = crate::notify::Alert {
+                    term: [crate::notify::title(&format!("⏰ {d} · cosmostui")), vec![0x07]].concat(),
+                    desktop: Some((format!("{name} reminds you"), d.clone())),
+                    chime: sk.notify.sound,
+                };
+                self.term_out.extend(&a.term);
+                self.titled = true;
+                if !cfg!(test) {
+                    crate::notify::fire(&a);
+                }
+            }
+            self.dirty = true;
+        }
+        if self.buddy.break_due(sk.buddy.break_mins) {
+            let name = view::buddy_identity(self).name;
+            self.buddy.say_kind("break", &sk.buddy, &name);
+            self.dirty = true;
+        }
+        self.poll_pet_talk();
+    }
+
+    /// `/pettalk <message>`
+    fn pet_talk_command(&mut self, msg: &str) {
+        let sk = crate::skin::current();
+        let id = view::buddy_identity(self);
+        if !sk.buddy.enabled {
+            self.note("Your pet is off — /buddy on brings it back");
+            return;
+        }
+        if msg == "stop" {
+            if let Some(t) = self.pet_talk.take() {
+                t.stop();
+                self.buddy.listening = false;
+                self.flash(format!("{} stopped thinking", id.name), theme::YELLOW());
+            }
+            return;
+        }
+        if msg.is_empty() {
+            self.note(format!(
+                "Talk to {}: /pettalk how's it going? · remind me in 20 minutes to stretch · what changed in the repo? · do a trick · let's change your colours",
+                id.name
+            ));
+            return;
+        }
+        if self.pet_talk.is_some() {
+            self.error(format!("{} is still thinking…", id.name));
+            return;
+        }
+        let ctx = crate::pettalk::Context { pet: self.pet_profile(&id), session: self.pet_session(), cwd: self.cwd.clone() };
+        self.pet_chat.push(crate::pettalk::user(msg));
+        crate::pettalk::trim(&mut self.pet_chat, 12);
+        self.block(view::pet_heard(self, msg, self.width));
+        self.buddy.listening = true;
+        self.pet_talk = Some(crate::pettalk::ask(self.alias.clone(), zcore::cli_home(), ctx, self.pet_chat.clone()));
+        self.dirty = true;
+    }
+
+    /// Who the pet is, for its prompt.
+    fn pet_profile(&self, id: &crate::buddy::Identity) -> String {
+        let p = &self.buddy.progress;
+        format!(
+            "You are {}, a {} {} (personality: {}). Level {} — {} turns worked together, {} red tests turned green, {} chats, a {}-day streak.",
+            id.name,
+            id.rarity.label(),
+            id.species().name,
+            id.personality(),
+            p.level(),
+            p.turns,
+            p.fixes,
+            p.chats,
+            p.streak
+        )
+    }
+
+    /// What's happening in the session, for the pet's prompt.
+    fn pet_session(&self) -> String {
+        let mut s = vec![
+            format!("- model: {} · mode: {}", self.alias, self.mode.name()),
+            format!("- folder: {}", self.cwd.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()),
+            format!("- session: {} min, {} turns, spent {}", self.session_started.elapsed().as_secs() / 60, self.usage.turns, view::ledger(self).1),
+        ];
+        if self.busy {
+            s.push(format!("- the assistant is working right now ({}s in)", self.busy_since.elapsed().as_secs()));
+        }
+        let recent: Vec<String> = self.history.iter().rev().take(3).map(|h| format!("\"{}\"", crate::wrap::ellipsize(h, 120))).collect();
+        if !recent.is_empty() {
+            s.push(format!("- their latest requests (newest first): {}", recent.join(", ")));
+        }
+        if !self.last_reply.is_empty() {
+            s.push(format!("- the assistant's last reply began: \"{}\"", crate::wrap::ellipsize(&self.last_reply.replace('\n', " "), 300)));
+        }
+        if !self.reminders.is_empty() {
+            let r: Vec<String> = self.reminders.iter().map(|(t, w)| format!("\"{w}\" in {} min", t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60))).collect();
+            s.push(format!("- reminders you're keeping: {}", r.join(", ")));
+        }
+        s.join("
+")
+    }
+
+    fn poll_pet_talk(&mut self) {
+        let Some(t) = &self.pet_talk else { return };
+        if t.started.elapsed() > Duration::from_secs(180) {
+            t.stop();
+            self.pet_talk = None;
+            self.buddy.listening = false;
+            self.error(format!("{} took too long to answer — try again", view::buddy_identity(self).name));
+            return;
+        }
+        let Ok(reply) = t.rx.try_recv() else { return };
+        self.pet_talk = None;
+        self.buddy.listening = false;
+        self.dirty = true;
+        match reply {
+            crate::pettalk::Reply::Failed(e) => self.error(format!("{} couldn't answer: {e}", view::buddy_identity(self).name)),
+            crate::pettalk::Reply::Text { text, actions, usd } => {
+                self.pet_usd += usd.unwrap_or(0.0);
+                let shown = if text.is_empty() { "…".to_string() } else { text.clone() };
+                self.pet_chat.push(crate::pettalk::assistant(&text));
+                self.block(view::pet_reply(self, &shown, self.width));
+                let first = shown.split(['.', '!', '?', '\n']).next().unwrap_or("").trim().to_string();
+                if !first.is_empty() {
+                    self.buddy.speak(crate::wrap::ellipsize(&first, 60), 8);
+                }
+                self.buddy.chatted();
+                for a in actions {
+                    self.pet_act(a);
+                }
+                self.pet_progress();
+            }
+        }
+    }
+
+    /// Do what the pet decided to do.
+    fn pet_act(&mut self, a: crate::pettalk::Action) {
+        use crate::pettalk::Action;
+        use crate::skin::edit::{set_in_file, Val};
+        let name = view::buddy_identity(self).name;
+        let ui = zcore::cli_home().join("ui.toml");
+        match a {
+            Action::Remind { mins, text } => {
+                self.reminders.push((Instant::now() + Duration::from_secs(mins * 60), text.clone()));
+                self.note(format!("⏰ {name} will remind you in {mins} min: {text}"));
+            }
+            Action::Trick(t) => self.buddy.trick(t),
+            Action::Rename(n) => match set_in_file(&ui, "buddy", "name", &Val::Str(n.clone())) {
+                Ok(()) => {
+                    self.skin_reload = true;
+                    self.note(format!("✎ {name} is now called {n}"));
+                }
+                Err(e) => self.error(e),
+            },
+            Action::Species(s) => match set_in_file(&ui, "buddy", "species", &Val::Str(s.clone())) {
+                Ok(()) => {
+                    self.skin_reload = true;
+                    self.buddy.trick(crate::buddy::Trick::Spin);
+                    self.note(format!("✎ {name} turned into a {s}"));
+                }
+                Err(e) => self.error(e),
+            },
+            Action::Customise(req) => {
+                self.note(format!("✎ {name} passed that to /customise: {req}"));
+                self.start_customise(&req);
+            }
+        }
     }
 
     fn set_title(&mut self, text: &str) {
@@ -844,6 +1056,7 @@ impl App {
     /// Poll dictation, sign-in and shell jobs (once per loop turn).
     fn poll_jobs(&mut self) {
         self.poll_customise();
+        self.poll_pet();
         if let Some(rec) = &mut self.rec {
             if !rec.transcribing {
                 rec.tick();
@@ -1367,6 +1580,7 @@ impl App {
             }
             "buddy" => self.buddy_command(args.trim()),
             "customise" | "customize" => self.customise_command(args.trim()),
+            "pettalk" | "talk" => self.pet_talk_command(args.trim()),
             "verbs" => self.verbs_command(args.trim()),
             "notify" => {
                 let sk = crate::skin::current();
@@ -1866,7 +2080,7 @@ impl App {
             "" => {
                 if sk.buddy.enabled {
                     let id = view::buddy_identity(self);
-                    self.block(crate::buddy::card(&id, self.buddy.mood(self.busy)));
+                    self.block(crate::buddy::card(&id, &sk.buddy, &self.buddy, self.busy));
                 } else {
                     self.note("Your buddy is off — /buddy on brings it back");
                 }
@@ -1885,6 +2099,26 @@ impl App {
                 return;
             }
             "name" => save("name", Val::Str(rest.chars().take(24).collect())).map(|_| format!("Say hi to {rest}")),
+            "trick" => {
+                match crate::buddy::Trick::parse(if rest.is_empty() { "hop" } else { rest }) {
+                    Some(t) => self.buddy.trick(t),
+                    None => self.error("Tricks: hop, spin, sparkle, nap"),
+                }
+                self.dirty = true;
+                return;
+            }
+            "species" if rest.is_empty() => {
+                let all: Vec<String> = crate::pixel::SPECIES.iter().map(|s| format!("{} ({})", s.name, s.blurb)).collect();
+                self.note(format!("Species: {} — /buddy species <name>", all.join(" · ")));
+                return;
+            }
+            "species" => match crate::pixel::canonical(rest) {
+                Some(s) => save("species", Val::Str(s.name.into())).map(|_| format!("Your pet is now a {}", s.name)),
+                None => {
+                    self.error(format!("No species {rest:?} — /buddy species lists them"));
+                    return;
+                }
+            },
             "reroll" => {
                 let mut cfg = sk.buddy.clone();
                 cfg.seed += 1;
@@ -1897,7 +2131,7 @@ impl App {
             "quiet" => save("quips", Val::Str("off".into())).map(|_| "Buddy will keep its thoughts to itself".to_string()),
             "chatty" => save("quips", Val::Str("builtin".into())).map(|_| "Buddy will speak up again".to_string()),
             _ => {
-                self.error("Usage: /buddy [pet | name <name> | reroll | mini | full | quiet | chatty | on | off]");
+                self.error("Usage: /buddy [pet | trick <hop|spin|sparkle|nap> | name <name> | species [name] | reroll | mini | full | quiet | chatty | on | off]");
                 return;
             }
         };
@@ -1908,6 +2142,29 @@ impl App {
             }
             Err(e) => self.error(format!("Couldn't save the buddy settings: {e}")),
         }
+    }
+
+    /// Back at the terminal after a while: what happened meanwhile.
+    fn welcome_back(&mut self) {
+        let Some((at, turns, fixes)) = self.away.take() else { return };
+        if at.elapsed() < Duration::from_secs(180) || !crate::skin::current().buddy.enabled {
+            return;
+        }
+        let p = &self.buddy.progress;
+        let (dt, df) = (p.turns.saturating_sub(turns), p.fixes.saturating_sub(fixes));
+        if dt == 0 && df == 0 {
+            return;
+        }
+        let mut s = format!("While you were away: {dt} turn{} done", if dt == 1 { "" } else { "s" });
+        if df > 0 {
+            s.push_str(&format!(", {df} red test{} fixed", if df == 1 { "" } else { "s" }));
+        }
+        if self.busy {
+            s.push_str(", still working");
+        }
+        self.buddy.speak(s, 15);
+        self.buddy.trick(crate::buddy::Trick::Hop);
+        self.dirty = true;
     }
 
     fn answer_perm(&mut self, code: u8) {
@@ -2416,6 +2673,7 @@ pub fn try_run(opts: &RunOpts, cwd: &Path) -> Result<Option<i32>> {
         app.cwd = PathBuf::from(d);
     }
     app.user = zcore::welcome::user_name();
+    app.buddy.progress = crate::buddy::Progress::load(&zcore::cli_home());
     app.cont(crate::logo::banner("cosmos", concat!("v", env!("CARGO_PKG_VERSION"))));
 
     let (mut skin, notes) = crate::skin::Watcher::start(&app.cwd);
@@ -2640,12 +2898,17 @@ Press Enter to go back to cosmostui.");
                     }
                     CEvent::FocusGained => {
                         app.focused = Some(true);
+                        app.welcome_back();
                         // back from elsewhere: the "done" title has been seen
                         if !app.busy && app.titled {
                             app.set_title("cosmostui");
                         }
                     }
-                    CEvent::FocusLost => app.focused = Some(false),
+                    CEvent::FocusLost => {
+                        app.focused = Some(false);
+                        let p = &app.buddy.progress;
+                        app.away = Some((Instant::now(), p.turns, p.fixes));
+                    }
                     _ => {}
                 }
                 if !event::poll(Duration::ZERO)? {
@@ -3140,6 +3403,82 @@ FAILED
         println!("\n==== {finish}: {:?} ====", a.notice.as_ref().map(|n| n.0.clone()));
         println!("{}", std::fs::read_to_string(home.join("ui.toml")).unwrap_or_default());
         println!("mod spend: ${:.4}", a.mod_usd);
+    }
+
+    #[test]
+    fn pettalk_round_trips_and_the_pet_acts() {
+        let _env = crate::env_lock();
+        let mut sk = crate::skin::Skin::default();
+        sk.buddy.species = "owl".into();
+        sk.buddy.name = "Hoot".into();
+        sk.buddy.images = "off".into();
+        crate::skin::scoped_skin(sk, || {
+            let mut a = app();
+            let home = tempfile::tempdir().unwrap();
+            std::env::set_var("COSMOS_CLI_HOME", home.path());
+            a.alias = "fixture".into();
+            let (cmd, _rx) = std::sync::mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            a.input = "/pettalk ping".chars().collect();
+            a.cursor = a.input.len();
+            a.on_key(key(KeyCode::Enter), &cmd, &stop);
+            assert!(a.pet_talk.is_some() && a.buddy.listening);
+            assert_eq!(a.buddy.mood(false), crate::buddy::Mood::Listening);
+            let t0 = Instant::now();
+            while a.pet_talk.is_some() && t0.elapsed() < Duration::from_secs(20) {
+                a.poll_pet();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let rows: Vec<String> = a.out.iter().map(text).collect();
+            assert!(rows.iter().any(|r| r.contains("you → Hoot: ping")), "{rows:#?}");
+            assert!(rows.iter().any(|r| r.contains("Hoot")) && rows.iter().any(|r| r.contains("pong")), "{rows:#?}");
+            assert!(rows.iter().any(|r| r.contains('▀') || r.contains('▄')), "its picture is drawn: {rows:#?}");
+            assert_eq!(a.buddy.progress.chats, 1);
+            assert_eq!(a.pet_chat.len(), 2, "it remembers the exchange");
+
+            // what the pet can do
+            a.pet_act(crate::pettalk::Action::Remind { mins: 1, text: "stretch".into() });
+            assert_eq!(a.reminders.len(), 1);
+            a.reminders[0].0 = Instant::now() - Duration::from_secs(1);
+            a.term_out.clear();
+            a.poll_pet();
+            assert!(a.reminders.is_empty());
+            assert!(a.buddy.current_quip(&crate::skin::current().buddy).is_some_and(|q| q.contains("stretch")));
+            assert!(String::from_utf8_lossy(&a.term_out).contains("⏰ stretch"), "title + bell");
+            a.pet_act(crate::pettalk::Action::Species("penguin".into()));
+            a.pet_act(crate::pettalk::Action::Rename("Waddles".into()));
+            let ui = std::fs::read_to_string(home.path().join("ui.toml")).unwrap();
+            assert!(ui.contains("species = \"penguin\"") && ui.contains("name = \"Waddles\""), "{ui}");
+            a.pet_act(crate::pettalk::Action::Customise("tool:ui_set {\"path\":\"spinner.style\",\"value\":\"moon\"}".into()));
+            assert!(a.customise.is_some(), "handed to /customise (with its boundaries)");
+            while a.customise.is_some() {
+                a.poll_customise();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+    }
+
+    #[test]
+    fn the_pet_welcomes_you_back_and_levels_up() {
+        let _env = crate::env_lock();
+        crate::skin::scoped_skin(crate::skin::Skin::default(), || {
+            let mut a = app();
+            a.away = Some((Instant::now() - Duration::from_secs(600), 0, 0));
+            a.buddy.progress.turns = 3;
+            a.buddy.progress.fixes = 1;
+            a.welcome_back();
+            let q = a.buddy.current_quip(&crate::skin::current().buddy).unwrap_or_default().to_string();
+            assert!(q.contains("3 turns done") && q.contains("1 red test fixed"), "{q}");
+            // a short absence says nothing
+            a.buddy.quip = None;
+            a.away = Some((Instant::now(), 0, 0));
+            a.welcome_back();
+            assert!(a.buddy.quip.is_none());
+            // enough XP announces the level
+            a.buddy.grant(500);
+            a.pet_progress();
+            assert!(a.notice.as_ref().is_some_and(|n| n.0.contains("reached level")), "{:?}", a.notice);
+        });
     }
 
     #[test]

@@ -205,8 +205,15 @@ pub struct BuddyCfg {
     /// how long a quip stays up
     pub quip_secs: u64,
     /// your own quips by moment: hello, done, long_done, error, tests_pass,
-    /// tests_fail, waiting, compact, pet, sleep, degraded ({name} = the buddy)
+    /// tests_fail, waiting, compact, pet, sleep, degraded, break, level
+    /// ({name} = the pet)
     pub lines: BTreeMap<String, Vec<String>>,
+    /// recolour the pet: outline, body, shade, belly, accent, cheeks, details, eyes
+    pub colors: BTreeMap<String, String>,
+    /// real images of the pet: "auto", "sixel", "kitty" or "off" (pixel art)
+    pub images: String,
+    /// suggest a break after this many minutes of work (0 = never)
+    pub break_mins: u64,
 }
 
 impl Default for BuddyCfg {
@@ -220,6 +227,9 @@ impl Default for BuddyCfg {
             quips: "builtin".into(),
             quip_secs: 6,
             lines: BTreeMap::new(),
+            colors: BTreeMap::new(),
+            images: "auto".into(),
+            break_mins: 50,
         }
     }
 }

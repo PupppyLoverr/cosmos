@@ -565,7 +565,8 @@ pub fn preview(skin: &Skin, w: usize) -> Vec<Line<'static>> {
         if skin.buddy.enabled {
             let id = crate::buddy::hatch("preview", &skin.buddy);
             out.push(Line::default());
-            for row in crate::buddy::sprite(&id, crate::buddy::Mood::Happy, 0, true) {
+            let pose = crate::pixel::Pose { eyes: crate::pixel::Eyes::Happy, dy: 1, extras: Default::default() };
+            for row in crate::buddy::sprite(&id, &skin.buddy, pose) {
                 let mut l = vec![Span::raw(" ")];
                 l.extend(row);
                 out.push(Line::from(l));
@@ -603,7 +604,7 @@ fn picker_options(path: &str) -> Vec<Value> {
         "diff.layout" => s(&["auto", "unified", "split"]),
         "markdown.links" => s(&["auto", "osc8", "inline"]),
         "buddy.size" => s(&["full", "mini", "off"]),
-        "buddy.species" => std::iter::once(json!("")).chain(crate::buddy::SPECIES.iter().map(|(n, _)| json!(n))).collect(),
+        "buddy.species" => std::iter::once(json!("")).chain(crate::pixel::SPECIES.iter().map(|s| json!(s.name))).collect(),
         "notify.desktop" => s(&["unfocused", "always", "never"]),
         _ => vec![json!(false), json!(true)],
     }
@@ -1069,10 +1070,10 @@ mod tests {
         crate::skin::scoped_skin(Skin::default(), || {
             assert_eq!(picker_step(&p.ui, 1, 1).unwrap(), "Spinner → twinkle");
             assert_eq!(picker_step(&p.ui, 8, 1).unwrap(), "Motion → reduced");
-            assert_eq!(picker_step(&p.ui, 7, -1).unwrap(), "Species → star");
+            assert_eq!(picker_step(&p.ui, 7, -1).unwrap(), "Species → robot");
         });
         let ui = std::fs::read_to_string(&p.ui).unwrap();
-        assert!(ui.contains("style = \"twinkle\"") && ui.contains("reduce = true") && ui.contains("species = \"star\""), "{ui}");
+        assert!(ui.contains("style = \"twinkle\"") && ui.contains("reduce = true") && ui.contains("species = \"robot\""), "{ui}");
         for (_, path) in PICKER {
             assert!(picker_options(path).iter().all(|v| schema::check(path, v).is_ok()), "{path}");
         }

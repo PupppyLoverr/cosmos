@@ -24,7 +24,10 @@ pub const BOUNDARIES: &[&str] = &[
 
 /// `{name}` placeholders a buddy line can be keyed by.
 pub const LINE_KINDS: &[&str] =
-    &["hello", "done", "long_done", "error", "tests_pass", "tests_fail", "waiting", "compact", "pet", "sleep", "degraded"];
+    &["hello", "done", "long_done", "error", "tests_pass", "tests_fail", "waiting", "compact", "pet", "sleep", "degraded", "break", "level"];
+
+/// Parts of a pet that `[buddy.colors]` can recolour.
+pub const PET_PARTS: &[&str] = &["outline", "body", "shade", "belly", "accent", "cheeks", "details", "eyes"];
 
 fn enums(path: &str) -> Option<Vec<String>> {
     let v = |s: &[&str]| Some(s.iter().map(|x| x.to_string()).collect());
@@ -35,7 +38,8 @@ fn enums(path: &str) -> Option<Vec<String>> {
         "diff.layout" => v(&["auto", "unified", "split"]),
         "markdown.links" => v(&["auto", "osc8", "inline"]),
         "buddy.size" => v(&["full", "mini", "off"]),
-        "buddy.species" => Some(std::iter::once(String::new()).chain(crate::buddy::SPECIES.iter().map(|(n, _)| n.to_string())).collect()),
+        "buddy.species" => Some(std::iter::once(String::new()).chain(crate::pixel::SPECIES.iter().map(|s| s.name.to_string())).collect()),
+        "buddy.images" => v(&["auto", "sixel", "kitty", "off"]),
         "buddy.quips" => v(&["builtin", "off"]),
         "notify.bell" | "notify.desktop" => v(&["unfocused", "always", "never"]),
         "notify.events" => v(&["done", "waiting", "error"]),
@@ -52,6 +56,7 @@ fn range(path: &str) -> Option<(i64, i64)> {
         "diff.context" => (0, 20),
         "buddy.seed" => (0, 1_000_000),
         "buddy.quip_secs" => (1, 60),
+        "buddy.break_mins" => (0, 480),
         "notify.min_secs" => (0, 3600),
         _ => return None,
     })
@@ -118,7 +123,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("buddy.seed", "change to hatch a different buddy"),
     ("buddy.quips", "one-liners when things happen"),
     ("buddy.quip_secs", "how long a quip stays up"),
-    ("buddy.lines.<kind>", "custom quips for a moment ({name} = the buddy)"),
+    ("buddy.lines.<kind>", "custom quips for a moment ({name} = the pet)"),
+    ("buddy.colors.<part>", "recolour the pet's pixel art"),
+    ("buddy.images", "real images of the pet where the terminal supports them (sixel/kitty)"),
+    ("buddy.break_mins", "nudge to take a break after this many minutes of work (0 = never)"),
     ("notify.title", "turn state in the terminal title"),
     ("notify.bell", "terminal bell"),
     ("notify.desktop", "desktop notification"),
@@ -132,7 +140,7 @@ fn help(path: &str) -> &'static str {
 }
 
 /// The open-ended maps: (prefix, what the key must be).
-const MAPS: &[&str] = &["theme.colors", "spinner.tool_verbs", "buddy.lines"];
+const MAPS: &[&str] = &["theme.colors", "spinner.tool_verbs", "buddy.lines", "buddy.colors"];
 
 fn boundary(seg: &str) -> bool {
     let s = seg.to_ascii_lowercase();
@@ -202,6 +210,16 @@ pub fn check(path: &str, value: &Value) -> Result<(String, String, Val), String>
                     let s = value.as_str().ok_or_else(|| format!("{path}: expected a colour string"))?;
                     if palette::parse_color(s).is_none() {
                         return Err(format!("{path}: {s:?} is not a colour (\"#rrggbb\", \"#rgb\" or an ANSI name)"));
+                    }
+                    Val::Str(s.to_string())
+                }
+                "buddy.colors" => {
+                    if !PET_PARTS.contains(&k) {
+                        return Err(format!("{path}: unknown part (parts: {})", PET_PARTS.join(", ")));
+                    }
+                    let s = value.as_str().ok_or_else(|| format!("{path}: expected a colour string"))?;
+                    if !matches!(palette::parse_color(s), Some(ratatui_core::style::Color::Rgb(..))) {
+                        return Err(format!("{path}: pets need an RGB colour like \"#ff8a3c\""));
                     }
                     Val::Str(s.to_string())
                 }
@@ -317,6 +335,7 @@ pub fn text() -> String {
                 let (key, what) = match path.as_str() {
                     "theme.colors" => ("<token>", format!("colour; tokens: {}", palette::TOKENS.join(", "))),
                     "spinner.tool_verbs" => ("<tool>", "string".to_string()),
+                    "buddy.colors" => ("<part>", format!("\"#rrggbb\"; parts: {}", PET_PARTS.join(", "))),
                     _ => ("<kind>", format!("list of strings; kinds: {}", LINE_KINDS.join(", "))),
                 };
                 out.push_str(&format!("  {k}.{key}: {what} — {}\n", help(&format!("{path}.{key}"))));

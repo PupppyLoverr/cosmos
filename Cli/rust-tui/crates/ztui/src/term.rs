@@ -259,6 +259,13 @@ pub fn write_line(buf: &mut Vec<u8>, line: &Line<'_>, max: usize) {
             // a hyperlink marker from markdown → OSC 8
             if let Some(url) = crate::markdown::take_link(ch, &mut chars) {
                 let _ = buf.queue(Print(std::mem::take(&mut chunk)));
+                // a pet image reserved over the rows above (see image.rs)
+                if url.starts_with("img:") {
+                    if let Some(bytes) = crate::image::draw(&url) {
+                        buf.extend_from_slice(&bytes);
+                    }
+                    continue;
+                }
                 let _ = buf.queue(Print(format!("\x1b]8;;{url}\x1b\\")));
                 linked = !url.is_empty();
                 continue;

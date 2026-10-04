@@ -6,6 +6,9 @@
 //! there's no terminal (piped stdin/stdout, tests).
 
 mod buddy;
+mod image;
+mod pettalk;
+mod pixel;
 mod customise;
 mod highlight;
 #[cfg(feature = "highlight")]
