@@ -1918,7 +1918,8 @@ impl AppState {
     }
 
     pub fn chat_in_mode(&self, chat: &Chat) -> bool {
-        chat.cloud_seat.is_some() == self.cloud_mode
+        let cloud_mode = self.cloud_mode && self.workspace_scope != Some(WorkspaceScope::Local);
+        chat.cloud_seat.is_some() == cloud_mode
     }
 
     /// The sidebar's Sessions list: every non-archived chat of a LIVE space,
@@ -2013,9 +2014,16 @@ impl AppState {
     }
 
     pub fn active_cloud_seat(&self) -> Option<&crate::cloud::SeatRow> {
-        self.cloud_mode
+        (self.cloud_mode && self.workspace_scope != Some(WorkspaceScope::Local))
             .then_some(self.cloud_seat_pick.as_ref())
             .flatten()
+    }
+
+    fn apply_workspace_scope(&mut self, scope: WorkspaceScope) {
+        self.workspace_scope = Some(scope);
+        if scope == WorkspaceScope::Local {
+            self.cloud_mode = false;
+        }
     }
 
     /// Configured seats (empty until the first fetch lands).
@@ -2352,7 +2360,7 @@ impl AppState {
         // baseline instead of comparing the new runtime with the old one.
         self.connectivity_observed = false;
         let engine_info = handle.engine_info();
-        self.workspace_scope = Some(engine_info.workspace_scope);
+        self.apply_workspace_scope(engine_info.workspace_scope);
         self.local_device_id = Some(engine_info.device_id.clone());
         self.engine = Some(handle.clone());
         let mut watch_tasks = Vec::with_capacity(10);
@@ -3969,6 +3977,8 @@ mod tests {
             harness_session_cwd: None,
             parent_chat_id: None,
             cloud_seat: None,
+            cloud_run: None,
+            cloud_backup: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -4811,6 +4821,29 @@ mod tests {
         assert_eq!(ids(&state), [String::from("local")]);
         state.cloud_mode = true;
         assert_eq!(ids(&state), [String::from("cloud")]);
+
+        state.cloud_seat_pick = Some(crate::cloud::SeatRow {
+            config: zeron_engine::cloud::SeatConfig {
+                id: "seat".into(),
+                label: "Build seat".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        state.workspace_scope = Some(WorkspaceScope::Local);
+        assert_eq!(ids(&state), [String::from("local")]);
+        assert!(state.active_cloud_seat().is_none());
+    }
+
+    #[test]
+    fn applying_local_scope_disables_effective_cloud_mode() {
+        let mut state = AppState::new();
+        state.cloud_mode = true;
+
+        state.apply_workspace_scope(WorkspaceScope::Local);
+
+        assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
+        assert!(!state.cloud_mode);
     }
 
     #[test]

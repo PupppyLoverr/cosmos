@@ -195,6 +195,47 @@ pub struct SessionsEngine {
     inner: Arc<Inner>,
 }
 
+fn cloud_run_is_live(run: &zeron_proto::CloudRun) -> bool {
+    matches!(
+        run.status,
+        zeron_proto::CloudRunStatus::Working | zeron_proto::CloudRunStatus::Queued
+    )
+}
+
+fn insert_cloud_run_candidate(
+    candidates: &mut HashMap<String, zeron_proto::CloudRun>,
+    run: zeron_proto::CloudRun,
+) {
+    match candidates.entry(run.chat_id.clone()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(run);
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if cloud_run_progress_cmp(&run, entry.get()).is_gt() {
+                entry.insert(run);
+            }
+        }
+    }
+}
+
+fn cloud_run_progress_cmp(
+    left: &zeron_proto::CloudRun,
+    right: &zeron_proto::CloudRun,
+) -> std::cmp::Ordering {
+    left.mirrored_bytes
+        .cmp(&right.mirrored_bytes)
+        .then_with(|| match (&left.remote_cursor, &right.remote_cursor) {
+            (Some(left), Some(right)) => match (left.parse::<u64>(), right.parse::<u64>()) {
+                (Ok(left), Ok(right)) => left.cmp(&right),
+                _ => left.cmp(right),
+            },
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (None, None) => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| left.updated_at.cmp(&right.updated_at))
+}
+
 impl SessionsEngine {
     /// A live desktop viewport renews its bridge lease over local IPC.
     pub fn register_browser(&self, url: &str) -> Result<(), String> {
@@ -295,19 +336,6 @@ impl SessionsEngine {
         let Some(store) = self.inner.cloud.get().cloned() else {
             return;
         };
-        let live: Vec<zeron_proto::CloudRun> = store
-            .runs()
-            .into_iter()
-            .filter(|run| {
-                matches!(
-                    run.status,
-                    zeron_proto::CloudRunStatus::Working | zeron_proto::CloudRunStatus::Queued
-                )
-            })
-            .collect();
-        if live.is_empty() {
-            return;
-        }
         let sessions = self.clone();
         tokio::spawn(async move {
             // Chat docs live in the workspace host, which attaches after the
@@ -318,7 +346,27 @@ impl SessionsEngine {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
-            for run in live {
+            let Some(workspace) = sessions.inner.workspace() else {
+                return;
+            };
+            let mut live = HashMap::new();
+            for run in store.runs().into_iter().filter(cloud_run_is_live) {
+                insert_cloud_run_candidate(&mut live, run);
+            }
+            match workspace.read_chats() {
+                Ok(chats) => {
+                    for run in chats
+                        .into_iter()
+                        .filter_map(|chat| chat.cloud_run)
+                        .filter(cloud_run_is_live)
+                    {
+                        insert_cloud_run_candidate(&mut live, run);
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "could not read cloud runs from registry"),
+            }
+            for run in live.into_values() {
+                store.upsert_run(run.clone());
                 if lock(&sessions.inner.runs).contains_key(&run.chat_id) {
                     continue;
                 }
@@ -4981,6 +5029,47 @@ async fn drive_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cloud_run_candidate(bytes: u64, cursor: Option<&str>) -> zeron_proto::CloudRun {
+        let now = Utc::now();
+        zeron_proto::CloudRun {
+            id: "run-1".into(),
+            chat_id: "chat-1".into(),
+            seat_id: "seat-1".into(),
+            command: None,
+            status: zeron_proto::CloudRunStatus::Working,
+            log_path: None,
+            remote_ref: None,
+            mirrored_bytes: bytes,
+            remote_cursor: cursor.map(str::to_owned),
+            entry_id: None,
+            error: None,
+            workspace: None,
+            harness_session: None,
+            prompt: None,
+            started_at: now,
+            finished_at: None,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn cloud_run_recovery_prefers_greater_byte_and_cursor_progress() {
+        let mut candidates = HashMap::new();
+        insert_cloud_run_candidate(&mut candidates, cloud_run_candidate(99, Some("9")));
+        insert_cloud_run_candidate(&mut candidates, cloud_run_candidate(100, Some("2")));
+        assert_eq!(
+            candidates["chat-1"].mirrored_bytes, 100,
+            "greater mirrored byte progress wins"
+        );
+
+        insert_cloud_run_candidate(&mut candidates, cloud_run_candidate(100, Some("10")));
+        assert_eq!(
+            candidates["chat-1"].remote_cursor.as_deref(),
+            Some("10"),
+            "numeric cursors compare by progress rather than lexically"
+        );
+    }
 
     fn remote_tail_frame(run_id: &str, bytes: &[u8], metadata: &str) -> String {
         use base64::Engine as _;

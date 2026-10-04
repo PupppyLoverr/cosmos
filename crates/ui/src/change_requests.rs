@@ -379,6 +379,8 @@ mod tests {
             harness_session_cwd: None,
             parent_chat_id: None,
             cloud_seat: None,
+            cloud_run: None,
+            cloud_backup: None,
             space_id: Some("space".into()),
             last_seen_at: None,
             room_gen: None,

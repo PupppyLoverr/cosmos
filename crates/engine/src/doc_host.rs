@@ -4226,7 +4226,7 @@ impl DocHost {
             let Some(target) = self.remote_host_for(chat) else {
                 return true; // became locally hosted: bytes already here
             };
-            match self.push_attachments(&target, transfers).await {
+            match self.push_attachments(chat, &target, transfers).await {
                 Ok(()) => {
                     tracing::info!(chat = %chat, device = %target,
                         count = transfers.len(), "queued attachments delivered");
@@ -4530,6 +4530,7 @@ impl DocHost {
     /// of feeding a zombie pipe forever (2026-08-19 incident).
     async fn push_attachments(
         &self,
+        chat_id: &str,
         target: &str,
         transfers: &[crate::uploads::AttachmentTransfer],
     ) -> Result<(), TransferError> {
@@ -4596,6 +4597,7 @@ impl DocHost {
             }
             let params = serde_json::json!({
                 "uploadId": transfer.upload_id, "fileName": transfer.file_name,
+                "chatId": chat_id,
             });
             let call = client.call(zeron_rpc::methods::UPLOAD_COMMIT, params);
             match tokio::time::timeout(TRANSFER_COMMIT_TIMEOUT, call).await {
@@ -4671,6 +4673,159 @@ impl DocHost {
                 }
             }
         });
+    }
+
+    pub fn upload_attachment_blob(
+        &self,
+        chat_id: &str,
+        path: &str,
+        uploads: &crate::uploads::Uploads,
+    ) -> bool {
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return false;
+        };
+        if !valid_blob_chat_id(chat_id) {
+            return false;
+        }
+        let Some(part_id) = uploads.attachment_blob_part_id(path) else {
+            return false;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        let url = format!(
+            "{}/blob/{chat_id}/{}",
+            edge.url.trim_end_matches('/'),
+            encode_part_segment(&part_id)
+        );
+        let http = self.inner.http.clone();
+        let path = Path::new(path).to_path_buf();
+        self.spawn_worker_on(&runtime, async move {
+            let bytes = match tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let file = std::fs::File::open(path)?;
+                if file.metadata()?.len() > crate::uploads::MAX_BYTES {
+                    return Err(std::io::Error::other("attachment exceeds the mirror limit"));
+                }
+                let mut bytes = Vec::new();
+                file.take(crate::uploads::MAX_BYTES + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > crate::uploads::MAX_BYTES {
+                    return Err(std::io::Error::other("attachment exceeds the mirror limit"));
+                }
+                Ok(bytes)
+            })
+            .await
+            {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "attachment blob read failed (best-effort)");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "attachment blob read task failed (best-effort)");
+                    return;
+                }
+            };
+            for attempt in 0..3 {
+                let bearer = match edge.bearer().await {
+                    Ok(bearer) => bearer,
+                    Err(error) => {
+                        tracing::warn!(%error, attempt, "attachment blob token unavailable");
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(250 << attempt))
+                                .await;
+                        }
+                        continue;
+                    }
+                };
+                match http
+                    .put(&url)
+                    .bearer_auth(bearer)
+                    .header("content-type", "application/octet-stream")
+                    .body(bytes.clone())
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => return,
+                    Ok(response) => {
+                        let status = response.status();
+                        tracing::warn!(%url, %status, attempt, "attachment blob upload rejected");
+                        if status.is_client_error()
+                            && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let error = describe_http_error(error);
+                        tracing::warn!(%url, %error, attempt, "attachment blob upload failed");
+                    }
+                }
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
+                }
+            }
+        });
+        true
+    }
+
+    pub async fn fetch_attachment_blob(
+        &self,
+        chat_id: &str,
+        path: &str,
+        uploads: &crate::uploads::Uploads,
+    ) -> Result<(), EngineError> {
+        if !valid_blob_chat_id(chat_id) {
+            return Err(EngineError::Other("Invalid attachment chat id".into()));
+        }
+        let Some(part_id) = uploads.attachment_blob_part_id(path) else {
+            return Err(EngineError::Other("Invalid attachment blob path".into()));
+        };
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return Err(EngineError::Other("offline: no edge configured".into()));
+        };
+        let bearer = edge.bearer().await?;
+        let url = format!(
+            "{}/blob/{chat_id}/{}",
+            edge.url.trim_end_matches('/'),
+            encode_part_segment(&part_id)
+        );
+        let response = self
+            .inner
+            .http
+            .get(&url)
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .map_err(|error| {
+                EngineError::Other(format!(
+                    "attachment blob fetch failed: {}",
+                    describe_http_error(error)
+                ))
+            })?;
+        if !response.status().is_success() {
+            return Err(EngineError::Other(format!(
+                "attachment blob fetch: HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        use futures::StreamExt;
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                EngineError::Other(format!(
+                    "attachment blob body read failed: {}",
+                    describe_http_error(error)
+                ))
+            })?;
+            if bytes.len().saturating_add(chunk.len()) as u64 > crate::uploads::MAX_BYTES {
+                return Err(EngineError::Other("Attachment is too large".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        uploads.restore_attachment_blob(path, &bytes)
     }
 
     /// Fetch a sidecar blob by its doc-resident ref (`{chatId}/{partId}` or
@@ -5600,6 +5755,182 @@ fn encode_part_segment(part_id: &str) -> String {
         }
     }
     out
+}
+
+fn valid_blob_chat_id(chat_id: &str) -> bool {
+    !chat_id.is_empty()
+        && chat_id.len() <= 128
+        && chat_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+#[cfg(test)]
+mod attachment_blob_tests {
+    use super::{DocHost, DocHostConfig, EdgeConfig};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn local_profile_attachment_uploads_skip_without_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "local".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let uploads = crate::uploads::Uploads::from_root(&dir.path().join("uploads"));
+        let path = uploads.dir().join("12345678-photo.png");
+        std::fs::create_dir_all(uploads.dir()).unwrap();
+        std::fs::write(&path, b"local attachment").unwrap();
+
+        assert!(!host.upload_attachment_blob("chat-local", path.to_str().unwrap(), &uploads));
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_mirrors_to_the_edge_blob_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = b"\x89PNG\r\n\x1a\nfixture".to_vec();
+        let expected_body = body.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let (header_end, content_length) = loop {
+                let count = socket.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= header_end + 4 + content_length {
+                        break (header_end, content_length);
+                    }
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(headers.starts_with("PUT /blob/chat-1/att~12345678-photo.png "));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test")
+            );
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("content-type: application/octet-stream")
+            );
+            assert_eq!(
+                &request[header_end + 4..header_end + 4 + content_length],
+                expected_body.as_slice()
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path().join("docs")).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "device".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: Some(EdgeConfig::with_static_token(
+                    format!("http://{address}"),
+                    "test",
+                )),
+            },
+        );
+        let uploads = crate::uploads::Uploads::from_root(&dir.path().join("uploads"));
+        std::fs::create_dir_all(uploads.dir()).unwrap();
+        let path = uploads.dir().join("12345678-photo.png");
+        std::fs::write(&path, body).unwrap();
+
+        assert!(host.upload_attachment_blob("chat-1", path.to_str().unwrap(), &uploads));
+        server.await.unwrap();
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn missing_attachment_is_fetched_from_edge_into_uploads_root() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = b"\x89PNG\r\n\x1a\nfixture";
+        let expected_body = body.to_vec();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let count = socket.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("GET /blob/chat-1/att~12345678-photo.png "));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test")
+            );
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path().join("docs")).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "device".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: Some(EdgeConfig::with_static_token(
+                    format!("http://{address}"),
+                    "test",
+                )),
+            },
+        );
+        let uploads = crate::uploads::Uploads::from_root(&dir.path().join("uploads"));
+        let path = uploads.dir().join("12345678-photo.png");
+
+        host.fetch_attachment_blob("chat-1", path.to_str().unwrap(), &uploads)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), expected_body);
+        assert!(
+            uploads
+                .read_chunk(path.to_str().unwrap(), 0, &[])
+                .unwrap()
+                .done
+        );
+        host.shutdown_workers().await;
+    }
 }
 
 #[cfg(test)]

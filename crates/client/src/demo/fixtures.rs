@@ -410,6 +410,8 @@ pub(crate) fn seed(
             room_gen: Some(2),
             parent_chat_id: demo.parent.map(str::to_owned),
             cloud_seat: None,
+            cloud_run: None,
+            cloud_backup: None,
         };
         doc.upsert_chat(&chat)?;
         if let Some(status) = demo.status {

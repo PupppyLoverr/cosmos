@@ -25,6 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use zeron_doc::{REGISTRY_DOC_ID, RegistryDoc};
 use zeron_sync::DocsStore;
@@ -53,6 +54,8 @@ fn marker_lock() -> std::sync::MutexGuard<'static, ()> {
 struct Marker {
     #[serde(default)]
     imports: Vec<MarkerEntry>,
+    #[serde(default)]
+    read_roots: Vec<ReadRootGrant>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,6 +66,22 @@ struct MarkerEntry {
     imported_at_ms: i64,
     imported_chats: usize,
     imported_spaces: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadRootGrant {
+    org_id: String,
+    user_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalChatSummary {
+    pub chat_id: String,
+    pub title: Option<String>,
+    pub updated_at: DateTime<Utc>,
+    pub archived: bool,
 }
 
 /// What the wizard needs to offer (or silently skip) the import step.
@@ -220,6 +239,23 @@ impl LocalImporter {
             imported_chats: chats,
             imported_spaces: spaces,
         });
+        self.publish_marker_locked(&marker)
+    }
+
+    fn record_read_root_grant(&self) -> Result<(), EngineError> {
+        let _guard = marker_lock();
+        let mut marker = self.load_marker_locked();
+        marker.read_roots.retain(|entry| {
+            entry.org_id != self.inner.org_id || entry.user_id != self.inner.user_id
+        });
+        marker.read_roots.push(ReadRootGrant {
+            org_id: self.inner.org_id.clone(),
+            user_id: self.inner.user_id.clone(),
+        });
+        self.publish_marker_locked(&marker)
+    }
+
+    fn publish_marker_locked(&self, marker: &Marker) -> Result<(), EngineError> {
         let bytes = serde_json::to_vec_pretty(&marker)
             .map_err(|err| EngineError::Other(format!("marker serialize: {err}")))?;
         let path = self.marker_path();
@@ -252,6 +288,76 @@ impl LocalImporter {
         };
         let registry = RegistryDoc::from_bytes(&bytes, &self.inner.device_id)?;
         Ok(Some((store, registry)))
+    }
+
+    pub fn list_local_chats(&self) -> Result<Vec<LocalChatSummary>, EngineError> {
+        let Some((_, registry)) = self.open_source()? else {
+            return Ok(Vec::new());
+        };
+        let mut chats: Vec<_> = registry
+            .read_chats()?
+            .into_iter()
+            .map(|chat| LocalChatSummary {
+                chat_id: chat.id,
+                title: chat.title,
+                updated_at: chat.last_message_at.unwrap_or(chat.created_at),
+                archived: chat.archived,
+            })
+            .collect();
+        chats.sort_by_key(|chat| std::cmp::Reverse(chat.updated_at));
+        Ok(chats)
+    }
+
+    pub fn copy_local_chat_to_cloud(
+        &self,
+        local_chat_id: &str,
+        new_chat_id: &str,
+        device_id: &str,
+        cloud_seat: zeron_proto::CloudSeatBinding,
+    ) -> Result<(), EngineError> {
+        let Some((source_store, registry)) = self.open_source()? else {
+            return Err(EngineError::Other("local chat not found".into()));
+        };
+        let source_chat = registry
+            .read_chats()?
+            .into_iter()
+            .find(|chat| chat.id == local_chat_id)
+            .ok_or_else(|| EngineError::Other("local chat not found".into()))?;
+
+        let source_uploads = self.source_uploads();
+        if source_uploads.is_dir() {
+            self.inner.uploads.add_read_only_root(&source_uploads);
+            self.record_read_root_grant()?;
+        }
+
+        if let Some(bytes) = source_store.load_snapshot(local_chat_id)? {
+            let bytes = rewrite_chat_snapshot(&bytes, local_chat_id, new_chat_id)?;
+            self.inner.target_store.save_snapshot_with_cursor(
+                new_chat_id,
+                &bytes,
+                0,
+                CHAT2_DOC_EPOCH,
+            )?;
+        }
+
+        let mut row = source_chat;
+        row.id = new_chat_id.to_string();
+        row.device_id = device_id.to_string();
+        row.cwd = None;
+        row.branch = None;
+        row.checkout_id = None;
+        row.source_context = None;
+        row.harness_session_id = None;
+        row.harness_session_cwd = None;
+        row.space_id = None;
+        row.last_seen_at = None;
+        row.room_gen = Some(CHAT2_DOC_EPOCH);
+        row.parent_chat_id = None;
+        row.cloud_seat = Some(cloud_seat);
+        row.cloud_run = None;
+        row.cloud_backup = None;
+        self.inner.workspace.import_chat_row(&row)?;
+        Ok(())
     }
 
     /// What's importable right now (target-dedup applied).
@@ -436,9 +542,56 @@ impl LocalImporter {
     }
 }
 
+fn rewrite_chat_snapshot(
+    bytes: &[u8],
+    source_chat_id: &str,
+    new_chat_id: &str,
+) -> Result<Vec<u8>, EngineError> {
+    let doc = loro::LoroDoc::new();
+    doc.import(bytes)
+        .map_err(|err| EngineError::Other(format!("local chat snapshot import: {err}")))?;
+    let session = zeron_doc::SessionDoc::from_doc(doc);
+    if let Some(embedded_chat_id) = session.chat_id() {
+        if embedded_chat_id != source_chat_id {
+            return Err(EngineError::Other(format!(
+                "local chat document id mismatch: expected {source_chat_id}, got {embedded_chat_id}"
+            )));
+        }
+        session.set_chat_id(new_chat_id)?;
+    }
+    Ok(session.export_snapshot()?)
+}
+
+/// Whether a recorded import grants the synced profile `(org, user)` the local
+/// profile's uploads root as a read-only jail root. `EngineCore::assemble`
+/// calls this on every account-scoped boot.
+pub fn marker_grants_read_root(data_dir: &Path, org_id: &str, user_id: &str) -> Option<PathBuf> {
+    let marker: Marker = std::fs::read_to_string(data_dir.join(MARKER_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())?;
+    let hit = marker
+        .imports
+        .iter()
+        .any(|e| e.org_id == org_id && e.user_id == user_id);
+    let granted = marker
+        .read_roots
+        .iter()
+        .any(|entry| entry.org_id == org_id && entry.user_id == user_id);
+    let uploads = data_dir.join("profiles").join("local").join("uploads");
+    ((hit || granted) && uploads.is_dir()).then_some(uploads)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ImportEvent;
+    use super::{CHAT2_DOC_EPOCH, ImportEvent, LocalImporter, marker_grants_read_root};
+    use chrono::Utc;
+    use std::sync::Arc;
+    use zeron_doc::{MessageRole, REGISTRY_DOC_ID, RegistryDoc, SessionDoc, SessionMessageEntry};
+    use zeron_proto::{Chat, ChatConfig, CloudSeatBinding, CloudSeatKind, HarnessId, SandboxLevel};
+    use zeron_sync::DocsStore;
+
+    use crate::uploads::Uploads;
+    use crate::workspace_host::{WorkspaceHost, WorkspaceHostConfig};
 
     #[test]
     fn import_events_serialize_camel_case() {
@@ -466,19 +619,174 @@ mod tests {
         .expect("serialize");
         assert_eq!(chat["chatId"], "c1", "fields must be camelCase: {chat}");
     }
-}
 
-/// Whether a recorded import grants the synced profile `(org, user)` the local
-/// profile's uploads root as a read-only jail root. `EngineCore::assemble`
-/// calls this on every account-scoped boot.
-pub fn marker_grants_read_root(data_dir: &Path, org_id: &str, user_id: &str) -> Option<PathBuf> {
-    let marker: Marker = std::fs::read_to_string(data_dir.join(MARKER_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())?;
-    let hit = marker
-        .imports
-        .iter()
-        .any(|e| e.org_id == org_id && e.user_id == user_id);
-    let uploads = data_dir.join("profiles").join("local").join("uploads");
-    (hit && uploads.is_dir()).then_some(uploads)
+    #[tokio::test]
+    async fn copy_local_chat_to_cloud_clones_docs_and_leaves_source_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let source_root = data_dir.join("profiles").join("local");
+        std::fs::create_dir_all(source_root.join("uploads")).unwrap();
+        let source_store = DocsStore::open(&source_root).unwrap();
+        let source_id = "local-chat";
+        let now = Utc::now();
+        let mut registry = RegistryDoc::new("local-device");
+        let source_chat = Chat {
+            id: source_id.into(),
+            device_id: "local-device".into(),
+            title: Some("Local title".into()),
+            archived: true,
+            cwd: Some("/local/workspace".into()),
+            branch: Some("local-branch".into()),
+            checkout_id: Some("local-checkout".into()),
+            source_context: None,
+            config: Some(ChatConfig {
+                harness: HarnessId::Mock,
+                model: Some("test-model".into()),
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+            }),
+            last_message_preview: Some("hello".into()),
+            last_message_at: Some(now),
+            created_at: now,
+            harness_session_id: Some("local-harness-session".into()),
+            harness_session_cwd: Some("/local/workspace".into()),
+            space_id: Some("local-space".into()),
+            last_seen_at: Some(now),
+            room_gen: Some(CHAT2_DOC_EPOCH),
+            parent_chat_id: Some("local-parent".into()),
+            cloud_seat: None,
+            cloud_run: None,
+            cloud_backup: None,
+        };
+        registry.upsert_chat(&source_chat).unwrap();
+        source_store
+            .save_snapshot(REGISTRY_DOC_ID, &registry.to_bytes().unwrap())
+            .unwrap();
+        let source_registry_before = source_store
+            .load_snapshot(REGISTRY_DOC_ID)
+            .unwrap()
+            .unwrap();
+
+        let source_doc = SessionDoc::init(source_id).unwrap();
+        source_doc
+            .push_message(&SessionMessageEntry {
+                id: "message-1".into(),
+                role: MessageRole::User,
+                parts: Vec::new(),
+                created_at: now.timestamp_millis(),
+                device_id: "local-device".into(),
+                status: None,
+                continuation_of: None,
+                duration_ms: None,
+            })
+            .unwrap();
+        source_store
+            .save_snapshot(source_id, &source_doc.export_snapshot().unwrap())
+            .unwrap();
+        let source_bytes_before = source_store.load_snapshot(source_id).unwrap().unwrap();
+        std::fs::write(
+            source_root.join("uploads").join("attachment.png"),
+            b"attachment",
+        )
+        .unwrap();
+
+        let target_root = data_dir.join("orgs").join("org").join("user");
+        let target_store = Arc::new(DocsStore::open(&target_root).unwrap());
+        let workspace = WorkspaceHost::open(
+            target_store.clone(),
+            WorkspaceHostConfig {
+                device_id: "synced-device".into(),
+                device_name: "Synced device".into(),
+                platform: "macos".into(),
+                org_id: "org".into(),
+                user_id: "user".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        let uploads = Uploads::from_root(&target_root.join("uploads"));
+        let importer = LocalImporter::new(
+            data_dir,
+            "synced-device",
+            "org",
+            "user",
+            target_store.clone(),
+            target_root.join("journals"),
+            workspace.clone(),
+            uploads,
+        );
+        let local_chats = importer.list_local_chats().unwrap();
+        assert_eq!(local_chats.len(), 1);
+        assert_eq!(local_chats[0].chat_id, source_id);
+        assert_eq!(local_chats[0].title.as_deref(), Some("Local title"));
+        assert!(local_chats[0].archived);
+        let first_id = crate::new_id();
+        let first_binding = CloudSeatBinding {
+            seat_id: "seat".into(),
+            kind: CloudSeatKind::Ssh,
+            label: "Seat".into(),
+            repo: None,
+            workspace_path: Some(format!("/seat/{first_id}")),
+            branch: None,
+            model_label: None,
+            expires_at: None,
+        };
+        importer
+            .copy_local_chat_to_cloud(source_id, &first_id, "synced-device", first_binding.clone())
+            .unwrap();
+
+        let copied = workspace.chat(&first_id).unwrap().unwrap();
+        assert_ne!(copied.id, source_id);
+        assert_eq!(copied.device_id, "synced-device");
+        assert_eq!(copied.title, source_chat.title);
+        assert_eq!(copied.config, source_chat.config);
+        assert_eq!(copied.cloud_seat.as_ref(), Some(&first_binding));
+        assert_eq!(copied.space_id, None);
+        assert_eq!(copied.parent_chat_id, None);
+        assert_eq!(copied.harness_session_id, None);
+        assert_eq!(copied.harness_session_cwd, None);
+        assert_eq!(copied.room_gen, Some(CHAT2_DOC_EPOCH));
+
+        let copied_bytes = target_store.load_snapshot(&first_id).unwrap().unwrap();
+        let copied_raw = loro::LoroDoc::new();
+        copied_raw.import(&copied_bytes).unwrap();
+        let copied_doc = SessionDoc::from_doc(copied_raw);
+        assert_eq!(copied_doc.chat_id().as_deref(), Some(first_id.as_str()));
+        assert_eq!(
+            copied_doc.read_entries().unwrap(),
+            source_doc.read_entries().unwrap()
+        );
+        assert_eq!(
+            source_store.load_snapshot(source_id).unwrap().unwrap(),
+            source_bytes_before
+        );
+        assert_eq!(
+            source_store
+                .load_snapshot(REGISTRY_DOC_ID)
+                .unwrap()
+                .unwrap(),
+            source_registry_before
+        );
+        assert_eq!(
+            marker_grants_read_root(data_dir, "org", "user"),
+            Some(source_root.join("uploads"))
+        );
+
+        let second_id = crate::new_id();
+        let mut second_binding = first_binding;
+        second_binding.workspace_path = Some(format!("/seat/{second_id}"));
+        importer
+            .copy_local_chat_to_cloud(source_id, &second_id, "synced-device", second_binding)
+            .unwrap();
+        assert_ne!(first_id, second_id);
+        assert_eq!(
+            workspace.chat(&second_id).unwrap().unwrap().title,
+            source_chat.title
+        );
+        assert_eq!(
+            source_store.load_snapshot(source_id).unwrap().unwrap(),
+            source_bytes_before
+        );
+    }
 }

@@ -117,9 +117,13 @@ async fn late_create_chat_binding_persists_and_dispatches_to_boat() {
     registry.register(Arc::new(CountingHarness(local_runs.clone())));
     let core = EngineCore::assemble(tmp.path(), registry, HarnessId::Mock, None)
         .expect("engine core assembles");
+    let cloud = core
+        .cloud
+        .as_ref()
+        .expect("Development profile loads a CloudStore");
 
     let (endpoint, mut requests, boat_task) = stub_boat().await;
-    core.cloud
+    cloud
         .save_seat(SeatConfig {
             id: SEAT.into(),
             kind: Some(zeron_proto::CloudSeatKind::Box),
@@ -129,7 +133,7 @@ async fn late_create_chat_binding_persists_and_dispatches_to_boat() {
             ..Default::default()
         })
         .unwrap();
-    core.cloud
+    cloud
         .set_seat_token(SEAT, "boxToken", Some("test-token".into()))
         .unwrap();
 
@@ -203,8 +207,7 @@ async fn late_create_chat_binding_persists_and_dispatches_to_boat() {
         .await
         .expect("cloud run dispatches");
 
-    let cloud_run = core
-        .cloud
+    let cloud_run = cloud
         .run_for_chat(CHAT)
         .expect("remote run ledger row exists");
     assert_eq!(cloud_run.seat_id, SEAT);
@@ -224,8 +227,7 @@ async fn late_create_chat_binding_persists_and_dispatches_to_boat() {
     );
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if core
-                .cloud
+            if cloud
                 .run_for_chat(CHAT)
                 .is_some_and(|run| run.status == CloudRunStatus::Error)
             {

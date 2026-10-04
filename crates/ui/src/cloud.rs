@@ -1808,6 +1808,14 @@ impl CloudRail {
         if matches!(self.analysis, Loadable::Loading) {
             return;
         }
+        if !matches!(
+            self.state.read(cx).workspace_scope,
+            Some(zeron_proto::WorkspaceScope::Synced | zeron_proto::WorkspaceScope::Development)
+        ) {
+            self.analysis = Loadable::Error("Cloud needs you signed in".into());
+            cx.notify();
+            return;
+        }
         let Some(engine) = self.engine(cx) else {
             self.analysis = Loadable::Error("Engine not connected".into());
             cx.notify();

@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -30,9 +30,100 @@ use crate::EngineError;
 const CONFIG_FILE: &str = "cloud.json";
 const KEYS_FILE: &str = "cloud-keys.json";
 const RUNS_FILE: &str = "cloud-runs.json";
+const BACKUPS_DIR: &str = "seat-backups";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const REGISTRY_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 /// `docker exec` container prefix (spec): `cosmos-cloud-<workspace>`.
 pub const CONTAINER_PREFIX: &str = "cosmos-cloud";
+
+pub(crate) fn migrate_legacy_cloud_files(
+    data_dir: &Path,
+    store_root: &Path,
+) -> std::io::Result<bool> {
+    let legacy_config = data_dir.join(CONFIG_FILE);
+    if store_root.join(CONFIG_FILE).exists() || !legacy_config.is_file() {
+        return Ok(false);
+    }
+
+    std::fs::create_dir_all(store_root)?;
+    let mut moved = false;
+    for name in [KEYS_FILE, RUNS_FILE, BACKUPS_DIR, CONFIG_FILE] {
+        let source = data_dir.join(name);
+        let destination = store_root.join(name);
+        if source.exists() && !destination.exists() {
+            move_legacy_path(&source, &destination)?;
+            moved = true;
+        }
+    }
+    if moved {
+        tracing::info!(
+            source = %data_dir.display(),
+            destination = %store_root.display(),
+            "migrated legacy cloud state into the synced profile"
+        );
+    }
+    Ok(moved)
+}
+
+fn move_legacy_path(source: &Path, destination: &Path) -> std::io::Result<()> {
+    match std::fs::rename(source, destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            let staging = destination.with_extension("cloud-migration");
+            let _ = remove_path(&staging);
+            let copied = if source.is_dir() {
+                copy_dir_recursive(source, &staging)
+            } else {
+                std::fs::copy(source, &staging).map(|_| ())
+            };
+            if let Err(error) = copied {
+                let _ = remove_path(&staging);
+                return Err(error);
+            }
+            if let Err(error) = std::fs::rename(&staging, destination) {
+                let _ = remove_path(&staging);
+                return Err(error);
+            }
+            remove_path(source)?;
+        }
+        Err(error) => return Err(error),
+    }
+    if destination
+        .file_name()
+        .is_some_and(|name| name == KEYS_FILE)
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(from, to)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Stored shapes
@@ -343,12 +434,44 @@ pub struct CloudStore {
     inner: Arc<CloudStoreInner>,
 }
 
+pub(crate) enum RegistryWrite {
+    Run(CloudRun),
+    Backup(WorkspaceBackup),
+}
+
 struct CloudStoreInner {
     dir: PathBuf,
     state: RwLock<CloudState>,
+    registry_sync: std::sync::Mutex<RegistrySyncState>,
     /// Automations asked to fire now ("Run now"), drained by the scheduler.
     run_now: std::sync::Mutex<Vec<String>>,
     run_now_signal: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct RegistrySyncState {
+    sink: Option<Arc<dyn Fn(RegistryWrite) + Send + Sync>>,
+    last_progress_write: HashMap<String, Instant>,
+}
+
+fn registry_safe_run(run: CloudRun) -> CloudRun {
+    let mut run = run;
+    run.command = None;
+    run.error = None;
+    run.prompt = None;
+    run
+}
+
+fn cloud_run_progress_only(before: &CloudRun, after: &CloudRun) -> bool {
+    if before.mirrored_bytes == after.mirrored_bytes && before.remote_cursor == after.remote_cursor
+    {
+        return false;
+    }
+    let mut comparable_before = before.clone();
+    comparable_before.mirrored_bytes = after.mirrored_bytes;
+    comparable_before.remote_cursor = after.remote_cursor.clone();
+    comparable_before.updated_at = after.updated_at;
+    comparable_before == *after
 }
 
 #[derive(Default)]
@@ -425,10 +548,52 @@ impl CloudStore {
                     runs,
                     load_error,
                 }),
+                registry_sync: std::sync::Mutex::new(RegistrySyncState::default()),
                 run_now: std::sync::Mutex::new(Vec::new()),
                 run_now_signal: tokio::sync::Notify::new(),
             }),
         }
+    }
+
+    pub(crate) fn set_registry_sink(&self, sink: Arc<dyn Fn(RegistryWrite) + Send + Sync>) {
+        self.inner
+            .registry_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sink = Some(sink);
+    }
+
+    fn emit_registry_write(&self, write: RegistryWrite) {
+        let sync = self
+            .inner
+            .registry_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sink) = &sync.sink {
+            sink(write);
+        }
+    }
+
+    fn emit_registry_run(&self, run: CloudRun, progress_only: bool) {
+        let now = Instant::now();
+        let mut sync = self
+            .inner
+            .registry_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if progress_only
+            && sync
+                .last_progress_write
+                .get(&run.chat_id)
+                .is_some_and(|last| now.duration_since(*last) < REGISTRY_PROGRESS_INTERVAL)
+        {
+            return;
+        }
+        let Some(sink) = sync.sink.clone() else {
+            return;
+        };
+        sync.last_progress_write.insert(run.chat_id.clone(), now);
+        sink(RegistryWrite::Run(registry_safe_run(run)));
     }
 
     fn write<T: ?Sized + Serialize>(
@@ -890,6 +1055,7 @@ impl CloudStore {
     }
 
     pub fn upsert_run(&self, run: CloudRun) {
+        let registry_run = run.clone();
         let mut state = self.inner.state.write().unwrap();
         match state.runs.runs.iter_mut().find(|r| r.id == run.id) {
             Some(existing) => *existing = run,
@@ -897,16 +1063,27 @@ impl CloudStore {
         }
         drop(state);
         let _ = self.persist_runs();
+        self.emit_registry_run(registry_run, false);
     }
 
     pub fn update_run(&self, run_id: &str, f: impl FnOnce(&mut CloudRun)) {
+        let mut registry_update = None;
         let mut state = self.inner.state.write().unwrap();
         if let Some(run) = state.runs.runs.iter_mut().find(|r| r.id == run_id) {
+            let before = run.clone();
             f(run);
             run.updated_at = Utc::now();
+            let mut before_with_updated_at = before.clone();
+            before_with_updated_at.updated_at = run.updated_at;
+            if before_with_updated_at != *run {
+                registry_update = Some((before, run.clone()));
+            }
         }
         drop(state);
         let _ = self.persist_runs();
+        if let Some((before, after)) = registry_update {
+            self.emit_registry_run(after.clone(), cloud_run_progress_only(&before, &after));
+        }
     }
 
     /// A redacted config view for RPC: secrets collapse to `has_*` booleans.
@@ -1053,11 +1230,13 @@ impl CloudStore {
 
     /// Record (replace) the chat's snapshot row.
     pub fn record_backup(&self, backup: WorkspaceBackup) {
+        let registry_backup = backup.clone();
         let mut state = self.inner.state.write().unwrap();
         state.config.backups.retain(|b| b.chat_id != backup.chat_id);
         state.config.backups.push(backup);
         drop(state);
         let _ = self.persist_config();
+        self.emit_registry_write(RegistryWrite::Backup(registry_backup));
     }
 
     pub fn mark_backup_restored(&self, chat_id: &str, seat_id: &str) {
@@ -4147,6 +4326,62 @@ mod tests {
     }
 
     #[test]
+    fn migrates_legacy_cloud_state_into_a_profile_store_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_root = dir.path().join("orgs/org/user");
+        let backup = dir.path().join("seat-backups/seat/chat.tar");
+        std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), b"{\"seats\":[]}").unwrap();
+        std::fs::write(dir.path().join(KEYS_FILE), b"{\"key\":\"local\"}").unwrap();
+        std::fs::write(dir.path().join(RUNS_FILE), b"{\"runs\":[]}").unwrap();
+        std::fs::write(&backup, b"backup").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.path().join(KEYS_FILE),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+
+        assert!(migrate_legacy_cloud_files(dir.path(), &store_root).unwrap());
+        assert_eq!(
+            std::fs::read(store_root.join(CONFIG_FILE)).unwrap(),
+            b"{\"seats\":[]}"
+        );
+        assert_eq!(
+            std::fs::read(store_root.join(KEYS_FILE)).unwrap(),
+            b"{\"key\":\"local\"}"
+        );
+        assert_eq!(
+            std::fs::read(store_root.join(RUNS_FILE)).unwrap(),
+            b"{\"runs\":[]}"
+        );
+        assert_eq!(
+            std::fs::read(store_root.join(BACKUPS_DIR).join("seat/chat.tar")).unwrap(),
+            b"backup"
+        );
+        assert!(!dir.path().join(CONFIG_FILE).exists());
+        assert!(!dir.path().join(KEYS_FILE).exists());
+        assert!(!dir.path().join(RUNS_FILE).exists());
+        assert!(!dir.path().join(BACKUPS_DIR).exists());
+        assert!(!migrate_legacy_cloud_files(dir.path(), &store_root).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(store_root.join(KEYS_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
     fn mints_an_ssh_key_when_asked() {
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("cosmos_ed25519");
@@ -4284,6 +4519,58 @@ mod tests {
             Some("sid")
         );
         assert_eq!(reloaded.harness_session_for_chat("c", "other"), None);
+    }
+
+    #[test]
+    fn registry_sink_strips_private_run_fields_and_coalesces_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CloudStore::load(dir.path());
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = writes.clone();
+        store.set_registry_sink(Arc::new(move |write| {
+            if let RegistryWrite::Run(run) = write {
+                observed.lock().unwrap().push(run);
+            }
+        }));
+
+        let now = Utc::now();
+        store.upsert_run(CloudRun {
+            id: "run-1".into(),
+            chat_id: "chat-1".into(),
+            seat_id: "seat-1".into(),
+            command: Some("claude --api-key private".into()),
+            status: zeron_proto::CloudRunStatus::Working,
+            log_path: Some("/home/seat/run.log".into()),
+            remote_ref: Some("123".into()),
+            mirrored_bytes: 0,
+            remote_cursor: None,
+            entry_id: Some("entry-1".into()),
+            error: Some("private error".into()),
+            workspace: Some("/workspace/chat-1".into()),
+            harness_session: None,
+            prompt: Some("private prompt".into()),
+            started_at: now,
+            finished_at: None,
+            updated_at: now,
+        });
+        let initial = writes.lock().unwrap()[0].clone();
+        assert_eq!(initial.command, None);
+        assert_eq!(initial.error, None);
+        assert_eq!(initial.prompt, None);
+
+        store.update_run("run-1", |run| run.mirrored_bytes = 24);
+        store.update_run("run-1", |run| run.remote_cursor = Some("7".into()));
+        assert_eq!(writes.lock().unwrap().len(), 1);
+
+        store.update_run("run-1", |run| {
+            run.status = zeron_proto::CloudRunStatus::Done;
+            run.finished_at = Some(Utc::now());
+        });
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1].mirrored_bytes, 24);
+        assert_eq!(writes[1].remote_cursor.as_deref(), Some("7"));
+        assert_eq!(writes[1].status, zeron_proto::CloudRunStatus::Done);
     }
 
     #[test]
@@ -4494,23 +4781,29 @@ mod tests {
     fn store_roundtrip_and_redaction() {
         let dir = tempfile::tempdir().unwrap();
         let store = CloudStore::load(dir.path());
-        store.save_seat(SeatConfig {
-            id: "vps-1".into(),
-            kind: Some(CloudSeatKind::Ssh),
-            label: "dev box".into(),
-            ssh_alias: Some("devbox".into()),
-            ..Default::default()
-        });
-        store.set_seat_token("vps-1", "githubPat", Some("pat-123".into()));
-        store.save_provider(
-            ProviderConfig {
-                provider: Some(ByokProvider::Anthropic),
-                model: Some("claude-opus-4-6".into()),
-                use_for_cloud: true,
+        store
+            .save_seat(SeatConfig {
+                id: "vps-1".into(),
+                kind: Some(CloudSeatKind::Ssh),
+                label: "dev box".into(),
+                ssh_alias: Some("devbox".into()),
                 ..Default::default()
-            },
-            Some("sk-ant-secret".into()),
-        );
+            })
+            .unwrap();
+        store
+            .set_seat_token("vps-1", "githubPat", Some("pat-123".into()))
+            .unwrap();
+        store
+            .save_provider(
+                ProviderConfig {
+                    provider: Some(ByokProvider::Anthropic),
+                    model: Some("claude-opus-4-6".into()),
+                    use_for_cloud: true,
+                    ..Default::default()
+                },
+                Some("sk-ant-secret".into()),
+            )
+            .unwrap();
         let view = store.view();
         // Secrets never serialize into the view — only the has_* flags.
         let text = view.to_string();

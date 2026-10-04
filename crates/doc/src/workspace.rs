@@ -289,6 +289,17 @@ impl WorkspaceDoc {
             Some(seat) => row.insert("cloudSeat", LoroValue::from(serde_json::to_value(seat)?))?,
             None => row.delete("cloudSeat")?,
         }
+        match &chat.cloud_run {
+            Some(run) => row.insert("cloudRun", LoroValue::from(serde_json::to_value(run)?))?,
+            None => row.delete("cloudRun")?,
+        }
+        match &chat.cloud_backup {
+            Some(backup) => row.insert(
+                "cloudBackup",
+                LoroValue::from(serde_json::to_value(backup)?),
+            )?,
+            None => row.delete("cloudBackup")?,
+        }
         self.doc.commit();
         Ok(())
     }
@@ -721,6 +732,10 @@ pub(crate) struct RawChat {
     parent_chat_id: Option<String>,
     #[serde(default)]
     cloud_seat: Option<zeron_proto::CloudSeatBinding>,
+    #[serde(default)]
+    cloud_run: Option<zeron_proto::CloudRun>,
+    #[serde(default)]
+    cloud_backup: Option<zeron_proto::CloudBackupPointer>,
 }
 
 /// Decode a chat row's `config` leniently: unknown enum values (a newer
@@ -763,6 +778,8 @@ impl From<RawChat> for Chat {
             room_gen: raw.room_gen,
             parent_chat_id: raw.parent_chat_id,
             cloud_seat: raw.cloud_seat,
+            cloud_run: raw.cloud_run,
+            cloud_backup: raw.cloud_backup,
         }
     }
 }
@@ -870,6 +887,8 @@ mod tests {
             harness_session_cwd: None,
             parent_chat_id: Some("parent-chat".into()),
             cloud_seat: None,
+            cloud_run: None,
+            cloud_backup: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -1001,6 +1020,47 @@ mod tests {
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].title, None);
         assert_eq!(chats[0].last_message_preview.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn cloud_metadata_survives_workspace_chat_upserts() {
+        let ws = WorkspaceDoc::new();
+        let mut original = chat("chat-1", "dev-a");
+        original.cloud_run = Some(zeron_proto::CloudRun {
+            id: "run-1".into(),
+            chat_id: "chat-1".into(),
+            seat_id: "seat-1".into(),
+            command: None,
+            status: zeron_proto::CloudRunStatus::Working,
+            log_path: Some("/home/seat/run.log".into()),
+            remote_ref: Some("123".into()),
+            mirrored_bytes: 12,
+            remote_cursor: Some("7".into()),
+            entry_id: Some("entry-1".into()),
+            error: None,
+            workspace: Some("/workspace/chat-1".into()),
+            harness_session: None,
+            prompt: None,
+            started_at: ts(1_000),
+            finished_at: None,
+            updated_at: ts(2_000),
+        });
+        original.cloud_backup = Some(zeron_proto::CloudBackupPointer {
+            seat_id: "seat-1".into(),
+            device_id: "dev-a".into(),
+            path: "seat-backups/chat-1.tar.gz".into(),
+            bytes: Some(128),
+            created_at: ts(2_000),
+        });
+        ws.upsert_chat(&original).unwrap();
+
+        let mut updated = ws.read_chats().unwrap().remove(0);
+        updated.archived = true;
+        ws.upsert_chat(&updated).unwrap();
+
+        let row = ws.read_chats().unwrap().remove(0);
+        assert_eq!(row.cloud_run, original.cloud_run);
+        assert_eq!(row.cloud_backup, original.cloud_backup);
     }
 
     #[test]

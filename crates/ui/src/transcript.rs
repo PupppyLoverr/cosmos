@@ -5547,6 +5547,7 @@ impl Transcript {
             return;
         };
         let local = self.state.read(cx).local_device_id.clone();
+        let chat_id = self.chat_id.clone();
         // Relay-forward only for a genuinely remote owner; the local device's
         // files are served directly.
         let target = (local.as_deref() != Some(device_id.as_str())).then(|| device_id.clone());
@@ -5558,6 +5559,7 @@ impl Transcript {
                 &engine,
                 cx.background_executor(),
                 target.as_deref(),
+                chat_id.as_deref(),
                 &path,
                 expected_raster_mime.as_deref(),
             )

@@ -390,6 +390,19 @@ pub struct WorkspaceBackup {
     pub restored_to: Option<String>,
 }
 
+/// Pointer to a workspace snapshot held in one device's profile store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudBackupPointer {
+    pub seat_id: String,
+    pub device_id: String,
+    /// Relative to the device's profile store root.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Seat health as the last probe reported it — drives the bot bar's dot and
 /// the settings "Health" block.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

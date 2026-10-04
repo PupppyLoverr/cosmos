@@ -346,7 +346,7 @@ fn chunk_ranges(b64_len: usize) -> Vec<(u64, std::ops::Range<usize>)> {
 /// Chunked upload: base64 the bytes, `UploadChunk{uploadId,seq,data}` per
 /// [`UPLOAD_CHUNK_B64_CHARS`] slice (positional `seq` makes the cheap retry
 /// idempotent), a few chunks in flight at once, then
-/// `UploadCommit{uploadId,fileName}` → the durable absolute path on the target
+/// `UploadCommit{uploadId,fileName,chatId}` → the durable absolute path on the target
 /// device. The caller mints `upload_id` — the queued-attachment flow derives
 /// its `pending://` refs from the same identity before the bytes move.
 /// `progress` (when given) accumulates uploaded BINARY bytes — the
@@ -356,6 +356,7 @@ pub async fn upload_attachment(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
+    chat_id: &str,
     upload_id: &str,
     attachment: &StagedAttachment,
     progress: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -429,7 +430,11 @@ pub async fn upload_attachment(
             })
             .await?;
         let params = with_target(
-            serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name }),
+            serde_json::json!({
+                "uploadId": upload_id,
+                "fileName": attachment.name,
+                "chatId": chat_id,
+            }),
             target_device_id,
         );
         let reply = call_with_timeout(
@@ -462,12 +467,13 @@ pub struct LoadedAttachmentImage {
     pub image: Arc<Image>,
 }
 
-/// `ReadAttachmentChunk` loop: 45KB base64 chunks until `done` (bounded, with
+/// `ReadAttachmentChunk{chatId}` loop: 45KB base64 chunks until `done` (bounded, with
 /// the same stuck-offset guard as zeron's `readAttachmentImage`).
 pub async fn read_attachment_image(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
+    chat_id: Option<&str>,
     path: &str,
     expected_raster_mime: Option<&str>,
 ) -> Option<LoadedAttachmentImage> {
@@ -477,10 +483,11 @@ pub async fn read_attachment_image(
     let mut offset = 0u64;
     let mut done = false;
     for _ in 0..MAX_READ_CHUNKS {
-        let params = with_target(
-            serde_json::json!({ "path": path, "offset": offset }),
-            target_device_id,
-        );
+        let mut params = serde_json::json!({ "path": path, "offset": offset });
+        if let Some(chat_id) = chat_id {
+            params["chatId"] = chat_id.into();
+        }
+        let params = with_target(params, target_device_id);
         let chunk = call_with_timeout(
             engine,
             executor,
@@ -1402,11 +1409,11 @@ mod generated_image_tests {
     #[tokio::test]
     async fn generated_image_chunk_reader_targets_owner_and_bounds_decode() {
         let executor = gpui_platform::background_executor();
-        for (width, target, expected, succeeds) in [
-            (64, Some("remote-owner"), "image/png", true),
-            (64, None, "image/png", true),
-            (4097, None, "image/png", false),
-            (64, None, "image/gif", false),
+        for (width, target, expected, succeeds, chat_id) in [
+            (64, Some("remote-owner"), "image/png", true, Some("chat-1")),
+            (64, None, "image/png", true, None),
+            (4097, None, "image/png", false, None),
+            (64, None, "image/gif", false, None),
         ] {
             let mut png = std::io::Cursor::new(Vec::new());
             image::DynamicImage::new_rgba8(width, 1)
@@ -1422,6 +1429,7 @@ mod generated_image_tests {
                 &engine,
                 &executor,
                 target,
+                chat_id,
                 "/profile/uploads/image.png",
                 Some(expected),
             )
@@ -1430,6 +1438,7 @@ mod generated_image_tests {
             let calls = calls.lock().unwrap();
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0]["path"], "/profile/uploads/image.png");
+            assert_eq!(calls[0].get("chatId").and_then(|v| v.as_str()), chat_id);
             assert_eq!(
                 calls[0].get("targetDeviceId").and_then(|v| v.as_str()),
                 target

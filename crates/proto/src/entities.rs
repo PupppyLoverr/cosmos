@@ -236,6 +236,10 @@ pub struct Chat {
     /// `cloud.json`, keyed by `seat_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_seat: Option<crate::cloud::CloudSeatBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_run: Option<crate::cloud::CloudRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_backup: Option<crate::cloud::CloudBackupPointer>,
 }
 
 impl Chat {

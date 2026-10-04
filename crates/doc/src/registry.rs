@@ -962,6 +962,8 @@ impl RegistryDoc {
             ),
             ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
             ("cloudSeat", json!(chat.cloud_seat.as_ref())),
+            ("cloudRun", json!(chat.cloud_run.as_ref())),
+            ("cloudBackup", json!(chat.cloud_backup.as_ref())),
         ]);
         self.write(KIND_CHATS, &chat.id.clone(), OpKind::Upsert, set);
         Ok(())
@@ -1055,7 +1057,10 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    pub fn set_chat_cloud_seat_if_unset(
+    /// Rebind a chat to another cloud seat (a dead Railway trial's thread
+    /// moving to Boat or a fresh trial). The chat must already be bound to a
+    /// cloud seat; creating a Cloud chat is an explicit separate operation.
+    pub fn set_chat_cloud_seat(
         &mut self,
         chat_id: &str,
         cloud_seat: &zeron_proto::CloudSeatBinding,
@@ -1063,7 +1068,7 @@ impl RegistryDoc {
         let Some(row) = self.overlay_row(KIND_CHATS, chat_id) else {
             return Ok(false);
         };
-        if row
+        if !row
             .fields
             .get("cloudSeat")
             .is_some_and(|value| !value.is_null())
@@ -1079,13 +1084,10 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    /// Rebind a chat to another cloud seat (a dead Railway trial's thread
-    /// moving to Boat or a fresh trial). Unlike the create-time stamp this
-    /// overwrites; the caller owns the "moving on purpose" decision.
-    pub fn set_chat_cloud_seat(
+    pub fn set_chat_cloud_run(
         &mut self,
         chat_id: &str,
-        cloud_seat: &zeron_proto::CloudSeatBinding,
+        cloud_run: &zeron_proto::CloudRun,
     ) -> Result<bool, DocError> {
         if self.overlay_row(KIND_CHATS, chat_id).is_none() {
             return Ok(false);
@@ -1094,7 +1096,24 @@ impl RegistryDoc {
             KIND_CHATS,
             chat_id,
             OpKind::Update,
-            fields([("cloudSeat", serde_json::to_value(cloud_seat)?)]),
+            fields([("cloudRun", serde_json::to_value(cloud_run)?)]),
+        );
+        Ok(true)
+    }
+
+    pub fn set_chat_cloud_backup(
+        &mut self,
+        chat_id: &str,
+        cloud_backup: &zeron_proto::CloudBackupPointer,
+    ) -> Result<bool, DocError> {
+        if self.overlay_row(KIND_CHATS, chat_id).is_none() {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("cloudBackup", serde_json::to_value(cloud_backup)?)]),
         );
         Ok(true)
     }

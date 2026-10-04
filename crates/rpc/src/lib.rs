@@ -227,6 +227,12 @@ pub mod methods {
     pub const LOCAL_IMPORT_STATUS: &str = "LocalImportStatus";
     /// One-time local→synced profile import: run it (stream of progress items).
     pub const IMPORT_LOCAL_WORKSPACE: &str = "ImportLocalWorkspace";
+    /// `{}` → `[{chatId, title, updatedAt, archived}]` from this device's
+    /// Local profile.
+    pub const LIST_LOCAL_CHATS: &str = "ListLocalChats";
+    /// `{localChatId, seatId}` → `{chatId}`; explicitly copies a Local chat
+    /// to a new Cloud chat without mutating the source.
+    pub const COPY_LOCAL_CHAT_TO_CLOUD: &str = "CopyLocalChatToCloud";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";
