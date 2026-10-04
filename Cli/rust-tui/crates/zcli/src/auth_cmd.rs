@@ -111,11 +111,8 @@ fn login(args: &[String]) -> i32 {
     }
     if let Some(p) = zcore::acp_client::plugin(id) {
         // the vendor's own sign-in; Cosmos never sees the credentials
-        if !zcore::acp_client::installed(p.id) {
-            eprintln!("✗ {} isn't installed — {}", p.name, p.install);
-            return exit::PROVIDER;
-        }
-        return match zcore::acp_client::login(p.id) {
+        // installs the official CLI first when it's missing
+        return match zcore::acp_client::connect(p.id, &mut |s| println!("· {s}")) {
             Ok(()) => {
                 // pull the plan's real model list now that sign-in works
                 let note = match catalog::provider(id).map(zcore::live::fetch) {

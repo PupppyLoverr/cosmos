@@ -395,7 +395,7 @@ fn run_tool(p: &Paths, auto_apply: bool, name: &str, input: &Value) -> Result<(S
                 if zcore::acp_client::installed(id) {
                     format!("{} is installed: {}. The operator picks it in /model.", plugin.name, zcore::acp_client::status(id))
                 } else {
-                    format!("{} isn't installed. Tell the operator to {}; it then appears in /model.", plugin.name, plugin.install)
+                    format!("{} isn't installed yet. Tell the operator: {} — then it appears in /model.", plugin.name, plugin.install)
                 },
                 None,
             ))

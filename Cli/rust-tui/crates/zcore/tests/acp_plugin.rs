@@ -140,6 +140,15 @@ fn acp_plugins_end_to_end() {
     assert_eq!(stop, "cancelled");
     drop(s);
 
+    // the vendors' own install folders must never be found from a test:
+    // point every profile variable at an empty folder
+    let nohome = dir.path().join("nohome");
+    std::fs::create_dir_all(&nohome).unwrap();
+    let saved: Vec<(&str, Option<std::ffi::OsString>)> = ["LOCALAPPDATA", "APPDATA", "USERPROFILE", "HOME"].iter().map(|k| (*k, std::env::var_os(k))).collect();
+    for (k, _) in &saved {
+        std::env::set_var(k, &nohome);
+    }
+
     // 3. through the agent loop, found on PATH as `devin`
     let bin = dir.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -187,4 +196,10 @@ fn acp_plugins_end_to_end() {
 
     std::env::set_var("PATH", old_path);
     std::env::remove_var("FAKE_ACP_AGENT");
+    for (k, v) in saved {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
 }

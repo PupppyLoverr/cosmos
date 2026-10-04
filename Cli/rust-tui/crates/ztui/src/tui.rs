@@ -257,6 +257,8 @@ pub struct App {
     pub user: Option<String>,
     /// `/onboarding` asked the loop to hand the terminal to cosmostui-welcome
     pub replay_onboard: bool,
+    /// a subscription to install and/or sign in to with the terminal handed over
+    pub handoff: Option<String>,
     /// `ui.toml` was just written by a command — reload it now, not in a second
     pub skin_reload: bool,
     /// the companion beside the composer
@@ -356,6 +358,7 @@ impl App {
             last_reply: String::new(),
             user: None,
             replay_onboard: false,
+            handoff: None,
             skin_reload: false,
             buddy: crate::buddy::Buddy::new(),
             focused: None,
@@ -1523,26 +1526,45 @@ impl App {
     fn connect_acp(&mut self, id: &str) {
         let Some(p) = zcore::acp_client::plugin(id) else { return };
         if !zcore::acp_client::installed(id) {
-            self.error(format!("{} isn't installed — {}", p.name, p.install));
+            // no CLI yet: install the vendor's official one, then sign in
+            self.handoff = Some(id.to_string());
             return;
         }
-        // the agent reports the plan's real model list on session/new —
-        // grab it now so the picker shows more than "<id>/default"
+        // signed in already? the agent reports the plan's model list on session/new
         match zcore::catalog::provider(id).map(zcore::live::fetch) {
             Some(Ok(models)) => {
                 let _ = zcore::live::store(id, &models);
+                self.reload_models();
+                self.note(format!("{} is connected — it runs on your {} plan", p.name, p.name));
+                self.open_model_picker_for(id);
             }
-            Some(Err(e)) => self.note(format!("Couldn't get {}'s model list ({e:#}) — showing its default", p.name)),
+            // most likely not signed in: run the vendor's sign-in
+            _ => self.handoff = Some(id.to_string()),
+        }
+    }
+
+    /// After the terminal comes back from an install / sign-in.
+    fn after_handoff(&mut self, id: &str, res: Result<(), String>) {
+        let name = zcore::acp_client::plugin(id).map(|p| p.name).unwrap_or(id);
+        if let Err(e) = res {
+            self.error(format!("Couldn't connect {name}: {e}"));
+            return;
+        }
+        match zcore::catalog::provider(id).map(zcore::live::fetch) {
+            Some(Ok(models)) => {
+                let n = models.len();
+                let _ = zcore::live::store(id, &models);
+                self.reload_models();
+                self.note(format!("{name} is connected · {n} models on your plan"));
+                self.open_model_picker_for(id);
+            }
+            Some(Err(e)) => {
+                self.reload_models();
+                self.note(format!("{name} is set up, but its model list didn't load ({e:#}) — showing its default"));
+                self.open_model_picker_for(id);
+            }
             None => {}
         }
-        self.reload_models();
-        self.note(format!(
-            "{} found — it runs on your {} plan. Not signed in yet? Run `{}` in a terminal (or `cosmostui auth login {id}`).",
-            p.name,
-            p.name,
-            p.login.join(" ")
-        ));
-        self.open_model_picker_for(id);
     }
 
     fn open_model_picker(&mut self) {
@@ -2485,6 +2507,24 @@ fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender
             app.dirty = true;
         }
         app.poll_jobs();
+        if let Some(id) = app.handoff.take() {
+            // the installer and the vendor's sign-in need the real terminal
+            let out = std::mem::take(&mut app.out);
+            screen.draw(&out, Frame { lines: &[], cursor: None })?;
+            screen.leave(&[]);
+            println!();
+            let res = zcore::acp_client::connect(&id, &mut |s| println!("[1m· {s}[0m"));
+            if let Err(e) = &res {
+                println!("
+✗ {e:#}
+Press Enter to go back to cosmostui.");
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+            }
+            *screen = Screen::enter()?;
+            app.after_handoff(&id, res.map_err(|e| format!("{e:#}")));
+            app.dirty = true;
+        }
         if app.replay_onboard {
             app.replay_onboard = false;
             if zcore::welcome::exe().is_none() {

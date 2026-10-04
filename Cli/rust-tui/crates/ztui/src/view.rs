@@ -945,7 +945,7 @@ fn connect_picker(filter: &[char], sel: usize, w: usize) -> (Vec<Line<'static>>,
                 if zcore::acp_client::installed(&p.id) {
                     Span::styled("✓ CLI installed", theme::fg(GREEN()))
                 } else {
-                    dim("not installed")
+                    dim("↵ installs + signs in")
                 }
             }
             _ => match zcore::creds::key_for(&p.id, &p.env) {
@@ -967,7 +967,7 @@ fn connect_picker(filter: &[char], sel: usize, w: usize) -> (Vec<Line<'static>>,
         let how = match p.kind.as_str() {
             "chatgpt" => "Opens your browser — use your ChatGPT Plus/Pro plan instead of an API key".to_string(),
             "acp" => match zcore::acp_client::plugin(&p.id) {
-                Some(a) => format!("Runs {}'s own agent on your plan (ACP) · sign in once with `{}`", a.name, a.login.join(" ")),
+                Some(a) => format!("Runs {}'s own agent on your plan · cosmostui installs its official CLI if needed and opens the sign-in", a.name),
                 None => String::new(),
             },
             _ => format!("Paste a key, or set {} · {}", p.env.join(" / "), p.base_url),
