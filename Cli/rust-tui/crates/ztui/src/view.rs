@@ -686,7 +686,7 @@ fn bubble_text(app: &App) -> Option<(String, Style)> {
     Some(match app.buddy.current_quip(&sk.buddy) {
         Some(q) => (format!("‹ {q} ›"), Style::new().fg(ACCENT()).add_modifier(Modifier::ITALIC)),
         None if mood == crate::buddy::Mood::Listening => ("‹ … ›".to_string(), DIM()),
-        None if mood == crate::buddy::Mood::Loved => ("♥ ♥ ♥".to_string(), theme::fg(RED())),
+        None if mood == crate::buddy::Mood::Loved => ("♡ ♡ ♡".to_string(), theme::fg(RED())),
         None if mood == crate::buddy::Mood::Sleeping => ("z Z z".to_string(), DIM()),
         None => return None,
     })
@@ -1134,7 +1134,7 @@ pub fn busy_line(app: &App, ms: u128) -> Line<'static> {
     }
     if cfg.show_tokens {
         if let Some(st) = &app.stream {
-            meta.push(format!("↓ {} tokens", kfmt((st.chars / 4) as u64)));
+            meta.push(format!("↓ {} tokens", kfmt(((app.turn_chars + st.chars) / 4) as u64)));
         }
     }
     if !cfg.hint.is_empty() {
@@ -1163,6 +1163,30 @@ pub fn turn_footer(app: &App) -> Vec<Line<'static>> {
         text.push_str(&format!(" · ↓ {} tokens", kfmt(out_tokens)));
     }
     vec![Line::from(vec![sp(" "), Span::styled(format!("{} ", cfg.footer_glyph), theme::fg(ACCENT())), dim(text)])]
+}
+
+/// Messages waiting for the task to finish, with what you can do to each.
+fn queue_rows(app: &App, w: usize) -> Vec<Line<'static>> {
+    if app.queue.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![Line::from(vec![
+        sp(" "),
+        Span::styled(format!("⏸ {} queued", app.queue.len()), theme::fg(ACCENT())),
+        dim(if app.queue_sel.is_some() { " · ↑↓ choose · ↵ send now · e edit · x remove · esc back" } else { " · sent when this finishes · ↑ to send now, edit or remove" }),
+    ])];
+    for (i, (shown, _)) in app.queue.iter().enumerate() {
+        let on = app.queue_sel == Some(i);
+        let actions = if on { "  ↑ send now  ✎ edit  ✕ remove" } else { "" };
+        let room = w.saturating_sub(6 + width_of(actions));
+        let text = ellipsize(&shown.replace('\n', " ⏎ "), room);
+        out.push(Line::from(vec![
+            if on { Span::styled("   ❯ ", theme::fg(ACCENT())) } else { dim("   · ") },
+            Span::styled(text, if on { theme::bold(Style::new()) } else { DIM() }),
+            Span::styled(actions, theme::fg(ACCENT())),
+        ]));
+    }
+    out
 }
 
 /// `✎ customising · setting spinner.style = "comet" · 4s · /customise stop`,
@@ -1225,6 +1249,16 @@ fn customise_picker(sel: usize, w: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// The diff as the pager draws it (full, coloured).
+fn pager_diff(o: &crate::tui::Output, w: usize) -> Option<Vec<Line<'static>>> {
+    o.diff.as_ref().map(|d| crate::toolview::diff_full(d, w.saturating_sub(2)))
+}
+
+/// How many rows the pager scrolls over for `o`.
+pub fn pager_len(o: &crate::tui::Output, w: usize) -> usize {
+    pager_diff(o, w).map(|l| l.len()).unwrap_or(o.body.len())
+}
+
 /// Rows the ctrl+o pager shows at once.
 pub const PAGER_ROWS: usize = 18;
 
@@ -1234,7 +1268,8 @@ fn pager(app: &App, idx: usize, scroll: usize, w: usize) -> Vec<Line<'static>> {
     let Some(o) = app.outputs.iter().rev().nth(idx) else {
         return vec![Line::from(dim(" Nothing to expand yet · esc"))];
     };
-    let total = o.body.len();
+    let styled = pager_diff(o, w);
+    let total = styled.as_ref().map(Vec::len).unwrap_or(o.body.len());
     let top = scroll.min(total.saturating_sub(PAGER_ROWS));
     let nw = total.max(1).to_string().len();
     let mut out = vec![
@@ -1246,7 +1281,10 @@ fn pager(app: &App, idx: usize, scroll: usize, w: usize) -> Vec<Line<'static>> {
             dim(format!("  {}/{n}", idx + 1)),
         ]),
     ];
-    for (i, l) in o.body.iter().enumerate().skip(top).take(PAGER_ROWS) {
+    if let Some(rows) = &styled {
+        out.extend(rows.iter().skip(top).take(PAGER_ROWS).cloned());
+    }
+    for (i, l) in o.body.iter().enumerate().skip(top).take(if styled.is_some() { 0 } else { PAGER_ROWS }) {
         let room = w.saturating_sub(nw + 4);
         out.push(Line::from(vec![dim(format!(" {:>nw$}  ", i + 1)), sp(ellipsize(&l.replace('\t', "    "), room))]));
     }
@@ -1371,6 +1409,7 @@ pub fn live(app: &App) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
     if let Some(strip) = customise_strip(app, w, ms) {
         out.push(strip);
     }
+    out.extend(queue_rows(app, w));
     let full = buddy_full(app);
     let pet_w = if full { crate::buddy::sprite_width(&buddy_identity(app)) + 1 } else { 0 };
     let mut head = 0;

@@ -269,8 +269,9 @@ fn command(exe: &Path) -> Command {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Update {
     Text(String),
-    /// a vendor tool started or changed: (id, kind, title, status, raw input, output text)
-    Tool { id: String, kind: String, title: String, status: String, input: Value, output: String },
+    /// a vendor tool started or changed: (id, kind, title, status, raw input,
+    /// output text, and the file change it made, if it reported one)
+    Tool { id: String, kind: String, title: String, status: String, input: Value, output: String, diff: Option<FileDiff> },
 }
 
 /// The operator's answer to a permission request.
@@ -438,7 +439,7 @@ impl AcpSession {
     /// A request with no streaming expected (setup calls).
     fn call_simple(&mut self, method: &str, params: Value) -> Result<Value> {
         let deadline = Instant::now() + self.setup_timeout;
-        self.call(method, params, &mut |_| {}, &mut |_, _| false, None, Some(deadline))
+        self.call(method, params, &mut |_| {}, &mut |_, _| false, &|| false, Some(deadline))
     }
 
     /// Send a request and pump messages until its response arrives.
@@ -448,7 +449,7 @@ impl AcpSession {
         params: Value,
         on_update: &mut dyn FnMut(&Value),
         decide: Decide,
-        interrupt: Option<&AtomicBool>,
+        stop: &dyn Fn() -> bool,
         deadline: Option<Instant>,
     ) -> Result<Value> {
         self.next_id += 1;
@@ -456,12 +457,10 @@ impl AcpSession {
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
         let mut cancelled = false;
         loop {
-            if let Some(flag) = interrupt {
-                if !cancelled && flag.load(Ordering::Relaxed) {
-                    cancelled = true;
-                    let sid = self.session_id.clone();
-                    self.send(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid}}))?;
-                }
+            if !cancelled && stop() {
+                cancelled = true;
+                let sid = self.session_id.clone();
+                self.send(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid}}))?;
             }
             if deadline.is_some_and(|d| Instant::now() > d) {
                 bail!("{} did not answer {method} in time", self.agent_name);
@@ -515,6 +514,17 @@ impl AcpSession {
         decide: Decide,
         interrupt: Option<&AtomicBool>,
     ) -> Result<String> {
+        self.prompt_until(text, on, decide, &|| interrupt.is_some_and(|f| f.load(Ordering::Relaxed)))
+    }
+
+    /// `prompt`, cancelled (`session/cancel`) as soon as `stop()` says so.
+    pub fn prompt_until(
+        &mut self,
+        text: &str,
+        on: &mut dyn FnMut(Update),
+        decide: Decide,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<String> {
         let sid = self.session_id.clone();
         let mut handle = |u: &Value| {
             if let Some(up) = parse_update(u) {
@@ -526,7 +536,7 @@ impl AcpSession {
             json!({"sessionId": sid, "prompt": [{"type": "text", "text": text}]}),
             &mut handle,
             decide,
-            interrupt,
+            stop,
             None,
         )?;
         Ok(r["stopReason"].as_str().unwrap_or("end_turn").to_string())
@@ -544,6 +554,25 @@ fn choose(params: &Value, allow: bool) -> Value {
         }
     }
     json!({"outcome": "cancelled"})
+}
+
+/// A file change an ACP tool reported (`{"type": "diff", path, oldText, newText}`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileDiff {
+    pub path: String,
+    /// None: a new file
+    pub old: Option<String>,
+    pub new: String,
+}
+
+fn content_diff(c: &Value) -> Option<FileDiff> {
+    c.as_array()?.iter().find(|i| i["type"].as_str() == Some("diff")).and_then(|i| {
+        Some(FileDiff {
+            path: i["path"].as_str()?.to_string(),
+            old: i["oldText"].as_str().map(str::to_string),
+            new: i["newText"].as_str().unwrap_or("").to_string(),
+        })
+    })
 }
 
 fn content_text(c: &Value) -> String {
@@ -624,6 +653,7 @@ pub fn parse_update(u: &Value) -> Option<Update> {
             status: u["status"].as_str().unwrap_or("").to_string(),
             input: u.get("rawInput").cloned().unwrap_or(Value::Null),
             output: content_text(&u["content"]),
+            diff: content_diff(&u["content"]),
         }),
         _ => None,
     }
@@ -641,6 +671,10 @@ mod tests {
             "content": [{"type": "content", "content": {"type": "text", "text": "3 files"}}, {"type": "diff", "path": "a.rs"}]}));
         let Some(Update::Tool { id, status, output, .. }) = u else { panic!() };
         assert_eq!((id.as_str(), status.as_str(), output.as_str()), ("c1", "completed", "3 files\nedited a.rs"));
+        let u = parse_update(&json!({"sessionUpdate": "tool_call_update", "toolCallId": "c2",
+            "content": [{"type": "diff", "path": "a.rs", "oldText": "a\n", "newText": "b\n"}]}));
+        let Some(Update::Tool { diff, .. }) = u else { panic!() };
+        assert_eq!(diff, Some(FileDiff { path: "a.rs".into(), old: Some("a\n".into()), new: "b\n".into() }));
         assert!(parse_update(&json!({"sessionUpdate": "plan", "entries": []})).is_none());
         let p = json!({"options": [{"optionId": "a", "kind": "allow_always"}, {"optionId": "r", "kind": "reject_once"}]});
         assert_eq!(choose(&p, true), json!({"outcome": "selected", "optionId": "a"}));

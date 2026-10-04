@@ -13,7 +13,7 @@ pub const STYLES: &[&str] = &["orb", "hop", "sparkle", "heart", "twinkle", "brai
 
 pub fn frames(style: &str) -> &'static [&'static str] {
     match style {
-        "twinkle" => &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"],
+        "twinkle" => &["·", "✢", "✲", "✶", "✻", "✽", "✻", "✶", "✲", "✢"],
         "braille" => &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
         "moon" => &["◯", "◔", "◑", "◕", "●", "◕", "◑", "◔"],
         "comet" => &["✦··", "·✦·", "··✦", "·✦·"],
@@ -24,7 +24,7 @@ pub fn frames(style: &str) -> &'static [&'static str] {
         // a little face that crouches, jumps and lands
         "hop" => &["₍-ᴗ-₎", "(•ᴗ•)", "⁽°ᴗ°⁾", "⁽^ᴗ^⁾✧", "⁽°ᴗ°⁾", "(•ᴗ•)", "₍-ᴗ-₎", "₍˘ᴗ˘₎"],
         "sparkle" => &["·", "✧", "✦", "★", "✦", "✧"],
-        "heart" => &["♡", "♥", "♥", "♡", "·", "♡"],
+        "heart" => &["♡", "❥", "❥", "♡", "·", "♡"],
         // orb: a glow that swells and settles
         _ => &["·", "∘", "○", "◎", "◉", "●", "◉", "◎", "○", "∘"],
     }

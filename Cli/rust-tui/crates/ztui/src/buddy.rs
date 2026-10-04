@@ -588,7 +588,7 @@ pub fn mini(id: &Identity, mood: Mood) -> Span<'static> {
         Mood::Happy => ('^', '^'),
         Mood::Waiting | Mood::Listening => ('°', '°'),
         Mood::Sleeping => ('-', '-'),
-        Mood::Loved => ('♥', '♥'),
+        Mood::Loved => ('♡', '♡'),
     };
     let (r0, g0, b0) = id.species().palette.b;
     Span::styled(format!("({l}ᴥ{r})"), Style::new().fg(Color::Rgb(r0, g0, b0)))

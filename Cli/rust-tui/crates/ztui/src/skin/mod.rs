@@ -143,11 +143,14 @@ pub struct DiffCfg {
     pub syntax: bool,
     /// wrap long lines with ↳ instead of cutting them
     pub wrap: bool,
+    /// diffs up to this many rows show inline; bigger ones fold to their
+    /// +/− counts with ctrl+o to view (0 = always fold)
+    pub inline_rows: usize,
 }
 
 impl Default for DiffCfg {
     fn default() -> Self {
-        DiffCfg { style: "cosmos".into(), layout: "auto".into(), max_rows: 40, context: 2, word_diff: true, syntax: true, wrap: true }
+        DiffCfg { style: "cosmos".into(), layout: "auto".into(), max_rows: 40, context: 2, word_diff: true, syntax: true, wrap: true, inline_rows: 12 }
     }
 }
 

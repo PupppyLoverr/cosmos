@@ -53,6 +53,12 @@ pub struct Agent {
     /// Streaming text sink — the TUI paints tokens as they arrive. Not part
     /// of the event log (the full `assistant` event still follows the turn).
     pub on_delta: Option<DeltaSink>,
+    /// Live progress of a subscription agent's own tools (UI only — the log
+    /// still gets one `tool_call` per tool when the turn ends).
+    pub on_tool: Option<ToolSink>,
+    /// "send now" messages waiting to join the task; a subscription agent's
+    /// prompt stops early for them (its session keeps the context)
+    pub steer: Option<SteerQueue>,
     /// Set by submit_plan — the TUI watches this to offer /approve.
     pub pending_plan: Option<String>,
     /// git worktrees created by `task {worktree:true}` — (path, branch).
@@ -92,6 +98,12 @@ pub type Asker = Box<dyn FnMut(&str) -> bool + Send>;
 
 /// Receives each streamed text fragment of a top-level turn.
 pub type DeltaSink = Box<dyn FnMut(&str) + Send>;
+
+/// Receives each change to a vendor tool as it happens.
+pub type ToolSink = Box<dyn FnMut(&Value) + Send>;
+
+/// Messages the operator sent into the running task ("send now").
+pub type SteerQueue = Arc<std::sync::Mutex<Vec<String>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -286,6 +298,8 @@ impl Agent {
             boot_tokens,
             asker: None,
             on_delta: None,
+            on_tool: None,
+            steer: None,
             pending_plan: None,
             worktrees: Vec::new(),
             world,
@@ -486,11 +500,19 @@ impl Agent {
 
         let mut text = String::new();
         let mut tools: Vec<(String, String, String, Value, String, String)> = Vec::new();
+        // a tool ran since the last text: the next text starts a new paragraph
+        let mut after_tool = false;
         let mode = self.mode;
         let allow: Vec<String> = self.opts.allow.iter().chain(self.cfg.permissions.allow.iter()).cloned().collect();
         let interrupt = self.interrupt.clone();
+        let steer = self.steer.clone();
+        let stop = move || {
+            interrupt.as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                || steer.as_ref().is_some_and(|s| s.lock().map(|q| !q.is_empty()).unwrap_or(false))
+        };
         let result = {
             let delta = &mut self.on_delta;
+            let tool_sink = &mut self.on_tool;
             let asker = &mut self.asker;
             let log = &mut self.session;
             let mut on = |u: crate::acp_client::Update| match u {
@@ -498,9 +520,19 @@ impl Agent {
                     if let Some(f) = delta.as_mut() {
                         f(&t);
                     }
+                    // a new tool between finished sentences: a new paragraph
+                    // (never inside a word — chunks can split anywhere)
+                    let ended = text.trim_end_matches(' ').ends_with(['.', '!', '?', ':', '\n']);
+                    if std::mem::take(&mut after_tool) && ended && !text.ends_with("\n\n") {
+                        text.push_str(if text.ends_with('\n') { "\n" } else { "\n\n" });
+                    }
                     text.push_str(&t);
                 }
-                crate::acp_client::Update::Tool { id, kind, title, status, input, output } => {
+                crate::acp_client::Update::Tool { id, kind, title, status, input, output, diff } => {
+                    if !tools.iter().any(|t| t.0 == id) {
+                        after_tool = true;
+                    }
+                    let entry_id = id.clone();
                     match tools.iter_mut().find(|t| t.0 == id) {
                         Some(t) => {
                             if !kind.is_empty() {
@@ -521,6 +553,15 @@ impl Agent {
                         }
                         None => tools.push((id, kind, title, input, status, output)),
                     }
+                    // tell the UI right away, so the call shows as it happens
+                    if let (Some(f), Some(t)) = (tool_sink.as_mut(), tools.iter().find(|t| t.0 == entry_id)) {
+                        let mut v = json!({"id": t.0, "name": format!("{plugin}:{}", if t.1.is_empty() { "tool" } else { &t.1 }),
+                                           "kind": t.1, "title": t.2, "input": t.3, "status": t.4, "output": t.5});
+                        if let Some(d) = diff {
+                            v["diff"] = json!({"path": d.path, "old": d.old, "new": d.new});
+                        }
+                        f(&v);
+                    }
                 }
             };
             let mut decide = |title: &str, params: &Value| -> bool {
@@ -533,7 +574,7 @@ impl Agent {
                 log.append("permission_decision", json!({"tool": label, "granted": granted, "source": "acp"}));
                 granted
             };
-            session.prompt(&prompt, &mut on, &mut decide, interrupt.as_deref())
+            session.prompt_until(&prompt, &mut on, &mut decide, &stop)
         };
         for (id, kind, title, input, status, output) in tools {
             let out: String = output.chars().take(2000).collect();
