@@ -642,3 +642,64 @@ Gates after the fixes: `cargo test --workspace` 231 passed, 0 failed, 7 ignored
 (+0.78 MiB); startup PASS (`--version` 18.5 ms vs 19.6 ms for the pre-skins
 binary, ping 50.5 vs 51.1 ms on the same machine minutes apart); toast smoke
 PASS.
+
+## 2026-10-04 — pixel-art pets, /pettalk, subscriptions without their CLI
+
+Branch `cosmostui-pets`.
+
+**Subscriptions without a preinstalled CLI.** `acp_client::connect` runs the
+vendor's own official installer when the CLI is missing, then the vendor's
+sign-in, both with the terminal attached. It is reached through `/connect` (the
+TUI hands over the terminal and comes back) and `cosmostui auth login <id>`.
+The installers are:
+
+| Vendor | Windows | macOS / Linux |
+|---|---|---|
+| Cursor | `irm 'https://cursor.com/install?win32=true' \| iex` | `curl -fsSL https://cursor.com/install \| bash` |
+| Devin | `irm https://static.devin.ai/cli/setup.ps1 \| iex` | `curl -fsSL https://static.devin.ai/cli/setup.sh \| bash` |
+| Codex | `npm install -g @zed-industries/codex-acp @openai/codex` | same |
+
+CLIs are looked up in the installers' own folders as well as PATH
+(`%LOCALAPPDATA%\cursor-agent`, `%LOCALAPPDATA%\devin\cli\bin`,
+`~/.local/bin`, `%APPDATA%\npm`), so a fresh install works without a restart.
+
+What was verified:
+- All four installer URLs answered 200.
+- Both scripts install where the lookup searches.
+- A fresh install was not run on this machine: Cursor's Windows installer
+  permanently appends its folder to the user PATH, even when pointed at a
+  throwaway profile.
+- The direct private-API route (api2.cursor.sh, Codeium gRPC) was declined. It
+  breaks the vendors' terms and breaks whenever they ship an update.
+
+**Pets.**
+- **Sprites.** 10 hand-drawn 16×9 sprites. A contact sheet rendered from the
+  source grids was reviewed by eye. Sixel output was checked by decoding it
+  with an independent decoder: all 10 pets reproduced pixel-for-pixel, including
+  the crown, sparkle and blush.
+- **Real images.** Windows Terminal here is 1.24 (sixel-capable). Image
+  placement in a live terminal was not screen-captured; `[buddy] images =
+  "off"` falls back to half-block art.
+
+**Live `/pettalk`** (`tui::tests::live_pettalk`, through the App on the real
+home, with no settings written):
+
+| Model | Time | Result |
+|---|---|---|
+| `chatgpt/gpt-5.6-terra` | 3.4 s | answered in character; `@remind 1 stretch` set a reminder; `@trick sparkle` played |
+| `cursor/composer-2.5[fast=true]` (ACP) | 25.4 s (cold agent) | summarised the session and the git facts (branch, recent work); set a reminder; no `node.exe` left; scratch folder removed |
+
+Found along the way: the ACP integration test reached the real Cursor install
+once `executable()` looked in vendor folders (the agent browsed temp files and
+the repo read-only). The test now points `LOCALAPPDATA` / `APPDATA` /
+`USERPROFILE` / `HOME` at an empty folder.
+
+**Gates.**
+
+```
+cargo test --workspace   248 passed, 0 failed, 9 ignored (×2)
+conformance.ps1          19/19 PASS
+run.ps1                  9/9 PASS
+size-gate.ps1            PASS 6.59 MiB (+0.88 MiB over 5.71, limit +1.0)
+startup.ps1              PASS --version +9.7 ms, ping +118 ms (busy machine; baseline 34 ms)
+```

@@ -233,6 +233,18 @@ mod tests {
         pixel::canvas(s, &s.palette, Pose { eyes: Eyes::Open, dy: 1, extras: Extras::default() })
     }
 
+    /// Writes a sixel of every pet for an external decoder check:
+    /// `COSMOS_SIXEL_OUT=<dir> cargo test -p ztui dump_sixels -- --ignored`.
+    #[test]
+    #[ignore]
+    fn dump_sixels() {
+        let dir = std::path::PathBuf::from(std::env::var("COSMOS_SIXEL_OUT").unwrap());
+        for s in pixel::SPECIES {
+            let px = pixel::canvas(s, &s.palette, Pose { eyes: Eyes::Open, dy: 1, extras: Extras { blush: true, sparkle: true, crown: true, ..Default::default() } });
+            std::fs::write(dir.join(format!("{}.six", s.name)), sixel(&px, 6)).unwrap();
+        }
+    }
+
     #[test]
     fn sixel_is_well_formed() {
         let out = sixel(&px(), 4);

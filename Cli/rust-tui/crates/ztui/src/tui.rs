@@ -3540,6 +3540,40 @@ FAILED
         });
     }
 
+    /// Live: talk to the pet on a real model, through the App, on the real
+    /// home. Ignored — `COSMOS_LIVE_MODEL=<alias> COSMOS_LIVE_SAY="<msg>"
+    /// cargo test -p ztui live_pettalk -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_pettalk() {
+        let _env = crate::env_lock();
+        let model = std::env::var("COSMOS_LIVE_MODEL").expect("set COSMOS_LIVE_MODEL");
+        let say = std::env::var("COSMOS_LIVE_SAY").expect("set COSMOS_LIVE_SAY");
+        let cwd = std::env::current_dir().unwrap();
+        let (_w, _) = crate::skin::Watcher::start(&cwd);
+        let mut a = App::new(&cwd, model_rows(), 100);
+        a.alias = model;
+        a.buddy.progress = crate::buddy::Progress::load(&zcore::cli_home());
+        a.history = vec!["fix the flaky markdown test".into(), "make the pets nicer".into()];
+        a.last_reply = "I replaced the ASCII pets with pixel art and added /pettalk.".into();
+        let (cmd, _rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        a.input = format!("/pettalk {say}").chars().collect();
+        a.cursor = a.input.len();
+        a.on_key(key(KeyCode::Enter), &cmd, &stop);
+        let t0 = Instant::now();
+        while a.pet_talk.is_some() && t0.elapsed() < Duration::from_secs(200) {
+            a.poll_pet();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!("answered in {:.1}s", t0.elapsed().as_secs_f32());
+        for l in &a.out {
+            println!("{}", l.spans.iter().map(|s| s.content.to_string()).collect::<String>());
+        }
+        println!("reminders: {:?}", a.reminders.iter().map(|(_, s)| s).collect::<Vec<_>>());
+        println!("bubble: {:?} · chats {} · pet spend ${:.4}", a.buddy.quip.as_ref().map(|q| q.0.clone()), a.buddy.progress.chats, a.pet_usd);
+    }
+
     #[test]
     fn classic_preset_is_the_classic_skin() {
         let sk: crate::skin::Skin = toml::from_str(CLASSIC_UI).unwrap();
