@@ -5319,6 +5319,7 @@ impl Pickers {
             .as_ref()
             .map(|s| s.config.id.clone());
         let active = self.active;
+        let signup_waiting = self.state.read(cx).cloud_trial_signup_waiting;
         let seat_count = rows.len();
         let scrollbar = popover::rail(self, "cloud-seat-scrollbar", &theme, cx);
         let body: AnyElement = if rows.is_empty() {
@@ -5342,7 +5343,7 @@ impl Pickers {
                         .max_h(px(self.list_budget(120.0)))
                         .children(rows.into_iter().enumerate().map(|(ix, seat)| {
                             let is_selected = picked.as_deref() == Some(seat.config.id.as_str());
-                            let note = crate::cloud::seat_status_note(&seat);
+                            let note = crate::cloud::seat_status_note(&seat, signup_waiting);
                             let label: SharedString = seat.config.label.clone().into();
                             let probe = seat.config.last_probe.clone();
                             popover::menu_row_nav(
@@ -5659,7 +5660,8 @@ impl Pickers {
             let state = self.state.read(cx);
             let seat = state.active_cloud_seat();
             let failed = state.cloud_trial_failure.is_some();
-            let trial_starting = state.cloud_trial_starting || state.cloud_trial_signup_waiting;
+            let trial_starting = state.cloud_trial_starting;
+            let signup_waiting = state.cloud_trial_signup_waiting;
             let repo: SharedString = state
                 .cloud_repo_pick
                 .as_ref()
@@ -5673,7 +5675,12 @@ impl Pickers {
                 .unwrap_or_else(|| "No repository".to_string())
                 .into();
             (
-                SharedString::from(crate::cloud::seat_chip_label(seat, failed, trial_starting)),
+                SharedString::from(crate::cloud::seat_chip_label(
+                    seat,
+                    failed,
+                    trial_starting,
+                    signup_waiting,
+                )),
                 repo,
             )
         };
