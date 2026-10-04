@@ -5451,6 +5451,9 @@ impl Shell {
                                         composer.continue_with_railway(cx)
                                     });
                                 }
+                                crate::cloud::seats::CloudSeatsEvent::SignIn => {
+                                    this.start_sign_in(cx);
+                                }
                             }
                         },
                     ));

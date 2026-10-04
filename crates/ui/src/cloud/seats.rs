@@ -4,7 +4,7 @@ use gpui::{
     AnyElement, Context, Entity, IntoElement, Render, SharedString, Task, Window, div, prelude::*,
     px,
 };
-use zeron_proto::{ByokProvider, CloudSeatKind, HarnessId};
+use zeron_proto::{ByokProvider, CloudSeatKind, HarnessId, WorkspaceScope};
 use zeron_rpc::methods;
 
 use zeron_engine::cloud::SeatConfig;
@@ -39,6 +39,7 @@ impl SeatForm {
 pub(crate) enum CloudSeatsEvent {
     StartTrial,
     ContinueWithRailway,
+    SignIn,
 }
 
 impl gpui::EventEmitter<CloudSeatsEvent> for CloudSeatsPage {}
@@ -659,6 +660,11 @@ impl CloudSeatsPage {
     }
 
     fn save_boat(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local) {
+            self.error = Some("Sign in to add a Boat token.".into());
+            cx.notify();
+            return;
+        }
         let token = SeatForm::text(&self.form.box_token, cx);
         if token.is_empty() {
             self.error = Some("Paste your Boat token first.".into());
@@ -1057,6 +1063,7 @@ impl Render for CloudSeatsPage {
         let starting = state.cloud_trial_starting;
         let waiting = state.cloud_trial_signup_waiting;
         let failure = state.cloud_trial_failure.clone();
+        let local_profile = state.workspace_scope == Some(WorkspaceScope::Local);
         let railway = seats
             .iter()
             .find(|seat| seat.config.kind == Some(CloudSeatKind::Railway));
@@ -1257,6 +1264,31 @@ impl Render for CloudSeatsPage {
             ));
         }
 
+        let local_sign_in_section = widgets::section_card(&theme).child(
+            widgets::card_row(&theme, true)
+                .child(widgets::row_tile(&theme, icons::CLOUD))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(widgets::row_title(&theme, "Sign in to use a cloud computer"))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.text_muted)
+                                .child("Cloud computers need a Cosmos account. Sign in, then start the free Railway trial or add a Boat token."),
+                        ),
+                )
+                .child(
+                    popover::btn_primary(&theme, "Log in")
+                        .id("cloud-sign-in")
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(CloudSeatsEvent::SignIn))),
+                ),
+        );
+
         let mut column = widgets::page_column()
             .child(widgets::page_header(&theme, "Cloud computer", None))
             .child(
@@ -1266,9 +1298,12 @@ impl Render for CloudSeatsPage {
                 )
                 .max_w(px(560.0))
                 .line_height(px(20.0)),
-            )
-            .child(railway_section)
-            .child(boat_section);
+            );
+        if local_profile {
+            column = column.child(local_sign_in_section);
+        } else {
+            column = column.child(railway_section).child(boat_section);
+        }
 
         if let Some(seat) = self.runner_seat_id.as_deref().and_then(|seat_id| {
             seats

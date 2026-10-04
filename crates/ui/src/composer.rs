@@ -9768,12 +9768,18 @@ impl Composer {
                         Ok(view) => view,
                         Err(err) => {
                             tracing::warn!(error = %err, "railway trial seat lookup failed");
-                            this.update(cx, |_, _| {
+                            let message = err.to_string();
+                            this.update(cx, |composer, cx| {
+                                composer.state.update(cx, |state, cx| {
+                                    state.cloud_trial_failure = Some(message.clone());
+                                    cx.notify();
+                                });
                                 crate::notify::post(
                                     "Railway trial couldn't start",
-                                    &err.to_string(),
+                                    &message,
                                     None,
-                                )
+                                );
+                                cx.notify();
                             })
                             .ok();
                             return;
@@ -9781,12 +9787,18 @@ impl Composer {
                     },
                     Err(err) => {
                         tracing::warn!(error = %err, "railway trial seat lookup failed");
-                        this.update(cx, |_, _| {
+                        let message = err.to_string();
+                        this.update(cx, |composer, cx| {
+                            composer.state.update(cx, |state, cx| {
+                                state.cloud_trial_failure = Some(message.clone());
+                                cx.notify();
+                            });
                             crate::notify::post(
                                 "Railway trial couldn't start",
-                                &err.to_string(),
+                                &message,
                                 None,
-                            )
+                            );
+                            cx.notify();
                         })
                         .ok();
                         return;
