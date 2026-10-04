@@ -250,6 +250,34 @@ fn host_message(line: &str) -> String {
     trimmed.to_string()
 }
 
+fn network_failure(stderr: &str) -> Option<&'static str> {
+    let stderr = stderr.to_lowercase();
+    if stderr.contains("could not resolve hostname") {
+        Some("Can't find railway.new — check your internet connection, then try again")
+    } else if stderr.contains("network is unreachable") || stderr.contains("no route to host") {
+        Some(
+            "This network has no IPv4 route to Railway (the free trial is IPv4-only) — try another Wi‑Fi or a phone hotspot, or add a Boat token",
+        )
+    } else if stderr.contains("banner exchange")
+        || stderr.contains("kex_exchange_identification")
+        || stderr.contains("connection reset")
+        || stderr.contains("connection closed by")
+    {
+        Some("Railway didn't answer — it may be busy, try again in a minute")
+    } else if stderr.contains("operation timed out")
+        || stderr.contains("connection timed out")
+        || stderr.contains("timed out")
+    {
+        Some(
+            "Can't reach Railway over SSH — this network or a VPN is blocking port 22. Try another Wi‑Fi or a phone hotspot, or add a Boat token",
+        )
+    } else if stderr.contains("connection refused") {
+        Some("Railway refused the connection — try again in a minute")
+    } else {
+        None
+    }
+}
+
 /// The honest reason a connect failed, from ssh's own stderr.
 fn ssh_failure(out: &crate::cloud::ExecOutcome) -> String {
     let stderr = out.stderr.trim();
@@ -278,8 +306,8 @@ fn ssh_failure(out: &crate::cloud::ExecOutcome) -> String {
     if stderr.contains("identity") || stderr.contains("Permission denied") {
         return "no SSH key on this machine — run `ssh-keygen -t ed25519`, then retry".into();
     }
-    if stderr.contains("Operation timed out") || stderr.contains("timed out") {
-        return "railway.new unreachable (check IPv4 — the trial needs it)".into();
+    if let Some(message) = network_failure(stderr) {
+        return message.into();
     }
     stderr
         .lines()
@@ -374,6 +402,74 @@ mod tests {
             stderr: String::new(),
         };
         assert_eq!(ssh_failure(&out), "limited. Sign up to keep building.");
+    }
+
+    #[test]
+    fn ssh_failure_classifies_real_network_errors() {
+        let cases = [
+            (
+                "macOS operation timeout",
+                "ssh: connect to host railway.new port 22: Operation timed out",
+                "Can't reach Railway over SSH — this network or a VPN is blocking port 22. Try another Wi‑Fi or a phone hotspot, or add a Boat token",
+            ),
+            (
+                "Linux/Windows connection timeout",
+                "ssh: connect to host railway.new port 22: Connection timed out",
+                "Can't reach Railway over SSH — this network or a VPN is blocking port 22. Try another Wi‑Fi or a phone hotspot, or add a Boat token",
+            ),
+            (
+                "banner exchange timeout",
+                "Connection timed out during banner exchange\r\nConnection to 66.33.22.2 port 22 timed out",
+                "Railway didn't answer — it may be busy, try again in a minute",
+            ),
+            (
+                "key exchange reset",
+                "kex_exchange_identification: read: Connection reset by peer",
+                "Railway didn't answer — it may be busy, try again in a minute",
+            ),
+            (
+                "network unreachable",
+                "ssh: connect to host railway.new port 22: Network is unreachable",
+                "This network has no IPv4 route to Railway (the free trial is IPv4-only) — try another Wi‑Fi or a phone hotspot, or add a Boat token",
+            ),
+            (
+                "no route to host",
+                "ssh: connect to host railway.new port 22: No route to host",
+                "This network has no IPv4 route to Railway (the free trial is IPv4-only) — try another Wi‑Fi or a phone hotspot, or add a Boat token",
+            ),
+            (
+                "hostname resolution failure",
+                "ssh: Could not resolve hostname railway.new: nodename nor servname provided, or not known",
+                "Can't find railway.new — check your internet connection, then try again",
+            ),
+            (
+                "connection refused",
+                "ssh: connect to host railway.new port 22: Connection refused",
+                "Railway refused the connection — try again in a minute",
+            ),
+        ];
+
+        for (case, stderr, expected) in cases {
+            let out = crate::cloud::ExecOutcome {
+                code: 255,
+                stdout: String::new(),
+                stderr: stderr.into(),
+            };
+            assert_eq!(ssh_failure(&out), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn railway_banner_precedes_network_timeout() {
+        let out = crate::cloud::ExecOutcome {
+            code: 255,
+            stdout: String::new(),
+            stderr: "Railway is temporarily disabled in this region — try again later\nssh: connect to host railway.new port 22: Operation timed out".into(),
+        };
+        assert_eq!(
+            ssh_failure(&out),
+            "Railway is temporarily disabled in this region — try again later"
+        );
     }
 
     #[test]
