@@ -8855,6 +8855,7 @@ impl Shell {
             .cloud_seat_pick
             .as_ref()
             .map(|seat| seat.config.id.clone());
+        let signup_waiting = self.state.read(cx).cloud_trial_signup_waiting;
         let mut menu = popover::popover_card(&theme)
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.close_cloud_seat_menu(cx);
@@ -8875,7 +8876,7 @@ impl Shell {
                         cx: &mut Context<Self>| {
             let seat_data = seat.clone();
             let selected = picked.as_deref() == Some(seat.config.id.as_str());
-            let status = crate::cloud::seat_status_note(seat);
+            let status = crate::cloud::seat_status_note(seat, signup_waiting);
             let mut row = popover::menu_row(
                 theme,
                 selected,
@@ -9083,14 +9084,22 @@ impl Shell {
     }
 
     fn render_cloud_seat_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let seat = self.state.read(cx).active_cloud_seat().cloned();
-        let trial_failed = self.state.read(cx).cloud_trial_failure.is_some();
-        let trial_starting = {
+        let (seat, trial_failed, trial_starting, signup_waiting) = {
             let state = self.state.read(cx);
-            state.cloud_trial_starting || state.cloud_trial_signup_waiting
+            (
+                state.active_cloud_seat().cloned(),
+                state.cloud_trial_failure.is_some(),
+                state.cloud_trial_starting,
+                state.cloud_trial_signup_waiting,
+            )
         };
-        let label: SharedString =
-            crate::cloud::seat_chip_label(seat.as_ref(), trial_failed, trial_starting).into();
+        let label: SharedString = crate::cloud::seat_chip_label(
+            seat.as_ref(),
+            trial_failed,
+            trial_starting,
+            signup_waiting,
+        )
+        .into();
         let open = self.cloud_seat_menu.is_open();
         let trigger = div()
             .id("sidebar-cloud-seat")

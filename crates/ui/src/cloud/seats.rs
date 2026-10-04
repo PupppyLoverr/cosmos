@@ -661,13 +661,15 @@ impl CloudSeatsPage {
 
     fn save_boat(&mut self, cx: &mut Context<Self>) {
         if self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local) {
-            self.error = Some("Sign in to add a Boat token.".into());
+            self.note = Some("Sign in to add a Boat token.".into());
+            self.error = None;
             cx.notify();
             return;
         }
         let token = SeatForm::text(&self.form.box_token, cx);
         if token.is_empty() {
-            self.error = Some("Paste your Boat token first.".into());
+            self.note = Some("Paste your Boat token first.".into());
+            self.error = None;
             cx.notify();
             return;
         }
@@ -1138,12 +1140,22 @@ impl Render for CloudSeatsPage {
             railway_actions = railway_actions.child(if primary {
                 popover::btn_primary(&theme, label)
                     .id("railway-action")
-                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(event)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.error = None;
+                        this.note = None;
+                        cx.notify();
+                        cx.emit(event)
+                    }))
                     .into_any_element()
             } else {
                 popover::btn_ghost(&theme, label, "railway-action")
                     .id("railway-action")
-                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(event)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.error = None;
+                        this.note = None;
+                        cx.notify();
+                        cx.emit(event)
+                    }))
                     .into_any_element()
             });
         }
