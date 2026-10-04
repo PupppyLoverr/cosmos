@@ -1990,8 +1990,9 @@ pub struct Shell {
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
     computer_page: Option<Entity<ComputerPage>>,
-    /// Settings → Cloud computer — seat list + add-seat card.
+    /// Settings → Cloud computer.
     cloud_seats_page: Option<Entity<crate::cloud::seats::CloudSeatsPage>>,
+    cloud_seats_sub: Option<Subscription>,
     /// Settings → Models — BYOK provider rows for cloud sessions.
     models_page: Option<Entity<crate::cloud::ModelsPage>>,
     /// Sidebar boards — the Kanban run board and the Automations list.
@@ -2504,6 +2505,7 @@ impl Shell {
             harnesses_page: None,
             computer_page: None,
             cloud_seats_page: None,
+            cloud_seats_sub: None,
             models_page: None,
             kanban_page: None,
             automations_page: None,
@@ -5432,8 +5434,30 @@ impl Shell {
             SettingsSection::CloudComputer => {
                 if self.cloud_seats_page.is_none() {
                     let state = self.state.clone();
-                    self.cloud_seats_page =
-                        Some(cx.new(|cx| crate::cloud::seats::CloudSeatsPage::new(state, cx)));
+                    let page = cx.new(|cx| crate::cloud::seats::CloudSeatsPage::new(state, cx));
+                    self.cloud_seats_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &crate::cloud::seats::CloudSeatsEvent, cx| {
+                            match event {
+                                crate::cloud::seats::CloudSeatsEvent::StartTrial => {
+                                    this.composer.update(cx, |composer, cx| {
+                                        composer.clear_failure(cx);
+                                        composer.start_railway_trial(cx)
+                                    });
+                                }
+                                crate::cloud::seats::CloudSeatsEvent::ContinueWithRailway => {
+                                    this.composer.update(cx, |composer, cx| {
+                                        composer.clear_failure(cx);
+                                        composer.continue_with_railway(cx)
+                                    });
+                                }
+                                crate::cloud::seats::CloudSeatsEvent::SignIn => {
+                                    this.start_sign_in(cx);
+                                }
+                            }
+                        },
+                    ));
+                    self.cloud_seats_page = Some(page);
                 }
                 match &self.cloud_seats_page {
                     Some(page) => page.clone().into_any_element(),
@@ -8925,8 +8949,13 @@ impl Shell {
                     if crate::cloud::stalled_trial(&seat_data) {
                         this.state
                             .update(cx, |state, _| state.cloud_trial_failure = None);
-                        this.composer
-                            .update(cx, |composer, cx| composer.start_railway_trial(cx));
+                        this.composer.update(cx, |composer, cx| {
+                            if seat_data.config.signup_url.is_some() {
+                                composer.continue_with_railway(cx);
+                            } else {
+                                composer.start_railway_trial(cx);
+                            }
+                        });
                     }
                     cx.notify();
                 }))
@@ -9056,7 +9085,12 @@ impl Shell {
     fn render_cloud_seat_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let seat = self.state.read(cx).active_cloud_seat().cloned();
         let trial_failed = self.state.read(cx).cloud_trial_failure.is_some();
-        let label: SharedString = crate::cloud::seat_chip_label(seat.as_ref(), trial_failed).into();
+        let trial_starting = {
+            let state = self.state.read(cx);
+            state.cloud_trial_starting || state.cloud_trial_signup_waiting
+        };
+        let label: SharedString =
+            crate::cloud::seat_chip_label(seat.as_ref(), trial_failed, trial_starting).into();
         let open = self.cloud_seat_menu.is_open();
         let trigger = div()
             .id("sidebar-cloud-seat")

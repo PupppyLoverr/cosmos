@@ -190,6 +190,12 @@ pub struct SeatConfig {
     /// the user's browser, never embedded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_url: Option<String>,
+    /// Railway signup link — opens in the user's browser, never embedded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signup_url: Option<String>,
+    /// Railway's long-poll URL for signup completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signup_poll_url: Option<String>,
     /// A URL the seat serves for previews (Railway's `*.up.railway.app`
     /// preview; Boat's hosted-port URL) — the Open-preview action's target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1684,7 +1690,7 @@ fn default_ssh_keys() -> Vec<PathBuf> {
 pub fn ssh_identity() -> Option<PathBuf> {
     SSH_IDENTITY
         .get_or_init(|| {
-            if !default_ssh_keys().is_empty() {
+            if default_ssh_identity_is_usable() {
                 return None;
             }
             let dir = SSH_KEY_DIR.get()?.clone();
@@ -1708,6 +1714,40 @@ pub fn ssh_identity() -> Option<PathBuf> {
             }
         })
         .clone()
+}
+
+fn default_ssh_identity_is_usable() -> bool {
+    if std::env::var_os("SSH_AUTH_SOCK").is_some() {
+        let mut ssh_add = std::process::Command::new("ssh-add");
+        ssh_add
+            .arg("-L")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            ssh_add.creation_flags(0x08000000);
+        }
+        if ssh_add.status().is_ok_and(|status| status.success()) {
+            return true;
+        }
+    }
+    default_ssh_keys().into_iter().any(|key| {
+        let mut keygen = std::process::Command::new("ssh-keygen");
+        keygen
+            .args(["-y", "-P", "", "-f"])
+            .arg(key)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            keygen.creation_flags(0x08000000);
+        }
+        keygen.status().is_ok_and(|status| status.success())
+    })
 }
 
 /// `ssh-keygen` an unencrypted ed25519 key at `key` (+ `key.pub`).
@@ -2377,6 +2417,23 @@ pub async fn verify_provider(
 // Seat probes
 // ---------------------------------------------------------------------------
 
+fn fold_railway_trial_failure(seat: &mut SeatConfig, trial: &crate::railway::RailwayTrial) {
+    if trial.signup_required {
+        seat.signup_url = trial.signup_url.clone();
+    }
+    if trial.poll_url.is_some() {
+        seat.signup_poll_url = trial.poll_url.clone();
+    }
+    if trial.claim_required {
+        let now = Utc::now();
+        seat.claim_url = trial.claim_url.clone().or(seat.claim_url.clone());
+        seat.expires_at = Some(
+            seat.expires_at
+                .map_or(now, |expires_at| expires_at.min(now)),
+        );
+    }
+}
+
 /// Probe a seat: never throws — the answer IS the probe result.
 pub async fn probe_seat(
     http: &reqwest::Client,
@@ -2415,24 +2472,20 @@ pub async fn probe_seat(
                     probe.detail = trial.detail.or_else(|| Some("railway.new trial VM".into()));
                     // A fresh manifest can extend or clarify the deadline and
                     // claim link — fold them into the stored seat.
-                    if trial.expires_at.is_some() || trial.claim_url.is_some() {
-                        let mut seat = seat.clone();
-                        seat.expires_at = trial.expires_at.or(seat.expires_at);
-                        seat.claim_url = trial.claim_url.or(seat.claim_url);
-                        seat.preview_url = trial.preview_url.or(seat.preview_url);
-                        let _ = store.save_seat(seat);
+                    let mut updated = seat.clone();
+                    updated.expires_at = trial.expires_at.or(updated.expires_at);
+                    updated.claim_url = trial.claim_url.or(updated.claim_url);
+                    updated.preview_url = trial.preview_url.or(updated.preview_url);
+                    updated.signup_url = None;
+                    updated.signup_poll_url = None;
+                    if &updated != seat {
+                        let _ = store.save_seat(updated);
                     }
                 }
                 Err(failure) => {
-                    if failure.trial.claim_required {
-                        let now = Utc::now();
-                        let mut updated = seat.clone();
-                        updated.claim_url = failure.trial.claim_url.or(updated.claim_url);
-                        updated.expires_at = Some(
-                            updated
-                                .expires_at
-                                .map_or(now, |expires_at| expires_at.min(now)),
-                        );
+                    let mut updated = seat.clone();
+                    fold_railway_trial_failure(&mut updated, &failure.trial);
+                    if &updated != seat {
                         let _ = store.save_seat(updated);
                     }
                     probe.detail = Some(failure.detail);
@@ -4286,6 +4339,33 @@ mod tests {
             format_github_error(reqwest::StatusCode::FORBIDDEN, "Forbidden"),
             "github 403 Forbidden: Forbidden"
         );
+    }
+
+    #[test]
+    fn folds_railway_signup_and_claim_failures_into_the_seat() {
+        let mut seat = SeatConfig::default();
+        let signup = crate::railway::RailwayTrial {
+            signup_required: true,
+            signup_url: Some("https://railway.com/ssh-signup?code=signup".into()),
+            poll_url: Some("https://backboard.railway.com/poll?code=signup".into()),
+            ..Default::default()
+        };
+        fold_railway_trial_failure(&mut seat, &signup);
+        assert_eq!(seat.signup_url, signup.signup_url);
+        assert_eq!(seat.signup_poll_url, signup.poll_url);
+
+        let later_deadline = Utc::now() + chrono::Duration::minutes(5);
+        seat.expires_at = Some(later_deadline);
+        let claim = crate::railway::RailwayTrial {
+            claim_required: true,
+            claim_url: Some("https://railway.com/ssh-signup?code=claim".into()),
+            poll_url: Some("https://backboard.railway.com/poll?code=claim".into()),
+            ..Default::default()
+        };
+        fold_railway_trial_failure(&mut seat, &claim);
+        assert_eq!(seat.claim_url, claim.claim_url);
+        assert_eq!(seat.signup_poll_url, claim.poll_url);
+        assert!(seat.expires_at.unwrap() <= later_deadline);
     }
 
     #[test]

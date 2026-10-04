@@ -271,13 +271,24 @@ mod tests {
         let mut trial = seat(CloudSeatKind::Railway);
         trial.config.label = "Railway trial".into();
         assert_eq!(
-            seat_chip_label(Some(&trial), false),
+            seat_chip_label(Some(&trial), false, false),
             "Railway trial — starting…"
         );
         assert_eq!(
-            seat_chip_label(Some(&trial), true),
+            seat_chip_label(Some(&trial), true, false),
             "Railway trial — unavailable"
         );
+        assert_eq!(
+            seat_chip_label(Some(&trial), true, true),
+            "Railway trial — starting…"
+        );
+        trial.config.signup_url = Some("https://railway.com/signup".into());
+        assert_eq!(
+            seat_chip_label(Some(&trial), false, false),
+            "Railway trial — sign in to continue"
+        );
+        assert_eq!(seat_status_note(&trial), Some("sign in"));
+        trial.config.signup_url = None;
         // Never connected: picking it re-asks Railway.
         assert!(stalled_trial(&trial));
         trial.config.expires_at = Some(Utc::now() + Duration::minutes(42));
@@ -286,12 +297,12 @@ mod tests {
             ..Default::default()
         });
         assert!(!stalled_trial(&trial));
-        assert!(seat_chip_label(Some(&trial), false).starts_with("Railway trial — 4"));
+        assert!(seat_chip_label(Some(&trial), false, false).starts_with("Railway trial — 4"));
         assert_eq!(seat_status_note(&trial), None);
         trial.config.expires_at = Some(Utc::now() - Duration::minutes(1));
         assert!(stalled_trial(&trial));
         assert_eq!(
-            seat_chip_label(Some(&trial), false),
+            seat_chip_label(Some(&trial), false, false),
             "Railway trial — ended"
         );
         assert_eq!(seat_status_note(&trial), Some("trial ended"));
@@ -302,8 +313,8 @@ mod tests {
         assert_eq!(seat_status_note(&boat), Some("needs token"));
         boat.has_box_token = true;
         assert_eq!(seat_status_note(&boat), None);
-        assert_eq!(seat_chip_label(Some(&boat), false), "Cloud — box");
-        assert_eq!(seat_chip_label(None, false), "Choose a seat…");
+        assert_eq!(seat_chip_label(Some(&boat), false, false), "Cloud — box");
+        assert_eq!(seat_chip_label(None, false, false), "Choose a seat…");
     }
 
     #[test]
@@ -476,6 +487,7 @@ pub(crate) fn stalled_trial(seat: &SeatRow) -> bool {
 /// The seat's one-word problem for menu rows, if any.
 pub(crate) fn seat_status_note(seat: &SeatRow) -> Option<&'static str> {
     match seat.config.kind {
+        Some(CloudSeatKind::Railway) if seat.config.signup_url.is_some() => Some("sign in"),
         Some(CloudSeatKind::Railway) if seat.config.expired() => Some("trial ended"),
         Some(CloudSeatKind::Ssh)
             if seat
@@ -496,22 +508,39 @@ pub(crate) fn seat_status_note(seat: &SeatRow) -> Option<&'static str> {
 }
 
 /// How a picked seat reads on a chip: "Railway trial — 42m", "Cloud — box".
-pub(crate) fn seat_chip_label(seat: Option<&SeatRow>, trial_failed: bool) -> String {
+pub(crate) fn seat_chip_label(
+    seat: Option<&SeatRow>,
+    trial_failed: bool,
+    trial_starting: bool,
+) -> String {
     match seat {
         Some(seat) if seat.config.kind == Some(CloudSeatKind::GitHub) => {
             format!("GitHub — {}", seat.config.label)
         }
         Some(seat) if seat.config.kind == Some(CloudSeatKind::Railway) => {
-            match seat.config.expires_at {
-                None if trial_failed => "Railway trial — unavailable".into(),
-                None => "Railway trial — starting…".into(),
-                Some(_) if seat.config.expired() => "Railway trial — ended".into(),
-                Some(at) => format!(
+            if trial_starting {
+                "Railway trial — starting…".into()
+            } else if seat.config.signup_url.is_some() {
+                "Railway trial — sign in to continue".into()
+            } else if seat.config.expired() {
+                "Railway trial — ended".into()
+            } else if let Some(at) = seat.config.expires_at {
+                format!(
                     "Railway trial — {}m",
                     at.signed_duration_since(chrono::Utc::now())
                         .num_minutes()
                         .max(0)
-                ),
+                )
+            } else if trial_failed
+                || seat
+                    .config
+                    .last_probe
+                    .as_ref()
+                    .is_some_and(|probe| !probe.online)
+            {
+                "Railway trial — unavailable".into()
+            } else {
+                "Railway trial — starting…".into()
             }
         }
         Some(seat) => format!("Cloud — {}", seat.config.label),

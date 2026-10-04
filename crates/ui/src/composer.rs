@@ -5731,6 +5731,7 @@ pub struct Composer {
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
+    railway_signup_task: Option<Task<()>>,
     /// The queued message being edited in the composer (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
@@ -5940,7 +5941,17 @@ impl Composer {
                 crate::pickers::CloudChipAction::SeatPicked { restart_trial } => {
                     this.clear_failure(cx);
                     if *restart_trial {
-                        this.start_railway_trial(cx);
+                        let signup = this
+                            .state
+                            .read(cx)
+                            .cloud_seat_pick
+                            .as_ref()
+                            .is_some_and(|seat| seat.config.signup_url.is_some());
+                        if signup {
+                            this.continue_with_railway(cx);
+                        } else {
+                            this.start_railway_trial(cx);
+                        }
                     }
                 }
             },
@@ -6075,7 +6086,17 @@ impl Composer {
                 crate::pickers::CloudChipAction::SeatPicked { restart_trial } => {
                     this.clear_failure(cx);
                     if *restart_trial {
-                        this.start_railway_trial(cx);
+                        let signup = this
+                            .state
+                            .read(cx)
+                            .cloud_seat_pick
+                            .as_ref()
+                            .is_some_and(|seat| seat.config.signup_url.is_some());
+                        if signup {
+                            this.continue_with_railway(cx);
+                        } else {
+                            this.start_railway_trial(cx);
+                        }
                     }
                 }
             },
@@ -6204,7 +6225,17 @@ impl Composer {
                 crate::pickers::CloudChipAction::SeatPicked { restart_trial } => {
                     this.clear_failure(cx);
                     if *restart_trial {
-                        this.start_railway_trial(cx);
+                        let signup = this
+                            .state
+                            .read(cx)
+                            .cloud_seat_pick
+                            .as_ref()
+                            .is_some_and(|seat| seat.config.signup_url.is_some());
+                        if signup {
+                            this.continue_with_railway(cx);
+                        } else {
+                            this.start_railway_trial(cx);
+                        }
                     }
                 }
             },
@@ -6343,6 +6374,7 @@ impl Composer {
             dictation_placeholder: None,
             advance_task: None,
             send_task: None,
+            railway_signup_task: None,
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
             editing_queued: None,
@@ -9547,15 +9579,6 @@ impl Composer {
         cx.notify();
     }
 
-    /// Load the shared cloud view (seats + BYOK + automations) through
-    /// `AppState::refresh_cloud` — staleness-gated, single-flight, shared with
-    /// the settings pages and the rail.
-    fn load_cloud_view(&mut self, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| {
-            state.refresh_cloud(Some(std::time::Duration::from_secs(10)), cx)
-        });
-    }
-
     /// The shared cloud view as the composer sees it.
     fn cloud_view<'a>(&self, cx: &'a App) -> Option<&'a crate::cloud::CloudView> {
         self.state.read(cx).cloud_view()
@@ -9612,6 +9635,113 @@ impl Composer {
 
     /// One-click trial on-ramp: reuse the Railway seat if one is already
     /// configured, otherwise create it, then probe and pick that seat.
+    pub(crate) fn continue_with_railway(&mut self, cx: &mut Context<Self>) {
+        let railway = self
+            .state
+            .read(cx)
+            .cloud_seats()
+            .iter()
+            .find(|seat| seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway))
+            .cloned();
+        let Some(seat) = railway else {
+            self.start_railway_trial(cx);
+            return;
+        };
+        let url = seat
+            .config
+            .signup_url
+            .as_deref()
+            .or(seat.config.claim_url.as_deref());
+        let Some(url) = url else {
+            self.start_railway_trial(cx);
+            return;
+        };
+        cx.open_url(url);
+        if seat.config.signup_poll_url.is_none() {
+            return;
+        }
+        if self.railway_signup_task.is_some() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            crate::notify::post(
+                "Railway signup",
+                "Railway signup status could not be checked. Continue again to retry.",
+                None,
+            );
+            return;
+        };
+        let seat_id = seat.config.id.clone();
+        self.state.update(cx, |state, cx| {
+            state.cloud_trial_signup_waiting = true;
+            cx.notify();
+        });
+        self.railway_signup_task = Some(cx.spawn(async move |this, cx| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
+            let client = engine.client();
+            let mut approved = false;
+            let mut failure = None;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    failure = Some(
+                        "Railway signup is still waiting. Continue again to check its status."
+                            .to_string(),
+                    );
+                    break;
+                }
+                use futures::FutureExt;
+                let result = futures::select! {
+                    result = client.call(
+                        zeron_rpc::methods::CLOUD_RAILWAY_SIGNUP_WAIT,
+                        serde_json::json!({ "seatId": seat_id.clone() }),
+                    ).fuse() => Some(result),
+                    _ = cx.background_executor().timer(remaining).fuse() => None,
+                };
+                let Some(result) = result else {
+                    failure = Some(
+                        "Railway signup is still waiting. Continue again to check its status."
+                            .to_string(),
+                    );
+                    break;
+                };
+                match result {
+                    Ok(reply) => match reply.get("pending").and_then(serde_json::Value::as_bool) {
+                        Some(true) => continue,
+                        Some(false) => {
+                            approved = true;
+                            break;
+                        }
+                        None => {
+                            failure = Some("Railway sent an unexpected reply".into());
+                            break;
+                        }
+                    },
+                    Err(err) => {
+                        failure = Some(err.to_string());
+                        break;
+                    }
+                }
+            }
+            let _ = this.update(cx, |composer, cx| {
+                composer.railway_signup_task = None;
+                composer.state.update(cx, |state, cx| {
+                    state.cloud_trial_signup_waiting = false;
+                    if approved {
+                        state.cloud_trial_failure = None;
+                    }
+                    cx.notify();
+                });
+                if approved {
+                    composer.start_railway_trial(cx);
+                } else if let Some(message) = failure {
+                    crate::notify::post("Railway signup", &message, None);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     pub(crate) fn start_railway_trial(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -9623,6 +9753,8 @@ impl Composer {
         }
         self.state.update(cx, |state, cx| {
             state.cloud_trial_starting = true;
+            state.cloud_trial_signup_waiting = false;
+            state.cloud_trial_failure = None;
             cx.notify();
         });
         cx.spawn(async move |this, cx| {
@@ -9636,12 +9768,18 @@ impl Composer {
                         Ok(view) => view,
                         Err(err) => {
                             tracing::warn!(error = %err, "railway trial seat lookup failed");
-                            this.update(cx, |_, _| {
+                            let message = err.to_string();
+                            this.update(cx, |composer, cx| {
+                                composer.state.update(cx, |state, cx| {
+                                    state.cloud_trial_failure = Some(message.clone());
+                                    cx.notify();
+                                });
                                 crate::notify::post(
                                     "Railway trial couldn't start",
-                                    &err.to_string(),
+                                    &message,
                                     None,
-                                )
+                                );
+                                cx.notify();
                             })
                             .ok();
                             return;
@@ -9649,12 +9787,18 @@ impl Composer {
                     },
                     Err(err) => {
                         tracing::warn!(error = %err, "railway trial seat lookup failed");
-                        this.update(cx, |_, _| {
+                        let message = err.to_string();
+                        this.update(cx, |composer, cx| {
+                            composer.state.update(cx, |state, cx| {
+                                state.cloud_trial_failure = Some(message.clone());
+                                cx.notify();
+                            });
                             crate::notify::post(
                                 "Railway trial couldn't start",
-                                &err.to_string(),
+                                &message,
                                 None,
-                            )
+                            );
+                            cx.notify();
                         })
                         .ok();
                         return;
@@ -9766,7 +9910,12 @@ impl Composer {
                     if let Some(row) = picked_row {
                         if let Some(err) = probe_error {
                             tracing::warn!(error = %err, "railway trial provision failed");
-                            crate::notify::post("Railway trial couldn't start", &err, None);
+                            let message = if row.config.signup_url.is_some() {
+                                "Railway wants you to sign in to keep using the free trial — choose Continue with Railway in Settings → Cloud computer, or add a Boat token.".to_string()
+                            } else {
+                                format!("The free cloud trial couldn't start ({err}). Try again from Settings → Cloud computer, or add a Boat token.")
+                            };
+                            crate::notify::post("Railway trial couldn't start", &message, None);
                         } else {
                             composer.clear_failure(cx);
                         }
@@ -9782,7 +9931,8 @@ impl Composer {
                         });
                     } else if let Some(err) = probe_error {
                         tracing::warn!(error = %err, "railway trial provision failed");
-                        crate::notify::post("Railway trial couldn't start", &err, None);
+                        let message = format!("The free cloud trial couldn't start ({err}). Try again from Settings → Cloud computer, or add a Boat token.");
+                        crate::notify::post("Railway trial couldn't start", &message, None);
                     }
                     cx.notify();
                 })
@@ -9952,21 +10102,26 @@ impl Composer {
         {
             // Every user's on-ramp: with no seat yet, the free Railway trial
             // starts right here (a saved Boat token would already be picked).
-            let (starting, has_seats, failed) = {
+            let (starting, has_seats, failed, signup_required) = {
                 let state = self.state.read(cx);
                 (
-                    state.cloud_trial_starting,
+                    state.cloud_trial_starting || state.cloud_trial_signup_waiting,
                     !state.cloud_seats().is_empty(),
                     state.cloud_trial_failure.clone(),
+                    state.cloud_seats().iter().any(|seat| {
+                        seat.config.kind == Some(zeron_proto::CloudSeatKind::Railway)
+                            && seat.config.signup_url.is_some()
+                    }),
                 )
             };
             self.failure = Some(if starting {
                 "Your cloud computer is starting — send again in a moment.".into()
             } else if let Some(reason) = failed {
-                format!(
-                    "The free cloud trial couldn't start ({reason}). Add a Boat token in Settings → Cloud computer, or switch to Agent."
-                )
-                .into()
+                if signup_required {
+                    "Railway wants you to sign in to keep using the free trial — choose Continue with Railway in Settings → Cloud computer, or add a Boat token.".into()
+                } else {
+                    format!("The free cloud trial couldn't start ({reason}). Try again from Settings → Cloud computer, or add a Boat token.").into()
+                }
             } else if has_seats {
                 "Cloud mode is on — pick a seat from the cloud chip above the composer (or switch to Agent).".into()
             } else {

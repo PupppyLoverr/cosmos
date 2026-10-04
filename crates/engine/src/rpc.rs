@@ -4026,6 +4026,8 @@ impl RpcService for EngineRpc {
                         if seat.kind == Some(zeron_proto::CloudSeatKind::Railway) {
                             seat.expires_at = None;
                             seat.claim_url = None;
+                            seat.signup_url = None;
+                            seat.signup_poll_url = None;
                         }
                     });
                 }
@@ -4037,6 +4039,25 @@ impl RpcService for EngineRpc {
                     .record_probe(&seat.id, probe.clone())
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&probe)
+            }
+            methods::CLOUD_RAILWAY_SIGNUP_WAIT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    seat_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let seat = self
+                    .cloud()?
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                let Some(poll_url) = seat.signup_poll_url.as_deref() else {
+                    return RpcReply::value(&serde_json::json!({ "pending": false }));
+                };
+                let pending = crate::railway::signup_status(&self.http, poll_url)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "pending": pending }))
             }
             methods::CLOUD_VERIFY_PROVIDER => {
                 let p: CloudProviderParams = parse_params(params)?;

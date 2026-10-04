@@ -5659,6 +5659,7 @@ impl Pickers {
             let state = self.state.read(cx);
             let seat = state.active_cloud_seat();
             let failed = state.cloud_trial_failure.is_some();
+            let trial_starting = state.cloud_trial_starting || state.cloud_trial_signup_waiting;
             let repo: SharedString = state
                 .cloud_repo_pick
                 .as_ref()
@@ -5672,7 +5673,7 @@ impl Pickers {
                 .unwrap_or_else(|| "No repository".to_string())
                 .into();
             (
-                SharedString::from(crate::cloud::seat_chip_label(seat, failed)),
+                SharedString::from(crate::cloud::seat_chip_label(seat, failed, trial_starting)),
                 repo,
             )
         };
