@@ -86,6 +86,18 @@ const NEW_THREAD_SELECTOR_ROW_HEIGHT: f32 = 20.0;
 // row's equal 8px top/bottom gutters.
 const SESSION_FOOTER_HEIGHT: f32 = 24.0;
 
+fn cloud_seat_for_create(
+    scope: Option<zeron_proto::WorkspaceScope>,
+    seat: Option<&zeron_proto::CloudSeatBinding>,
+) -> Option<serde_json::Value> {
+    matches!(
+        scope,
+        Some(zeron_proto::WorkspaceScope::Synced | zeron_proto::WorkspaceScope::Development)
+    )
+    .then(|| seat.and_then(|seat| serde_json::to_value(seat).ok()))
+    .flatten()
+}
+
 /// Route chrome dissolves around the middle of the shared-element move. The
 /// two ramps never overlap, which avoids duplicate picker ids/popovers while
 /// still letting their surrounding geometry collapse continuously.
@@ -9589,6 +9601,7 @@ impl Composer {
             label: seat.config.label.clone(),
             repo,
             workspace_path,
+            runner_device_id: seat.config.runner_device_id.clone(),
             branch,
             model_label: self
                 .cloud_view(cx)
@@ -9924,7 +9937,15 @@ impl Composer {
         // The seat pick binds the chat to a cloud/GitHub seat. A picked but
         // unprovisioned seat (missing token/host/repo) keeps the option
         // visible while blocking Start with one line of copy.
-        let cloud_seat = self.seat_binding(&chat_id, cx);
+        let workspace_scope = self.state.read(cx).workspace_scope;
+        let cloud_seat = if matches!(
+            workspace_scope,
+            Some(zeron_proto::WorkspaceScope::Synced | zeron_proto::WorkspaceScope::Development)
+        ) {
+            self.seat_binding(&chat_id, cx)
+        } else {
+            None
+        };
         if is_new
             && self.state.read(cx).cloud_mode
             && self.state.read(cx).active_cloud_seat().is_none()
@@ -10187,6 +10208,7 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             None,
+                            &chat_id,
                             upload_id,
                             att,
                             Some(progress.clone()),
@@ -10222,6 +10244,7 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             host_device_id.as_deref(),
+                            &chat_id,
                             upload_id,
                             att,
                             Some(progress.clone()),
@@ -10399,8 +10422,8 @@ impl Composer {
                         }
                         // The seat binding lands on the chat row — every later
                         // run of this chat dispatches to the seat.
-                        if let Some(seat) = &cloud_seat
-                            && let Ok(seat) = serde_json::to_value(seat)
+                        if let Some(seat) =
+                            cloud_seat_for_create(workspace_scope, cloud_seat.as_ref())
                         {
                             object.insert("cloudSeat".into(), seat);
                         }
@@ -12265,6 +12288,32 @@ mod modal_selection_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_chat_cloud_seat_is_only_added_in_cloud_profiles() {
+        let seat = zeron_proto::CloudSeatBinding {
+            seat_id: "seat".into(),
+            kind: zeron_proto::CloudSeatKind::Ssh,
+            label: "Build seat".into(),
+            repo: None,
+            workspace_path: Some("/workspace".into()),
+            runner_device_id: None,
+            branch: None,
+            model_label: None,
+            expires_at: None,
+        };
+
+        assert!(
+            cloud_seat_for_create(Some(zeron_proto::WorkspaceScope::Local), Some(&seat)).is_none()
+        );
+        assert!(
+            cloud_seat_for_create(Some(zeron_proto::WorkspaceScope::Synced), Some(&seat)).is_some()
+        );
+        assert!(
+            cloud_seat_for_create(Some(zeron_proto::WorkspaceScope::Development), Some(&seat))
+                .is_some()
+        );
+    }
 
     fn composer_focus_window(
         cx: &mut gpui::TestAppContext,

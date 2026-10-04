@@ -385,6 +385,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(core.workspace_scope(), WorkspaceScope::Local);
+        assert!(core.cloud.is_none());
         assert_eq!(
             core.uploads.dir(),
             dir.path().join("profiles/local/uploads")

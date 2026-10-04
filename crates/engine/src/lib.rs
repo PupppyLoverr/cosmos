@@ -37,6 +37,8 @@ pub mod registry;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
+pub mod runner_credentials;
+pub(crate) mod runner_runtime;
 pub mod seat_desktop;
 pub mod sessions;
 pub mod sister_apps;
@@ -167,10 +169,10 @@ pub struct EngineCore {
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
     /// Cloud/GitHub agent mode: seat config + BYOK keys + automations + the
-    /// remote-run ledger, all under `data_dir` (`cloud.json` /
-    /// `cloud-keys.json` / `cloud-runs.json`). Sessions consults it to route
-    /// `cloudSeat` chats to the seat instead of a local harness.
-    pub cloud: cloud::CloudStore,
+    /// remote-run ledger, scoped to Synced and Development profile stores.
+    pub cloud: Option<cloud::CloudStore>,
+    /// Device-local runner identity and sealed credential vault.
+    pub runner_credentials: Option<Arc<runner_credentials::RunnerCredentialVault>>,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -327,7 +329,11 @@ impl EngineCore {
             uploads.clone(),
             agent_accounts_config.codex_home.join("generated_images"),
         );
-        let local_import = (profile.scope() == WorkspaceScope::Synced).then(|| {
+        let local_import = matches!(
+            profile.scope(),
+            WorkspaceScope::Synced | WorkspaceScope::Development
+        )
+        .then(|| {
             local_import::LocalImporter::new(
                 data_dir,
                 &device_id,
@@ -357,20 +363,72 @@ impl EngineCore {
             registry.clone(),
             repos.clone(),
         ));
-        // Cloud/GitHub agent mode: `cloudSeat` chats dispatch to the seat.
-        let cloud = cloud::CloudStore::load(data_dir);
         cloud::set_ssh_key_dir(data_dir);
-        sessions.set_cloud(cloud.clone());
-        let scheduler = cloud::Scheduler::new(
-            cloud.clone(),
-            doc_host.clone(),
-            workspace.clone(),
-            device_id.clone(),
-        );
-        scheduler.start();
-        // Runs that kept going on a seat while the app was closed pick up
-        // where their transcript stopped.
-        sessions.resume_cloud_runs();
+        let cloud = if matches!(
+            profile.scope(),
+            WorkspaceScope::Synced | WorkspaceScope::Development
+        ) {
+            if let Err(error) = cloud::migrate_legacy_cloud_files(data_dir, profile.store_root()) {
+                tracing::warn!(%error, "legacy Cloud file migration failed");
+            }
+            let cloud = cloud::CloudStore::load(profile.store_root());
+            let registry_workspace = workspace.clone();
+            let registry_root = profile.store_root().to_path_buf();
+            let registry_device_id = device_id.clone();
+            cloud.set_registry_sink(Arc::new(move |write| match write {
+                cloud::RegistryWrite::Run(run) => {
+                    if let Err(error) =
+                        registry_workspace.set_chat_cloud_run(&run.chat_id, &run)
+                    {
+                        tracing::warn!(chat_id = %run.chat_id, %error, "could not sync cloud run metadata");
+                    }
+                }
+                cloud::RegistryWrite::Backup(backup) => {
+                    let path = match Path::new(&backup.path).strip_prefix(&registry_root) {
+                        Ok(path) => path.to_string_lossy().into_owned(),
+                        Err(error) => {
+                            tracing::warn!(chat_id = %backup.chat_id, %error, "cloud backup path is outside the profile store");
+                            return;
+                        }
+                    };
+                    let pointer = zeron_proto::CloudBackupPointer {
+                        seat_id: backup.seat_id,
+                        device_id: registry_device_id.clone(),
+                        path,
+                        bytes: Some(backup.bytes),
+                        created_at: backup.taken_at,
+                    };
+                    if let Err(error) = registry_workspace
+                        .set_chat_cloud_backup(&backup.chat_id, &pointer)
+                    {
+                        tracing::warn!(chat_id = %backup.chat_id, %error, "could not sync cloud backup metadata");
+                    }
+                }
+            }));
+            sessions.set_cloud(cloud.clone());
+            cloud::Scheduler::new(
+                cloud.clone(),
+                doc_host.clone(),
+                workspace.clone(),
+                device_id.clone(),
+            )
+            .start();
+            sessions.resume_cloud_runs();
+            Some(cloud)
+        } else {
+            None
+        };
+        let runner_credentials = if cloud.is_some() {
+            Some(Arc::new(
+                runner_credentials::RunnerCredentialVault::load(profile.store_root())
+                    .map_err(EngineError::Other)?,
+            ))
+        } else {
+            None
+        };
+        if let Some(credentials) = &runner_credentials {
+            sessions.set_runner_credentials(credentials.clone());
+        }
         let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
         // Turn starts snapshot the checkout tree — the "Latest turn" diff base.
         let turn_diff = diff_sync.clone();
@@ -399,6 +457,7 @@ impl EngineCore {
             pairing,
             local_import,
             cloud,
+            runner_credentials,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
@@ -543,8 +602,13 @@ impl EngineCore {
         .with_pairing(self.pairing.clone())
         .with_previews(self.previews.clone())
         .with_computer(self.computer.clone())
-        .with_tools(self.tools.clone())
-        .with_cloud(self.cloud.clone());
+        .with_tools(self.tools.clone());
+        if let Some(cloud) = self.cloud.clone() {
+            rpc = rpc.with_cloud(cloud);
+        }
+        if let Some(credentials) = self.runner_credentials.clone() {
+            rpc = rpc.with_runner_credentials(credentials);
+        }
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }

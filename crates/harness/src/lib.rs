@@ -59,6 +59,26 @@ pub struct RunControls {
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
     pub interrupt: CancellationToken,
+    /// Per-run process environment. This is deliberately not part of
+    /// `RunRequest`, so credentials never cross the command/doc wire.
+    pub environment: RunEnvironment,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RunEnvironment {
+    pub remove: Vec<String>,
+    pub set: Vec<(String, String)>,
+}
+
+impl RunEnvironment {
+    pub fn apply_to(&self, command: &mut tokio::process::Command) {
+        for key in &self.remove {
+            command.env_remove(key);
+        }
+        for (key, value) in &self.set {
+            command.env(key, value);
+        }
+    }
 }
 
 /// Catalog provenance stays internal; RPC clients retain the Vec<Model> shape.

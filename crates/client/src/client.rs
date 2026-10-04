@@ -760,6 +760,8 @@ impl Client {
             room_gen: Some(2),
             parent_chat_id: None,
             cloud_seat: None,
+            cloud_run: None,
+            cloud_backup: None,
         };
         let id = chat.id.clone();
         self.inner.registry_write(|doc| doc.upsert_chat(&chat))?;

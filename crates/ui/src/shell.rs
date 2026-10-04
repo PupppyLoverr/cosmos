@@ -183,6 +183,12 @@ struct ChatMenuState {
     page: ChatMenuPage,
 }
 
+#[derive(Clone)]
+enum SidebarWipTransfer {
+    Return { chat_id: String },
+    Send { chat_id: String, seat_id: String },
+}
+
 /// Interruptible height tween for the sidebar's device/archive disclosures.
 /// The rendered element owns the frame clock; this state preserves the current
 /// interpolated height when a second click reverses an in-flight transition.
@@ -1774,6 +1780,23 @@ enum PendingExit {
 
 const CLOUD_RAIL_CACHE: usize = 3;
 
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalChatCopyEntry {
+    chat_id: String,
+    title: Option<String>,
+    #[serde(default)]
+    archived: bool,
+}
+
+fn should_offer_local_chat_copy(
+    scope: Option<WorkspaceScope>,
+    cloud_mode: bool,
+    local_chat_count: usize,
+) -> bool {
+    scope == Some(WorkspaceScope::Synced) && cloud_mode && local_chat_count > 0
+}
+
 fn touch_mru(order: &mut Vec<String>, id: &str, cap: usize) -> Vec<String> {
     order.retain(|entry| entry != id);
     order.push(id.to_string());
@@ -1812,6 +1835,41 @@ mod cloud_rail_mru_tests {
         assert_eq!(order, ids(&["d", "b"]));
         assert!(order.contains(&"b".to_string()));
         assert!(order.len() <= 2);
+    }
+}
+
+#[cfg(test)]
+mod local_chat_copy_tests {
+    use super::should_offer_local_chat_copy;
+    use zeron_proto::WorkspaceScope;
+
+    #[test]
+    fn local_chat_copy_option_is_only_offered_for_synced_cloud_with_chats() {
+        assert!(should_offer_local_chat_copy(
+            Some(WorkspaceScope::Synced),
+            true,
+            1
+        ));
+        assert!(!should_offer_local_chat_copy(
+            Some(WorkspaceScope::Synced),
+            true,
+            0
+        ));
+        assert!(!should_offer_local_chat_copy(
+            Some(WorkspaceScope::Synced),
+            false,
+            1
+        ));
+        assert!(!should_offer_local_chat_copy(
+            Some(WorkspaceScope::Development),
+            true,
+            1
+        ));
+        assert!(!should_offer_local_chat_copy(
+            Some(WorkspaceScope::Local),
+            true,
+            1
+        ));
     }
 }
 
@@ -1994,6 +2052,10 @@ pub struct Shell {
     spaces_menu_bar: popover::MenuScrollbarState,
     /// The cloud destination picker below the Agent/Cloud mode toggle.
     cloud_seat_menu: popover::Popup<()>,
+    local_chats_for_copy: Option<Vec<LocalChatCopyEntry>>,
+    show_local_chats_for_copy: bool,
+    local_chats_for_copy_task: Option<Task<()>>,
+    local_chat_copy_task: Option<Task<()>>,
     /// Persisted organization/sort/metadata controls beside the project filter.
     sidebar_view_menu: popover::Popup<spaces::SidebarViewMenu>,
     /// Natural-tab-order focus target for the icon-only view-options button.
@@ -2035,6 +2097,8 @@ pub struct Shell {
     user_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
+    sidebar_wip_transfer: Option<SidebarWipTransfer>,
+    sidebar_cloud_transfer_task: Option<Task<()>>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -2478,6 +2542,10 @@ impl Shell {
             spaces_menu: popover::Popup::default(),
             spaces_menu_bar: popover::MenuScrollbarState::default(),
             cloud_seat_menu: popover::Popup::default(),
+            local_chats_for_copy: None,
+            show_local_chats_for_copy: false,
+            local_chats_for_copy_task: None,
+            local_chat_copy_task: None,
             sidebar_view_menu: popover::Popup::default(),
             sidebar_view_trigger_focus: cx.focus_handle().tab_stop(true),
             sidebar_pinned_heights: Vec::new(),
@@ -2503,6 +2571,8 @@ impl Shell {
             attention_sound_gate: Default::default(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
+            sidebar_wip_transfer: None,
+            sidebar_cloud_transfer_task: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
@@ -8337,6 +8407,13 @@ impl Shell {
     }
 
     fn set_cloud_mode(&mut self, cloud_mode: bool, cx: &mut Context<Self>) {
+        if cloud_mode && self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local) {
+            self.start_sign_in(cx);
+            return;
+        }
+        if !cloud_mode && self.show_local_chats_for_copy {
+            self.close_cloud_seat_menu(cx);
+        }
         if self.state.read(cx).cloud_mode != cloud_mode {
             self.composer
                 .update(cx, |composer, cx| composer.clear_failure(cx));
@@ -8364,6 +8441,11 @@ impl Shell {
 
     fn render_cloud_mode_toggle(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let cloud_mode = self.state.read(cx).cloud_mode;
+        let cloud_label = if self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local) {
+            "Sign in to use Cloud"
+        } else {
+            "Cloud — run on a cloud seat"
+        };
         let segment = |id: &'static str,
                        label: &'static str,
                        icon_path: &'static str,
@@ -8408,13 +8490,8 @@ impl Shell {
             !cloud_mode,
         )
         .on_click(cx.listener(|this, _, _, cx| this.set_cloud_mode(false, cx)));
-        let cloud = segment(
-            "sidebar-cloud-mode",
-            "Cloud — run on a cloud seat",
-            icons::CLOUD,
-            cloud_mode,
-        )
-        .on_click(cx.listener(|this, _, _, cx| this.set_cloud_mode(true, cx)));
+        let cloud = segment("sidebar-cloud-mode", cloud_label, icons::CLOUD, cloud_mode)
+            .on_click(cx.listener(|this, _, _, cx| this.set_cloud_mode(true, cx)));
         div()
             .mx(px(Theme::SPACE_SM))
             .mt(px(Theme::SPACE_SM))
@@ -8432,14 +8509,316 @@ impl Shell {
     }
 
     fn close_cloud_seat_menu(&mut self, cx: &mut Context<Self>) {
+        self.show_local_chats_for_copy = false;
         if self.cloud_seat_menu.begin_close() {
             popover::reap_popup(cx, |shell: &mut Self| &mut shell.cloud_seat_menu);
             cx.notify();
         }
     }
 
+    fn load_local_chats_for_copy(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Synced)
+            || self.local_chats_for_copy_task.is_some()
+        {
+            return;
+        }
+        self.local_chats_for_copy = None;
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.local_chats_for_copy = Some(Vec::new());
+            return;
+        };
+        self.local_chats_for_copy_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::LIST_LOCAL_CHATS, serde_json::json!({}))
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<Vec<LocalChatCopyEntry>>(value)
+                        .map_err(|err| err.to_string())
+                });
+            this.update(cx, |shell, cx| {
+                shell.local_chats_for_copy_task = None;
+                match result {
+                    Ok(chats) => shell.local_chats_for_copy = Some(chats),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "list local chats for Cloud copy failed");
+                        shell.local_chats_for_copy = Some(Vec::new());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn copy_local_chat_to_cloud(&mut self, local_chat_id: String, cx: &mut Context<Self>) {
+        if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Synced) {
+            self.sidebar_notice = Some("Cloud needs you signed in".into());
+            cx.notify();
+            return;
+        }
+        let Some(seat_id) = self
+            .state
+            .read(cx)
+            .active_cloud_seat()
+            .map(|seat| seat.config.id.clone())
+        else {
+            self.sidebar_notice = Some("Choose a Cloud seat before copying a local chat.".into());
+            cx.notify();
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.sidebar_notice = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+
+        self.close_cloud_seat_menu(cx);
+        self.sidebar_notice = Some("Copying local chat to Cloud…".into());
+        self.local_chat_copy_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::COPY_LOCAL_CHAT_TO_CLOUD,
+                    serde_json::json!({
+                        "localChatId": local_chat_id,
+                        "seatId": seat_id,
+                    }),
+                )
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|value| {
+                    value
+                        .get("chatId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .ok_or_else(|| "Copy to Cloud returned no chat ID".to_string())
+                });
+            this.update(cx, |shell, cx| {
+                shell.local_chat_copy_task = None;
+                match result {
+                    Ok(chat_id) => {
+                        shell.sidebar_notice = None;
+                        shell.route = Route::Chat;
+                        shell
+                            .state
+                            .update(cx, |state, cx| state.select_chat(Some(chat_id), cx));
+                    }
+                    Err(err) => {
+                        shell.sidebar_notice = Some(format!("Copy to Cloud failed: {err}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn transfer_synced_chat(
+        &mut self,
+        chat_id: String,
+        seat_id: Option<String>,
+        push_wip: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Synced) {
+            self.sidebar_notice =
+                Some("Cloud chats need you signed in — local chats stay on this computer".into());
+            self.sidebar_wip_transfer = None;
+            cx.notify();
+            return;
+        }
+        let is_cloud_chat = self
+            .state
+            .read(cx)
+            .chat_row(&chat_id)
+            .is_some_and(|chat| chat.cloud_seat.is_some());
+        let seat_id = if is_cloud_chat {
+            None
+        } else {
+            seat_id.or_else(|| {
+                self.state
+                    .read(cx)
+                    .active_cloud_seat()
+                    .map(|seat| seat.config.id.clone())
+            })
+        };
+        if !is_cloud_chat && seat_id.is_none() {
+            self.sidebar_notice = Some("Choose a Cloud seat before sending this chat.".into());
+            self.sidebar_wip_transfer = None;
+            cx.notify();
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.sidebar_notice = Some("Engine not connected".into());
+            self.sidebar_wip_transfer = None;
+            cx.notify();
+            return;
+        };
+
+        let is_send = !is_cloud_chat;
+        let transfer = if is_cloud_chat {
+            SidebarWipTransfer::Return {
+                chat_id: chat_id.clone(),
+            }
+        } else {
+            SidebarWipTransfer::Send {
+                chat_id: chat_id.clone(),
+                seat_id: seat_id.expect("cloud send has a selected seat"),
+            }
+        };
+        self.sidebar_wip_transfer = None;
+        self.sidebar_notice = Some(
+            if is_send {
+                "Sending chat to Cloud…"
+            } else {
+                "Returning chat to this Mac…"
+            }
+            .into(),
+        );
+        self.close_chat_menu(cx);
+        self.sidebar_cloud_transfer_task = Some(cx.spawn(async move |this, cx| {
+            let result = match &transfer {
+                SidebarWipTransfer::Return { chat_id } => engine
+                    .client()
+                    .call(
+                        methods::CLOUD_RETURN_CHAT,
+                        serde_json::json!({ "chatId": chat_id, "pushWip": push_wip }),
+                    )
+                    .await,
+                SidebarWipTransfer::Send { chat_id, seat_id } => engine
+                    .client()
+                    .call(
+                        methods::CLOUD_SEND_CHAT,
+                        serde_json::json!({
+                            "chatId": chat_id,
+                            "seatId": seat_id,
+                            "pushWip": push_wip,
+                        }),
+                    )
+                    .await,
+            }
+            .map_err(|err| err.to_string());
+            this.update(cx, |shell, cx| {
+                shell.sidebar_cloud_transfer_task = None;
+                match result {
+                    Ok(_) => {
+                        shell.sidebar_wip_transfer = None;
+                        shell.sidebar_notice = Some(
+                            if is_send {
+                                "Chat sent to Cloud."
+                            } else {
+                                "Chat returned to this Mac."
+                            }
+                            .into(),
+                        );
+                        shell
+                            .state
+                            .update(cx, |state, cx| state.refresh_cloud(None, cx));
+                    }
+                    Err(err) => {
+                        if err
+                            == "uncommitted changes here — push them to a WIP branch first"
+                            || err
+                                == "uncommitted changes on the runner — push them to a WIP branch first"
+                        {
+                            shell.sidebar_wip_transfer = Some(transfer);
+                        } else {
+                            shell.sidebar_wip_transfer = None;
+                        }
+                        shell.sidebar_notice = Some(err.into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn push_sidebar_wip_and_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(transfer) = self.sidebar_wip_transfer.clone() else {
+            return;
+        };
+        match transfer {
+            SidebarWipTransfer::Return { chat_id } => {
+                self.transfer_synced_chat(chat_id, None, true, cx);
+            }
+            SidebarWipTransfer::Send { chat_id, seat_id } => {
+                self.transfer_synced_chat(chat_id, Some(seat_id), true, cx);
+            }
+        }
+    }
+
     fn render_cloud_seat_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let theme = theme.for_popup();
+        let local_chat_count = self.local_chats_for_copy.as_ref().map_or(0, Vec::len);
+        if self.show_local_chats_for_copy
+            && should_offer_local_chat_copy(
+                self.state.read(cx).workspace_scope,
+                self.state.read(cx).cloud_mode,
+                local_chat_count,
+            )
+        {
+            let chats = self.local_chats_for_copy.clone().unwrap_or_default();
+            let mut menu = popover::popover_card(&theme)
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.close_cloud_seat_menu(cx);
+                }))
+                .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
+                .child(popover::menu_heading(&theme, "Copy a local chat to Cloud"))
+                .child(
+                    popover::menu_row(&theme, false, "sidebar-copy-local-back")
+                        .id("sidebar-copy-local-back")
+                        .child("‹ Cloud seats")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_local_chats_for_copy = false;
+                            cx.notify();
+                        })),
+                )
+                .child(popover::menu_separator());
+            for chat in chats {
+                let chat_id = chat.chat_id.clone();
+                let title = chat
+                    .title
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or_else(|| "Untitled chat".into());
+                let mut row = popover::menu_row(
+                    &theme,
+                    false,
+                    format!("sidebar-copy-local-chat-{}", chat.chat_id),
+                )
+                .id(SharedString::from(format!(
+                    "sidebar-copy-local-chat-{}",
+                    chat.chat_id
+                )))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    icon(icons::CLOUD)
+                        .size(px(13.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(title));
+                if chat.archived {
+                    row = row.child(
+                        div()
+                            .flex_none()
+                            .text_size(crate::typography::ui_rems(9.5))
+                            .text_color(theme.text_muted)
+                            .child("Archived"),
+                    );
+                }
+                menu = menu.child(row.cursor_pointer().on_click(cx.listener(
+                    move |this, _, _, cx| this.copy_local_chat_to_cloud(chat_id.clone(), cx),
+                )));
+            }
+            return menu.into_any_element();
+        }
         let seats = self
             .state
             .read(cx)
@@ -8529,6 +8908,10 @@ impl Shell {
             }
             row.cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.state.read(cx).workspace_scope == Some(WorkspaceScope::Local) {
+                        this.start_sign_in(cx);
+                        return;
+                    }
                     this.composer
                         .update(cx, |composer, cx| composer.clear_failure(cx));
                     this.state.update(cx, |state, cx| {
@@ -8604,6 +8987,39 @@ impl Shell {
                 menu = menu.child(seat_row(seat, ix, "github", &theme, cx));
             }
         }
+        let can_copy_local_chats = should_offer_local_chat_copy(
+            self.state.read(cx).workspace_scope,
+            self.state.read(cx).cloud_mode,
+            self.local_chats_for_copy.as_ref().map_or(0, Vec::len),
+        );
+        if can_copy_local_chats {
+            menu = menu.child(popover::menu_separator()).child(
+                popover::menu_row(&theme, false, "sidebar-copy-local-chats")
+                    .id("sidebar-copy-local-chats")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .cursor_pointer()
+                    .child(
+                        icon(icons::CLOUD)
+                            .size(px(13.0))
+                            .flex_none()
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child("Copy a local chat to Cloud…"),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_local_chats_for_copy = true;
+                        cx.notify();
+                    })),
+            );
+        }
         if seats.is_empty() {
             menu = menu.child(
                 div()
@@ -8678,6 +9094,7 @@ impl Shell {
                         state.refresh_cloud(Some(Duration::from_secs(10)), cx);
                     });
                     this.cloud_seat_menu.open(());
+                    this.load_local_chats_for_copy(cx);
                     let _ = window;
                     cx.notify();
                 }
@@ -9138,25 +9555,44 @@ impl Shell {
             })
             // Inline mutation-failure notice.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
-                el.child(
-                    div()
-                        .id("sidebar-notice")
-                        .mx(px(Theme::SPACE_SM))
-                        .mb(px(Theme::SPACE_SM))
-                        .px(px(Theme::SPACE_SM))
-                        .py(px(4.0))
-                        .rounded(px(Theme::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(theme.danger)
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.danger)
+                let mut card = div()
+                    .id("sidebar-notice")
+                    .mx(px(Theme::SPACE_SM))
+                    .mb(px(Theme::SPACE_SM))
+                    .px(px(Theme::SPACE_SM))
+                    .py(px(4.0))
+                    .rounded(px(Theme::CONTROL_RADIUS))
+                    .border_1()
+                    .border_color(theme.danger)
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.danger);
+                if self.sidebar_wip_transfer.is_some() {
+                    card =
+                        card.flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(div().flex_1().min_w_0().child(notice))
+                            .child(
+                                popover::btn_ghost(
+                                    theme,
+                                    "Push a WIP branch and continue",
+                                    "sidebar-wip-push",
+                                )
+                                .id("sidebar-wip-push")
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| this.push_sidebar_wip_and_transfer(cx),
+                                )),
+                            );
+                } else {
+                    card = card
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.sidebar_notice = None;
                             cx.notify();
                         }))
-                        .child(notice),
-                )
+                        .child(notice);
+                }
+                el.child(card)
             })
             .child(
                 div()
@@ -10215,6 +10651,19 @@ impl Shell {
                 .read(cx)
                 .chat_row(&chat_id)
                 .is_some_and(|chat| chat.archived);
+            let is_cloud_chat = self
+                .state
+                .read(cx)
+                .chat_row(&chat_id)
+                .is_some_and(|chat| chat.cloud_seat.is_some());
+            let synced_scope = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Synced);
+            let transfer_chat_id = chat_id.clone();
+            let transfer_send_chat_id = chat_id.clone();
+            let send_seat_id = self
+                .state
+                .read(cx)
+                .active_cloud_seat()
+                .map(|seat| seat.config.id.clone());
             let (archive_icon, archive_label) = chat_archive_menu_item(chat_archived);
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
@@ -10277,6 +10726,50 @@ impl Shell {
                                     .text_color(theme.text_muted),
                             ),
                     )
+                    .when(synced_scope && is_cloud_chat, |menu| {
+                        menu.child(
+                            popover::menu_row(&theme, false, format!("chat-menu-return-{chat_id}"))
+                                .id("chat-menu-return")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.transfer_synced_chat(
+                                        transfer_chat_id.clone(),
+                                        None,
+                                        false,
+                                        cx,
+                                    )
+                                }))
+                                .child(
+                                    icon(icons::ARROW_LEFT)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Return to this Mac")),
+                        )
+                    })
+                    .when(synced_scope && !is_cloud_chat, |menu| {
+                        menu.child(
+                            popover::menu_row(
+                                &theme,
+                                false,
+                                format!("chat-menu-send-cloud-{chat_id}"),
+                            )
+                            .id("chat-menu-send-cloud")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.transfer_synced_chat(
+                                    transfer_send_chat_id.clone(),
+                                    send_seat_id.clone(),
+                                    false,
+                                    cx,
+                                )
+                            }))
+                            .child(
+                                icon(icons::CLOUD)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Send to Cloud")),
+                        )
+                    })
                     .child(popover::menu_separator())
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
@@ -13928,6 +14421,8 @@ mod tests {
             room_gen: None,
             parent_chat_id: None,
             cloud_seat: None,
+            cloud_run: None,
+            cloud_backup: None,
         }
     }
 

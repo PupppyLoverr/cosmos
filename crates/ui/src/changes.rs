@@ -6009,6 +6009,8 @@ rename to new_name.rs
             harness_session_cwd: None,
             parent_chat_id: None,
             cloud_seat: None,
+            cloud_run: None,
+            cloud_backup: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,

@@ -266,7 +266,9 @@ impl Harness for AmpHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        let mut child = self.build_command(&exe, &request).spawn().map_err(|e| {
+        let mut command = self.build_command(&exe, &request);
+        controls.environment.apply_to(&mut command);
+        let mut child = command.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
             } else {

@@ -35,7 +35,11 @@ const SEED_ENTRIES: usize = 12;
 const SEED_ENTRY_MAX: usize = 400;
 const SEED_TOTAL_MAX: usize = 4000;
 
-fn temp_chat_fields(source: &zeron_proto::Chat, chat_id: &str) -> serde_json::Value {
+fn temp_chat_fields(
+    source: &zeron_proto::Chat,
+    chat_id: &str,
+    workspace_scope: Option<zeron_proto::WorkspaceScope>,
+) -> serde_json::Value {
     let mut fields = serde_json::json!({
         "op": "createChat",
         "chatId": chat_id,
@@ -52,7 +56,11 @@ fn temp_chat_fields(source: &zeron_proto::Chat, chat_id: &str) -> serde_json::Va
     if let Some(config) = &source.config {
         fields["config"] = serde_json::to_value(config).unwrap_or_default();
     }
-    if let Some(seat) = &source.cloud_seat {
+    if matches!(
+        workspace_scope,
+        Some(zeron_proto::WorkspaceScope::Synced | zeron_proto::WorkspaceScope::Development)
+    ) && let Some(seat) = &source.cloud_seat
+    {
         fields["cloudSeat"] = serde_json::to_value(seat).unwrap_or_default();
     }
     fields
@@ -140,7 +148,7 @@ impl SideChat {
             return;
         };
         let chat_id = uuid::Uuid::new_v4().to_string();
-        let fields = temp_chat_fields(source, &chat_id);
+        let fields = temp_chat_fields(source, &chat_id, self.state.read(cx).workspace_scope);
         self.creating = true;
         self.failure = None;
         cx.notify();
@@ -612,7 +620,11 @@ mod tests {
     #[test]
     fn local_temp_chat_fields_preserve_device_and_source_context() {
         let source = source_chat(None, None);
-        let fields = temp_chat_fields(&source, "temp-local");
+        let fields = temp_chat_fields(
+            &source,
+            "temp-local",
+            Some(zeron_proto::WorkspaceScope::Local),
+        );
 
         assert_eq!(fields["chatId"], "temp-local");
         assert!(fields["archived"].as_bool().unwrap());
@@ -638,7 +650,11 @@ mod tests {
             "modelLabel": "Claude",
         });
         let source = source_chat(Some("space-123"), Some(cloud_seat.clone()));
-        let fields = temp_chat_fields(&source, "temp-cloud");
+        let fields = temp_chat_fields(
+            &source,
+            "temp-cloud",
+            Some(zeron_proto::WorkspaceScope::Synced),
+        );
 
         assert_eq!(fields["chatId"], "temp-cloud");
         assert!(fields["archived"].as_bool().unwrap());
@@ -650,5 +666,24 @@ mod tests {
             fields["config"],
             serde_json::to_value(source.config).unwrap()
         );
+    }
+
+    #[test]
+    fn local_scope_does_not_inherit_a_cloud_seat() {
+        let seat = serde_json::json!({
+            "seatId": "seat-123",
+            "kind": "ssh",
+            "label": "Build seat",
+            "workspacePath": "/workspace",
+        });
+        let source = source_chat(None, Some(seat));
+        let fields = temp_chat_fields(
+            &source,
+            "temp-local",
+            Some(zeron_proto::WorkspaceScope::Local),
+        );
+
+        assert!(fields["archived"].as_bool().unwrap());
+        assert!(fields.get("cloudSeat").is_none());
     }
 }

@@ -2069,7 +2069,7 @@ struct GitHubCommitAuthor {
     email: String,
 }
 
-fn parse_github_remote(remote: &str) -> Option<(String, String)> {
+pub(crate) fn parse_github_remote(remote: &str) -> Option<(String, String)> {
     let remote = remote.trim();
     let path = remote
         .strip_prefix("https://github.com/")

@@ -117,9 +117,13 @@ async fn late_create_chat_binding_persists_and_dispatches_to_boat() {
     registry.register(Arc::new(CountingHarness(local_runs.clone())));
     let core = EngineCore::assemble(tmp.path(), registry, HarnessId::Mock, None)
         .expect("engine core assembles");
+    let cloud = core
+        .cloud
+        .as_ref()
+        .expect("Development profile loads a CloudStore");
 
     let (endpoint, mut requests, boat_task) = stub_boat().await;
-    core.cloud
+    cloud
         .save_seat(SeatConfig {
             id: SEAT.into(),
             kind: Some(zeron_proto::CloudSeatKind::Box),
@@ -129,7 +133,7 @@ async fn late_create_chat_binding_persists_and_dispatches_to_boat() {
             ..Default::default()
         })
         .unwrap();
-    core.cloud
+    cloud
         .set_seat_token(SEAT, "boxToken", Some("test-token".into()))
         .unwrap();
 
@@ -196,15 +200,14 @@ async fn late_create_chat_binding_persists_and_dispatches_to_boat() {
     core.sessions
         .dispatch(
             CHAT,
-            HarnessId::Mock,
+            HarnessId::ClaudeCode,
             run_request(),
             Some("user-message".into()),
         )
         .await
         .expect("cloud run dispatches");
 
-    let cloud_run = core
-        .cloud
+    let cloud_run = cloud
         .run_for_chat(CHAT)
         .expect("remote run ledger row exists");
     assert_eq!(cloud_run.seat_id, SEAT);
@@ -224,8 +227,7 @@ async fn late_create_chat_binding_persists_and_dispatches_to_boat() {
     );
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if core
-                .cloud
+            if cloud
                 .run_for_chat(CHAT)
                 .is_some_and(|run| run.status == CloudRunStatus::Error)
             {
@@ -237,6 +239,98 @@ async fn late_create_chat_binding_persists_and_dispatches_to_boat() {
     .await
     .expect("stub transport error is surfaced on the cloud run");
     assert_eq!(local_runs.load(Ordering::SeqCst), 0);
+
+    core.shutdown().await;
+    boat_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unsupported_boat_harness_fails_before_prompt_or_provisioning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = Arc::new(HarnessRegistry::new());
+    registry.register(Arc::new(CountingHarness(Arc::new(AtomicUsize::new(0)))));
+    let core = EngineCore::assemble(tmp.path(), registry, HarnessId::Mock, None)
+        .expect("engine core assembles");
+    let cloud = core.cloud.as_ref().unwrap();
+    let (endpoint, mut requests, boat_task) = stub_boat().await;
+    cloud
+        .save_seat(SeatConfig {
+            id: SEAT.into(),
+            kind: Some(zeron_proto::CloudSeatKind::Box),
+            label: "Boat test".into(),
+            box_endpoint: Some(endpoint),
+            ..Default::default()
+        })
+        .unwrap();
+    cloud
+        .set_seat_token(SEAT, "boxToken", Some("test-token".into()))
+        .unwrap();
+    let binding = zeron_proto::CloudSeatBinding {
+        seat_id: SEAT.into(),
+        kind: zeron_proto::CloudSeatKind::Box,
+        label: "Boat test".into(),
+        repo: None,
+        workspace_path: Some("/workspace".into()),
+        runner_device_id: None,
+        branch: None,
+        model_label: None,
+        expires_at: None,
+    };
+    core.workspace
+        .create_chat_with_parent(
+            CHAT,
+            None,
+            Some(&core.device_id),
+            None,
+            Some("/workspace".into()),
+            None,
+            Some(binding),
+        )
+        .unwrap();
+
+    core.sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            run_request(),
+            Some("unsupported-user-message".into()),
+        )
+        .await
+        .expect("unsupported provider failure is surfaced in transcript");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if cloud
+                .run_for_chat(CHAT)
+                .is_some_and(|run| run.status == CloudRunStatus::Error)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("unsupported harness marks the cloud run failed");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        requests.try_recv().is_err(),
+        "unsupported harness made no Boat request"
+    );
+    let entries = core
+        .doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .read_entries()
+        .unwrap();
+    assert!(entries.iter().any(|entry| {
+        entry.parts.iter().any(|part| {
+            matches!(
+                part,
+                zeron_doc::MessagePart::Text { text, .. }
+                    if text == "Cloud run failed: Boat's built-in agent runs Claude Code only — install a Cosmos runner on this box to use Mock"
+            )
+        })
+    }));
 
     core.shutdown().await;
     boat_task.abort();

@@ -494,12 +494,16 @@ struct UploadChunkParams {
 struct UploadCommitParams {
     upload_id: String,
     file_name: String,
+    #[serde(default)]
+    chat_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReadAttachmentChunkParams {
     path: String,
+    #[serde(default)]
+    chat_id: Option<String>,
     #[serde(default)]
     offset: u64,
 }
@@ -751,6 +755,7 @@ pub struct EngineRpc {
     /// ledger). `Option` so bare test rigs stay light; every `Cloud*` handler
     /// fails "unavailable" without it.
     cloud: Option<crate::cloud::CloudStore>,
+    runner_credentials: Option<std::sync::Arc<crate::runner_credentials::RunnerCredentialVault>>,
     /// Shared HTTP client for seat probes / provider verification / GitHub.
     http: reqwest::Client,
     engine_info: EngineInfo,
@@ -801,6 +806,7 @@ impl EngineRpc {
             updater: None,
             local_import: None,
             cloud: None,
+            runner_credentials: None,
             http: reqwest::Client::new(),
             engine_info,
         }
@@ -862,6 +868,14 @@ impl EngineRpc {
         self
     }
 
+    pub fn with_runner_credentials(
+        mut self,
+        credentials: std::sync::Arc<crate::runner_credentials::RunnerCredentialVault>,
+    ) -> Self {
+        self.runner_credentials = Some(credentials);
+        self
+    }
+
     fn computer(&self) -> Result<&zeron_computer::ComputerService, RpcError> {
         self.computer
             .as_ref()
@@ -875,9 +889,83 @@ impl EngineRpc {
     }
 
     fn cloud(&self) -> Result<&crate::cloud::CloudStore, RpcError> {
+        if self.engine_info.workspace_scope == WorkspaceScope::Local {
+            return Err(RpcError::Failed("Cloud needs you signed in".into()));
+        }
         self.cloud
             .as_ref()
             .ok_or_else(|| RpcError::Failed("cloud service unavailable".into()))
+    }
+
+    fn runner_credentials(
+        &self,
+    ) -> Result<&crate::runner_credentials::RunnerCredentialVault, RpcError> {
+        if self.engine_info.workspace_scope == WorkspaceScope::Local {
+            return Err(RpcError::Failed("Cloud needs you signed in".into()));
+        }
+        self.runner_credentials
+            .as_deref()
+            .ok_or_else(|| RpcError::Failed("runner credential service unavailable".into()))
+    }
+
+    fn cloud_binding_for_seat(
+        seat: &crate::cloud::SeatConfig,
+        chat_id: &str,
+        previous: Option<&zeron_proto::CloudSeatBinding>,
+    ) -> zeron_proto::CloudSeatBinding {
+        let repo = previous.and_then(|binding| binding.repo.clone());
+        let branch = previous.and_then(|binding| binding.branch.clone());
+        let workspace_path = match &repo {
+            Some(full_name) => {
+                crate::cloud::repo_workspace(&seat.workspace(), full_name, branch.as_deref())
+            }
+            None => crate::cloud::chat_workspace(&seat.workspace(), chat_id),
+        };
+        zeron_proto::CloudSeatBinding {
+            seat_id: seat.id.clone(),
+            kind: seat.kind.unwrap_or(zeron_proto::CloudSeatKind::Ssh),
+            label: seat.label.clone(),
+            repo,
+            workspace_path: Some(workspace_path),
+            runner_device_id: seat.runner_device_id.clone(),
+            branch,
+            model_label: previous.and_then(|binding| binding.model_label.clone()),
+            expires_at: seat.expires_at,
+        }
+    }
+
+    fn cloud_host_device(&self, binding: &zeron_proto::CloudSeatBinding) -> String {
+        binding
+            .runner_device_id
+            .clone()
+            .unwrap_or_else(|| self.engine_info.device_id.clone())
+    }
+
+    fn refuse_rebind(&self, chat_id: &str) -> Result<(), RpcError> {
+        if self.engine_info.workspace_scope == WorkspaceScope::Local {
+            return Err(RpcError::Failed(
+                "Cloud chats need you signed in — local chats stay on this computer".into(),
+            ));
+        }
+        let synced_running = self
+            .workspace
+            .read_sessions()
+            .map_err(|error| RpcError::Failed(error.to_string()))?
+            .iter()
+            .any(|session| {
+                session.chat_id == chat_id
+                    && matches!(
+                        session.status,
+                        zeron_proto::SessionStatus::Working
+                            | zeron_proto::SessionStatus::AwaitingInput
+                    )
+            });
+        if self.sessions.is_running(chat_id) || synced_running {
+            return Err(RpcError::Failed(
+                "stop the running turn before moving this chat".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -1260,6 +1348,20 @@ impl EngineRpc {
                 parent_chat_id,
                 cloud_seat,
             } => {
+                if cloud_seat.is_some() && self.engine_info.workspace_scope == WorkspaceScope::Local
+                {
+                    return Err(RpcError::Failed(
+                        "Cloud chats need you signed in — local chats stay on this computer".into(),
+                    ));
+                }
+                let (space_id, device_id, cwd) = match cloud_seat.as_ref() {
+                    Some(binding) if binding.runner_device_id.is_some() => (
+                        None,
+                        binding.runner_device_id.clone(),
+                        binding.workspace_path.clone(),
+                    ),
+                    _ => (space_id, device_id, cwd),
+                };
                 self.workspace
                     .create_chat_with_parent(
                         &chat_id,
@@ -1478,6 +1580,7 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         methods::CLONE_REPO | methods::FETCH_ALL | methods::APPLY_UPDATE => {
             Duration::from_secs(15 * 60)
         }
+        methods::RUNNER_PUSH_WIP => Duration::from_secs(15 * 60),
         methods::INSTALL_HARNESS => Duration::from_secs(15 * 60),
         methods::CREATE_WORKTREE => Duration::from_secs(120),
         // Adapter discovery budget plus relay/shutdown overhead. Hermes's
@@ -1580,6 +1683,12 @@ pub(crate) fn forwardable(method: &str) -> bool {
             | methods::COMPLETE_AGENT_LOGIN
             | methods::POLL_AGENT_LOGIN
             | methods::CANCEL_AGENT_LOGIN
+            | methods::RUNNER_INFO
+            | methods::RUNNER_SEAL_CREDENTIAL
+            | methods::RUNNER_REVOKE_CREDENTIAL
+            | methods::RUNNER_SET_LOGIN
+            | methods::RUNNER_WORKSPACE_STATUS
+            | methods::RUNNER_PUSH_WIP
             // Uploads/attachments target the chat's host device (the agent reads
             // the committed file from that device's disk).
             | methods::UPLOAD_CHUNK
@@ -2735,6 +2844,11 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
             }
             methods::LOCAL_IMPORT_STATUS => {
+                if self.engine_info.workspace_scope != WorkspaceScope::Synced {
+                    return Err(RpcError::Failed(
+                        "local import requires a synced workspace".into(),
+                    ));
+                }
                 let importer = self.local_importer()?.clone();
                 let status = tokio::task::spawn_blocking(move || importer.status())
                     .await
@@ -2743,6 +2857,11 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&status)
             }
             methods::IMPORT_LOCAL_WORKSPACE => {
+                if self.engine_info.workspace_scope != WorkspaceScope::Synced {
+                    return Err(RpcError::Failed(
+                        "local import requires a synced workspace".into(),
+                    ));
+                }
                 let importer = self.local_importer()?.clone();
                 // Progress rides an unbounded channel: the importer is
                 // blocking (sqlite + fs) and must never wedge on a slow
@@ -2769,6 +2888,62 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(Box::pin(futures::stream::poll_fn(
                     move |cx| rx.poll_recv(cx),
                 ))))
+            }
+            methods::LIST_LOCAL_CHATS => {
+                if !matches!(
+                    self.engine_info.workspace_scope,
+                    WorkspaceScope::Synced | WorkspaceScope::Development
+                ) {
+                    return Err(RpcError::Failed("Cloud needs you signed in".into()));
+                }
+                let importer = self.local_importer()?.clone();
+                let chats = tokio::task::spawn_blocking(move || importer.list_local_chats())
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&chats)
+            }
+            methods::COPY_LOCAL_CHAT_TO_CLOUD => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    local_chat_id: String,
+                    seat_id: String,
+                }
+                let p: P = parse_params(params)?;
+                if !matches!(
+                    self.engine_info.workspace_scope,
+                    WorkspaceScope::Synced | WorkspaceScope::Development
+                ) {
+                    return Err(RpcError::Failed("Cloud needs you signed in".into()));
+                }
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                if seat.expired() {
+                    return Err(RpcError::Failed(
+                        "that Railway trial has ended — pick a live seat".into(),
+                    ));
+                }
+                let chat_id = crate::new_id();
+                let binding = Self::cloud_binding_for_seat(&seat, &chat_id, None);
+                let device_id = self.cloud_host_device(&binding);
+                let importer = self.local_importer()?.clone();
+                let local_chat_id = p.local_chat_id;
+                let new_chat_id = chat_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    importer.copy_local_chat_to_cloud(
+                        &local_chat_id,
+                        &new_chat_id,
+                        &device_id,
+                        binding,
+                    )
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "chatId": chat_id }))
             }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {
@@ -3740,6 +3915,10 @@ impl RpcService for EngineRpc {
                     .uploads
                     .commit(&p.upload_id, &p.file_name)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if let Some(chat_id) = p.chat_id.as_deref() {
+                    self.doc_host
+                        .upload_attachment_blob(chat_id, &path, &self.uploads);
+                }
                 // Bytes just landed on this device: any command deferred on
                 // them (queued-attachment refs) is executable NOW.
                 self.doc_host.kick_drains();
@@ -3756,6 +3935,15 @@ impl RpcService for EngineRpc {
                     .filter_map(|chat| chat.cwd)
                     .map(std::path::PathBuf::from)
                     .collect();
+                if !std::path::Path::new(&p.path).is_file()
+                    && let Some(chat_id) = p.chat_id.as_deref()
+                    && let Err(error) = self
+                        .doc_host
+                        .fetch_attachment_blob(chat_id, &p.path, &self.uploads)
+                        .await
+                {
+                    tracing::debug!(chat_id, %error, "attachment blob fetch missed");
+                }
                 let chunk = self
                     .uploads
                     .read_chunk(&p.path, p.offset, &roots)
@@ -4202,6 +4390,15 @@ impl RpcService for EngineRpc {
                     seat_id: String,
                 }
                 let p: P = parse_params(params)?;
+                self.refuse_rebind(&p.chat_id)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::Failed(format!("no such chat: {}", p.chat_id)))?;
+                let previous = chat.cloud_seat.as_ref().ok_or_else(|| {
+                    RpcError::Failed("this chat isn't a Cloud chat — use Copy to Cloud".into())
+                })?;
                 let cloud = self.cloud()?.clone();
                 let seat = cloud
                     .seat(&p.seat_id)
@@ -4211,44 +4408,513 @@ impl RpcService for EngineRpc {
                         "that Railway trial has ended — pick a live seat".into(),
                     ));
                 }
-                if self.sessions.is_running(&p.chat_id) {
-                    return Err(RpcError::Failed(
-                        "stop the running turn before moving this chat".into(),
-                    ));
+                let binding = Self::cloud_binding_for_seat(&seat, &p.chat_id, Some(previous));
+                self.workspace
+                    .rebind_chat_host(
+                        &p.chat_id,
+                        &self.cloud_host_device(&binding),
+                        binding.workspace_path.as_deref(),
+                        Some(&binding),
+                    )
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true, "binding": binding }))
+            }
+            methods::CLOUD_RETURN_CHAT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    chat_id: String,
+                    #[serde(default)]
+                    cwd: Option<String>,
+                    #[serde(default)]
+                    push_wip: bool,
                 }
+                let p: P = parse_params(params)?;
+                self.refuse_rebind(&p.chat_id)?;
                 let chat = self
                     .workspace
                     .chat(&p.chat_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
                     .ok_or_else(|| RpcError::Failed(format!("no such chat: {}", p.chat_id)))?;
-                let previous = chat.cloud_seat.clone();
-                let repo = previous.as_ref().and_then(|b| b.repo.clone());
-                // Repo chats check out under the new seat's workspace; a
-                // repo-less chat gets its own workspace there, which the
-                // chat's backup restores into on the next run.
-                let branch = previous.as_ref().and_then(|b| b.branch.clone());
-                let workspace_path = match &repo {
-                    Some(full_name) => crate::cloud::repo_workspace(
-                        &seat.workspace(),
-                        full_name,
-                        branch.as_deref(),
-                    ),
-                    None => crate::cloud::chat_workspace(&seat.workspace(), &p.chat_id),
-                };
-                let binding = zeron_proto::CloudSeatBinding {
-                    seat_id: seat.id.clone(),
-                    kind: seat.kind.unwrap_or(zeron_proto::CloudSeatKind::Ssh),
-                    label: seat.label.clone(),
-                    repo,
-                    workspace_path: Some(workspace_path),
-                    branch,
-                    model_label: previous.as_ref().and_then(|b| b.model_label.clone()),
-                    expires_at: seat.expires_at,
-                };
+                let binding = chat
+                    .cloud_seat
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("this chat isn't a Cloud chat".into()))?;
+                let mut wip_branch = None;
+                if let Some(runner_device_id) = binding.runner_device_id.as_deref() {
+                    let remote = runner_device_id != self.engine_info.device_id;
+                    let status = if remote {
+                        self.forward(
+                            runner_device_id,
+                            methods::RUNNER_WORKSPACE_STATUS,
+                            serde_json::json!({ "chatId": p.chat_id }),
+                        )
+                        .await?
+                    } else {
+                        let cwd = chat
+                            .cwd
+                            .as_deref()
+                            .or(binding.workspace_path.as_deref())
+                            .ok_or_else(|| {
+                                RpcError::Failed("runner workspace path is missing".into())
+                            })?;
+                        let path = crate::repos::expand_home(cwd)
+                            .map(std::path::PathBuf::from)
+                            .map_err(|error| RpcError::Failed(error.to_string()))?;
+                        let inspected = crate::runner_runtime::inspect_workspace(&path)
+                            .await
+                            .map_err(RpcError::Failed)?;
+                        let (dirty, branch) = inspected.unwrap_or((false, None));
+                        RpcReply::value(&serde_json::json!({ "dirty": dirty, "branch": branch }))?
+                    };
+                    let status = match status {
+                        RpcReply::Value(value) => value,
+                        RpcReply::Stream(_) => {
+                            return Err(RpcError::Failed(
+                                "runner workspace status returned a stream".into(),
+                            ));
+                        }
+                    };
+                    let dirty = status
+                        .get("dirty")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if dirty && !p.push_wip {
+                        return Err(RpcError::Failed(
+                            "uncommitted changes on the runner — push them to a WIP branch first"
+                                .into(),
+                        ));
+                    }
+                    if dirty {
+                        let pushed = if remote {
+                            self.forward(
+                                runner_device_id,
+                                methods::RUNNER_PUSH_WIP,
+                                serde_json::json!({ "chatId": p.chat_id }),
+                            )
+                            .await?
+                        } else {
+                            let cwd = chat
+                                .cwd
+                                .as_deref()
+                                .or(binding.workspace_path.as_deref())
+                                .expect("runner workspace path checked above");
+                            let path = crate::repos::expand_home(cwd)
+                                .map(std::path::PathBuf::from)
+                                .map_err(|error| RpcError::Failed(error.to_string()))?;
+                            let token = crate::runner_runtime::runner_github_token(
+                                self.runner_credentials.as_deref(),
+                            )
+                            .ok_or_else(|| {
+                                RpcError::Failed(
+                                    "seal a GitHub credential to this runner before pushing WIP"
+                                        .into(),
+                                )
+                            })?;
+                            let branch = crate::runner_runtime::push_wip_branch(
+                                &path,
+                                &p.chat_id,
+                                "WIP from Cosmos runner",
+                                Some(token),
+                            )
+                            .await
+                            .map_err(RpcError::Failed)?;
+                            RpcReply::value(&serde_json::json!({ "branch": branch }))?
+                        };
+                        let pushed = match pushed {
+                            RpcReply::Value(value) => value,
+                            RpcReply::Stream(_) => {
+                                return Err(RpcError::Failed(
+                                    "runner WIP push returned a stream".into(),
+                                ));
+                            }
+                        };
+                        wip_branch = pushed
+                            .get("branch")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                    }
+                }
                 self.workspace
-                    .rebind_chat_seat(&p.chat_id, &binding)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true, "binding": binding }))
+                    .rebind_chat_host(
+                        &p.chat_id,
+                        &self.engine_info.device_id,
+                        p.cwd.as_deref(),
+                        None,
+                    )
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                self.workspace.set_chat_harness_session(&p.chat_id, "", "");
+                RpcReply::value(&serde_json::json!({ "ok": true, "wipBranch": wip_branch }))
+            }
+            methods::CLOUD_SEND_CHAT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    chat_id: String,
+                    seat_id: String,
+                    #[serde(default)]
+                    push_wip: bool,
+                }
+                let p: P = parse_params(params)?;
+                self.refuse_rebind(&p.chat_id)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .ok_or_else(|| RpcError::Failed(format!("no such chat: {}", p.chat_id)))?;
+                if chat.cloud_seat.is_some() {
+                    return Err(RpcError::Failed("this chat is already a Cloud chat".into()));
+                }
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                if seat.expired() {
+                    return Err(RpcError::Failed(
+                        "that Railway trial has ended — pick a live seat".into(),
+                    ));
+                }
+                let mut wip_branch = None;
+                let mut repo = None;
+                let mut branch = None;
+                if let Some(cwd) = chat.cwd.as_deref() {
+                    let path = crate::repos::expand_home(cwd)
+                        .map(std::path::PathBuf::from)
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                    if let Some((dirty, current_branch)) =
+                        crate::runner_runtime::inspect_workspace(&path)
+                            .await
+                            .map_err(RpcError::Failed)?
+                    {
+                        if dirty && !p.push_wip {
+                            return Err(RpcError::Failed(
+                                "uncommitted changes here — push them to a WIP branch first".into(),
+                            ));
+                        }
+                        if dirty {
+                            wip_branch = Some(
+                                crate::runner_runtime::push_wip_branch(
+                                    &path,
+                                    &p.chat_id,
+                                    "WIP from Cosmos",
+                                    None,
+                                )
+                                .await
+                                .map_err(RpcError::Failed)?,
+                            );
+                        }
+                        branch = wip_branch.clone().or(current_branch);
+                        repo = crate::runner_runtime::origin_url(&path)
+                            .await
+                            .map_err(RpcError::Failed)?
+                            .as_deref()
+                            .and_then(crate::repos::parse_github_remote)
+                            .map(|(owner, name)| format!("{owner}/{name}"));
+                    }
+                }
+                let mut binding = Self::cloud_binding_for_seat(&seat, &p.chat_id, None);
+                binding.repo = repo;
+                binding.branch = branch;
+                if let Some(repo) = binding.repo.as_deref() {
+                    binding.workspace_path = Some(crate::cloud::repo_workspace(
+                        &seat.workspace(),
+                        repo,
+                        binding.branch.as_deref(),
+                    ));
+                }
+                self.workspace
+                    .rebind_chat_host(
+                        &p.chat_id,
+                        &self.cloud_host_device(&binding),
+                        binding.workspace_path.as_deref(),
+                        Some(&binding),
+                    )
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                self.workspace.set_chat_harness_session(&p.chat_id, "", "");
+                RpcReply::value(&serde_json::json!({
+                    "ok": true,
+                    "binding": binding,
+                    "wipBranch": wip_branch,
+                }))
+            }
+            methods::RUNNER_WORKSPACE_STATUS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    chat_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .ok_or_else(|| RpcError::Failed(format!("no such chat: {}", p.chat_id)))?;
+                let binding = chat
+                    .cloud_seat
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("chat is not assigned to a runner".into()))?;
+                if binding.runner_device_id.as_deref() != Some(self.engine_info.device_id.as_str())
+                {
+                    return Err(RpcError::Failed(
+                        "chat is not assigned to this runner".into(),
+                    ));
+                }
+                let cwd = chat
+                    .cwd
+                    .as_deref()
+                    .or(binding.workspace_path.as_deref())
+                    .ok_or_else(|| RpcError::Failed("runner workspace path is missing".into()))?;
+                let path = crate::repos::expand_home(cwd)
+                    .map(std::path::PathBuf::from)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let inspected = crate::runner_runtime::inspect_workspace(&path)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                let (dirty, branch) = inspected.unwrap_or((false, None));
+                RpcReply::value(&serde_json::json!({ "dirty": dirty, "branch": branch }))
+            }
+            methods::RUNNER_PUSH_WIP => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    chat_id: String,
+                }
+                let p: P = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .ok_or_else(|| RpcError::Failed(format!("no such chat: {}", p.chat_id)))?;
+                let binding = chat
+                    .cloud_seat
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("chat is not assigned to a runner".into()))?;
+                if binding.runner_device_id.as_deref() != Some(self.engine_info.device_id.as_str())
+                {
+                    return Err(RpcError::Failed(
+                        "chat is not assigned to this runner".into(),
+                    ));
+                }
+                let cwd = chat
+                    .cwd
+                    .as_deref()
+                    .or(binding.workspace_path.as_deref())
+                    .ok_or_else(|| RpcError::Failed("runner workspace path is missing".into()))?;
+                let path = crate::repos::expand_home(cwd)
+                    .map(std::path::PathBuf::from)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let token =
+                    crate::runner_runtime::runner_github_token(self.runner_credentials.as_deref())
+                        .ok_or_else(|| {
+                            RpcError::Failed(
+                                "seal a GitHub credential to this runner before pushing WIP".into(),
+                            )
+                        })?;
+                let branch = crate::runner_runtime::push_wip_branch(
+                    &path,
+                    &p.chat_id,
+                    "WIP from Cosmos runner",
+                    Some(token),
+                )
+                .await
+                .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "branch": branch }))
+            }
+            methods::CLOUD_SET_SEAT_RUNNER => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    seat_id: String,
+                    #[serde(default)]
+                    device_id: Option<String>,
+                }
+                let p: P = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                if let Some(device_id) = p.device_id.as_deref() {
+                    let devices = self
+                        .workspace
+                        .read_devices()
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                    if !devices.iter().any(|device| device.id == device_id) {
+                        return Err(RpcError::Failed(
+                            "runner device is not registered in this profile".into(),
+                        ));
+                    }
+                }
+                let mut seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                seat.runner_device_id = p.device_id;
+                cloud.save_seat(seat.clone()).map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true, "seat": seat }))
+            }
+            methods::RUNNER_INFO => {
+                let credentials = self.runner_credentials()?;
+                RpcReply::value(&serde_json::json!({
+                    "deviceId": self.engine_info.device_id,
+                    "sealPublicKey": credentials.public_key_base64(),
+                    "credentials": credentials.metadata(),
+                    "runnerLogins": credentials.runner_logins(),
+                }))
+            }
+            methods::RUNNER_SEAL_CREDENTIAL => {
+                #[derive(Deserialize)]
+                struct P {
+                    sealed: crate::runner_credentials::SealedRunnerCredential,
+                }
+                let p: P = parse_params(params)?;
+                self.runner_credentials()?
+                    .store(p.sealed)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::RUNNER_REVOKE_CREDENTIAL => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    #[serde(default)]
+                    provider: Option<zeron_proto::ByokProvider>,
+                    #[serde(default)]
+                    kind: Option<crate::runner_credentials::RunnerCredentialKind>,
+                }
+                let p: P = parse_params(params)?;
+                self.runner_credentials()?
+                    .revoke(p.provider, p.kind)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::RUNNER_SET_LOGIN => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    harness: HarnessId,
+                    enabled: bool,
+                }
+                let p: P = parse_params(params)?;
+                self.runner_credentials()?
+                    .set_login(p.harness, p.enabled)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLOUD_SEAL_FOR_RUNNER => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    seat_id: String,
+                    provider: String,
+                    #[serde(default)]
+                    key: Option<String>,
+                    #[serde(default)]
+                    use_saved_key: bool,
+                    #[serde(default)]
+                    base_url: Option<String>,
+                    #[serde(default)]
+                    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+                }
+                let p: P = parse_params(params)?;
+                let cloud = self.cloud()?.clone();
+                let seat = cloud
+                    .seat(&p.seat_id)
+                    .ok_or_else(|| RpcError::Failed(format!("no such seat: {}", p.seat_id)))?;
+                let target = seat
+                    .runner_device_id
+                    .ok_or_else(|| RpcError::Failed("this seat has no registered runner".into()))?;
+                let github = p.provider.eq_ignore_ascii_case("github");
+                let provider = if github {
+                    None
+                } else {
+                    zeron_proto::ByokProvider::from_id(&p.provider).or_else(|| {
+                        serde_json::from_value(serde_json::Value::String(p.provider.clone())).ok()
+                    })
+                };
+                if !github && provider.is_none() {
+                    return Err(RpcError::Failed("unknown credential provider".into()));
+                }
+                let kind = if github {
+                    crate::runner_credentials::RunnerCredentialKind::Github
+                } else {
+                    crate::runner_credentials::RunnerCredentialKind::ApiKey
+                };
+                let key = if p.use_saved_key {
+                    if github {
+                        cloud.github_pat(crate::cloud::CloudStore::SHARED_GITHUB_KEY)
+                    } else {
+                        cloud.provider_key(provider.unwrap())
+                    }
+                } else {
+                    p.key.filter(|key| !key.trim().is_empty())
+                }
+                .ok_or_else(|| RpcError::Failed("no saved or supplied key is available".into()))?;
+                let base_url = if github {
+                    if p.base_url.is_some() {
+                        return Err(RpcError::Failed(
+                            "GitHub credentials do not accept a base URL".into(),
+                        ));
+                    }
+                    None
+                } else {
+                    let configured = provider
+                        .and_then(|provider| cloud.provider(provider))
+                        .and_then(|config| config.base_url);
+                    if let Some(raw) = p.base_url.or(configured) {
+                        use crate::agent_accounts::stores::{HostPolicy, trusted_base};
+                        let trusted =
+                            trusted_base(&raw, HostPolicy::AnyDns, false).ok_or_else(|| {
+                                RpcError::Failed(
+                                    "base URL must be HTTPS on a DNS hostname without userinfo"
+                                        .into(),
+                                )
+                            })?;
+                        Some(trusted.to_string())
+                    } else {
+                        None
+                    }
+                };
+                let info_params = serde_json::json!({ "targetDeviceId": target });
+                let info_reply = if target == self.doc_host.device_id() {
+                    self.handle(methods::RUNNER_INFO, info_params).await?
+                } else {
+                    self.forward(&target, methods::RUNNER_INFO, info_params)
+                        .await?
+                };
+                let info = match info_reply {
+                    RpcReply::Value(value) => value,
+                    RpcReply::Stream(_) => {
+                        return Err(RpcError::Failed(
+                            "runner info returned an unexpected stream".into(),
+                        ));
+                    }
+                };
+                let public_key = info
+                    .get("sealPublicKey")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RpcError::Failed("runner did not provide a seal key".into()))?;
+                let public_key = base64::engine::general_purpose::STANDARD
+                    .decode(public_key)
+                    .map_err(|_| RpcError::Failed("runner seal key is invalid".into()))?;
+                let public_key: [u8; 32] = public_key
+                    .try_into()
+                    .map_err(|_| RpcError::Failed("runner seal key is invalid".into()))?;
+                let plaintext = crate::runner_credentials::RunnerCredentialPlaintext {
+                    kind,
+                    provider,
+                    key,
+                    base_url,
+                    expires_at: p.expires_at,
+                };
+                let sealed = crate::runner_credentials::seal_for_runner(&public_key, &plaintext)
+                    .map_err(RpcError::Failed)?;
+                let seal_params = serde_json::json!({
+                    "targetDeviceId": target,
+                    "sealed": sealed,
+                });
+                if target == self.doc_host.device_id() {
+                    self.handle(methods::RUNNER_SEAL_CREDENTIAL, seal_params)
+                        .await
+                } else {
+                    self.forward(&target, methods::RUNNER_SEAL_CREDENTIAL, seal_params)
+                        .await
+                }
             }
             methods::CLOUD_BACKUP_CHAT => {
                 #[derive(Deserialize)]
@@ -4432,14 +5098,27 @@ impl RpcService for EngineRpc {
             methods::CLOUD_SEAT_CONTROL => {
                 let p: CloudSeatControlParams = parse_params(params)?;
                 let cloud = self.cloud()?.clone();
+                let runner_bound = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|chat| chat.cloud_seat)
+                    .is_some_and(|binding| binding.runner_device_id.is_some());
                 match p.op.as_str() {
                     // Interrupt the live run — the seat survives; the harness
                     // process stops.
                     "stop" | "interrupt" => {
-                        self.sessions
-                            .interrupt(&p.chat_id)
-                            .await
-                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        if runner_bound {
+                            self.doc_host
+                                .queue_command(&p.chat_id, SessionCommandPayload::Interrupt {})
+                                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        } else {
+                            self.sessions
+                                .interrupt(&p.chat_id)
+                                .await
+                                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                        }
                     }
                     // Approve: a NeedsApproval gate clears by continuing the
                     // run — queue an affirmative steer the harness consumes
@@ -4460,6 +5139,12 @@ impl RpcService for EngineRpc {
                     // Pause/resume ride SIGSTOP/SIGCONT on the seat's harness
                     // process — honest no-op when the seat can't exec.
                     "pause" | "resume" => {
+                        if runner_bound {
+                            return Err(RpcError::Failed(
+                                "runner-hosted chats must be controlled through their command queue"
+                                    .into(),
+                            ));
+                        }
                         let signal = if p.op == "pause" { "-STOP" } else { "-CONT" };
                         let run = cloud
                             .run_for_chat(&p.chat_id)
@@ -4876,6 +5561,788 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeron_rpc::RpcService;
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn dirty_git_checkout(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let repo = root.join("repo");
+        let remote = root.join("remote.git");
+        std::fs::create_dir_all(&repo).unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        git(&repo, &["init"]);
+        git(&repo, &["config", "user.name", "Cloud Test"]);
+        git(&repo, &["config", "user.email", "cloud@example.com"]);
+        std::fs::write(repo.join("work.txt"), "initial").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["remote", "add", "origin"])
+            .arg(&remote)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        std::fs::write(repo.join("work.txt"), "changed").unwrap();
+        (repo, remote)
+    }
+
+    #[tokio::test]
+    async fn rebind_refuses_synced_chats_with_running_session_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::development(dir.path(), "org", "user");
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            std::sync::Arc::new(crate::default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        core.workspace
+            .create_chat("running-chat", None, Some(&core.device_id), None, None)
+            .unwrap();
+        core.workspace.record_session(&zeron_proto::Session {
+            last_completed_turn: None,
+            chat_id: "running-chat".into(),
+            device_id: core.device_id.clone(),
+            status: zeron_proto::SessionStatus::Working,
+            started_at: Some(chrono::Utc::now()),
+            updated_at: chrono::Utc::now(),
+        });
+
+        let error = core
+            .rpc_service()
+            .handle(
+                methods::CLOUD_SEND_CHAT,
+                serde_json::json!({ "chatId": "running-chat", "seatId": "seat" }),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected running-chat refusal"));
+        assert!(matches!(
+            error,
+            RpcError::Failed(message) if message == "stop the running turn before moving this chat"
+        ));
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn send_chat_refuses_dirty_working_tree_then_pushes_and_rebinds_same_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::development(dir.path(), "org", "user");
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            std::sync::Arc::new(crate::default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let (repo, remote) = dirty_git_checkout(checkout.path());
+        let cwd = repo.to_string_lossy().to_string();
+        core.workspace
+            .create_chat(
+                "send-chat",
+                None,
+                Some(&core.device_id),
+                None,
+                Some(cwd.clone()),
+            )
+            .unwrap();
+        core.workspace
+            .set_chat_harness_session("send-chat", "native-session", &cwd);
+        core.cloud
+            .as_ref()
+            .unwrap()
+            .save_seat(crate::cloud::SeatConfig {
+                id: "runner-seat".into(),
+                kind: Some(zeron_proto::CloudSeatKind::Ssh),
+                label: "Runner".into(),
+                workspace_path: Some("/runner/workspaces".into()),
+                runner_device_id: Some(core.device_id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let rpc = core.rpc_service();
+        let error = rpc
+            .handle(
+                methods::CLOUD_SEND_CHAT,
+                serde_json::json!({ "chatId": "send-chat", "seatId": "runner-seat" }),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected dirty checkout refusal"));
+        assert!(matches!(
+            error,
+            RpcError::Failed(message)
+                if message == "uncommitted changes here — push them to a WIP branch first"
+        ));
+
+        let reply = rpc
+            .handle(
+                methods::CLOUD_SEND_CHAT,
+                serde_json::json!({
+                    "chatId": "send-chat",
+                    "seatId": "runner-seat",
+                    "pushWip": true
+                }),
+            )
+            .await
+            .unwrap();
+        let RpcReply::Value(reply) = reply else {
+            panic!("expected unary CloudSendChat response");
+        };
+        let branch = reply["wipBranch"].as_str().unwrap();
+        assert!(branch.starts_with("cosmos/wip/send-cha-"));
+        let chat = core.workspace.chat("send-chat").unwrap().unwrap();
+        assert_eq!(chat.id, "send-chat");
+        assert_eq!(chat.device_id, core.device_id);
+        assert_eq!(chat.cloud_seat.as_ref().unwrap().seat_id, "runner-seat");
+        assert_eq!(
+            chat.cwd.as_deref(),
+            chat.cloud_seat.as_ref().unwrap().workspace_path.as_deref()
+        );
+        assert_eq!(
+            chat.cloud_seat.as_ref().unwrap().branch.as_deref(),
+            Some(branch)
+        );
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "WIP from Cosmos"
+        );
+        assert_eq!(
+            core.workspace.chat_harness_session("send-chat"),
+            Some((String::new(), Some(String::new())))
+        );
+        let output = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(remote)
+            .args(["branch", "--list", branch])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), branch);
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn return_chat_blocks_dirty_runner_workspace_without_rebinding() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::development(dir.path(), "org", "user");
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            std::sync::Arc::new(crate::default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let (repo, _) = dirty_git_checkout(checkout.path());
+        let cwd = repo.to_string_lossy().to_string();
+        core.workspace
+            .create_chat(
+                "return-chat",
+                None,
+                Some(&core.device_id),
+                None,
+                Some(cwd.clone()),
+            )
+            .unwrap();
+        let binding = zeron_proto::CloudSeatBinding {
+            seat_id: "runner-seat".into(),
+            kind: zeron_proto::CloudSeatKind::Ssh,
+            label: "Runner".into(),
+            repo: None,
+            workspace_path: Some(cwd.clone()),
+            runner_device_id: Some(core.device_id.clone()),
+            branch: None,
+            model_label: None,
+            expires_at: None,
+        };
+        core.workspace
+            .rebind_chat_host("return-chat", &core.device_id, Some(&cwd), Some(&binding))
+            .unwrap();
+        let error = core
+            .rpc_service()
+            .handle(
+                methods::CLOUD_RETURN_CHAT,
+                serde_json::json!({ "chatId": "return-chat" }),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected runner dirty-worktree refusal"));
+        assert!(matches!(
+            error,
+            RpcError::Failed(message)
+                if message == "uncommitted changes on the runner — push them to a WIP branch first"
+        ));
+        let chat = core.workspace.chat("return-chat").unwrap().unwrap();
+        assert_eq!(chat.device_id, core.device_id);
+        assert_eq!(chat.cloud_seat.as_ref(), Some(&binding));
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn return_chat_clears_runner_path_when_no_local_cwd_is_supplied() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::development(dir.path(), "org", "user");
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            std::sync::Arc::new(crate::default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let runner_path = "/runner/workspaces/return-chat";
+        core.workspace
+            .create_chat(
+                "return-chat",
+                None,
+                Some(&core.device_id),
+                None,
+                Some(runner_path.into()),
+            )
+            .unwrap();
+        core.workspace
+            .set_chat_harness_session("return-chat", "native-session", runner_path);
+        let binding = zeron_proto::CloudSeatBinding {
+            seat_id: "runner-seat".into(),
+            kind: zeron_proto::CloudSeatKind::Ssh,
+            label: "Runner".into(),
+            repo: None,
+            workspace_path: Some(runner_path.into()),
+            runner_device_id: Some(core.device_id.clone()),
+            branch: None,
+            model_label: None,
+            expires_at: None,
+        };
+        core.workspace
+            .rebind_chat_host(
+                "return-chat",
+                &core.device_id,
+                Some(runner_path),
+                Some(&binding),
+            )
+            .unwrap();
+
+        core.rpc_service()
+            .handle(
+                methods::CLOUD_RETURN_CHAT,
+                serde_json::json!({ "chatId": "return-chat" }),
+            )
+            .await
+            .unwrap();
+
+        let chat = core.workspace.chat("return-chat").unwrap().unwrap();
+        assert_eq!(chat.id, "return-chat");
+        assert_eq!(chat.device_id, core.device_id);
+        assert!(chat.cwd.is_none());
+        assert!(chat.cloud_seat.is_none());
+        assert_eq!(
+            core.workspace.chat_harness_session("return-chat"),
+            Some((String::new(), Some(String::new())))
+        );
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn local_profile_rejects_cloud_chat_creation_and_cloud_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::local(dir.path()).unwrap();
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            std::sync::Arc::new(crate::default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        assert!(core.cloud.is_none());
+        assert!(core.runner_credentials.is_none());
+        core.uploads
+            .append("local-upload", "cGhvdG8=", Some(0))
+            .unwrap();
+        let attachment_path = core.uploads.commit("local-upload", "photo.png").unwrap();
+        assert!(!core.doc_host.upload_attachment_blob(
+            "local-cloud-chat",
+            &attachment_path,
+            &core.uploads
+        ));
+        let rpc = core.rpc_service();
+        let error = rpc
+            .handle(
+                methods::MUTATE,
+                serde_json::json!({
+                    "op": "createChat",
+                    "chatId": "local-cloud-chat",
+                    "deviceId": core.device_id,
+                    "cloudSeat": {
+                        "seatId": "seat",
+                        "kind": "ssh",
+                        "label": "Seat"
+                    }
+                }),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected local cloud-seat rejection"));
+        assert!(matches!(
+            error,
+            RpcError::Failed(message)
+                if message == "Cloud chats need you signed in — local chats stay on this computer"
+        ));
+        assert!(core.workspace.chat("local-cloud-chat").unwrap().is_none());
+
+        let error = rpc
+            .handle(methods::CLOUD_GET_CONFIG, serde_json::json!({}))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected local cloud-access rejection"));
+        assert!(matches!(
+            error,
+            RpcError::Failed(message) if message == "Cloud needs you signed in"
+        ));
+        let error = rpc
+            .handle(
+                methods::CLOUD_MOVE_CHAT,
+                serde_json::json!({"chatId": "local-chat", "seatId": "seat"}),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected local cloud-move rejection"));
+        assert!(matches!(
+            error,
+            RpcError::Failed(message)
+                if message == "Cloud chats need you signed in — local chats stay on this computer"
+        ));
+        for (method, params) in [
+            (
+                methods::CLOUD_RETURN_CHAT,
+                serde_json::json!({ "chatId": "local-chat" }),
+            ),
+            (
+                methods::CLOUD_SEND_CHAT,
+                serde_json::json!({ "chatId": "local-chat", "seatId": "seat" }),
+            ),
+        ] {
+            let error = rpc
+                .handle(method, params)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("expected local rebind rejection"));
+            assert!(matches!(
+                error,
+                RpcError::Failed(message)
+                    if message == "Cloud chats need you signed in — local chats stay on this computer"
+            ));
+        }
+        for method in [methods::LIST_LOCAL_CHATS, methods::COPY_LOCAL_CHAT_TO_CLOUD] {
+            let error = rpc
+                .handle(
+                    method,
+                    serde_json::json!({"localChatId": "local-chat", "seatId": "seat"}),
+                )
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("expected local-copy rejection"));
+            assert!(matches!(
+                error,
+                RpcError::Failed(message) if message == "Cloud needs you signed in"
+            ));
+        }
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn move_chat_rejects_a_chat_without_a_cloud_seat() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::development(dir.path(), "org", "user");
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            std::sync::Arc::new(crate::default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        core.workspace
+            .create_chat("local-chat", None, Some(&core.device_id), None, None)
+            .unwrap();
+        let error = core
+            .rpc_service()
+            .handle(
+                methods::CLOUD_MOVE_CHAT,
+                serde_json::json!({"chatId": "local-chat", "seatId": "seat"}),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected seatless-chat rejection"));
+        assert!(matches!(
+            error,
+            RpcError::Failed(message)
+                if message == "this chat isn't a Cloud chat — use Copy to Cloud"
+        ));
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn runner_seat_assignment_is_profile_checked_and_create_chat_uses_runner_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::development(dir.path(), "org", "user");
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            std::sync::Arc::new(crate::default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let cloud = core.cloud.as_ref().unwrap();
+        let seat = crate::cloud::SeatConfig {
+            id: "runner-seat".into(),
+            kind: Some(zeron_proto::CloudSeatKind::Ssh),
+            label: "Runner".into(),
+            workspace_path: Some("/srv/cosmos".into()),
+            ..Default::default()
+        };
+        cloud.save_seat(seat.clone()).unwrap();
+        let rpc = core.rpc_service();
+        let error = rpc
+            .handle(
+                methods::CLOUD_SET_SEAT_RUNNER,
+                serde_json::json!({
+                    "seatId": "runner-seat",
+                    "deviceId": "not-in-this-profile"
+                }),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected unknown runner rejection"));
+        assert!(matches!(
+            error,
+            RpcError::Failed(message) if message == "runner device is not registered in this profile"
+        ));
+
+        rpc.handle(
+            methods::CLOUD_SET_SEAT_RUNNER,
+            serde_json::json!({
+                "seatId": "runner-seat",
+                "deviceId": core.device_id
+            }),
+        )
+        .await
+        .unwrap();
+        let seat = cloud.seat("runner-seat").unwrap();
+        assert_eq!(
+            seat.runner_device_id.as_deref(),
+            Some(core.device_id.as_str())
+        );
+        let binding = EngineRpc::cloud_binding_for_seat(&seat, "runner-chat", None);
+        assert_eq!(rpc.cloud_host_device(&binding), core.device_id);
+
+        rpc.handle(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createChat",
+                "chatId": "runner-chat",
+                "spaceId": "ignored-space",
+                "deviceId": "viewport-device",
+                "cwd": "/viewport/path",
+                "cloudSeat": binding,
+            }),
+        )
+        .await
+        .unwrap();
+        let chat = core.workspace.chat("runner-chat").unwrap().unwrap();
+        assert_eq!(chat.device_id, core.device_id);
+        assert_eq!(chat.space_id, None);
+        assert_eq!(
+            chat.cwd.as_deref(),
+            Some(binding.workspace_path.as_deref().unwrap())
+        );
+        assert_eq!(chat.cloud_seat, Some(binding));
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn runner_stop_is_queued_for_the_registered_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::development(dir.path(), "org", "user");
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            std::sync::Arc::new(crate::default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let cloud = core.cloud.as_ref().unwrap();
+        let seat = crate::cloud::SeatConfig {
+            id: "runner-seat".into(),
+            kind: Some(zeron_proto::CloudSeatKind::Ssh),
+            label: "Runner".into(),
+            runner_device_id: Some("remote-runner".into()),
+            ..Default::default()
+        };
+        cloud.save_seat(seat.clone()).unwrap();
+        let binding = EngineRpc::cloud_binding_for_seat(&seat, "runner-chat", None);
+        core.workspace
+            .create_chat_with_parent(
+                "runner-chat",
+                None,
+                Some("remote-runner"),
+                None,
+                binding.workspace_path.clone(),
+                None,
+                Some(binding),
+            )
+            .unwrap();
+
+        core.rpc_service()
+            .handle(
+                methods::CLOUD_SEAT_CONTROL,
+                serde_json::json!({"chatId": "runner-chat", "op": "stop"}),
+            )
+            .await
+            .unwrap();
+
+        let handle = core.doc_host.open("runner-chat").unwrap();
+        let commands = handle.doc().read_commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0].payload,
+            zeron_doc::SessionCommandPayload::Interrupt {}
+        ));
+        assert_eq!(commands[0].status, zeron_doc::SessionCommandStatus::Pending);
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn runner_credential_rpcs_store_only_sealed_material_and_login_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::development(dir.path(), "org", "user");
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            std::sync::Arc::new(crate::default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let vault = core.runner_credentials.as_ref().unwrap();
+        core.cloud
+            .as_ref()
+            .unwrap()
+            .save_seat(crate::cloud::SeatConfig {
+                id: "seal-seat".into(),
+                label: "Runner".into(),
+                runner_device_id: Some(core.device_id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let rpc = core.rpc_service();
+        rpc.handle(
+            methods::CLOUD_SEAL_FOR_RUNNER,
+            serde_json::json!({
+                "seatId": "seal-seat",
+                "provider": "anthropic",
+                "key": "test-anthropic-secret",
+                "baseUrl": "https://gateway.example.test/v1"
+            }),
+        )
+        .await
+        .unwrap();
+        let invalid_url = rpc
+            .handle(
+                methods::CLOUD_SEAL_FOR_RUNNER,
+                serde_json::json!({
+                    "seatId": "seal-seat",
+                    "provider": "anthropic",
+                    "key": "must-not-be-stored",
+                    "baseUrl": "http://gateway.example.test"
+                }),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected invalid base URL rejection"));
+        assert!(matches!(
+            invalid_url,
+            RpcError::Failed(message) if message.contains("base URL must be HTTPS")
+        ));
+        rpc.handle(
+            methods::RUNNER_SET_LOGIN,
+            serde_json::json!({ "harness": "codex", "enabled": true }),
+        )
+        .await
+        .unwrap();
+
+        let RpcReply::Value(info) = rpc
+            .handle(methods::RUNNER_INFO, serde_json::json!({}))
+            .await
+            .unwrap()
+        else {
+            panic!("runner info should be unary");
+        };
+        assert_eq!(
+            info["credentials"][0]["provider"],
+            serde_json::json!("anthropic")
+        );
+        assert!(info["credentials"][0].get("sealed").is_none());
+        assert!(info["credentials"][0].get("key").is_none());
+        assert_eq!(info["runnerLogins"], serde_json::json!(["codex"]));
+        let saved = vault.credentials();
+        let decoded = vault.unseal(&saved[0]).unwrap();
+        assert_eq!(decoded.key, "test-anthropic-secret");
+        assert_eq!(
+            decoded.base_url.as_deref(),
+            Some("https://gateway.example.test/v1")
+        );
+
+        rpc.handle(
+            methods::RUNNER_REVOKE_CREDENTIAL,
+            serde_json::json!({ "provider": "anthropic" }),
+        )
+        .await
+        .unwrap();
+        assert!(vault.credentials().is_empty());
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cloud_run_and_backup_metadata_write_through_and_registry_run_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::profile::EngineProfile::development(dir.path(), "org", "user");
+        let store_root = profile.store_root().to_path_buf();
+        let core = crate::EngineCore::assemble_with_profile(
+            profile,
+            std::sync::Arc::new(crate::default_registry()),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        core.workspace
+            .create_chat("metadata-chat", None, Some(&core.device_id), None, None)
+            .unwrap();
+        core.workspace
+            .create_chat(
+                "registry-only-chat",
+                None,
+                Some(&core.device_id),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        let cloud = core.cloud.as_ref().unwrap();
+        cloud.upsert_run(zeron_proto::CloudRun {
+            id: "run-write-through".into(),
+            chat_id: "metadata-chat".into(),
+            seat_id: "seat".into(),
+            command: Some("claude --api-key private".into()),
+            status: zeron_proto::CloudRunStatus::Working,
+            log_path: Some("/home/seat/run.log".into()),
+            remote_ref: Some("123".into()),
+            mirrored_bytes: 0,
+            remote_cursor: None,
+            entry_id: None,
+            error: None,
+            workspace: Some("/workspace/metadata-chat".into()),
+            harness: None,
+            model: None,
+            harness_session: None,
+            prompt: Some("private prompt".into()),
+            started_at: now,
+            finished_at: None,
+            updated_at: now,
+        });
+        let row = core.workspace.chat("metadata-chat").unwrap().unwrap();
+        let stored_run = row.cloud_run.unwrap();
+        assert_eq!(stored_run.id, "run-write-through");
+        assert_eq!(stored_run.command, None);
+        assert_eq!(stored_run.prompt, None);
+
+        cloud.record_backup(zeron_proto::WorkspaceBackup {
+            chat_id: "metadata-chat".into(),
+            seat_id: "seat".into(),
+            workspace: "/workspace/metadata-chat".into(),
+            path: store_root
+                .join("seat-backups/metadata-chat.tar.gz")
+                .to_string_lossy()
+                .into_owned(),
+            bytes: 128,
+            taken_at: now,
+            restored_to: None,
+        });
+        let row = core.workspace.chat("metadata-chat").unwrap().unwrap();
+        let pointer = row.cloud_backup.unwrap();
+        assert_eq!(pointer.seat_id, "seat");
+        assert_eq!(pointer.device_id, core.device_id);
+        assert_eq!(pointer.path, "seat-backups/metadata-chat.tar.gz");
+        assert_eq!(pointer.bytes, Some(128));
+
+        let registry_only = zeron_proto::CloudRun {
+            id: "run-registry-only".into(),
+            chat_id: "registry-only-chat".into(),
+            seat_id: "missing-seat".into(),
+            command: None,
+            status: zeron_proto::CloudRunStatus::Queued,
+            log_path: None,
+            remote_ref: None,
+            mirrored_bytes: 12,
+            remote_cursor: Some("7".into()),
+            entry_id: None,
+            error: None,
+            workspace: Some("/workspace/registry-only-chat".into()),
+            harness: None,
+            model: None,
+            harness_session: None,
+            prompt: None,
+            started_at: now,
+            finished_at: None,
+            updated_at: now,
+        };
+        core.workspace
+            .set_chat_cloud_run("registry-only-chat", &registry_only)
+            .unwrap();
+        assert!(!cloud.runs().iter().any(|run| run.id == "run-registry-only"));
+        core.sessions.resume_cloud_runs();
+        for _ in 0..100 {
+            if cloud.runs().iter().any(|run| run.id == "run-registry-only") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let recovered = cloud
+            .runs()
+            .into_iter()
+            .find(|run| run.id == "run-registry-only")
+            .expect("registry-only run is reinserted into the local ledger");
+        assert_eq!(recovered.mirrored_bytes, 12);
+        assert_eq!(recovered.remote_cursor.as_deref(), Some("7"));
+        core.shutdown().await;
+    }
 
     // Each subprocess has private HOME/PATH/overrides, avoiding process-global test races.
     #[cfg(unix)]
@@ -5305,6 +6772,11 @@ mod tests {
         assert!(forwardable(methods::WRITE_WORKSPACE_FILE));
         assert!(forwardable(methods::WATCH_WORKSPACE_FILES));
         assert!(forwardable(methods::WATCH_WORKSPACE_GIT_STATUS));
+        assert!(forwardable(methods::RUNNER_INFO));
+        assert!(forwardable(methods::RUNNER_SEAL_CREDENTIAL));
+        assert!(forwardable(methods::RUNNER_REVOKE_CREDENTIAL));
+        assert!(forwardable(methods::RUNNER_SET_LOGIN));
+        assert!(!forwardable(methods::CLOUD_SEAL_FOR_RUNNER));
         assert!(!is_stream_method(methods::LIST_WORKSPACE_DIRECTORY));
         assert!(!is_stream_method(methods::SEARCH_WORKSPACE_FILES));
         assert!(!is_stream_method(methods::READ_WORKSPACE_FILE));

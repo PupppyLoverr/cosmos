@@ -14,6 +14,7 @@ async fn live_run(cancel: bool) {
     let (steer, steering) = mpsc::channel(8);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        environment: Default::default(),
         steering,
         interrupt: interrupt.clone(),
         request_input: Box::new(|_| {

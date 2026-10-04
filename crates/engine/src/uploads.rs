@@ -7,14 +7,15 @@
 //! in-memory buffers), and `commit` assembles them into
 //! `{uploads_root}/{id8}-{name}` and returns the absolute path, which the
 //! composer appends to the prompt so the agent can read the file from disk.
-//! Attachments live only on the host device — every read proxies through the
-//! owning device via `ReadAttachmentChunk`; nothing is mirrored to the edge.
+//! Attachments live on the host device and are mirrored to the existing edge
+//! blob store for recovery; reads still proxy through the owner first.
 //!
 //! `read_chunk` serves transcript images back in 45KB base64 chunks. Path jail:
 //! only files under the uploads dir or a workspace-known chat cwd are readable
 //! (the RPC layer supplies the cwd roots) — and only supported image types, as
 //! in zeron.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::EngineError;
 
@@ -78,7 +80,7 @@ pub fn pending_refs_in(text: &str) -> Vec<String> {
         .collect()
 }
 /// Hard cap on an assembled file.
-const MAX_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Multiple of 3 so independent base64 chunks concatenate losslessly.
 const READ_CHUNK_BYTES: u64 = 45_000;
 
@@ -216,6 +218,42 @@ impl Uploads {
         std::fs::write(&path, &bytes)?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(path.to_string_lossy().to_string())
+    }
+
+    pub fn attachment_blob_part_id(&self, path: &str) -> Option<String> {
+        let path = Path::new(path);
+        let name = path.file_name()?.to_str()?;
+        let parent = path.parent()?;
+        std::fs::create_dir_all(&self.inner.dir).ok()?;
+        let root = self.inner.dir.canonicalize().ok()?;
+        if parent.canonicalize().ok()? != root {
+            return None;
+        }
+        attachment_blob_part_id(name)
+    }
+
+    pub fn restore_attachment_blob(&self, path: &str, bytes: &[u8]) -> Result<(), EngineError> {
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(EngineError::Other("Attachment is too large".into()));
+        }
+        self.attachment_blob_part_id(path)
+            .ok_or_else(|| EngineError::Other("Invalid attachment blob path".into()))?;
+        let path = Path::new(path);
+        let root = self.inner.dir.canonicalize()?;
+        let destination = root.join(
+            path.file_name()
+                .ok_or_else(|| EngineError::Other("Invalid attachment blob path".into()))?,
+        );
+        if destination.is_file() {
+            return Ok(());
+        }
+        let mut temporary = tempfile::NamedTempFile::new_in(&root)?;
+        temporary.write_all(bytes)?;
+        temporary.flush()?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| EngineError::Io(error.error))?;
+        Ok(())
     }
 
     /// The committed absolute path a pending ref resolves to on THIS device
@@ -433,6 +471,28 @@ fn sanitize(file_name: &str) -> String {
     }
 }
 
+fn attachment_blob_part_id(file_name: &str) -> Option<String> {
+    let id8 = file_name.get(..8)?;
+    let bytes = file_name.as_bytes();
+    if bytes.get(8) != Some(&b'-')
+        || !id8
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    let candidate = format!("att~{file_name}");
+    if candidate.len() <= 200
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:#~-".contains(&byte))
+    {
+        return Some(candidate);
+    }
+    let digest = format!("{:x}", Sha256::digest(file_name.as_bytes()));
+    Some(format!("att~{id8}-{}", &digest[..16]))
+}
+
 fn mime_by_ext(path: &Path) -> Option<&'static str> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "png" => Some("image/png"),
@@ -457,6 +517,44 @@ mod tests {
         assert_eq!(sanitize("../../etc/passwd"), "passwd");
         assert_eq!(sanitize("my photo (1).png"), "my_photo__1_.png");
         assert_eq!(sanitize(""), "upload");
+    }
+
+    #[test]
+    fn attachment_blob_names_are_valid_and_long_names_hash() {
+        assert_eq!(
+            attachment_blob_part_id("12345678-photo.png").as_deref(),
+            Some("att~12345678-photo.png")
+        );
+        let long_name = format!("12345678-{}.png", "a".repeat(220));
+        let part_id = attachment_blob_part_id(&long_name).unwrap();
+        assert!(part_id.starts_with("att~12345678-"));
+        assert_eq!(part_id.len(), "att~12345678-".len() + 16);
+        assert!(attachment_blob_part_id("bad/name.png").is_none());
+    }
+
+    #[test]
+    fn restores_attachment_blobs_only_under_the_uploads_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::from_root(&dir.path().join("uploads"));
+        std::fs::create_dir_all(uploads.dir()).unwrap();
+        let path = uploads.dir().join("12345678-photo.png");
+        uploads
+            .restore_attachment_blob(path.to_str().unwrap(), b"image bytes")
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"image bytes");
+
+        let outside = dir.path().join("outside.png");
+        assert!(
+            uploads
+                .restore_attachment_blob(outside.to_str().unwrap(), b"image bytes")
+                .is_err()
+        );
+        let oversized = vec![0; MAX_BYTES as usize + 1];
+        assert!(
+            uploads
+                .restore_attachment_blob(path.to_str().unwrap(), &oversized)
+                .is_err()
+        );
     }
 
     #[test]

@@ -873,7 +873,7 @@ mod tests {
             home.join(".agents/skills/private"),
         ] {
             std::fs::create_dir_all(&denied).unwrap();
-            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o0)).unwrap();
             let result = discover_at(HarnessId::Cursor, &repo, &home);
             std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
             let skills = result.unwrap();
@@ -910,7 +910,7 @@ mod tests {
         symlink("SKILL.md", cycle.join("SKILL.md")).unwrap();
 
         let denied = write(&repo, ".agents/skills/denied/SKILL.md", "Private");
-        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o0)).unwrap();
         // Root can read mode-000 files; missing and cyclic links still exercise
         // per-file I/O failures on privileged test runners.
         let denied_is_readable = std::fs::File::open(&denied).is_ok();

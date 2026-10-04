@@ -685,6 +685,7 @@ impl Composer {
             .selected_chat_row()
             .map(|chat| chat.device_id.clone())
             .unwrap_or_default();
+        let chat_id = state.selected_chat.clone();
         let engine = state.engine().cloned();
         let target =
             (state.local_device_id.as_deref() != Some(device.as_str())).then(|| device.clone());
@@ -716,6 +717,7 @@ impl Composer {
             let engine = engine.clone();
             let target = target.clone();
             let task_key = key.clone();
+            let chat_id = chat_id.clone();
             let task = cx.spawn(async move |this, cx| {
                 let _permit = preview_load_gate().lock().await;
                 let source = match attachments::attachment_snapshot(&task_key.0, &task_key.1) {
@@ -730,6 +732,7 @@ impl Composer {
                             &engine,
                             cx.background_executor(),
                             target.as_deref(),
+                            chat_id.as_deref(),
                             &task_key.1,
                             None,
                         )
@@ -793,6 +796,7 @@ impl Composer {
                 &engine,
                 cx.background_executor(),
                 target.as_deref(),
+                chat.as_deref(),
                 &path,
                 None,
             )
@@ -1318,7 +1322,7 @@ impl Composer {
                 let mut load_failed = paths.is_none();
                 for path in paths.unwrap_or_default() {
                     let loaded = crate::attachments::read_attachment_image(
-                        &engine, cx.background_executor(), Some(&host_device_id), &path,
+                        &engine, cx.background_executor(), Some(&host_device_id), Some(&chat_id), &path,
                         None,
                     ).await;
                     match loaded {
@@ -1548,6 +1552,7 @@ impl Composer {
                     for attachment in &staged {
                         let path = crate::attachments::upload_attachment(
                             &engine, cx.background_executor(), Some(&host_device_id),
+                            &chat_id,
                             &uuid::Uuid::new_v4().to_string(), attachment, None,
                         ).await.map_err(|err| err.to_string())?;
                         paths.push(path);

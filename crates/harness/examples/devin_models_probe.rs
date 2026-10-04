@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let (_steering, steering) = tokio::sync::mpsc::channel(8);
     let controls = RunControls {
+        environment: Default::default(),
         request_input: Box::new(|_| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let _ = tx.send(Vec::new());

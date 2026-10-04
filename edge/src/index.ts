@@ -46,6 +46,7 @@ import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
 import { ChatRoom } from "./chat-room";
 import installSh from "./install.sh";
+import { isBlobTooLarge } from "./blob-limits";
 
 export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom, PreviewRoom };
 
@@ -62,7 +63,6 @@ const safeDecode = (segment: string): string | undefined => {
 /** Tool part ids are harness-minted (`tool-1`, `call_x`, `m1#c1`-style) —
  * wider than ID_RE but still no slashes, so a part id can't traverse keys. */
 const PART_RE = /^[A-Za-z0-9._:#~-]{1,200}$/;
-const MAX_TOOL_BLOB_BYTES = 1024 * 1024;
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {
@@ -397,9 +397,8 @@ export default {
       const key = `blob/${auth.userId}/${parts[1]}/${partId}`;
       if (request.method === "PUT") {
         const body = await request.arrayBuffer();
-        // Outputs are 4KiB-capped at the harness boundary; diffs can run
-        // larger but a sidecar entry is one tool result, never a dump.
-        if (body.byteLength > MAX_TOOL_BLOB_BYTES) return json({ error: "too_large" }, 413);
+        // Attachments share this bucket/key shape but need room for image files.
+        if (isBlobTooLarge(partId, body.byteLength)) return json({ error: "too_large" }, 413);
         await env.BLOBS.put(key, body, {
           httpMetadata: {
             contentType: request.headers.get("content-type") ?? "text/plain; charset=utf-8"

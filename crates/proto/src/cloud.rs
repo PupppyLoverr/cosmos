@@ -72,6 +72,10 @@ pub struct CloudSeatBinding {
     /// the seat's configured default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
+    /// Device running the headless Cosmos runner for this seat. None keeps
+    /// the legacy laptop-driven seat behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_device_id: Option<String>,
     /// The repo branch the chat's checkout starts on (the composer's branch
     /// pick). None = the repo's default branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -296,6 +300,10 @@ pub struct CloudRun {
     /// Seat working directory this run executed in (the chat's workspace).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<crate::HarnessId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// The harness-native conversation this run continued or started
     /// (`claude --session-id`), so the next turn resumes it instead of
     /// starting cold. Stamped only once a turn completes with output.
@@ -390,6 +398,19 @@ pub struct WorkspaceBackup {
     pub restored_to: Option<String>,
 }
 
+/// Pointer to a workspace snapshot held in one device's profile store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudBackupPointer {
+    pub seat_id: String,
+    pub device_id: String,
+    /// Relative to the device's profile store root.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Seat health as the last probe reported it — drives the bot bar's dot and
 /// the settings "Health" block.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,4 +472,26 @@ pub struct SeatCapabilities {
     /// A harness run can outlive this app (detached exec / workflow).
     #[serde(default)]
     pub keeps_running: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CloudRun, CloudRunStatus};
+
+    #[test]
+    fn cloud_run_defaults_harness_and_model_for_older_rows() {
+        let run: CloudRun = serde_json::from_value(serde_json::json!({
+            "id": "run-1",
+            "chatId": "chat-1",
+            "seatId": "seat-1",
+            "status": "working",
+            "startedAt": "2025-01-01T00:00:00Z",
+            "updatedAt": "2025-01-01T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert!(run.harness.is_none());
+        assert!(run.model.is_none());
+        assert_eq!(run.status, CloudRunStatus::Working);
+    }
 }

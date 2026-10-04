@@ -483,6 +483,7 @@ impl Harness for CursorHarness {
         crate::browser_bridge_env(&mut cmd, &request);
         crate::computer_env(&mut cmd, &request);
         crate::tools_env(&mut cmd, &request);
+        controls.environment.apply_to(&mut cmd);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -775,6 +776,7 @@ async fn run_session(session: Session) {
         request_input: _request_input,
         mut steering,
         interrupt,
+        environment: _,
     } = controls;
 
     let mut assistant_message_id = new_message_id();

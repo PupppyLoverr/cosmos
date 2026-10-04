@@ -382,6 +382,12 @@ impl SessionDoc {
         }
     }
 
+    pub fn set_chat_id(&self, chat_id: &str) -> Result<(), DocError> {
+        self.doc.get_map("meta").insert("chatId", chat_id)?;
+        self.doc.commit();
+        Ok(())
+    }
+
     /// Insert a complete message entry (user/system messages, command-side inserts).
     /// Streaming assistant entries go through [`SegmentWriter`].
     pub fn push_message(&self, entry: &SessionMessageEntry) -> Result<(), DocError> {
@@ -1523,6 +1529,18 @@ mod tests {
             }]
         );
         assert_eq!(doc.chat_id().as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn chat_id_can_be_rewritten_without_changing_entries() {
+        let doc = SessionDoc::init("source").unwrap();
+        doc.push_message(&user_entry("m1", "hello")).unwrap();
+        let entries = doc.read_entries().unwrap();
+
+        doc.set_chat_id("copy").unwrap();
+
+        assert_eq!(doc.chat_id().as_deref(), Some("copy"));
+        assert_eq!(doc.read_entries().unwrap(), entries);
     }
 
     #[test]

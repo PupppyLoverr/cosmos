@@ -921,8 +921,54 @@ impl WorkspaceHost {
         chat_id: &str,
         cloud_seat: &zeron_proto::CloudSeatBinding,
     ) -> Result<(), EngineError> {
+        let chat = self
+            .read(|doc| doc.chat(chat_id))?
+            .ok_or_else(|| EngineError::Other(format!("no such chat: {chat_id}")))?;
+        if chat.cloud_seat.is_none() {
+            return Err(EngineError::Other(
+                "this chat isn't a Cloud chat — use Copy to Cloud".into(),
+            ));
+        }
         let moved = self.mutate(|doc| doc.set_chat_cloud_seat(chat_id, cloud_seat))?;
         if moved {
+            Ok(())
+        } else {
+            Err(EngineError::Other(format!("no such chat: {chat_id}")))
+        }
+    }
+
+    pub fn rebind_chat_host(
+        &self,
+        chat_id: &str,
+        device_id: &str,
+        cwd: Option<&str>,
+        cloud_seat: Option<&zeron_proto::CloudSeatBinding>,
+    ) -> Result<(), EngineError> {
+        if self.mutate(|doc| doc.set_chat_host(chat_id, device_id, cwd, cloud_seat))? {
+            Ok(())
+        } else {
+            Err(EngineError::Other(format!("no such chat: {chat_id}")))
+        }
+    }
+
+    pub fn set_chat_cloud_run(
+        &self,
+        chat_id: &str,
+        cloud_run: &zeron_proto::CloudRun,
+    ) -> Result<(), EngineError> {
+        if self.mutate(|doc| doc.set_chat_cloud_run(chat_id, cloud_run))? {
+            Ok(())
+        } else {
+            Err(EngineError::Other(format!("no such chat: {chat_id}")))
+        }
+    }
+
+    pub fn set_chat_cloud_backup(
+        &self,
+        chat_id: &str,
+        cloud_backup: &zeron_proto::CloudBackupPointer,
+    ) -> Result<(), EngineError> {
+        if self.mutate(|doc| doc.set_chat_cloud_backup(chat_id, cloud_backup))? {
             Ok(())
         } else {
             Err(EngineError::Other(format!("no such chat: {chat_id}")))
@@ -939,9 +985,11 @@ impl WorkspaceHost {
         parent_chat_id: Option<String>,
         cloud_seat: Option<zeron_proto::CloudSeatBinding>,
     ) -> Result<(), EngineError> {
-        if self.read(|doc| doc.chat(chat_id))?.is_some() {
+        if let Some(existing) = self.read(|doc| doc.chat(chat_id))? {
             if let Some(cloud_seat) = cloud_seat.as_ref() {
-                self.mutate(|doc| doc.set_chat_cloud_seat_if_unset(chat_id, cloud_seat))?;
+                let device_id = device_id.unwrap_or(&existing.device_id);
+                let cwd = cwd.as_deref().or(existing.cwd.as_deref());
+                self.mutate(|doc| doc.set_claimed_chat_host(chat_id, device_id, cwd, cloud_seat))?;
             }
             return Ok(()); // idempotent: optimistic client retries never duplicate
         }
@@ -990,6 +1038,8 @@ impl WorkspaceHost {
                 last_seen_at: None,
                 parent_chat_id: parent_chat_id.filter(|p| !p.trim().is_empty()),
                 cloud_seat,
+                cloud_run: None,
+                cloud_backup: None,
             })
         })?;
         Ok(())
@@ -1726,7 +1776,9 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{device_name_on_boot, linked_worktree_root};
+    use super::{WorkspaceHost, WorkspaceHostConfig, device_name_on_boot, linked_worktree_root};
+    use std::sync::Arc;
+    use zeron_sync::DocsStore;
 
     #[tokio::test]
     async fn registry_http_sync_retains_dns_cause() {
@@ -1748,6 +1800,50 @@ mod tests {
             assert!(message.contains("injected DNS lookup failure"), "{message}");
             assert!(!message.contains("token-secret"), "{message}");
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_create_does_not_stamp_a_cloud_seat() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = WorkspaceHost::open(
+            Arc::new(DocsStore::open(dir.path()).unwrap()),
+            WorkspaceHostConfig {
+                device_id: "test-device".into(),
+                device_name: "Test device".into(),
+                platform: "macos".into(),
+                org_id: "test-org".into(),
+                user_id: "test-user".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        host.create_chat("chat", None, Some("test-device"), None, None)
+            .unwrap();
+        let binding = zeron_proto::CloudSeatBinding {
+            seat_id: "seat".into(),
+            kind: zeron_proto::CloudSeatKind::Ssh,
+            label: "Seat".into(),
+            repo: None,
+            workspace_path: Some("/workspace".into()),
+            runner_device_id: None,
+            branch: None,
+            model_label: None,
+            expires_at: None,
+        };
+
+        host.create_chat_with_parent(
+            "chat",
+            None,
+            Some("test-device"),
+            None,
+            None,
+            None,
+            Some(binding.clone()),
+        )
+        .unwrap();
+        assert!(host.chat("chat").unwrap().unwrap().cloud_seat.is_none());
+        let error = host.rebind_chat_seat("chat", &binding).unwrap_err();
+        assert!(error.to_string().contains("isn't a Cloud chat"));
     }
 
     #[tokio::test]
