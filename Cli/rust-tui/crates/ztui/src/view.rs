@@ -875,6 +875,7 @@ fn help_rows(w: usize) -> Vec<Line<'static>> {
         ("ctrl+l", "clear the screen"),
         ("ctrl+o", "expand the last tool output"),
         ("ctrl+y / ctrl+n", "apply / discard a /customise draft"),
+        ("ctrl+p", "try a /customise draft on before applying it"),
         ("/", "commands — /model /providers /connect /login /resume /review …"),
     ];
     let kw = ROWS.iter().map(|(k, _)| width_of(k)).max().unwrap_or(0);
@@ -1177,11 +1178,18 @@ fn customise_strip(app: &App, w: usize, ms: u128) -> Option<Line<'static>> {
             Span::styled(ellipsize(&text, w.saturating_sub(4)), DIM()),
         ]));
     }
+    if app.preview_skin.is_some() {
+        return Some(Line::from(vec![
+            sp(" "),
+            Span::styled("✎ previewing the draft", theme::fg(ACCENT()).add_modifier(Modifier::BOLD)),
+            dim(ellipsize(" — ctrl+y keep · ctrl+n drop · ctrl+p back", w.saturating_sub(24))),
+        ]));
+    }
     if app.draft_ready {
         return Some(Line::from(vec![
             sp(" "),
             Span::styled("✎ draft ready", theme::fg(ACCENT())),
-            dim(ellipsize(" — ctrl+y apply · ctrl+n discard · /customise diff", w.saturating_sub(16))),
+            dim(ellipsize(" — ctrl+p try it on · ctrl+y apply · ctrl+n discard · /customise diff", w.saturating_sub(16))),
         ]));
     }
     None

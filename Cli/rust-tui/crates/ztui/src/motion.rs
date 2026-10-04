@@ -9,7 +9,7 @@ use ratatui_core::text::Span;
 use crate::skin::SpinnerCfg;
 
 /// Built-in spinner styles.
-pub const STYLES: &[&str] = &["orb", "twinkle", "braille", "moon", "comet", "pulse", "galaxy", "dots", "line"];
+pub const STYLES: &[&str] = &["orb", "hop", "sparkle", "heart", "twinkle", "braille", "moon", "comet", "pulse", "galaxy", "dots", "line"];
 
 pub fn frames(style: &str) -> &'static [&'static str] {
     match style {
@@ -21,20 +21,24 @@ pub fn frames(style: &str) -> &'static [&'static str] {
         "galaxy" => &["◜", "◠", "◝", "◞", "◡", "◟"],
         "dots" => &["⠁", "⠂", "⠄", "⡀", "⢀", "⠠", "⠐", "⠈"],
         "line" => &["-", "\\", "|", "/"],
+        // a little face that crouches, jumps and lands
+        "hop" => &["₍-ᴗ-₎", "(•ᴗ•)", "⁽°ᴗ°⁾", "⁽^ᴗ^⁾✧", "⁽°ᴗ°⁾", "(•ᴗ•)", "₍-ᴗ-₎", "₍˘ᴗ˘₎"],
+        "sparkle" => &["·", "✧", "✦", "★", "✦", "✧"],
+        "heart" => &["♡", "♥", "♥", "♡", "·", "♡"],
         // orb: a glow that swells and settles
         _ => &["·", "∘", "○", "◎", "◉", "●", "◉", "◎", "○", "∘"],
     }
 }
 
-/// The frame for `ms`, from custom frames or the named style.
+/// The frame for `ms`, from custom frames or the named style — padded to
+/// the widest frame so the text after it never jitters.
 pub fn frame(cfg: &SpinnerCfg, ms: u128, reduce: bool) -> String {
     let fps = cfg.fps.clamp(1, 60) as u128;
     let i = if reduce { 0 } else { (ms * fps / 1000) as usize };
-    if !cfg.frames.is_empty() {
-        return cfg.frames[i % cfg.frames.len()].clone();
-    }
-    let f = frames(&cfg.style);
-    f[i % f.len()].to_string()
+    let all: Vec<&str> = if cfg.frames.is_empty() { frames(&cfg.style).to_vec() } else { cfg.frames.iter().map(String::as_str).collect() };
+    let widest = all.iter().map(|f| crate::wrap::width_of(f)).max().unwrap_or(1);
+    let f = all[i % all.len()];
+    format!("{f}{}", " ".repeat(widest - crate::wrap::width_of(f)))
 }
 
 /// Mix two colours; non-RGB colours do not blend (returns `a` until t ≥ .5).
@@ -188,6 +192,10 @@ mod tests {
         assert_eq!(frame(&cfg, 0, false), "A");
         assert_eq!(frame(&cfg, 100, false), "B");
         assert_eq!(frame(&cfg, 100, true), "A", "reduced motion holds still");
+        // the sticker hops but keeps its width
+        let hop = SpinnerCfg { style: "hop".into(), ..Default::default() };
+        let w: Vec<usize> = (0..8).map(|k| crate::wrap::width_of(&frame(&hop, k * 100, false))).collect();
+        assert!(w.iter().all(|x| *x == 6), "{w:?}");
     }
 
     #[test]

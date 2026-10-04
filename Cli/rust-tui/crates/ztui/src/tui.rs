@@ -291,6 +291,8 @@ pub struct App {
     pub mod_usd: f64,
     /// a draft waits for ctrl+y / ctrl+n
     pub draft_ready: bool,
+    /// ctrl+p: the live UI drawn in the draft's look before applying it
+    pub preview_skin: Option<crate::skin::Skin>,
     /// the dictation key is physically down (Windows reports releases), so
     /// its auto-repeat can't stop a recording it just started
     toggle_held: bool,
@@ -385,6 +387,7 @@ impl App {
             mod_log: Vec::new(),
             mod_usd: 0.0,
             draft_ready: crate::customise::tidy(&crate::customise::Paths::new(&zcore::cli_home())),
+            preview_skin: None,
             toggle_held: false,
             toggle_last: None,
         }
@@ -1935,7 +1938,12 @@ impl App {
                         self.mod_log.drain(..100);
                     }
                 }
-                Up::Effect(Effect::Draft) => self.draft_ready = true,
+                Up::Effect(Effect::Draft) => {
+                    self.draft_ready = true;
+                    if self.preview_skin.is_some() {
+                        self.preview_skin = Self::load_draft();
+                    }
+                }
                 Up::Effect(Effect::Apply) => self.apply_draft(),
                 Up::Effect(Effect::Config) => self.reload_models(),
                 Up::Effect(Effect::Command) => self.commands = slash::load(&self.cwd),
@@ -1992,11 +2000,31 @@ impl App {
         rows.push(Line::default());
         rows.extend(crate::customise::preview(&skin, self.width.min(100)));
         rows.push(Line::default());
-        rows.push(Line::from(Span::styled(" ctrl+y apply · ctrl+n discard · /customise diff", theme::fg(theme::ACCENT()))));
+        rows.push(Line::from(Span::styled(" ctrl+p try it on · ctrl+y apply · ctrl+n discard · /customise diff", theme::fg(theme::ACCENT()))));
         self.block(rows);
     }
 
+    fn load_draft() -> Option<crate::skin::Skin> {
+        crate::skin::parse(&std::fs::read_to_string(Self::customise_paths().draft).ok()?).ok()
+    }
+
+    /// ctrl+p: try the draft on the live UI (spinner, pet, composer, status).
+    fn toggle_preview(&mut self) {
+        if self.preview_skin.take().is_some() {
+            self.flash("Back to your current look", crate::skin::palette().dim);
+            return;
+        }
+        match Self::load_draft() {
+            Some(sk) => {
+                self.preview_skin = Some(sk);
+                self.flash("Previewing the draft — ctrl+y keep it · ctrl+n drop it · ctrl+p back", theme::ACCENT());
+            }
+            None => self.error("The draft doesn't load — /customise diff shows it"),
+        }
+    }
+
     fn apply_draft(&mut self) {
+        self.preview_skin = None;
         match crate::customise::apply(&Self::customise_paths()) {
             Ok(a) => {
                 self.draft_ready = false;
@@ -2017,6 +2045,7 @@ impl App {
     }
 
     fn discard_draft(&mut self) {
+        self.preview_skin = None;
         crate::customise::discard(&Self::customise_paths());
         self.draft_ready = false;
         self.flash("Draft discarded", theme::YELLOW());
@@ -2250,11 +2279,11 @@ impl App {
             self.clear_screen = true;
             return;
         }
-        if ctrl && self.draft_ready && self.perm.is_none() && matches!(k.code, KeyCode::Char('y') | KeyCode::Char('n')) {
-            if k.code == KeyCode::Char('y') {
-                self.apply_draft();
-            } else {
-                self.discard_draft();
+        if ctrl && self.draft_ready && self.perm.is_none() && matches!(k.code, KeyCode::Char('y') | KeyCode::Char('n') | KeyCode::Char('p')) {
+            match k.code {
+                KeyCode::Char('y') => self.apply_draft(),
+                KeyCode::Char('n') => self.discard_draft(),
+                _ => self.toggle_preview(),
             }
             return;
         }
@@ -2850,7 +2879,11 @@ Press Enter to go back to cosmostui.");
         }
         if app.dirty {
             app.dirty = false;
-            let (lines, cursor) = view::live(app);
+            let (lines, cursor) = match &app.preview_skin {
+                // trying a draft on: draw the live region in its look
+                Some(sk) => crate::skin::scoped_skin(sk.clone(), || view::live(app)),
+                None => view::live(app),
+            };
             let out = std::mem::take(&mut app.out);
             screen.draw(&out, Frame { lines: &lines, cursor })?;
         }
@@ -3478,6 +3511,32 @@ FAILED
             a.buddy.grant(500);
             a.pet_progress();
             assert!(a.notice.as_ref().is_some_and(|n| n.0.contains("reached level")), "{:?}", a.notice);
+        });
+    }
+
+    #[test]
+    fn ctrl_p_tries_a_draft_on() {
+        let _env = crate::env_lock();
+        crate::skin::scoped_skin(crate::skin::Skin::default(), || {
+            let mut a = app();
+            let home = tempfile::tempdir().unwrap();
+            std::env::set_var("COSMOS_CLI_HOME", home.path());
+            let p = crate::customise::Paths::new(home.path());
+            crate::customise::exec(&p, false, "ui_set", &serde_json::json!({"path": "spinner.style", "value": "hop"}));
+            a.draft_ready = true;
+            let (cmd, _rx) = std::sync::mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            a.on_key(ctrl('p'), &cmd, &stop);
+            assert_eq!(a.preview_skin.as_ref().map(|s| s.spinner.style.as_str()), Some("hop"));
+            let rows: Vec<String> = view::live(&a).0.iter().map(text).collect();
+            assert!(rows.iter().any(|r| r.contains("previewing the draft")), "{rows:#?}");
+            a.on_key(ctrl('p'), &cmd, &stop);
+            assert!(a.preview_skin.is_none(), "ctrl+p again goes back");
+            a.on_key(ctrl('p'), &cmd, &stop);
+            a.on_key(ctrl('y'), &cmd, &stop);
+            assert!(a.preview_skin.is_none() && !a.draft_ready, "applying ends the preview");
+            assert!(std::fs::read_to_string(home.path().join("ui.toml")).unwrap().contains("style = \"hop\""));
         });
     }
 

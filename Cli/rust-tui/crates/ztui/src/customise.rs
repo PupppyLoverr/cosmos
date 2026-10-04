@@ -589,6 +589,7 @@ pub const PICKER: &[(&str, &str)] = &[
     ("Links", "markdown.links"),
     ("Buddy", "buddy.size"),
     ("Species", "buddy.species"),
+    ("Pet images", "buddy.images"),
     ("Motion", "motion.reduce"),
     ("Notifications", "notify.desktop"),
     ("Chime", "notify.sound"),
@@ -605,6 +606,7 @@ fn picker_options(path: &str) -> Vec<Value> {
         "markdown.links" => s(&["auto", "osc8", "inline"]),
         "buddy.size" => s(&["full", "mini", "off"]),
         "buddy.species" => std::iter::once(json!("")).chain(crate::pixel::SPECIES.iter().map(|s| json!(s.name))).collect(),
+        "buddy.images" => s(&["auto", "sixel", "kitty", "off"]),
         "notify.desktop" => s(&["unfocused", "always", "never"]),
         _ => vec![json!(false), json!(true)],
     }
@@ -651,6 +653,7 @@ How to work:
 - Use ui_preview to check the result, then finish with a short summary of what changed (2–4 lines). Don't ask questions back; make tasteful choices.
 - Colours: keep text readable on a dark terminal (or light for the light theme); prefer theme.name plus a few theme.colors overrides.
 - Verbs are \"Present:Past\" pairs, e.g. \"Warping:Warped\".
+- The pet is pixel art: buddy.species picks the creature, buddy.colors.<part> recolours it (RGB hex), buddy.name names it. spinner.style \"hop\" is a jumping sticker; \"sparkle\" and \"heart\" are gentler.
 - To add a model provider use provider_add then model_add; API keys are NEVER yours to handle — the operator adds them with /connect.
 
 Hard boundaries (enforced in code — don't try): permissions, sandbox, approval/ask mode, hooks, MCP servers, credentials, self-improvement and your own [customise] limits.";
@@ -1068,12 +1071,12 @@ mod tests {
         let _env = crate::env_lock();
         let (_d, p) = home();
         crate::skin::scoped_skin(Skin::default(), || {
-            assert_eq!(picker_step(&p.ui, 1, 1).unwrap(), "Spinner → twinkle");
-            assert_eq!(picker_step(&p.ui, 8, 1).unwrap(), "Motion → reduced");
+            assert_eq!(picker_step(&p.ui, 1, 1).unwrap(), "Spinner → hop");
+            assert_eq!(picker_step(&p.ui, 9, 1).unwrap(), "Motion → reduced");
             assert_eq!(picker_step(&p.ui, 7, -1).unwrap(), "Species → robot");
         });
         let ui = std::fs::read_to_string(&p.ui).unwrap();
-        assert!(ui.contains("style = \"twinkle\"") && ui.contains("reduce = true") && ui.contains("species = \"robot\""), "{ui}");
+        assert!(ui.contains("style = \"hop\"") && ui.contains("reduce = true") && ui.contains("species = \"robot\""), "{ui}");
         for (_, path) in PICKER {
             assert!(picker_options(path).iter().all(|v| schema::check(path, v).is_ok()), "{path}");
         }
