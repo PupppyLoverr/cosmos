@@ -71,7 +71,7 @@ pub struct RunEnvironment {
 }
 
 impl RunEnvironment {
-    pub fn apply_to(&self, command: &mut tokio::process::Command) {
+    pub(crate) fn apply_to(&self, command: &mut crate::process::Command) {
         for key in &self.remove {
             command.env_remove(key);
         }
