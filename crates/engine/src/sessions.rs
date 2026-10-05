@@ -2628,8 +2628,8 @@ async fn drive_remote_run(
 
     let entry_id = new_id();
     let mut segment: Option<zeron_doc::SegmentWriter> = None;
-    let mut text = String::new();
-    let mut render = RemoteRenderer::for_command(&command);
+    let mut folded: Vec<MessagePart> = Vec::new();
+    let mut feed = zeron_harness::remote::RemoteFeed::for_command(&command);
     let mut ansi = AnsiStripper::default();
     let mut buf = [0u8; 8192];
     let mut err_buf = [0u8; 4096];
@@ -2684,11 +2684,10 @@ async fn drive_remote_run(
                     Ok(0) => stdout_open = false,
                     Ok(n) => {
                         let clean = ansi.push(&buf[..n]);
-                        match render.as_mut() {
-                            Some(render) => text.push_str(&render.push(&clean)),
-                            None => text.push_str(&String::from_utf8_lossy(&clean)),
+                        for event in feed.push(&clean) {
+                            zeron_doc::fold_event_into_parts(&mut folded, &event);
                         }
-                        if segment.is_none() && !text.trim().is_empty() {
+                        if segment.is_none() && !folded.is_empty() {
                             segment = zeron_doc::SegmentWriter::begin(
                                 &doc,
                                 &entry_id,
@@ -2698,10 +2697,7 @@ async fn drive_remote_run(
                             .ok();
                         }
                         if let Some(segment) = segment.as_mut() {
-                            let _ = segment.sync(&[MessagePart::Text {
-                                id: "t0".into(),
-                                text: preserve_line_breaks(&strip_orphaned_ansi(&text)),
-                            }]);
+                            let _ = segment.sync(&render_parts(&folded));
                         }
                     }
                     Err(_) => stdout_open = false,
@@ -2725,25 +2721,20 @@ async fn drive_remote_run(
             break;
         }
     }
-    if let Some(render) = render.as_mut() {
-        text.push_str(&render.finish());
+    for event in feed.finish() {
+        zeron_doc::fold_event_into_parts(&mut folded, &event);
     }
     let status = child
         .wait()
         .await
         .map(|s| s.code().unwrap_or(-1))
         .unwrap_or(-1);
+    let transcript_text = folded_text(&folded);
     if expired {
-        terminal_cloud_run(&inner, &store, &chat_id, &run_id, &mut segment, &text);
+        terminal_cloud_run(&inner, &store, &chat_id, &run_id, &mut segment, &folded);
     } else if interrupted {
         if let Some(segment) = segment {
-            let _ = segment.finish(
-                &[MessagePart::Text {
-                    id: "t0".into(),
-                    text: preserve_line_breaks(&strip_orphaned_ansi(&text)),
-                }],
-                zeron_doc::MessageStatus::Aborted,
-            );
+            let _ = segment.finish(&render_parts(&folded), zeron_doc::MessageStatus::Aborted);
         }
         finish(
             &inner,
@@ -2752,16 +2743,12 @@ async fn drive_remote_run(
             zeron_proto::CloudRunStatus::Stopped,
             None,
         );
-    } else if !remote_agent_failed(status, &text) {
-        store.update_run(&run_id, |run| run.mirrored_bytes = text.len() as u64);
+    } else if !remote_agent_failed(status, &transcript_text) {
+        store.update_run(&run_id, |run| {
+            run.mirrored_bytes = transcript_text.len() as u64
+        });
         if let Some(segment) = segment {
-            let _ = segment.finish(
-                &[MessagePart::Text {
-                    id: "t0".into(),
-                    text: preserve_line_breaks(&strip_orphaned_ansi(&text)),
-                }],
-                zeron_doc::MessageStatus::Complete,
-            );
+            let _ = segment.finish(&render_parts(&folded), zeron_doc::MessageStatus::Complete);
         }
         finish(
             &inner,
@@ -2772,15 +2759,9 @@ async fn drive_remote_run(
         );
     } else {
         let stderr_text = String::from_utf8_lossy(&stderr_tail);
-        let message = remote_agent_failure_message(status, &text, &stderr_text);
+        let message = remote_agent_failure_message(status, &transcript_text, &stderr_text);
         if let Some(segment) = segment {
-            let _ = segment.finish(
-                &[MessagePart::Text {
-                    id: "t0".into(),
-                    text: preserve_line_breaks(&text),
-                }],
-                zeron_doc::MessageStatus::Aborted,
-            );
+            let _ = segment.finish(&render_parts(&folded), zeron_doc::MessageStatus::Aborted);
         }
         write_remote_error(&doc, &inner.device_id, &message);
         finish(
@@ -3076,6 +3057,91 @@ async fn drive_boat_turn(
     }
 }
 
+/// One Boat `/events` item → the local event stream's shapes, so the mirror
+/// folds tool chips and errors exactly like a local run does. Boat's
+/// per-kind payloads vary, so tool ids fall back to a run-local sequence.
+fn boat_agent_events(event: &serde_json::Value, seq: &mut u64) -> Vec<AgentEvent> {
+    let kind = event
+        .get("type")
+        .or_else(|| event.get("kind"))
+        .and_then(|k| k.as_str())
+        .unwrap_or_default();
+    let data = event.get("data").cloned().unwrap_or_default();
+    let tool_id = |data: &serde_json::Value, seq: &mut u64| {
+        data.get("toolUseID")
+            .or_else(|| data.get("callID"))
+            .or_else(|| data.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                *seq += 1;
+                format!("bt{seq}")
+            })
+    };
+    let tool_call = |data: &serde_json::Value, seq: &mut u64| AgentEvent::ToolCall {
+        id: tool_id(data, seq),
+        call: zeron_harness::remote::remote_tool_call(
+            data.get("name")
+                .or_else(|| data.get("tool"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("tool"),
+            &data.get("input").cloned().unwrap_or_default(),
+        ),
+    };
+    match kind {
+        // Assistant text deltas — mirror verbatim.
+        "assistant" | "message" | "text" => data
+            .get("text")
+            .or_else(|| data.get("delta"))
+            .and_then(|t| t.as_str())
+            .map(|t| AgentEvent::TextDelta {
+                text: t.to_string(),
+            })
+            .into_iter()
+            .collect(),
+        "tool_use" => vec![tool_call(&data, seq)],
+        "tool_result" => vec![AgentEvent::ToolResult {
+            id: tool_id(&data, seq),
+            is_error: data
+                .get("is_error")
+                .or_else(|| data.get("isError"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || data.get("status").and_then(|s| s.as_str()) == Some("error"),
+            output: data
+                .get("output")
+                .or_else(|| data.get("summary"))
+                .or_else(|| data.get("text"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            diff: None,
+        }],
+        // A bare "tool" summary keeps a real chip when the name is present,
+        // else the honest `›` text line it used to print.
+        "tool" => {
+            if data.get("name").is_some() || data.get("tool").is_some() {
+                vec![tool_call(&data, seq)]
+            } else {
+                data.get("summary")
+                    .and_then(|s| s.as_str())
+                    .map(|s| AgentEvent::TextDelta {
+                        text: format!("\n\n› {s}\n"),
+                    })
+                    .into_iter()
+                    .collect()
+            }
+        }
+        "error" => vec![AgentEvent::Error {
+            message: data
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("the Boat agent errored")
+                .to_string(),
+        }],
+        _ => Vec::new(),
+    }
+}
+
 /// How a mirrored Boat turn ended.
 enum BoatOutcome {
     Done,
@@ -3100,50 +3166,40 @@ async fn mirror_boat_events(
     // A reattach continues the run's own entry from the recorded cursor.
     resume_entry: Option<&str>,
 ) -> BoatOutcome {
+    // A reattach keeps the entry's parts — text AND tool chips — and folds
+    // new events on top, so nothing resolves back into a flat blob.
     let resumed = resume_entry.and_then(|id| {
         doc.find_entry(id).map(|(index, written)| {
-            let text = written
-                .iter()
-                .find_map(|part| match part {
-                    MessagePart::Text { text, .. } => Some(text.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
             (
                 id.to_string(),
-                zeron_doc::SegmentWriter::resume(doc, index, written),
-                text,
+                zeron_doc::SegmentWriter::resume(doc, index, written.clone()),
+                written,
             )
         })
     });
-    let (entry_id, mut segment, mut text) = match resumed {
-        Some((id, segment, text)) => (id, Some(segment), text),
+    let (entry_id, mut segment, mut folded) = match resumed {
+        Some((id, segment, folded)) => (id, Some(segment), folded),
         None => {
             let id = new_id();
             let segment =
                 zeron_doc::SegmentWriter::begin(doc, &id, &inner.device_id, now_ms()).ok();
-            (id, segment, String::new())
+            (id, segment, Vec::new())
         }
     };
     store.update_run(run_id, |run| run.entry_id = Some(entry_id.clone()));
     let mut idle_ticks = 0u32;
+    let mut tool_seq = 0u64;
     let close = |segment: &mut Option<zeron_doc::SegmentWriter>,
-                 text: &str,
+                 folded: &[MessagePart],
                  status: zeron_doc::MessageStatus| {
         if let Some(segment) = segment.take() {
-            let _ = segment.finish(
-                &[MessagePart::Text {
-                    id: "t0".into(),
-                    text: text.to_string(),
-                }],
-                status,
-            );
+            let _ = segment.finish(&render_parts(folded), status);
         }
     };
     loop {
         if *cancel_rx.borrow() || interrupt_token.is_cancelled() {
             let _ = api.interrupt(box_id).await;
-            close(&mut segment, &text, zeron_doc::MessageStatus::Aborted);
+            close(&mut segment, &folded, zeron_doc::MessageStatus::Aborted);
             return BoatOutcome::Stopped;
         }
         match api.events(box_id, cursor.as_deref()).await {
@@ -3154,7 +3210,7 @@ async fn mirror_boat_events(
                     .and_then(|e| e.as_array())
                     .cloned()
                 else {
-                    close(&mut segment, &text, zeron_doc::MessageStatus::Aborted);
+                    close(&mut segment, &folded, zeron_doc::MessageStatus::Aborted);
                     return BoatOutcome::Failed(
                         "boat: unexpected response from /sandboxes/{id}/events: missing events"
                             .into(),
@@ -3162,6 +3218,7 @@ async fn mirror_boat_events(
                 };
                 let mut grew = false;
                 let mut done = false;
+                let mut failed = None;
                 for event in items {
                     cursor = event
                         .get("cursor")
@@ -3172,44 +3229,24 @@ async fn mirror_boat_events(
                         .get("type")
                         .or_else(|| event.get("kind"))
                         .and_then(|k| k.as_str())
-                        .unwrap_or_default();
-                    let data = event.get("data").cloned().unwrap_or_default();
-                    match kind {
-                        // Assistant text deltas — mirror verbatim.
-                        "assistant" | "message" | "text" => {
-                            if let Some(t) = data
-                                .get("text")
-                                .or_else(|| data.get("delta"))
-                                .and_then(|t| t.as_str())
-                            {
-                                text.push_str(t);
-                                grew = true;
-                            }
-                        }
-                        // Tool lines keep the transcript honest without a
-                        // second surface.
-                        "tool" | "tool_use" | "tool_result" => {
-                            if let Some(t) = data
-                                .get("summary")
-                                .or_else(|| data.get("name"))
-                                .and_then(|t| t.as_str())
-                            {
-                                text.push_str(&format!("\n\n› {t}\n"));
-                                grew = true;
-                            }
-                        }
-                        "done" | "complete" | "finished" => done = true,
-                        "error" => {
-                            let message = data
-                                .get("message")
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("the Boat agent errored")
-                                .to_string();
-                            close(&mut segment, &text, zeron_doc::MessageStatus::Aborted);
-                            return BoatOutcome::Failed(message);
-                        }
-                        _ => {}
+                        .unwrap_or_default()
+                        .to_owned();
+                    if matches!(kind.as_str(), "done" | "complete" | "finished") {
+                        done = true;
+                        continue;
                     }
+                    let events = boat_agent_events(&event, &mut tool_seq);
+                    grew |= !events.is_empty();
+                    for agent_event in events {
+                        if let AgentEvent::Error { message } = &agent_event {
+                            failed = Some(message.clone());
+                        }
+                        zeron_doc::fold_event_into_parts(&mut folded, &agent_event);
+                    }
+                }
+                if let Some(message) = failed {
+                    close(&mut segment, &folded, zeron_doc::MessageStatus::Aborted);
+                    return BoatOutcome::Failed(message);
                 }
                 if let Some(next) = v
                     .get("nextCursor")
@@ -3224,18 +3261,16 @@ async fn mirror_boat_events(
                 }
                 if grew {
                     if let Some(segment) = segment.as_mut() {
-                        let _ = segment.sync(&[MessagePart::Text {
-                            id: "t0".into(),
-                            text: text.clone(),
-                        }]);
+                        let _ = segment.sync(&render_parts(&folded));
                     }
-                    store.update_run(run_id, |run| run.mirrored_bytes = text.len() as u64);
+                    let rendered_len = folded_text(&folded).len() as u64;
+                    store.update_run(run_id, |run| run.mirrored_bytes = rendered_len);
                     idle_ticks = 0;
                 } else {
                     idle_ticks += 1;
                 }
                 if done {
-                    close(&mut segment, &text, zeron_doc::MessageStatus::Complete);
+                    close(&mut segment, &folded, zeron_doc::MessageStatus::Complete);
                     return BoatOutcome::Done;
                 }
             }
@@ -3244,346 +3279,20 @@ async fn mirror_boat_events(
                 // is not — keep polling before giving up.
                 idle_ticks += 1;
                 if api.sandbox(box_id).await.map(|s| s.dead()).unwrap_or(false) {
-                    close(&mut segment, &text, zeron_doc::MessageStatus::Aborted);
+                    close(&mut segment, &folded, zeron_doc::MessageStatus::Aborted);
                     return BoatOutcome::Failed(format!("the Boat box died mid-run: {e}"));
                 }
             }
         }
         // No events for ~10 min → the agent likely wedged; end honestly.
         if idle_ticks > 300 {
-            close(&mut segment, &text, zeron_doc::MessageStatus::Aborted);
+            close(&mut segment, &folded, zeron_doc::MessageStatus::Aborted);
             return BoatOutcome::Failed(
                 "no agent events for 10 minutes — the run likely stalled on the box".into(),
             );
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-}
-
-/// Renders Claude Code's `--output-format stream-json` events as transcript
-/// text while the run is still going: assistant prose as paragraphs, each
-/// tool call as one `›` line, the final result only when it adds something.
-/// Lines that aren't JSON (an install notice, a shell error) pass through.
-#[derive(Default)]
-struct StreamJsonRenderer {
-    partial: Vec<u8>,
-    last_text: String,
-    after_tool: bool,
-}
-
-impl StreamJsonRenderer {
-    #[cfg(test)]
-    fn for_command(command: &str) -> Option<Self> {
-        command
-            .contains("--output-format stream-json")
-            .then(Self::default)
-    }
-
-    /// Feed raw output; returns the text for every line it completes.
-    fn push(&mut self, chunk: &[u8]) -> String {
-        self.partial.extend_from_slice(chunk);
-        let mut out = String::new();
-        while let Some(at) = self.partial.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.partial.drain(..=at).collect();
-            out.push_str(&self.render_line(&String::from_utf8_lossy(&line)));
-        }
-        out
-    }
-
-    /// The stream ended: render a last unterminated line, if any.
-    fn finish(&mut self) -> String {
-        let line = std::mem::take(&mut self.partial);
-        self.render_line(&String::from_utf8_lossy(&line))
-    }
-
-    fn render_line(&mut self, line: &str) -> String {
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.trim().is_empty() {
-            return String::new();
-        }
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            self.after_tool = false;
-            return format!("{line}\n");
-        };
-        let mut out = String::new();
-        match event.get("type").and_then(|t| t.as_str()) {
-            Some("assistant") => {
-                let blocks = event
-                    .pointer("/message/content")
-                    .and_then(|c| c.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                for block in blocks {
-                    match block.get("type").and_then(|t| t.as_str()) {
-                        Some("text") => {
-                            let text = block
-                                .get("text")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or_default()
-                                .trim();
-                            if text.is_empty() {
-                                continue;
-                            }
-                            if self.after_tool {
-                                out.push('\n');
-                            }
-                            out.push_str(text);
-                            out.push_str("\n\n");
-                            self.last_text = text.to_string();
-                            self.after_tool = false;
-                        }
-                        Some("tool_use") => {
-                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                            let input = block.get("input").cloned().unwrap_or_default();
-                            out.push_str(&format!("› {}\n", tool_line(name, &input)));
-                            self.after_tool = true;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Some("result") => {
-                let result = event
-                    .get("result")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or_default()
-                    .trim();
-                let is_error = event
-                    .get("is_error")
-                    .and_then(|e| e.as_bool())
-                    .unwrap_or(false);
-                if self.after_tool {
-                    out.push('\n');
-                }
-                if is_error {
-                    out.push_str(&format!(
-                        "⚠ {}\n",
-                        if result.is_empty() {
-                            "the agent stopped with an error"
-                        } else {
-                            result
-                        }
-                    ));
-                } else if !result.is_empty() && result != self.last_text {
-                    out.push_str(result);
-                    out.push('\n');
-                }
-                self.after_tool = false;
-            }
-            // system/init, tool results, rate-limit notices: not transcript.
-            _ => {}
-        }
-        out
-    }
-}
-
-/// One readable line for a tool call: what it touched, not its full input.
-fn tool_line(name: &str, input: &serde_json::Value) -> String {
-    let field = |key: &str| {
-        input
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-    };
-    let clip = |text: &str| {
-        let first = text.lines().next().unwrap_or_default();
-        let mut clipped: String = first.chars().take(120).collect();
-        if clipped.len() < first.len() || text.lines().nth(1).is_some() {
-            clipped.push('…');
-        }
-        clipped
-    };
-    let detail = match name {
-        "Bash" => field("command").map(|c| format!("`{}`", clip(c))),
-        "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => field("file_path")
-            .or_else(|| field("notebook_path"))
-            .map(str::to_string),
-        "Glob" | "Grep" => field("pattern").map(|p| format!("`{}`", clip(p))),
-        "WebFetch" => field("url").map(str::to_string),
-        "WebSearch" => field("query").map(str::to_string),
-        "Task" | "Agent" => field("description").map(str::to_string),
-        "TodoWrite" => Some("task list".to_string()),
-        _ => None,
-    };
-    match detail {
-        Some(detail) => format!("{name} {detail}"),
-        None => name.to_string(),
-    }
-}
-
-/// Renders `opencode run --format json` events the same way the Claude Code
-/// stream does: text parts as paragraphs, each tool call as one `›` line.
-/// Lines that aren't JSON (a login banner, a shell notice) pass through.
-#[derive(Default)]
-struct OpencodeJsonRenderer {
-    partial: Vec<u8>,
-    after_tool: bool,
-}
-
-impl OpencodeJsonRenderer {
-    fn push(&mut self, chunk: &[u8]) -> String {
-        self.partial.extend_from_slice(chunk);
-        let mut out = String::new();
-        while let Some(at) = self.partial.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.partial.drain(..=at).collect();
-            out.push_str(&self.render_line(&String::from_utf8_lossy(&line)));
-        }
-        out
-    }
-
-    fn finish(&mut self) -> String {
-        let line = std::mem::take(&mut self.partial);
-        self.render_line(&String::from_utf8_lossy(&line))
-    }
-
-    fn render_line(&mut self, line: &str) -> String {
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.trim().is_empty() {
-            return String::new();
-        }
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            self.after_tool = false;
-            return format!("{line}\n");
-        };
-        let mut out = String::new();
-        match event.get("type").and_then(|t| t.as_str()) {
-            Some("text") => {
-                let text = event
-                    .pointer("/part/text")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or_default()
-                    .trim();
-                if !text.is_empty() {
-                    if self.after_tool {
-                        out.push('\n');
-                    }
-                    out.push_str(text);
-                    out.push_str("\n\n");
-                    self.after_tool = false;
-                }
-            }
-            Some("tool_use") => {
-                let part = event.get("part").cloned().unwrap_or_default();
-                let tool = part
-                    .get("tool")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("tool");
-                let input = part
-                    .pointer("/state/input")
-                    .cloned()
-                    .unwrap_or_default();
-                out.push_str(&format!("› {}\n", opencode_tool_line(tool, &input)));
-                self.after_tool = true;
-            }
-            Some("error") => {
-                let message = event
-                    .get("error")
-                    .or_else(|| event.pointer("/part/error"))
-                    .map(|e| {
-                        e.as_str()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| e.to_string())
-                    })
-                    .unwrap_or_else(|| "the agent stopped with an error".into());
-                out.push_str(&format!("⚠ {message}\n"));
-                self.after_tool = false;
-            }
-            // step_start/step_finish, session bookkeeping: not transcript.
-            _ => {}
-        }
-        out
-    }
-}
-
-/// One readable line for an opencode tool call: what it touched, not its
-/// full input. Input keys vary by tool (`path`, `filePath`, `command`, …).
-fn opencode_tool_line(tool: &str, input: &serde_json::Value) -> String {
-    let field = |keys: &[&str]| -> Option<String> {
-        keys.iter()
-            .find_map(|key| input.get(*key).and_then(|v| v.as_str()))
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-    };
-    let clip = |text: &str| {
-        let first = text.lines().next().unwrap_or_default();
-        let mut clipped: String = first.chars().take(120).collect();
-        if clipped.len() < first.len() || text.lines().nth(1).is_some() {
-            clipped.push('…');
-        }
-        clipped
-    };
-    let detail = field(&["filePath", "file_path", "path", "notebookPath"])
-        .or_else(|| field(&["command", "pattern", "query", "url"]).map(|v| format!("`{}`", clip(&v))))
-        .or_else(|| field(&["description", "prompt", "task_id"]));
-    match detail {
-        Some(detail) => format!("{tool} {detail}"),
-        None => tool.to_string(),
-    }
-}
-
-/// The remote-output renderer a seat command needs, if any.
-enum RemoteRenderer {
-    StreamJson(StreamJsonRenderer),
-    OpencodeJson(OpencodeJsonRenderer),
-}
-
-impl RemoteRenderer {
-    fn for_command(command: &str) -> Option<Self> {
-        if command.contains("--output-format stream-json") {
-            return Some(Self::StreamJson(StreamJsonRenderer::default()));
-        }
-        if command.contains("--format json")
-            && crate::cloud::command_bin(command).contains("opencode")
-        {
-            return Some(Self::OpencodeJson(OpencodeJsonRenderer::default()));
-        }
-        None
-    }
-
-    fn push(&mut self, chunk: &[u8]) -> String {
-        match self {
-            Self::StreamJson(render) => render.push(chunk),
-            Self::OpencodeJson(render) => render.push(chunk),
-        }
-    }
-
-    fn finish(&mut self) -> String {
-        match self {
-            Self::StreamJson(render) => render.finish(),
-            Self::OpencodeJson(render) => render.finish(),
-        }
-    }
-}
-
-/// CSI fragments left when a control byte was eaten before the stream
-/// reached us (`[33m`, `[?25h`, `[38;2;155;109;255;4m`). Matches a `[`
-/// followed by CSI parameters and a final byte — narrow enough that real
-/// text (`[0m` inside a string literal, `[K` in a log message) is rare
-/// enough to sacrifice for never drawing escape garbage in the transcript.
-fn strip_orphaned_ansi(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    let mut copy_from = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'[' {
-            let mut j = i + 1;
-            while j < bytes.len() && matches!(bytes[j], b'0'..=b'9' | b';' | b'?' | b':') {
-                j += 1;
-            }
-            if j > i + 1 && j < bytes.len() && (0x40..=0x7e).contains(&bytes[j]) {
-                out.push_str(&text[copy_from..i]);
-                i = j + 1;
-                copy_from = i;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out.push_str(&text[copy_from..]);
-    out
 }
 
 #[derive(Default)]
@@ -3685,8 +3394,8 @@ async fn tail_remote_log(
     // The run's harness command — picks how its output renders.
     command: &str,
 ) {
-    let strip_headers = is_opencode_command(command);
-    let mut render = RemoteRenderer::for_command(command);
+    let mut feed = zeron_harness::remote::RemoteFeed::for_command(command);
+    let mut folded: Vec<MessagePart> = Vec::new();
     let (entry_id, mut segment) = match resume_entry.and_then(|id| {
         doc.find_entry(id).map(|(index, written)| {
             (
@@ -3700,20 +3409,13 @@ async fn tail_remote_log(
     };
     store.update_run(run_id, |run| run.entry_id = Some(entry_id.clone()));
     let mut mirrored: u64 = 0;
-    let mut text = String::new();
     let mut ansi = AnsiStripper::default();
     let mut ssh_255_streak = 0u8;
     loop {
         if *cancel_rx.borrow() {
             let _ = segment.take().and_then(|s| {
-                s.finish(
-                    &[MessagePart::Text {
-                        id: "t0".into(),
-                        text: cloud_run_doc_text(&text, strip_headers),
-                    }],
-                    zeron_doc::MessageStatus::Aborted,
-                )
-                .ok()
+                s.finish(&render_parts(&folded), zeron_doc::MessageStatus::Aborted)
+                    .ok()
             });
             inner.set_status(chat_id, SessionStatus::Idle, false);
             store.update_run(run_id, |run| {
@@ -3742,8 +3444,7 @@ async fn tail_remote_log(
                     || out.stderr.contains("Permission denied")
                     || out.stdout.contains("Permission denied")
                 {
-                    let text = cloud_run_output(&text, strip_headers);
-                    terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, text.as_ref());
+                    terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, &folded);
                     return;
                 }
                 let (chunk, alive, remote_exit) =
@@ -3757,11 +3458,10 @@ async fn tail_remote_log(
                 if !chunk.is_empty() {
                     mirrored += chunk.len() as u64;
                     let clean = ansi.push(&chunk);
-                    match render.as_mut() {
-                        Some(render) => text.push_str(&render.push(&clean)),
-                        None => text.push_str(&String::from_utf8_lossy(&clean)),
+                    for event in feed.push(&clean) {
+                        zeron_doc::fold_event_into_parts(&mut folded, &event);
                     }
-                    if segment.is_none() {
+                    if segment.is_none() && !folded.is_empty() {
                         segment = zeron_doc::SegmentWriter::begin(
                             doc,
                             &entry_id,
@@ -3771,19 +3471,18 @@ async fn tail_remote_log(
                         .ok();
                     }
                     if let Some(segment) = segment.as_mut() {
-                        let _ = segment.sync(&[MessagePart::Text {
-                            id: "t0".into(),
-                            text: cloud_run_doc_text(&text, strip_headers),
-                        }]);
+                        let _ = segment.sync(&render_parts(&folded));
                     }
                     store.update_run(run_id, |run| run.mirrored_bytes = mirrored);
                 }
                 if out.code != 0 || remote_exit.is_some() || !alive {
-                    if let Some(render) = render.as_mut() {
-                        text.push_str(&render.finish());
+                    for event in feed.finish() {
+                        zeron_doc::fold_event_into_parts(&mut folded, &event);
                     }
-                    let done =
-                        out.code == 0 && remote_exit == Some(0) && !remote_agent_failed(0, &text);
+                    let transcript_text = folded_text(&folded);
+                    let done = out.code == 0
+                        && remote_exit == Some(0)
+                        && !remote_agent_failed(0, &transcript_text);
                     let error = (!done).then(|| {
                         let status = remote_exit.unwrap_or_else(|| out.code.max(1));
                         let stderr = if remote_exit.is_none() && out.stderr.is_empty() {
@@ -3791,17 +3490,14 @@ async fn tail_remote_log(
                         } else {
                             out.stderr.clone()
                         };
-                        remote_agent_failure_message(status, &text, &stderr)
+                        remote_agent_failure_message(status, &transcript_text, &stderr)
                     });
                     if let Some(message) = error.as_deref() {
                         write_remote_error(doc, &inner.device_id, message);
                     }
                     let _ = segment.take().and_then(|s| {
                         s.finish(
-                            &[MessagePart::Text {
-                                id: "t0".into(),
-                                text: cloud_run_doc_text(&text, strip_headers),
-                            }],
+                            &render_parts(&folded),
                             if done {
                                 zeron_doc::MessageStatus::Complete
                             } else {
@@ -3838,8 +3534,7 @@ async fn tail_remote_log(
                     || (matches!(seat.kind, Some(zeron_proto::CloudSeatKind::Railway))
                         && e.contains("Railway"))
                 {
-                    let text = cloud_run_output(&text, strip_headers);
-                    terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, text.as_ref());
+                    terminal_cloud_run(inner, store, chat_id, run_id, &mut segment, &folded);
                     return;
                 }
                 tracing::warn!(seat = %seat.id, error = %e, "cloud run log tail failed");
@@ -3861,17 +3556,11 @@ fn terminal_cloud_run(
     chat_id: &str,
     run_id: &str,
     segment: &mut Option<zeron_doc::SegmentWriter>,
-    text: &str,
+    folded: &[MessagePart],
 ) {
     let _ = segment.take().and_then(|s| {
-        s.finish(
-            &[MessagePart::Text {
-                id: "t0".into(),
-                text: text.to_string(),
-            }],
-            zeron_doc::MessageStatus::Aborted,
-        )
-        .ok()
+        s.finish(&render_parts(folded), zeron_doc::MessageStatus::Aborted)
+            .ok()
     });
     inner.set_status(chat_id, SessionStatus::Errored, false);
     store.update_run(run_id, |run| {
@@ -3880,117 +3569,6 @@ fn terminal_cloud_run(
         run.finished_at = Some(Utc::now());
     });
     lock(&inner.runs).remove(chat_id);
-}
-
-/// Seat harnesses print plain terminal text; in the transcript's markdown a
-/// single newline would fold lines into one paragraph. Hard-break them
-/// (outside code fences) so the output reads the way it printed.
-fn preserve_line_breaks(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + text.len() / 16);
-    let mut in_fence = false;
-    let mut lines = text.split('\n').peekable();
-    while let Some(line) = lines.next() {
-        let fence = line.trim_start().starts_with("```");
-        if fence {
-            in_fence = !in_fence;
-        }
-        out.push_str(line);
-        if let Some(next) = lines.peek() {
-            let hard = !in_fence
-                && !fence
-                && !line.trim().is_empty()
-                && !next.trim().is_empty()
-                && !line.ends_with("  ")
-                && !next.trim_start().starts_with("```");
-            if hard {
-                out.push_str("  ");
-            }
-            out.push('\n');
-        }
-    }
-    out
-}
-
-fn is_opencode_command(command: &str) -> bool {
-    command
-        .split_whitespace()
-        .next()
-        .and_then(|executable| std::path::Path::new(executable).file_name())
-        .and_then(|basename| basename.to_str())
-        == Some("opencode")
-}
-
-fn is_opencode_header_line(line: &str) -> bool {
-    line.strip_prefix("> ").is_some_and(|header| {
-        let Some((a, b)) = header.split_once(" · ") else {
-            return false;
-        };
-        let token = |part: &str| {
-            !part.is_empty() && !part.chars().any(|ch| ch.is_whitespace() || ch == '·')
-        };
-        token(a) && token(b)
-    })
-}
-
-fn strip_opencode_headers(text: &str) -> std::borrow::Cow<'_, str> {
-    let has_header = text.split_inclusive('\n').any(|raw_line| {
-        if !raw_line.ends_with('\n') {
-            return false;
-        }
-        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        is_opencode_header_line(line)
-    });
-    if !has_header {
-        return std::borrow::Cow::Borrowed(text);
-    }
-
-    let mut skip_empty_line = false;
-    let mut out = String::with_capacity(text.len());
-
-    for raw_line in text.split_inclusive('\n') {
-        let terminated = raw_line.ends_with('\n');
-        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-
-        if skip_empty_line {
-            skip_empty_line = false;
-            if terminated && line.is_empty() {
-                continue;
-            }
-        }
-
-        if terminated && is_opencode_header_line(line) {
-            skip_empty_line = true;
-            continue;
-        }
-
-        out.push_str(raw_line);
-    }
-
-    std::borrow::Cow::Owned(out)
-}
-
-fn cloud_run_output(text: &str, strip_headers: bool) -> std::borrow::Cow<'_, str> {
-    let cleaned: std::borrow::Cow<'_, str> = if text.contains('[') {
-        std::borrow::Cow::Owned(strip_orphaned_ansi(text))
-    } else {
-        std::borrow::Cow::Borrowed(text)
-    };
-    if strip_headers {
-        match strip_opencode_headers(&cleaned) {
-            std::borrow::Cow::Borrowed(_) => cleaned,
-            stripped @ std::borrow::Cow::Owned(_) => {
-                std::borrow::Cow::Owned(stripped.into_owned())
-            }
-        }
-    } else {
-        cleaned
-    }
-}
-
-fn cloud_run_doc_text(text: &str, strip_headers: bool) -> String {
-    preserve_line_breaks(cloud_run_output(text, strip_headers).as_ref())
 }
 
 /// An honest error line in the transcript when a remote run can't even start.
@@ -4057,58 +3635,8 @@ fn write_transcript_note(doc: &crate::doc_host::DocWriter, device_id: &str, mess
 }
 
 #[cfg(test)]
-mod line_break_tests {
-    use super::preserve_line_breaks;
-
-    #[test]
-    fn plain_lines_hard_break_but_fences_stay_verbatim() {
-        assert_eq!(preserve_line_breaks("a\nb\n\nc"), "a  \nb\n\nc");
-        assert_eq!(
-            preserve_line_breaks("x\n```\nl1\nl2\n```\ny"),
-            "x\n```\nl1\nl2\n```\ny"
-        );
-        assert_eq!(preserve_line_breaks("done"), "done");
-    }
-}
-
-#[cfg(test)]
-mod opencode_header_tests {
-    use super::{
-        cloud_run_doc_text, is_opencode_command, preserve_line_breaks, strip_opencode_headers,
-    };
-
-    #[test]
-    fn removes_complete_opencode_headers_and_the_following_blank_line() {
-        assert_eq!(
-            strip_opencode_headers("\n> build · big-pickle\n\nHey!\n").as_ref(),
-            "\nHey!\n"
-        );
-    }
-
-    #[test]
-    fn keeps_quotes_and_incomplete_trailing_headers() {
-        let quote = "> note: this is quoted\n";
-        let incomplete = "Hello\n> build · big-pickle";
-        assert_eq!(strip_opencode_headers(quote).as_ref(), quote);
-        assert_eq!(strip_opencode_headers(incomplete).as_ref(), incomplete);
-    }
-
-    #[test]
-    fn command_detection_uses_the_executable_not_the_model_id() {
-        assert!(is_opencode_command("opencode run -m opencode/big-pickle"));
-        assert!(is_opencode_command(
-            "/usr/local/bin/opencode run -m opencode/big-pickle"
-        ));
-        assert!(!is_opencode_command("claude --model opencode/big-pickle"));
-
-        let text = "> build · big-pickle\n\nHey!\n";
-        assert_eq!(cloud_run_doc_text(text, false), preserve_line_breaks(text));
-    }
-}
-
-#[cfg(test)]
 mod remote_agent_failure_tests {
-    use super::{StreamJsonRenderer, remote_agent_failed, remote_agent_failure_message};
+    use super::{remote_agent_failed, remote_agent_failure_message};
 
     #[test]
     fn failed_stub_remote_surfaces_recent_stderr() {
@@ -4128,47 +3656,6 @@ mod remote_agent_failure_tests {
             remote_agent_failure_message(status, &stdout, &stderr),
             "Not logged in · Please run /login"
         );
-    }
-
-    #[test]
-    fn claude_stream_json_renders_progress_as_it_arrives() {
-        let mut render = StreamJsonRenderer::for_command(
-            "IS_SANDBOX=1 claude -p --output-format stream-json --verbose",
-        )
-        .expect("stream-json command renders");
-        assert!(StreamJsonRenderer::for_command("codex exec").is_none());
-        let lines = [
-            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I'll build the page."}]}}"#,
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls -la\necho hi"}}]}}"#,
-            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"total 0"}]}}"#,
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"/app/index.html","content":"<html>"}}]}}"#,
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done — the page is live."}]}}"#,
-            r#"{"type":"result","subtype":"success","is_error":false,"result":"Done — the page is live."}"#,
-        ];
-        let stream = lines.join("\n") + "\n";
-        // Split mid-line (and mid-character): output only lands per line.
-        let bytes = stream.as_bytes();
-        let cut = stream.find("page is").unwrap() + 2;
-        let mut out = render.push(&bytes[..cut]);
-        assert!(!out.contains("Done"));
-        out.push_str(&render.push(&bytes[cut..]));
-        out.push_str(&render.finish());
-        assert_eq!(
-            out,
-            "I'll build the page.\n\n› Bash `ls -la…`\n› Write /app/index.html\n\nDone — the page is live.\n\n"
-        );
-    }
-
-    #[test]
-    fn claude_stream_json_surfaces_errors_and_plain_lines() {
-        let mut render = StreamJsonRenderer::default();
-        let out = render.push(
-            b"`claude` isn't installed on this seat\n{\"type\":\"result\",\"is_error\":true,\"result\":\"Invalid API key \xc2\xb7 Please run /login\"}",
-        );
-        assert_eq!(out, "`claude` isn't installed on this seat\n");
-        assert_eq!(render.finish(), "⚠ Invalid API key · Please run /login\n");
-        assert_eq!(render.finish(), "");
     }
 
     #[test]

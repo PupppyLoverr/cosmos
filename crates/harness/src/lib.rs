@@ -203,6 +203,7 @@ pub mod archive_install;
 mod catalog;
 mod catalog_failure;
 pub mod redact;
+pub mod remote;
 pub use catalog_failure::{CatalogFailure, CatalogFailureCode};
 pub mod claude;
 pub mod codex;

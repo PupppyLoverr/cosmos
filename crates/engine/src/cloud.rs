@@ -1618,9 +1618,11 @@ pub async fn snapshot_workspace(store: &CloudStore, seat: &SeatConfig) -> Result
 // ---------------------------------------------------------------------------
 
 /// Snapshot excludes: build output and caches that rebuild on demand.
-const SNAPSHOT_EXCLUDES: &str = "--exclude=./node_modules --exclude=*/node_modules \
---exclude=./target --exclude=./dist --exclude=./.next --exclude=./.cache \
---exclude=./.venv --exclude=*/__pycache__ --exclude=*.log";
+// Each pattern is single-quoted: remote shells with non-POSIX globbing
+// (zsh's `no matches found`) would otherwise eat the `*` before tar sees it.
+const SNAPSHOT_EXCLUDES: &str = "'--exclude=./node_modules' '--exclude=*/node_modules' \
+'--exclude=./target' '--exclude=./dist' '--exclude=./.next' '--exclude=./.cache' \
+'--exclude=./.venv' '--exclude=*/__pycache__' '--exclude=*.log'";
 /// Largest snapshot pulled down (compressed).
 const MAX_SNAPSHOT: usize = 512 * 1024 * 1024;
 /// Boat snapshots ride exec stdout as base64 — keep them smaller.

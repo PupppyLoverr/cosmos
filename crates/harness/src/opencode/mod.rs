@@ -3675,7 +3675,7 @@ fn cap_text(text: &str, cap: usize) -> String {
 }
 
 /// Type an opencode-native tool invocation.
-fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
+pub(crate) fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
     let s = |keys: &[&str]| {
         keys.iter()
             .find_map(|k| input.get(*k))
