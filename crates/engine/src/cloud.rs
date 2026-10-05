@@ -2268,7 +2268,7 @@ pub fn seat_harness(
             }
         }
         H::Opencode => SeatHarness {
-            command: format!("opencode run{}", model_arg("-m", model)),
+            command: format!("opencode run --format json{}", model_arg("-m", model)),
             install: install(
                 "opencode",
                 "npm i -g opencode-ai || curl -fsSL https://opencode.ai/install | bash",
@@ -4488,12 +4488,18 @@ mod tests {
         );
         let opencode =
             seat_harness(HarnessId::Opencode, Some("opencode/big-pickle"), None).unwrap();
-        assert_eq!(opencode.command, "opencode run -m 'opencode/big-pickle'");
+        assert_eq!(
+            opencode.command,
+            "opencode run --format json -m 'opencode/big-pickle'"
+        );
         let devin = seat_harness(HarnessId::Devin, Some("swe-2-max"), None).unwrap();
         assert!(devin.command.ends_with("--model 'swe-2-max' -- {prompt}"));
         // A hostile model id can't break out of its word.
         let evil = seat_harness(HarnessId::Opencode, Some("x'; rm -rf / #"), None).unwrap();
-        assert_eq!(evil.command, "opencode run -m 'x'\\''; rm -rf / #'");
+        assert_eq!(
+            evil.command,
+            "opencode run --format json -m 'x'\\''; rm -rf / #'"
+        );
         assert!(seat_harness(HarnessId::Mock, None, None).is_err());
         assert_eq!(command_bin("FOO=1 /usr/bin/Codex.exe exec"), "codex");
         // The install prelude is valid sh.

@@ -9835,7 +9835,7 @@ impl Composer {
                                     "label": "Railway trial",
                                     "sshAlias": "railway.new",
                                     "workspacePath": "/app",
-                                    "harnessCommand": "opencode run -m opencode/big-pickle",
+                                    "harnessCommand": "opencode run --format json -m opencode/big-pickle",
                                     // A trial VM dies at the hour regardless — the
                                     // detached flag stays honest about what survives
                                     // the desktop closing.
