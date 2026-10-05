@@ -2629,7 +2629,8 @@ async fn drive_remote_run(
     let entry_id = new_id();
     let mut segment: Option<zeron_doc::SegmentWriter> = None;
     let mut text = String::new();
-    let mut render = StreamJsonRenderer::for_command(&command);
+    let mut render = RemoteRenderer::for_command(&command);
+    let mut ansi = AnsiStripper::default();
     let mut buf = [0u8; 8192];
     let mut err_buf = [0u8; 4096];
     let mut stderr_tail = Vec::new();
@@ -2682,9 +2683,10 @@ async fn drive_remote_run(
                 match read {
                     Ok(0) => stdout_open = false,
                     Ok(n) => {
+                        let clean = ansi.push(&buf[..n]);
                         match render.as_mut() {
-                            Some(render) => text.push_str(&render.push(&buf[..n])),
-                            None => text.push_str(&String::from_utf8_lossy(&buf[..n])),
+                            Some(render) => text.push_str(&render.push(&clean)),
+                            None => text.push_str(&String::from_utf8_lossy(&clean)),
                         }
                         if segment.is_none() && !text.trim().is_empty() {
                             segment = zeron_doc::SegmentWriter::begin(
@@ -2698,7 +2700,7 @@ async fn drive_remote_run(
                         if let Some(segment) = segment.as_mut() {
                             let _ = segment.sync(&[MessagePart::Text {
                                 id: "t0".into(),
-                                text: preserve_line_breaks(&text),
+                                text: preserve_line_breaks(&strip_orphaned_ansi(&text)),
                             }]);
                         }
                     }
@@ -2738,7 +2740,7 @@ async fn drive_remote_run(
             let _ = segment.finish(
                 &[MessagePart::Text {
                     id: "t0".into(),
-                    text: preserve_line_breaks(&text),
+                    text: preserve_line_breaks(&strip_orphaned_ansi(&text)),
                 }],
                 zeron_doc::MessageStatus::Aborted,
             );
@@ -2756,7 +2758,7 @@ async fn drive_remote_run(
             let _ = segment.finish(
                 &[MessagePart::Text {
                     id: "t0".into(),
-                    text: preserve_line_breaks(&text),
+                    text: preserve_line_breaks(&strip_orphaned_ansi(&text)),
                 }],
                 zeron_doc::MessageStatus::Complete,
             );
@@ -3270,6 +3272,7 @@ struct StreamJsonRenderer {
 }
 
 impl StreamJsonRenderer {
+    #[cfg(test)]
     fn for_command(command: &str) -> Option<Self> {
         command
             .contains("--output-format stream-json")
@@ -3409,6 +3412,180 @@ fn tool_line(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
+/// Renders `opencode run --format json` events the same way the Claude Code
+/// stream does: text parts as paragraphs, each tool call as one `›` line.
+/// Lines that aren't JSON (a login banner, a shell notice) pass through.
+#[derive(Default)]
+struct OpencodeJsonRenderer {
+    partial: Vec<u8>,
+    after_tool: bool,
+}
+
+impl OpencodeJsonRenderer {
+    fn push(&mut self, chunk: &[u8]) -> String {
+        self.partial.extend_from_slice(chunk);
+        let mut out = String::new();
+        while let Some(at) = self.partial.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.partial.drain(..=at).collect();
+            out.push_str(&self.render_line(&String::from_utf8_lossy(&line)));
+        }
+        out
+    }
+
+    fn finish(&mut self) -> String {
+        let line = std::mem::take(&mut self.partial);
+        self.render_line(&String::from_utf8_lossy(&line))
+    }
+
+    fn render_line(&mut self, line: &str) -> String {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.trim().is_empty() {
+            return String::new();
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            self.after_tool = false;
+            return format!("{line}\n");
+        };
+        let mut out = String::new();
+        match event.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                let text = event
+                    .pointer("/part/text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .trim();
+                if !text.is_empty() {
+                    if self.after_tool {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                    out.push_str("\n\n");
+                    self.after_tool = false;
+                }
+            }
+            Some("tool_use") => {
+                let part = event.get("part").cloned().unwrap_or_default();
+                let tool = part
+                    .get("tool")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("tool");
+                let input = part
+                    .pointer("/state/input")
+                    .cloned()
+                    .unwrap_or_default();
+                out.push_str(&format!("› {}\n", opencode_tool_line(tool, &input)));
+                self.after_tool = true;
+            }
+            Some("error") => {
+                let message = event
+                    .get("error")
+                    .or_else(|| event.pointer("/part/error"))
+                    .map(|e| {
+                        e.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| e.to_string())
+                    })
+                    .unwrap_or_else(|| "the agent stopped with an error".into());
+                out.push_str(&format!("⚠ {message}\n"));
+                self.after_tool = false;
+            }
+            // step_start/step_finish, session bookkeeping: not transcript.
+            _ => {}
+        }
+        out
+    }
+}
+
+/// One readable line for an opencode tool call: what it touched, not its
+/// full input. Input keys vary by tool (`path`, `filePath`, `command`, …).
+fn opencode_tool_line(tool: &str, input: &serde_json::Value) -> String {
+    let field = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|key| input.get(*key).and_then(|v| v.as_str()))
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let clip = |text: &str| {
+        let first = text.lines().next().unwrap_or_default();
+        let mut clipped: String = first.chars().take(120).collect();
+        if clipped.len() < first.len() || text.lines().nth(1).is_some() {
+            clipped.push('…');
+        }
+        clipped
+    };
+    let detail = field(&["filePath", "file_path", "path", "notebookPath"])
+        .or_else(|| field(&["command", "pattern", "query", "url"]).map(|v| format!("`{}`", clip(&v))))
+        .or_else(|| field(&["description", "prompt", "task_id"]));
+    match detail {
+        Some(detail) => format!("{tool} {detail}"),
+        None => tool.to_string(),
+    }
+}
+
+/// The remote-output renderer a seat command needs, if any.
+enum RemoteRenderer {
+    StreamJson(StreamJsonRenderer),
+    OpencodeJson(OpencodeJsonRenderer),
+}
+
+impl RemoteRenderer {
+    fn for_command(command: &str) -> Option<Self> {
+        if command.contains("--output-format stream-json") {
+            return Some(Self::StreamJson(StreamJsonRenderer::default()));
+        }
+        if command.contains("--format json")
+            && crate::cloud::command_bin(command).contains("opencode")
+        {
+            return Some(Self::OpencodeJson(OpencodeJsonRenderer::default()));
+        }
+        None
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> String {
+        match self {
+            Self::StreamJson(render) => render.push(chunk),
+            Self::OpencodeJson(render) => render.push(chunk),
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        match self {
+            Self::StreamJson(render) => render.finish(),
+            Self::OpencodeJson(render) => render.finish(),
+        }
+    }
+}
+
+/// CSI fragments left when a control byte was eaten before the stream
+/// reached us (`[33m`, `[?25h`, `[38;2;155;109;255;4m`). Matches a `[`
+/// followed by CSI parameters and a final byte — narrow enough that real
+/// text (`[0m` inside a string literal, `[K` in a log message) is rare
+/// enough to sacrifice for never drawing escape garbage in the transcript.
+fn strip_orphaned_ansi(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut copy_from = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            let mut j = i + 1;
+            while j < bytes.len() && matches!(bytes[j], b'0'..=b'9' | b';' | b'?' | b':') {
+                j += 1;
+            }
+            if j > i + 1 && j < bytes.len() && (0x40..=0x7e).contains(&bytes[j]) {
+                out.push_str(&text[copy_from..i]);
+                i = j + 1;
+                copy_from = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&text[copy_from..]);
+    out
+}
+
 #[derive(Default)]
 struct AnsiStripper {
     state: AnsiState,
@@ -3509,7 +3686,7 @@ async fn tail_remote_log(
     command: &str,
 ) {
     let strip_headers = is_opencode_command(command);
-    let mut render = StreamJsonRenderer::for_command(command);
+    let mut render = RemoteRenderer::for_command(command);
     let (entry_id, mut segment) = match resume_entry.and_then(|id| {
         doc.find_entry(id).map(|(index, written)| {
             (
@@ -3795,10 +3972,20 @@ fn strip_opencode_headers(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 fn cloud_run_output(text: &str, strip_headers: bool) -> std::borrow::Cow<'_, str> {
-    if strip_headers {
-        strip_opencode_headers(text)
+    let cleaned: std::borrow::Cow<'_, str> = if text.contains('[') {
+        std::borrow::Cow::Owned(strip_orphaned_ansi(text))
     } else {
         std::borrow::Cow::Borrowed(text)
+    };
+    if strip_headers {
+        match strip_opencode_headers(&cleaned) {
+            std::borrow::Cow::Borrowed(_) => cleaned,
+            stripped @ std::borrow::Cow::Owned(_) => {
+                std::borrow::Cow::Owned(stripped.into_owned())
+            }
+        }
+    } else {
+        cleaned
     }
 }
 
