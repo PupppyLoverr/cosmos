@@ -700,29 +700,8 @@ pub fn ledger(app: &App) -> (String, String) {
     let u = &app.usage;
     let window = app.models.iter().find(|m| m.alias == app.alias).map(|m| m.context).unwrap_or(128_000).max(1);
     let pct = (u.last_prompt as f64 / window as f64 * 100.0).round().min(100.0) as u64;
-    let money = |v: Option<f64>| match v {
-        Some(c) => format!("${c:.4}"),
-        None if u.plan => "plan".to_string(),
-        None => "$?".to_string(),
-    };
-    let [i, cr, cw, o] = u.last;
-    let full = format!(
-        "turn {} · in {} · cache_r {} · cache_w {} · out {} · {} · Σ {} · ctx {pct}%",
-        u.turns,
-        kfmt(i),
-        kfmt(cr),
-        kfmt(cw),
-        kfmt(o),
-        money(u.last_usd),
-        money(u.cum_usd)
-    );
-    let mut short = format!("Σ {} · ctx {pct}%", money(u.cum_usd));
-    let mut full = full;
-    if app.mod_usd > 0.0 {
-        // what /customise spent, kept apart from the conversation's ledger
-        full.push_str(&format!(" · mod ${:.4}", app.mod_usd));
-        short.push_str(&format!(" · mod ${:.4}", app.mod_usd));
-    }
+    let full = format!("Context: {} / {} tokens ({pct}%)", kfmt(u.last_prompt), kfmt(window));
+    let short = format!("Context {pct}%");
     (full, short)
 }
 

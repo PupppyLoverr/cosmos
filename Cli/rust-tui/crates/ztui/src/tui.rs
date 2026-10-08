@@ -3118,18 +3118,17 @@ FAILED
         };
         a.on_msg(Msg::Event(ev(serde_json::json!({"input": 1204, "cache_read": 18400, "cache_write": 0, "output": 312, "usd": 0.0041, "cum_usd": 0.0213}))));
         // narrow terminals get the short form
-        let (lines, _) = view::live(&a);
-        assert!(lines.iter().map(text).any(|r| r.contains("Σ $0.0213 · ctx") && !r.contains("turn 1")));
+
+        assert!(view::ledger(&a).1.starts_with("Context ") && view::ledger(&a).1.ends_with("%"), "{}", view::ledger(&a).1);
         a.width = 160;
         let (lines, _) = view::live(&a);
         let rows: Vec<String> = lines.iter().map(text).collect();
-        let status = rows.iter().find(|r| r.contains("ctx")).unwrap_or_else(|| panic!("{rows:?}"));
-        assert!(status.contains("turn 1 · in 1.2k · cache_r 18k · cache_w 0 · out 312 · $0.0041 · Σ $0.0213 · ctx"), "{status}");
-        // a subscription turn has no per-token price: "plan", never a guess
+        let status = rows.iter().find(|r| r.contains("Context:")).unwrap_or_else(|| panic!("{rows:?}"));
+        assert!(status.contains("Context: 19k / 200k tokens (") && !status.contains("cache_r") && !status.contains("$"), "{status}");
         a.on_msg(Msg::Event(ev(serde_json::json!({"input": 0, "cache_read": 0, "cache_write": 0, "output": 0, "usd": null, "billing": "subscription"}))));
         let (lines, _) = view::live(&a);
         let rows: Vec<String> = lines.iter().map(text).collect();
-        assert!(rows.iter().any(|r| r.contains("turn 2") && r.contains("· plan ·")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("Context:")), "{rows:?}");
     }
 
     #[test]
