@@ -18,3 +18,15 @@ edge/dist/
 .agents
 .claude
 CLAUDE.md
+
+# Build outputs and local-only artifacts — never commit.
+target/
+*/target/
+*.exe
+*.msi
+# Nested build dirs only: root /dist holds packaging assets, do not ignore it.
+*/dist/
+.next/
+releases/
+*.log
+.env.*
