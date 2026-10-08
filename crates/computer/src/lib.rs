@@ -291,6 +291,11 @@ impl ComputerSettings {
                 if self.telemetry { "true" } else { "false" }.into(),
             ),
             ("CUA_DRIVER_RS_UPDATE_CHECK".into(), "false".into()),
+            // Synthesized key-event gap (ms, driver clamps to 2–100; its
+            // default is 8). Half the default doubles per-event key
+            // throughput on the press_key/hotkey/slow-type paths without
+            // dropping events into apps' input queues.
+            ("CUA_DRIVER_KEY_GAP_MS".into(), "4".into()),
         ];
         if let Some(manifest) = manifest_path {
             env.push((
@@ -376,8 +381,8 @@ pub fn save_settings(data_dir: &Path, settings: &ComputerSettings) -> Result<(),
 /// checksum meaningful: a silent upstream re-publish fails verification
 /// instead of sliding in new bytes.
 pub const CUA_REPO: &str = "trycua/cua";
-pub const CUA_VERSION: &str = "0.28.2";
-pub const CUA_TAG: &str = "cua-driver-rs-v0.28.2";
+pub const CUA_VERSION: &str = "0.34.0";
+pub const CUA_TAG: &str = "cua-driver-rs-v0.34.0";
 
 #[derive(Debug, Clone, Copy)]
 pub struct ReleaseAsset {
@@ -407,34 +412,34 @@ impl ReleaseAsset {
 pub fn release_asset() -> Option<ReleaseAsset> {
     if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         Some(ReleaseAsset {
-            name: "cua-driver-rs-0.28.2-windows-x86_64-binary.zip",
-            sha256: "1f4bfceeab64cb7f56be7aad774c3dc2d2910d1427e4be1d79939c706e8029ba",
-            size_bytes: 29_085_823,
+            name: "cua-driver-rs-0.34.0-windows-x86_64-binary.zip",
+            sha256: "bcc520e50861c7092cf775846fec76ae386d7dcd6b5b408608b0ea4423a8b888",
+            size_bytes: 31_314_221,
         })
     } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
         Some(ReleaseAsset {
-            name: "cua-driver-rs-0.28.2-windows-arm64-binary.zip",
-            sha256: "578b88ff2dd56f06eb7e984d73aaf5e76f59c6fde9542c967d6a30d00213c680",
-            size_bytes: 27_394_922,
+            name: "cua-driver-rs-0.34.0-windows-arm64-binary.zip",
+            sha256: "df5786c6e7841d2f0d88f31c627c487181463ed99614b03efc0e907acfc698c3",
+            size_bytes: 29_454_268,
         })
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         Some(ReleaseAsset {
-            name: "cua-driver-rs-0.28.2-linux-x86_64-binary.tar.gz",
-            sha256: "a1d99fd04bb4927ef5ffdbe60eb91ed8b51a2bab60e10fc604a75bd59ce69c3e",
-            size_bytes: 30_603_028,
+            name: "cua-driver-rs-0.34.0-linux-x86_64-binary.tar.gz",
+            sha256: "629ac96eff829d4dfd5cf221f3f2165c2d813aed91e5efb7b20777a741cd70a7",
+            size_bytes: 34_818_314,
         })
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
         Some(ReleaseAsset {
-            name: "cua-driver-rs-0.28.2-linux-arm64-binary.tar.gz",
-            sha256: "55e8a32839a4ac369a773df4dac87b345bd4567779221ade4a5e39223a45a2e8",
-            size_bytes: 30_639_613,
+            name: "cua-driver-rs-0.34.0-linux-arm64-binary.tar.gz",
+            sha256: "9db8b9084add57eb97be8164367b24b6be54ed4f3dc01213e64b72d7fc09fddb",
+            size_bytes: 34_607_515,
         })
     } else if cfg!(target_os = "macos") {
         // Universal archive: one download covers Apple Silicon and Intel.
         Some(ReleaseAsset {
-            name: "cua-driver-rs-0.28.2-darwin-universal.tar.gz",
-            sha256: "e273181b26709c88b1d809474deb3c592b4efae3530b11d76318f1887fc3fbb1",
-            size_bytes: 70_078_129,
+            name: "cua-driver-rs-0.34.0-darwin-universal.tar.gz",
+            sha256: "2d0ade531c07b4d16e8078844fe1b63a0dfa0ee19677c9dcc079b4d3460ab387",
+            size_bytes: 75_844_139,
         })
     } else {
         None

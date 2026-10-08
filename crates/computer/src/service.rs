@@ -1356,10 +1356,13 @@ fn get_u32(args: &Value, key: &str) -> Option<u32> {
     args.get(key).and_then(Value::as_u64).map(|v| v as u32)
 }
 
-/// `verify_state`-compatible predicates evaluated locally against one
-/// fresh `window_state` snapshot. The driver's own element predicates
-/// return `observation_unavailable` (0.28.2) even when observe works, so
-/// Cosmos evaluates them itself — same vocabulary, same reply shape.
+/// Postcondition check. Prefers the driver's own `verify_state` — it waits
+/// for window stability and answers with real evidence — and falls back to
+/// the local evaluator (same predicate vocabulary, same reply shape, run
+/// against one fresh `window_state` snapshot) when the installed driver
+/// can't answer: older releases returned `observation_unavailable` for
+/// element predicates, and a refusal/error on any driver must not turn the
+/// check into a hard failure.
 async fn verify_predicates(
     backend: &dyn ComputerBackend,
     settings: &ComputerSettings,
@@ -1372,6 +1375,13 @@ async fn verify_predicates(
         Value::Array(items) => items,
         single => vec![single],
     };
+    if let Ok(outcome) = backend
+        .verify(pid, window_id, Value::Array(predicates.clone()))
+        .await
+        && verify_outcome_usable(&outcome)
+    {
+        return Ok(outcome);
+    }
     let wants_elements = predicates.iter().any(|p| p.get("element").is_some());
     // get_window_state refuses a bare "nothing to return" call — window-only
     // predicates still pass semantic:true capped at one element.
@@ -1429,6 +1439,26 @@ fn normalize_expect(expect: Value) -> Value {
         Value::Array(items) => Value::Array(items.into_iter().map(normalize_expect).collect()),
         scalar => scalar,
     }
+}
+
+/// Is this a real verdict or a shrug? A `verify_state` reply is usable
+/// only if at least one predicate reached `satisfied`/`unsatisfied` — when
+/// every verdict is `unknown` the driver couldn't evaluate anything
+/// (0.28.x's `observation_unavailable` on element predicates), so the
+/// caller should run the local evaluator instead.
+fn verify_outcome_usable(outcome: &Value) -> bool {
+    outcome
+        .get("predicates")
+        .and_then(Value::as_array)
+        .map(|predicates| {
+            predicates.iter().any(|p| {
+                matches!(
+                    p.get("status").and_then(Value::as_str),
+                    Some("satisfied") | Some("unsatisfied")
+                )
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn camel_to_snake_case(key: &str) -> String {

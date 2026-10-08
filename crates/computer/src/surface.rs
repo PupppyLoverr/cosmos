@@ -146,7 +146,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "computer_click",
-            "description": "Click an element or pixel in a window. PREFER element refs: elementIndex+snapshotId+windowId or elementToken — they work on backgrounded/minimized windows and survive DPI/scaling. x/y are window-local pixels from the observe digest/screenshot. 'expect' optionally runs computer_verify after the click. Returns the driver's effect report (confirmed|partial|unverifiable|suspected_noop) — 'unverifiable'/'suspected_noop' means re-observe before assuming success. On stale_element: re-observe and pick a fresh ref. On background_unavailable: retry with deliveryMode:'foreground' only if Full Control is on.",
+            "description": "Click an element or pixel in a window. PREFER element refs: elementIndex+snapshotId+windowId or elementToken — they work on backgrounded/minimized windows and survive DPI/scaling. x/y are window-local pixels from the observe digest/screenshot and are admitted against the session's freshest screenshot capture (auto-bound — an explicit captureId is optional). 'expect' optionally runs computer_verify after the click. Returns the driver's effect report (confirmed|partial|unverifiable|suspected_noop) — 'unverifiable'/'suspected_noop' means re-observe before assuming success. On stale_element: re-observe and pick a fresh ref. On background_unavailable: retry with deliveryMode:'foreground' only if Full Control is on.",
             "inputSchema": click_schema(),
         }),
         json!({
@@ -386,6 +386,7 @@ fn click_schema() -> Value {
             "button": {"type": "string", "enum": ["left", "middle"], "description": "Button for computer_click (default left)."},
             "count": {"type": "integer", "description": "Click count 1-3 (default 1)."},
             "modifiers": {"type": "array", "items": {"type": "string"}, "description": "Held modifiers: ctrl, shift, alt, win/cmd."},
+            "captureId": {"type": "string", "description": "Explicit session capture for x/y clicks (advanced — normally auto-bound to the freshest observe)."},
             "expect": {"type": "array", "description": "Optional computer_verify predicates to run after the click."},
         })),
         "additionalProperties": false,

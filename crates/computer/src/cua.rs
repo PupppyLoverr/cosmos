@@ -105,6 +105,15 @@ pub struct CuaBackend {
     /// Snapshot element frames used to fall back to screen-point actions when
     /// an out-of-process sheet rejects a token addressed to its owner window.
     element_frames: Arc<Mutex<HashMap<String, CachedElement>>>,
+    /// Latest admitted screenshot capture per (pid, window_id); (0,0) keys the
+    /// desktop capture. Driver ≥0.34 refuses a pixel-rung click unless the
+    /// session owns the capture the coordinates were picked from — observes
+    /// populate this and pixel actions mint one on demand when cold.
+    latest_captures: Arc<Mutex<HashMap<(i64, i64), String>>>,
+    /// Whether driver sessions on this backend get the visible agent cursor
+    /// (motion style + enable calls after `start_session`). Off in
+    /// observe-only mode — a cursor that never acts is just clutter.
+    show_agent_cursor: bool,
     native_menu: Option<NativeMenuPress>,
 }
 
@@ -150,6 +159,8 @@ impl CuaBackend {
             version: None,
             sheet_owners: Arc::new(Mutex::new(HashMap::new())),
             element_frames: Arc::new(Mutex::new(HashMap::new())),
+            latest_captures: Arc::new(Mutex::new(HashMap::new())),
+            show_agent_cursor: settings.control.acts(),
             native_menu,
         };
         // Name the shared session up-front — `start_session` is idempotent and
@@ -172,6 +183,8 @@ impl CuaBackend {
             version,
             sheet_owners: backend.sheet_owners,
             element_frames: backend.element_frames,
+            latest_captures: backend.latest_captures,
+            show_agent_cursor: backend.show_agent_cursor,
             native_menu: backend.native_menu,
         })
     }
@@ -194,6 +207,8 @@ impl CuaBackend {
             version: self.version.clone(),
             sheet_owners: self.sheet_owners.clone(),
             element_frames: self.element_frames.clone(),
+            latest_captures: self.latest_captures.clone(),
+            show_agent_cursor: self.show_agent_cursor,
             native_menu: self.native_menu.clone(),
         }
     }
@@ -221,6 +236,42 @@ impl CuaBackend {
                     .map(|_| ())
             }
             other => other.map(|_| ()),
+        }?;
+        self.configure_session_cursor().await;
+        Ok(())
+    }
+
+    /// The agent cursor for this session (driver ≥0.33): `adaptive` motion —
+    /// a careful approach on small targets and a swoop on long moves — timed
+    /// by Fitts' law so far targets cost less. Both calls are best-effort:
+    /// an older installed driver just lacks the tools and the calls are
+    /// skipped; a refusal can't block `start_session` (or every later tool
+    /// call that revives the session).
+    async fn configure_session_cursor(&self) {
+        if !self.show_agent_cursor {
+            return;
+        }
+        if self.client.has_tool("set_agent_cursor_motion") {
+            let _ = self
+                .client
+                .call_tool(
+                    "set_agent_cursor_motion",
+                    json!({
+                        "session": self.session,
+                        "style": "adaptive",
+                        "timing": "fitts",
+                    }),
+                )
+                .await;
+        }
+        if self.client.has_tool("set_agent_cursor_enabled") {
+            let _ = self
+                .client
+                .call_tool(
+                    "set_agent_cursor_enabled",
+                    json!({ "session": self.session, "enabled": true }),
+                )
+                .await;
         }
     }
 
@@ -330,6 +381,117 @@ impl CuaBackend {
                     role: element.role.clone(),
                 },
             );
+        }
+    }
+
+    /// Cache the session-owned capture an observe minted — driver ≥0.34
+    /// refuses a pixel-rung click unless the session owns a capture; this is
+    /// what lets an x,y click admit the coordinates' source screenshot.
+    fn record_capture(&self, pid: i64, window_id: i64, structured: &Value) {
+        let Some(capture_id) = structured.get("capture_id").and_then(Value::as_str) else {
+            return;
+        };
+        let mut captures = self
+            .latest_captures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if captures.len() > 64 {
+            captures.clear();
+        }
+        captures.insert((pid, window_id), capture_id.to_string());
+    }
+
+    /// A screenshot-only `get_window_state` — the driver skips the AX walk
+    /// when `include_accessibility_tree` is false — whose only job is to mint
+    /// a session capture for a pixel dispatch.
+    async fn mint_capture(&self, pid: i64, window_id: i64) -> Result<String, ComputerError> {
+        let result = self
+            .call(
+                "get_window_state",
+                json!({
+                    "pid": pid,
+                    "window_id": window_id,
+                    "include_screenshot": true,
+                    "include_accessibility_tree": false,
+                }),
+            )
+            .await?;
+        let structured = result
+            .get("structuredContent")
+            .cloned()
+            .unwrap_or(json!({}));
+        let capture_id = structured
+            .get("capture_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ComputerError::Unavailable(
+                    "driver returned no capture_id for the pixel click".into(),
+                )
+            })?
+            .to_string();
+        self.record_capture(pid, window_id, &structured);
+        Ok(capture_id)
+    }
+
+    /// Bind a session `capture_id` onto a pixel-rung call: reuse the latest
+    /// capture this window's observes minted, or mint a fresh screenshot-only
+    /// one when the cache is cold. Desktop scope uses the (0,0) capture.
+    async fn bind_pixel_capture(&self, call_args: &mut Value) {
+        if call_args.get("capture_id").is_some() {
+            return;
+        }
+        let key = if call_args.get("scope").and_then(Value::as_str) == Some("desktop") {
+            Some((0i64, 0i64))
+        } else {
+            let Some(pid) = call_args.get("pid").and_then(Value::as_i64) else {
+                return;
+            };
+            let window_id = match call_args.get("window_id").and_then(Value::as_i64) {
+                Some(id) => id,
+                None => match self.window_for(pid, None).await {
+                    Ok(window) => match window.get("window_id").and_then(Value::as_i64) {
+                        Some(id) => id,
+                        None => return,
+                    },
+                    Err(_) => return,
+                },
+            };
+            Some((pid, window_id))
+        };
+        let Some(key) = key else { return };
+        let cached = self
+            .latest_captures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned();
+        let capture = match cached {
+            Some(capture) => Some(capture),
+            None if key != (0, 0) => self.mint_capture(key.0, key.1).await.ok(),
+            None => None,
+        };
+        if let Some(capture) = capture {
+            call_args["capture_id"] = json!(capture);
+        }
+    }
+
+    /// A pixel-capture refusal: the admitted capture went stale, mismatched,
+    /// or was never this session's — drop it so the retry mints fresh.
+    fn is_capture_refusal(error: &ComputerError) -> bool {
+        match error {
+            ComputerError::Refused { code, message } => {
+                let code = code.to_ascii_lowercase();
+                let message = message.to_ascii_lowercase();
+                code.contains("capture")
+                    || (message.contains("capture")
+                        && (message.contains("stale")
+                            || message.contains("mismatch")
+                            || message.contains("bounds")
+                            || message.contains("expired")
+                            || message.contains("unknown")
+                            || message.contains("admit")))
+            }
+            _ => false,
         }
     }
 
@@ -1189,6 +1351,7 @@ impl CuaBackend {
             .get("structuredContent")
             .cloned()
             .unwrap_or(json!({}));
+        self.record_capture(pid, window_id, &structured);
         let elements = structured
             .get("elements")
             .and_then(Value::as_array)
@@ -1342,11 +1505,17 @@ impl CuaBackend {
                 .join(format!("computer-{}.png", uuid::Uuid::new_v4()))
         });
         if let Some(path) = &screenshot_path {
-            self.call(
-                "get_desktop_state",
-                json!({ "screenshot_out_file": path.to_string_lossy() }),
-            )
-            .await?;
+            let result = self
+                .call(
+                    "get_desktop_state",
+                    json!({ "screenshot_out_file": path.to_string_lossy() }),
+                )
+                .await?;
+            let structured = result
+                .get("structuredContent")
+                .cloned()
+                .unwrap_or(json!({}));
+            self.record_capture(0, 0, &structured);
         }
         let screenshot = finish_screenshot(screenshot_path).await;
         if text.is_empty() && !request.semantic {
@@ -1375,42 +1544,66 @@ impl CuaBackend {
         let args = &request.args;
         let delivery = request.delivery.as_str();
         let (tool, mut call_args) = match request.tool.as_str() {
-            "computer_launch_app" => (
-                "launch_app",
-                json!({
-                    "name": str_arg(args, "name"),
-                    "path": str_arg(args, "path"),
-                    "bundle_id": str_arg(args, "bundleId"),
-                    "aumid": str_arg(args, "aumid"),
-                    "launch_path": str_arg(args, "launchPath"),
+            "computer_launch_app" => ("launch_app", {
+                // Driver ≥0.34 (darwin) accepts only name/bundle_id/urls/
+                // additional_arguments — the path/aumid/launch_path/
+                // start_minimized fields were dropped and are refused as
+                // unknown keys. `path`/`launchPath` degrade to a name
+                // from the .app basename.
+                let name = str_arg(args, "name").or_else(|| {
+                    str_arg_any(args, &["path", "launchPath", "launch_path"]).and_then(|path| {
+                        Path::new(&path)
+                            .file_stem()
+                            .map(|stem| stem.to_string_lossy().into_owned())
+                    })
+                });
+                #[cfg_attr(target_os = "macos", allow(unused_mut))]
+                let mut call = json!({
+                    "name": name,
+                    "bundle_id": str_arg_any(args, &["bundleId", "bundle_id"]),
                     "additional_arguments": args.get("args").cloned().unwrap_or(Value::Null),
                     "urls": args.get("urls").cloned().unwrap_or(Value::Null),
-                    "start_minimized": bool_arg(args, "startMinimized").unwrap_or(false),
-                }),
-            ),
+                });
+                #[cfg(not(target_os = "macos"))]
+                if let Some(obj) = call.as_object_mut() {
+                    // Non-macOS driver schemas still take these.
+                    obj.insert("path".into(), str_arg(args, "path").into());
+                    obj.insert("aumid".into(), str_arg(args, "aumid").into());
+                    obj.insert("launch_path".into(), str_arg(args, "launchPath").into());
+                    obj.insert(
+                        "start_minimized".into(),
+                        bool_arg(args, "startMinimized").unwrap_or(false).into(),
+                    );
+                }
+                call
+            }),
             "computer_close_app" => ("kill_app", json!({ "pid": int_arg(args, "pid") })),
             "computer_focus_app" => (
                 "bring_to_front",
                 json!({ "pid": int_arg(args, "pid"), "window_id": int_arg(args, "windowId") }),
             ),
             "computer_click" | "computer_right_click" | "computer_double_click" => {
-                let tool = match request.tool.as_str() {
-                    "computer_right_click" => "right_click",
-                    "computer_double_click" => "double_click",
-                    _ => "click",
-                };
-                (
-                    tool,
-                    target_args(
-                        args,
-                        delivery,
+                // The variants take different extras driver-side: `click`
+                // alone has button/count/capture_id; right_click only
+                // `modifier`; double_click none.
+                let (tool, extra) = match request.tool.as_str() {
+                    "computer_right_click" => (
+                        "right_click",
+                        json!({
+                            "modifier": args.get("modifiers").cloned().unwrap_or(Value::Null),
+                        }),
+                    ),
+                    "computer_double_click" => ("double_click", json!({})),
+                    _ => (
+                        "click",
                         json!({
                             "button": str_arg(args, "button"),
                             "count": int_arg(args, "count"),
                             "modifier": args.get("modifiers").cloned().unwrap_or(Value::Null),
                         }),
                     ),
-                )
+                };
+                (tool, target_args(args, delivery, extra))
             }
             "computer_type_text" => (
                 "type_text",
@@ -1424,8 +1617,15 @@ impl CuaBackend {
                 ),
             ),
             "computer_set_value" => (
+                // set_value is AX-only driver-side — it has no delivery_mode,
+                // scope, target or x/y fields, so it can't use target_args.
                 "set_value",
-                target_args(args, delivery, json!({ "value": str_arg(args, "value") })),
+                json!({
+                    "pid": int_arg_any(args, &["pid"]),
+                    "window_id": int_arg_any(args, &["windowId", "window_id"]),
+                    "element_token": element_token_arg(args),
+                    "value": str_arg(args, "value"),
+                }),
             ),
             "computer_press_key" => (
                 "press_key",
@@ -1557,6 +1757,17 @@ impl CuaBackend {
                     " (window {window_id} is a sheet of window {owner}; addressed {owner})"
                 ));
             }
+        }
+        // Pixel-rung clicks (x,y with no element ref) must present the
+        // session-owned `capture_id` the coordinates came from (driver
+        // ≥0.34). Reuse the latest observe's capture for the window, or
+        // mint a fresh screenshot-only one when the cache is cold.
+        if tool == "click"
+            && call_args.get("element_token").is_none()
+            && call_args.get("capture_id").is_none()
+            && (call_args.get("x").is_some() || call_args.get("y").is_some())
+        {
+            self.bind_pixel_capture(&mut call_args).await;
         }
         let mut app_activation_note: Option<String> = None;
         let raised_invoke_menu_window = if tool == "invoke_menu" {
@@ -1691,6 +1902,19 @@ impl CuaBackend {
                     }
                     Some(Err(_)) | None => return Err(error),
                 }
+            }
+            Err(error)
+                if tool == "click"
+                    && call_args.get("capture_id").is_some()
+                    && Self::is_capture_refusal(&error) =>
+            {
+                // The admitted capture went stale between observe and click —
+                // drop it, mint a fresh screenshot, retry the same click once.
+                if let Some(obj) = call_args.as_object_mut() {
+                    obj.remove("capture_id");
+                }
+                self.bind_pixel_capture(&mut call_args).await;
+                self.call(tool, call_args.clone()).await?
             }
             Err(error) if Self::is_ax_window_unresolved(&error) && tool != "launch_app" => {
                 // Sheet windows: retarget to the owning window (window-local
@@ -1921,20 +2145,24 @@ impl CuaBackend {
     }
 }
 
-/// Shared target/addressing args for action tools — `pid`/`window_id`/
-/// `element_token`/`element_index`/`snapshot_id`/`x`/`y`/`scope`/`target`/
-/// `delivery_mode` pass straight through; `extra` adds the tool-specific ones.
+/// Shared target/addressing args for action tools.
+/// The driver's element handle is a single `element_token`
+/// (`s{snapshot}:{index}`); driver ≥0.34 refuses separate
+/// `element_index`/`snapshot_id` fields as unknown args, so the surface's
+/// `elementIndex`+`snapshotId` pair is always folded into a token here.
+/// Snake-case spellings (`element_index`, `window_id`, …) are accepted as
+/// aliases — harnesses guess both casings.
 fn target_args(args: &Value, delivery: &str, extra: Value) -> Value {
+    let element_token = element_token_arg(args);
     let mut out = json!({
-        "pid": int_arg(args, "pid"),
-        "window_id": int_arg(args, "windowId"),
-        "element_token": str_arg(args, "elementToken"),
-        "element_index": int_arg(args, "elementIndex"),
-        "snapshot_id": str_arg(args, "snapshotId"),
+        "pid": int_arg_any(args, &["pid"]),
+        "window_id": int_arg_any(args, &["windowId", "window_id"]),
+        "element_token": element_token,
         "x": num_arg(args, "x"),
         "y": num_arg(args, "y"),
         "scope": str_arg(args, "scope"),
         "target": args.get("target").cloned().unwrap_or(Value::Null),
+        "capture_id": str_arg_any(args, &["captureId", "capture_id"]),
         "delivery_mode": delivery,
     });
     if let (Some(out_obj), Some(extra_obj)) = (out.as_object_mut(), extra.as_object()) {
@@ -1943,6 +2171,30 @@ fn target_args(args: &Value, delivery: &str, extra: Value) -> Value {
         }
     }
     out
+}
+
+/// `elementToken`, or `snapshotId`+`elementIndex` folded into a token (the
+/// driver's only element handle ≥0.34). Snake-case aliases accepted.
+fn element_token_arg(args: &Value) -> Option<String> {
+    str_arg_any(args, &["elementToken", "element_token"]).or_else(|| {
+        match (
+            str_arg_any(args, &["snapshotId", "snapshot_id"]),
+            int_arg_any(args, &["elementIndex", "element_index"]),
+        ) {
+            (Some(snapshot_id), Some(element_index)) => {
+                Some(format!("{snapshot_id}:{element_index}"))
+            }
+            _ => None,
+        }
+    })
+}
+
+fn str_arg_any(args: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| str_arg(args, key))
+}
+
+fn int_arg_any(args: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| int_arg(args, key))
 }
 
 /// Surface menu path ("File > Save" string, or an already-array path) → the
@@ -2308,6 +2560,56 @@ mod fast_input_tests {
             12,
             &target
         ));
+    }
+
+    #[test]
+    fn target_args_folds_element_ref_into_token() {
+        let args = target_args(
+            &json!({
+                "pid": 7,
+                "windowId": 9,
+                "elementIndex": 3,
+                "snapshotId": "s00000012"
+            }),
+            "background",
+            json!({}),
+        );
+        assert_eq!(args["element_token"], "s00000012:3");
+        // Driver ≥0.34 refuses the split fields — never emitted.
+        assert!(args.get("element_index").is_none());
+        assert!(args.get("snapshot_id").is_none());
+        assert_eq!(args["pid"], 7);
+        assert_eq!(args["window_id"], 9);
+    }
+
+    #[test]
+    fn target_args_prefers_explicit_token_and_accepts_snake_case() {
+        let args = target_args(
+            &json!({
+                "element_token": "s5:2",
+                "element_index": 9,
+                "snapshot_id": "s9",
+                "window_id": 4,
+                "capture_id": "capture_abc"
+            }),
+            "background",
+            json!({}),
+        );
+        assert_eq!(args["element_token"], "s5:2");
+        assert_eq!(args["window_id"], 4);
+        assert_eq!(args["capture_id"], "capture_abc");
+    }
+
+    #[test]
+    fn capture_refusal_matches_driver_rejections() {
+        assert!(CuaBackend::is_capture_refusal(&ComputerError::refused(
+            "capture_stale",
+            "capture is stale or out of bounds"
+        )));
+        assert!(!CuaBackend::is_capture_refusal(&ComputerError::refused(
+            "element_not_found",
+            "element not found"
+        )));
     }
 }
 
