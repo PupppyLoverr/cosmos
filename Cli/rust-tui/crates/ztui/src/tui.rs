@@ -103,6 +103,8 @@ pub enum Popup {
 pub struct Output {
     pub title: String,
     pub body: Vec<String>,
+    /// the diff, drawn in colour when the pager shows it
+    pub diff: Option<Diff>,
 }
 
 /// `/customise reset classic`: the look cosmostui had before skins.
@@ -257,6 +259,8 @@ pub struct App {
     pub user: Option<String>,
     /// `/onboarding` asked the loop to hand the terminal to cosmostui-welcome
     pub replay_onboard: bool,
+    /// a subscription to install and/or sign in to with the terminal handed over
+    pub handoff: Option<String>,
     /// `ui.toml` was just written by a command — reload it now, not in a second
     pub skin_reload: bool,
     /// the companion beside the composer
@@ -269,6 +273,16 @@ pub struct App {
     pub titled: bool,
     /// an error arrived during this turn
     turn_err: Option<String>,
+    /// /pettalk waiting for the pet's answer
+    pet_talk: Option<crate::pettalk::Talk>,
+    /// the chat with the pet so far (it remembers)
+    pet_chat: Vec<zproto::Message>,
+    /// what pet chats have cost this session
+    pub pet_usd: f64,
+    /// (when, what) reminders the pet keeps
+    pub reminders: Vec<(Instant, String)>,
+    /// (left at, turns then, fixes then) while the terminal is unfocused
+    away: Option<(Instant, u64, u64)>,
     /// `/customise <request>` running in the background
     pub customise: Option<crate::customise::Runner>,
     /// what the customiser is doing (status strip)
@@ -279,6 +293,20 @@ pub struct App {
     pub mod_usd: f64,
     /// a draft waits for ctrl+y / ctrl+n
     pub draft_ready: bool,
+    /// ctrl+p: the live UI drawn in the draft's look before applying it
+    pub preview_skin: Option<crate::skin::Skin>,
+    /// messages typed while a task runs: (as typed, as sent)
+    pub queue: Vec<(String, String)>,
+    /// the queued message being managed (↑ from an empty composer)
+    pub queue_sel: Option<usize>,
+    /// where an edited queued message goes back
+    queue_edit: Option<usize>,
+    /// "send now": handed to the worker, which slips it into the running task
+    pub steer: crate::worker::Steer,
+    /// subscription-agent tools already drawn live this turn
+    acp_done: std::collections::HashSet<String>,
+    /// the reply being written streamed already (so it isn't drawn twice)
+    turn_streamed: bool,
     /// the dictation key is physically down (Windows reports releases), so
     /// its auto-repeat can't stop a recording it just started
     toggle_held: bool,
@@ -356,17 +384,30 @@ impl App {
             last_reply: String::new(),
             user: None,
             replay_onboard: false,
+            handoff: None,
             skin_reload: false,
             buddy: crate::buddy::Buddy::new(),
             focused: None,
             term_out: Vec::new(),
             titled: false,
             turn_err: None,
+            pet_talk: None,
+            pet_chat: Vec::new(),
+            pet_usd: 0.0,
+            reminders: Vec::new(),
+            away: None,
             customise: None,
             mod_status: String::new(),
             mod_log: Vec::new(),
             mod_usd: 0.0,
             draft_ready: crate::customise::tidy(&crate::customise::Paths::new(&zcore::cli_home())),
+            preview_skin: None,
+            queue: Vec::new(),
+            queue_sel: None,
+            queue_edit: None,
+            steer: crate::worker::Steer::default(),
+            acp_done: std::collections::HashSet::new(),
+            turn_streamed: false,
             toggle_held: false,
             toggle_last: None,
         }
@@ -397,13 +438,13 @@ impl App {
     }
 
     /// Keep a tool's full output for the ctrl+o pager.
-    fn keep_output(&mut self, title: String, mut body: Vec<String>) {
+    fn keep_output_styled(&mut self, title: String, mut body: Vec<String>, diff: Option<Diff>) {
         if body.len() > KEEP_OUTPUT_LINES {
             let more = body.len() - KEEP_OUTPUT_LINES;
             body.truncate(KEEP_OUTPUT_LINES);
             body.push(format!("… {more} more lines not kept"));
         }
-        self.outputs.push_back(Output { title, body });
+        self.outputs.push_back(Output { title, body, diff });
         while self.outputs.len() > KEEP_OUTPUTS {
             self.outputs.pop_front();
         }
@@ -412,12 +453,15 @@ impl App {
     /// A finished tool call: kept for ctrl+o, then grouped or committed.
     fn finish_tool(&mut self, v: crate::toolview::ToolView) {
         let w = self.width;
-        let title = format!("{} {}", view::tool_label(v.name), view::arg_summary(v.name, v.input, 200)).trim().to_string();
+        let title = match (crate::toolview::vendor(v.name), v.input["title"].as_str()) {
+            (Some((vendor, _)), Some(t)) => format!("{t} ({vendor})"),
+            _ => format!("{} {}", view::tool_label(v.name), view::arg_summary(v.name, v.input, 200)).trim().to_string(),
+        };
         let body: Vec<String> = match v.diff {
             Some(d) => crate::toolview::diff_text(d),
             None => crate::toolview::body_of(v.name, v.content.unwrap_or("")).lines().map(str::to_string).collect(),
         };
-        self.keep_output(title, body);
+        self.keep_output_styled(title, body, v.diff.cloned());
         let sk = crate::skin::current();
         if !v.interrupted && v.diff.is_none() && crate::toolview::groups(&sk, v.name, v.err) {
             self.explore.push(crate::toolview::Explored {
@@ -475,7 +519,204 @@ impl App {
         }
         let name = view::buddy_identity(self).name;
         self.buddy.on(m, &sk.buddy, &name);
+        self.pet_progress();
         self.dirty = true;
+    }
+
+    /// Save the pet's progress and announce a level-up.
+    fn pet_progress(&mut self) {
+        if std::mem::take(&mut self.buddy.progress_dirty) && !cfg!(test) {
+            self.buddy.progress.save(&zcore::cli_home());
+        }
+        if let Some(level) = self.buddy.leveled.take() {
+            let sk = crate::skin::current();
+            let id = view::buddy_identity(self);
+            self.buddy.say_kind("level", &sk.buddy, &id.name);
+            self.buddy.trick(crate::buddy::Trick::Sparkle);
+            let unlock = crate::buddy::UNLOCKS.iter().find(|(at, _)| *at == level).map(|(_, what)| format!(" — unlocked {what}")).unwrap_or_default();
+            self.flash(format!("✦ {} reached level {level}{unlock}", id.name), theme::ACCENT());
+        }
+    }
+
+    /// Reminders, break nudges and the pet's chat (once per loop turn).
+    fn poll_pet(&mut self) {
+        let sk = crate::skin::current();
+        if !sk.buddy.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let due: Vec<String> = self.reminders.iter().filter(|(t, _)| *t <= now).map(|(_, s)| s.clone()).collect();
+        if !due.is_empty() {
+            self.reminders.retain(|(t, _)| *t > now);
+            let name = view::buddy_identity(self).name;
+            for d in due {
+                self.buddy.speak(format!("⏰ {d}"), 30);
+                self.buddy.trick(crate::buddy::Trick::Hop);
+                self.note(format!("⏰ {name}: {d}"));
+                let a = crate::notify::Alert {
+                    term: [crate::notify::title(&format!("⏰ {d} · cosmostui")), vec![0x07]].concat(),
+                    desktop: Some((format!("{name} reminds you"), d.clone())),
+                    chime: sk.notify.sound,
+                };
+                self.term_out.extend(&a.term);
+                self.titled = true;
+                if !cfg!(test) {
+                    crate::notify::fire(&a);
+                }
+            }
+            self.dirty = true;
+        }
+        if self.buddy.break_due(sk.buddy.break_mins) {
+            let name = view::buddy_identity(self).name;
+            self.buddy.say_kind("break", &sk.buddy, &name);
+            self.dirty = true;
+        }
+        self.poll_pet_talk();
+    }
+
+    /// `/pettalk <message>`
+    fn pet_talk_command(&mut self, msg: &str) {
+        let sk = crate::skin::current();
+        let id = view::buddy_identity(self);
+        if !sk.buddy.enabled {
+            self.note("Your pet is off — /buddy on brings it back");
+            return;
+        }
+        if msg == "stop" {
+            if let Some(t) = self.pet_talk.take() {
+                t.stop();
+                self.buddy.listening = false;
+                self.flash(format!("{} stopped thinking", id.name), theme::YELLOW());
+            }
+            return;
+        }
+        if msg.is_empty() {
+            self.note(format!(
+                "Talk to {}: /pettalk how's it going? · remind me in 20 minutes to stretch · what changed in the repo? · do a trick · let's change your colours",
+                id.name
+            ));
+            return;
+        }
+        if self.pet_talk.is_some() {
+            self.error(format!("{} is still thinking…", id.name));
+            return;
+        }
+        let ctx = crate::pettalk::Context { pet: self.pet_profile(&id), session: self.pet_session(), cwd: self.cwd.clone() };
+        self.pet_chat.push(crate::pettalk::user(msg));
+        crate::pettalk::trim(&mut self.pet_chat, 12);
+        self.block(view::pet_heard(self, msg, self.width));
+        self.buddy.listening = true;
+        self.pet_talk = Some(crate::pettalk::ask(self.alias.clone(), zcore::cli_home(), ctx, self.pet_chat.clone()));
+        self.dirty = true;
+    }
+
+    /// Who the pet is, for its prompt.
+    fn pet_profile(&self, id: &crate::buddy::Identity) -> String {
+        let p = &self.buddy.progress;
+        format!(
+            "You are {}, a {} {} (personality: {}). Level {} — {} turns worked together, {} red tests turned green, {} chats, a {}-day streak.",
+            id.name,
+            id.rarity.label(),
+            id.species().name,
+            id.personality(),
+            p.level(),
+            p.turns,
+            p.fixes,
+            p.chats,
+            p.streak
+        )
+    }
+
+    /// What's happening in the session, for the pet's prompt.
+    fn pet_session(&self) -> String {
+        let mut s = vec![
+            format!("- model: {} · mode: {}", self.alias, self.mode.name()),
+            format!("- folder: {}", self.cwd.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()),
+            format!("- session: {} min, {} turns, spent {}", self.session_started.elapsed().as_secs() / 60, self.usage.turns, view::ledger(self).1),
+        ];
+        if self.busy {
+            s.push(format!("- the assistant is working right now ({}s in)", self.busy_since.elapsed().as_secs()));
+        }
+        let recent: Vec<String> = self.history.iter().rev().take(3).map(|h| format!("\"{}\"", crate::wrap::ellipsize(h, 120))).collect();
+        if !recent.is_empty() {
+            s.push(format!("- their latest requests (newest first): {}", recent.join(", ")));
+        }
+        if !self.last_reply.is_empty() {
+            s.push(format!("- the assistant's last reply began: \"{}\"", crate::wrap::ellipsize(&self.last_reply.replace('\n', " "), 300)));
+        }
+        if !self.reminders.is_empty() {
+            let r: Vec<String> = self.reminders.iter().map(|(t, w)| format!("\"{w}\" in {} min", t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60))).collect();
+            s.push(format!("- reminders you're keeping: {}", r.join(", ")));
+        }
+        s.join("
+")
+    }
+
+    fn poll_pet_talk(&mut self) {
+        let Some(t) = &self.pet_talk else { return };
+        if t.started.elapsed() > Duration::from_secs(180) {
+            t.stop();
+            self.pet_talk = None;
+            self.buddy.listening = false;
+            self.error(format!("{} took too long to answer — try again", view::buddy_identity(self).name));
+            return;
+        }
+        let Ok(reply) = t.rx.try_recv() else { return };
+        self.pet_talk = None;
+        self.buddy.listening = false;
+        self.dirty = true;
+        match reply {
+            crate::pettalk::Reply::Failed(e) => self.error(format!("{} couldn't answer: {e}", view::buddy_identity(self).name)),
+            crate::pettalk::Reply::Text { text, actions, usd } => {
+                self.pet_usd += usd.unwrap_or(0.0);
+                let shown = if text.is_empty() { "…".to_string() } else { text.clone() };
+                self.pet_chat.push(crate::pettalk::assistant(&text));
+                self.block(view::pet_reply(self, &shown, self.width));
+                let first = shown.split(['.', '!', '?', '\n']).next().unwrap_or("").trim().to_string();
+                if !first.is_empty() {
+                    self.buddy.speak(crate::wrap::ellipsize(&first, 60), 8);
+                }
+                self.buddy.chatted();
+                for a in actions {
+                    self.pet_act(a);
+                }
+                self.pet_progress();
+            }
+        }
+    }
+
+    /// Do what the pet decided to do.
+    fn pet_act(&mut self, a: crate::pettalk::Action) {
+        use crate::pettalk::Action;
+        use crate::skin::edit::{set_in_file, Val};
+        let name = view::buddy_identity(self).name;
+        let ui = zcore::cli_home().join("ui.toml");
+        match a {
+            Action::Remind { mins, text } => {
+                self.reminders.push((Instant::now() + Duration::from_secs(mins * 60), text.clone()));
+                self.note(format!("⏰ {name} will remind you in {mins} min: {text}"));
+            }
+            Action::Trick(t) => self.buddy.trick(t),
+            Action::Rename(n) => match set_in_file(&ui, "buddy", "name", &Val::Str(n.clone())) {
+                Ok(()) => {
+                    self.skin_reload = true;
+                    self.note(format!("✎ {name} is now called {n}"));
+                }
+                Err(e) => self.error(e),
+            },
+            Action::Species(s) => match set_in_file(&ui, "buddy", "species", &Val::Str(s.clone())) {
+                Ok(()) => {
+                    self.skin_reload = true;
+                    self.buddy.trick(crate::buddy::Trick::Spin);
+                    self.note(format!("✎ {name} turned into a {s}"));
+                }
+                Err(e) => self.error(e),
+            },
+            Action::Customise(req) => {
+                self.note(format!("✎ {name} passed that to /customise: {req}"));
+                self.start_customise(&req);
+            }
+        }
     }
 
     fn set_title(&mut self, text: &str) {
@@ -518,6 +759,7 @@ impl App {
 
     fn on_delta(&mut self, s: &str) {
         let w = self.width;
+        self.turn_streamed = true;
         let st = self.stream.get_or_insert_with(|| Stream {
             md: Md::new(),
             partial: String::new(),
@@ -559,6 +801,7 @@ impl App {
     /// Close the streaming reply: flush its last line and any held table.
     fn end_stream(&mut self) {
         if let Some(mut st) = self.stream.take() {
+            self.turn_chars += st.chars;
             let w = self.width;
             let mut rows = Vec::new();
             if !st.partial.is_empty() {
@@ -605,6 +848,7 @@ impl App {
             }
             Msg::Event(ev) => self.on_event(&ev),
             Msg::Delta(s) => self.on_delta(&s),
+            Msg::AcpTool(v) => self.on_acp_tool(&v),
             Msg::Diff { id, diff } => {
                 self.diffs.insert(id, diff);
             }
@@ -635,9 +879,6 @@ impl App {
                 self.error(s)
             }
             Msg::TurnDone => {
-                if let Some(st) = &self.stream {
-                    self.turn_chars += st.chars;
-                }
                 self.end_stream();
                 // anything still pending was cut short
                 for t in std::mem::take(&mut self.tools) {
@@ -656,6 +897,10 @@ impl App {
                 self.inflight = self.inflight.saturating_sub(1);
                 if self.inflight == 0 {
                     self.busy = false;
+                    let late: Vec<String> = self.steer.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default();
+                    for (k, t) in late.into_iter().enumerate() {
+                        self.queue.insert(k, (t.clone(), t));
+                    }
                     let lines = view::turn_footer(self);
                     if !lines.is_empty() {
                         self.cont(lines);
@@ -713,10 +958,13 @@ impl App {
                 let text = ev.data["text"].as_str().unwrap_or("");
                 if self.stream.is_some() {
                     self.end_stream();
-                } else if !text.trim().is_empty() {
-                    self.last_reply = text.trim().to_string();
+                } else if !self.turn_streamed && !text.trim().is_empty() {
                     self.block(markdown::render(text.trim_matches('\n'), w));
                 }
+                if !text.trim().is_empty() {
+                    self.last_reply = text.trim().to_string();
+                }
+                self.turn_streamed = false;
                 if let Some(calls) = ev.data["tool_calls"].as_array() {
                     for c in calls {
                         let name = c["name"].as_str().unwrap_or("tool");
@@ -766,7 +1014,11 @@ impl App {
                 }
             }
             // a subscription agent's own tool (ACP) — shown, never replayed
+            // drawn live already (Msg::AcpTool); this is the log's copy
+            "tool_call" if ev.data["source"] == "acp" && self.acp_done.contains(ev.data["id"].as_str().unwrap_or("")) => {}
             "tool_call" if ev.data["source"] == "acp" => {
+                self.end_stream();
+                self.tools.retain(|t| t.id != ev.data["id"].as_str().unwrap_or(""));
                 let name = ev.data["name"].as_str().unwrap_or("tool");
                 let status = ev.data["status"].as_str().unwrap_or("");
                 let input = serde_json::json!({"title": ev.data["title"]});
@@ -841,6 +1093,7 @@ impl App {
     /// Poll dictation, sign-in and shell jobs (once per loop turn).
     fn poll_jobs(&mut self) {
         self.poll_customise();
+        self.poll_pet();
         if let Some(rec) = &mut self.rec {
             if !rec.transcribing {
                 rec.tick();
@@ -1166,6 +1419,8 @@ impl App {
             self.verb_seed = crate::motion::now_ms() as u64 / 7;
             self.turn_chars = 0;
             self.turn_err = None;
+            self.turn_streamed = false;
+            self.acp_done.clear();
             self.buddy_on(crate::buddy::Moment::TurnStart);
             self.busy_title();
         }
@@ -1174,12 +1429,18 @@ impl App {
     }
 
     /// Send a prompt to the agent (`shown` is what the transcript displays).
-    fn send_prompt(&mut self, shown: &str, text: String, cmd: &Sender<Cmd>) {
-        let mut text = files::expand_mentions(&text, &self.cwd);
+    /// What the model gets: @mentions expanded, pending `!` output in front.
+    fn for_model(&mut self, text: &str) -> String {
+        let mut text = files::expand_mentions(text, &self.cwd);
         if !self.pending_ctx.is_empty() {
             let ctx = std::mem::take(&mut self.pending_ctx).join("\n\n");
             text = format!("{ctx}\n\n{text}");
         }
+        text
+    }
+
+    fn send_prompt(&mut self, shown: &str, text: String, cmd: &Sender<Cmd>) {
+        let text = self.for_model(&text);
         self.echoes.push(text.clone());
         self.block(view::user(shown, self.width));
         self.start_busy();
@@ -1250,6 +1511,13 @@ impl App {
         }
         let text = self.expand_pastes(&raw);
         self.pastes.clear();
+        if self.busy || self.inflight > 0 {
+            let at = self.queue_edit.take().unwrap_or(self.queue.len()).min(self.queue.len());
+            self.queue.insert(at, (raw, text));
+            self.dirty = true;
+            return;
+        }
+        self.queue_edit = None;
         self.send_prompt(&raw, text, cmd);
     }
 
@@ -1364,6 +1632,7 @@ impl App {
             }
             "buddy" => self.buddy_command(args.trim()),
             "customise" | "customize" => self.customise_command(args.trim()),
+            "pettalk" | "talk" => self.pet_talk_command(args.trim()),
             "verbs" => self.verbs_command(args.trim()),
             "notify" => {
                 let sk = crate::skin::current();
@@ -1523,26 +1792,161 @@ impl App {
     fn connect_acp(&mut self, id: &str) {
         let Some(p) = zcore::acp_client::plugin(id) else { return };
         if !zcore::acp_client::installed(id) {
-            self.error(format!("{} isn't installed — {}", p.name, p.install));
+            // no CLI yet: install the vendor's official one, then sign in
+            self.handoff = Some(id.to_string());
             return;
         }
-        // the agent reports the plan's real model list on session/new —
-        // grab it now so the picker shows more than "<id>/default"
+        // signed in already? the agent reports the plan's model list on session/new
         match zcore::catalog::provider(id).map(zcore::live::fetch) {
             Some(Ok(models)) => {
                 let _ = zcore::live::store(id, &models);
+                self.reload_models();
+                self.note(format!("{} is connected — it runs on your {} plan", p.name, p.name));
+                self.open_model_picker_for(id);
             }
-            Some(Err(e)) => self.note(format!("Couldn't get {}'s model list ({e:#}) — showing its default", p.name)),
+            // most likely not signed in: run the vendor's sign-in
+            _ => self.handoff = Some(id.to_string()),
+        }
+    }
+
+/// A subscription agent's tool, live: shown running the moment it starts
+    /// (after the text so far, so the transcript keeps its order), drawn
+    /// with its diff when it finishes.
+    fn on_acp_tool(&mut self, v: &serde_json::Value) {
+        let id = v["id"].as_str().unwrap_or("").to_string();
+        if id.is_empty() || self.acp_done.contains(&id) {
+            return;
+        }
+        let status = v["status"].as_str().unwrap_or("");
+        let done = matches!(status, "completed" | "failed");
+        let name = v["name"].as_str().unwrap_or("tool").to_string();
+        let input = serde_json::json!({"title": v["title"]});
+        self.dirty = true;
+        let pos = self.tools.iter().position(|t| t.id == id);
+        if pos.is_none() {
+            self.end_stream();
+        }
+        if !done {
+            match pos {
+                Some(i) => self.tools[i].input = input,
+                None => self.tools.push(PendingTool { id, name, input, started: Instant::now() }),
+            }
+            return;
+        }
+        let started = pos.map(|i| self.tools.remove(i).started);
+        let diff = v.get("diff").filter(|d| d.is_object()).map(|d| {
+            let old = d["old"].as_str();
+            let (lines, added, removed) = crate::worker::diff_rows(old.unwrap_or(""), d["new"].as_str().unwrap_or(""));
+            Diff { path: d["path"].as_str().unwrap_or("?").to_string(), added, removed, created: old.is_none(), lines }
+        });
+        self.finish_tool(crate::toolview::ToolView {
+            name: &name,
+            input: &input,
+            content: Some(v["output"].as_str().unwrap_or("")),
+            err: status == "failed",
+            diff: diff.as_ref(),
+            interrupted: false,
+            elapsed: started.map(|s| s.elapsed()),
+        });
+        self.acp_done.insert(id);
+    }
+
+    // ---- the queue ------------------------------------------------------
+
+    /// Send the next queued message once the task is done.
+    pub fn drain_queue(&mut self, cmd: &Sender<Cmd>) {
+        if self.busy || self.inflight > 0 || self.perm.is_some() || self.queue.is_empty() {
+            return;
+        }
+        let (shown, text) = self.queue.remove(0);
+        self.queue_sel = match self.queue_sel {
+            Some(0) | None => None,
+            Some(i) => Some(i - 1),
+        };
+        self.send_prompt(&shown, text, cmd);
+    }
+
+    /// "send now": into the running task, context intact.
+    fn send_now(&mut self, i: usize, cmd: &Sender<Cmd>) {
+        if i >= self.queue.len() {
+            return;
+        }
+        let (shown, text) = self.queue.remove(i);
+        self.queue_sel = None;
+        if !self.busy {
+            self.send_prompt(&shown, text, cmd);
+            return;
+        }
+        let text = self.for_model(&text);
+        if let Ok(mut s) = self.steer.lock() {
+            s.push(text);
+        }
+        self.flash("Sent — it joins the task at the next step", theme::ACCENT());
+        self.dirty = true;
+    }
+
+    /// Keys while a queued message is selected. True when handled.
+    fn queue_key(&mut self, k: &KeyEvent, cmd: &Sender<Cmd>) -> bool {
+        let Some(i) = self.queue_sel else { return false };
+        // ctrl+c, ctrl+o … keep working while a queued message is selected
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        let n = self.queue.len();
+        if n == 0 {
+            self.queue_sel = None;
+            return false;
+        }
+        let i = i.min(n - 1);
+        match k.code {
+            // past the top of the queue: on into prompt history
+            KeyCode::Up if i == 0 => {
+                self.queue_sel = None;
+                self.history_prev();
+            }
+            KeyCode::Up => self.queue_sel = Some(i - 1),
+            KeyCode::Down if i + 1 < n => self.queue_sel = Some(i + 1),
+            KeyCode::Down | KeyCode::Esc => self.queue_sel = None,
+            KeyCode::Enter | KeyCode::Char('s') => self.send_now(i, cmd),
+            KeyCode::Char('e') => {
+                let (shown, _) = self.queue.remove(i);
+                self.queue_sel = None;
+                self.queue_edit = Some(i);
+                self.input = shown.chars().collect();
+                self.cursor = self.input.len();
+            }
+            KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
+                self.queue.remove(i);
+                self.queue_sel = if self.queue.is_empty() { None } else { Some(i.min(self.queue.len() - 1)) };
+            }
+            _ => return true,
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// After the terminal comes back from an install / sign-in.
+    fn after_handoff(&mut self, id: &str, res: Result<(), String>) {
+        let name = zcore::acp_client::plugin(id).map(|p| p.name).unwrap_or(id);
+        if let Err(e) = res {
+            self.error(format!("Couldn't connect {name}: {e}"));
+            return;
+        }
+        match zcore::catalog::provider(id).map(zcore::live::fetch) {
+            Some(Ok(models)) => {
+                let n = models.len();
+                let _ = zcore::live::store(id, &models);
+                self.reload_models();
+                self.note(format!("{name} is connected · {n} models on your plan"));
+                self.open_model_picker_for(id);
+            }
+            Some(Err(e)) => {
+                self.reload_models();
+                self.note(format!("{name} is set up, but its model list didn't load ({e:#}) — showing its default"));
+                self.open_model_picker_for(id);
+            }
             None => {}
         }
-        self.reload_models();
-        self.note(format!(
-            "{} found — it runs on your {} plan. Not signed in yet? Run `{}` in a terminal (or `cosmostui auth login {id}`).",
-            p.name,
-            p.name,
-            p.login.join(" ")
-        ));
-        self.open_model_picker_for(id);
     }
 
     fn open_model_picker(&mut self) {
@@ -1569,7 +1973,8 @@ impl App {
         }
         if !self.quitting {
             self.quitting = true;
-            self.quit_deadline = Some(Instant::now() + Duration::from_millis(800));
+            // long enough for the worker to stop a subscription agent cleanly
+            self.quit_deadline = Some(Instant::now() + Duration::from_secs(3));
             let _ = cmd.send(Cmd::Quit);
         }
     }
@@ -1699,7 +2104,12 @@ impl App {
                         self.mod_log.drain(..100);
                     }
                 }
-                Up::Effect(Effect::Draft) => self.draft_ready = true,
+                Up::Effect(Effect::Draft) => {
+                    self.draft_ready = true;
+                    if self.preview_skin.is_some() {
+                        self.preview_skin = Self::load_draft();
+                    }
+                }
                 Up::Effect(Effect::Apply) => self.apply_draft(),
                 Up::Effect(Effect::Config) => self.reload_models(),
                 Up::Effect(Effect::Command) => self.commands = slash::load(&self.cwd),
@@ -1756,11 +2166,31 @@ impl App {
         rows.push(Line::default());
         rows.extend(crate::customise::preview(&skin, self.width.min(100)));
         rows.push(Line::default());
-        rows.push(Line::from(Span::styled(" ctrl+y apply · ctrl+n discard · /customise diff", theme::fg(theme::ACCENT()))));
+        rows.push(Line::from(Span::styled(" ctrl+p try it on · ctrl+y apply · ctrl+n discard · /customise diff", theme::fg(theme::ACCENT()))));
         self.block(rows);
     }
 
+    fn load_draft() -> Option<crate::skin::Skin> {
+        crate::skin::parse(&std::fs::read_to_string(Self::customise_paths().draft).ok()?).ok()
+    }
+
+    /// ctrl+p: try the draft on the live UI (spinner, pet, composer, status).
+    fn toggle_preview(&mut self) {
+        if self.preview_skin.take().is_some() {
+            self.flash("Back to your current look", crate::skin::palette().dim);
+            return;
+        }
+        match Self::load_draft() {
+            Some(sk) => {
+                self.preview_skin = Some(sk);
+                self.flash("Previewing the draft — ctrl+y keep it · ctrl+n drop it · ctrl+p back", theme::ACCENT());
+            }
+            None => self.error("The draft doesn't load — /customise diff shows it"),
+        }
+    }
+
     fn apply_draft(&mut self) {
+        self.preview_skin = None;
         match crate::customise::apply(&Self::customise_paths()) {
             Ok(a) => {
                 self.draft_ready = false;
@@ -1781,6 +2211,7 @@ impl App {
     }
 
     fn discard_draft(&mut self) {
+        self.preview_skin = None;
         crate::customise::discard(&Self::customise_paths());
         self.draft_ready = false;
         self.flash("Draft discarded", theme::YELLOW());
@@ -1844,7 +2275,7 @@ impl App {
             "" => {
                 if sk.buddy.enabled {
                     let id = view::buddy_identity(self);
-                    self.block(crate::buddy::card(&id, self.buddy.mood(self.busy)));
+                    self.block(crate::buddy::card(&id, &sk.buddy, &self.buddy, self.busy));
                 } else {
                     self.note("Your buddy is off — /buddy on brings it back");
                 }
@@ -1863,6 +2294,26 @@ impl App {
                 return;
             }
             "name" => save("name", Val::Str(rest.chars().take(24).collect())).map(|_| format!("Say hi to {rest}")),
+            "trick" => {
+                match crate::buddy::Trick::parse(if rest.is_empty() { "hop" } else { rest }) {
+                    Some(t) => self.buddy.trick(t),
+                    None => self.error("Tricks: hop, spin, sparkle, nap"),
+                }
+                self.dirty = true;
+                return;
+            }
+            "species" if rest.is_empty() => {
+                let all: Vec<String> = crate::pixel::SPECIES.iter().map(|s| format!("{} ({})", s.name, s.blurb)).collect();
+                self.note(format!("Species: {} — /buddy species <name>", all.join(" · ")));
+                return;
+            }
+            "species" => match crate::pixel::canonical(rest) {
+                Some(s) => save("species", Val::Str(s.name.into())).map(|_| format!("Your pet is now a {}", s.name)),
+                None => {
+                    self.error(format!("No species {rest:?} — /buddy species lists them"));
+                    return;
+                }
+            },
             "reroll" => {
                 let mut cfg = sk.buddy.clone();
                 cfg.seed += 1;
@@ -1875,7 +2326,7 @@ impl App {
             "quiet" => save("quips", Val::Str("off".into())).map(|_| "Buddy will keep its thoughts to itself".to_string()),
             "chatty" => save("quips", Val::Str("builtin".into())).map(|_| "Buddy will speak up again".to_string()),
             _ => {
-                self.error("Usage: /buddy [pet | name <name> | reroll | mini | full | quiet | chatty | on | off]");
+                self.error("Usage: /buddy [pet | trick <hop|spin|sparkle|nap> | name <name> | species [name] | reroll | mini | full | quiet | chatty | on | off]");
                 return;
             }
         };
@@ -1886,6 +2337,29 @@ impl App {
             }
             Err(e) => self.error(format!("Couldn't save the buddy settings: {e}")),
         }
+    }
+
+    /// Back at the terminal after a while: what happened meanwhile.
+    fn welcome_back(&mut self) {
+        let Some((at, turns, fixes)) = self.away.take() else { return };
+        if at.elapsed() < Duration::from_secs(180) || !crate::skin::current().buddy.enabled {
+            return;
+        }
+        let p = &self.buddy.progress;
+        let (dt, df) = (p.turns.saturating_sub(turns), p.fixes.saturating_sub(fixes));
+        if dt == 0 && df == 0 {
+            return;
+        }
+        let mut s = format!("While you were away: {dt} turn{} done", if dt == 1 { "" } else { "s" });
+        if df > 0 {
+            s.push_str(&format!(", {df} red test{} fixed", if df == 1 { "" } else { "s" }));
+        }
+        if self.busy {
+            s.push_str(", still working");
+        }
+        self.buddy.speak(s, 15);
+        self.buddy.trick(crate::buddy::Trick::Hop);
+        self.dirty = true;
     }
 
     fn answer_perm(&mut self, code: u8) {
@@ -1913,6 +2387,9 @@ impl App {
 
     fn on_key(&mut self, k: KeyEvent, cmd: &Sender<Cmd>, interrupt: &Arc<AtomicBool>) {
         self.buddy.on(crate::buddy::Moment::Input, &crate::skin::current().buddy, "");
+        if self.perm.is_none() && self.popup.is_none() && self.queue_key(&k, cmd) {
+            return;
+        }
         if self.quitting {
             return;
         }
@@ -1971,11 +2448,11 @@ impl App {
             self.clear_screen = true;
             return;
         }
-        if ctrl && self.draft_ready && self.perm.is_none() && matches!(k.code, KeyCode::Char('y') | KeyCode::Char('n')) {
-            if k.code == KeyCode::Char('y') {
-                self.apply_draft();
-            } else {
-                self.discard_draft();
+        if ctrl && self.draft_ready && self.perm.is_none() && matches!(k.code, KeyCode::Char('y') | KeyCode::Char('n') | KeyCode::Char('p')) {
+            match k.code {
+                KeyCode::Char('y') => self.apply_draft(),
+                KeyCode::Char('n') => self.discard_draft(),
+                _ => self.toggle_preview(),
             }
             return;
         }
@@ -2119,7 +2596,8 @@ impl App {
             }
             Some(Popup::Pager { idx, scroll }) => {
                 let n = self.outputs.len();
-                let len = self.outputs.iter().rev().nth(*idx).map(|o| o.body.len()).unwrap_or(0);
+                let w = self.width;
+                let len = self.outputs.iter().rev().nth(*idx).map(|o| view::pager_len(o, w)).unwrap_or(0);
                 let last = len.saturating_sub(view::PAGER_ROWS);
                 let page = view::PAGER_ROWS - 1;
                 match k.code {
@@ -2272,6 +2750,10 @@ impl App {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.len()),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.input.len(),
+            // ↑ from an empty composer manages the queue
+            KeyCode::Up if self.input.is_empty() && !self.queue.is_empty() && self.queue_sel.is_none() && self.key_entry.is_none() && self.hist_pos.is_none() => {
+                self.queue_sel = Some(self.queue.len() - 1);
+            }
             KeyCode::Up => {
                 let (_, crow, _) = view::wrapped_input(&self.input, self.cursor, view::input_width(self));
                 if crow == 0 && self.key_entry.is_none() {
@@ -2388,12 +2870,15 @@ pub fn try_run(opts: &RunOpts, cwd: &Path) -> Result<Option<i32>> {
         }
     }
     let interrupt = Arc::new(AtomicBool::new(false));
-    let (cmd, rx) = worker::spawn(opts.clone(), cwd.to_path_buf(), interrupt.clone());
+    let app_steer = worker::Steer::default();
+    let (cmd, rx) = worker::spawn(opts.clone(), cwd.to_path_buf(), interrupt.clone(), app_steer.clone());
     let mut app = App::new(cwd, models, screen.text_width());
+    app.steer = app_steer;
     if let Some(d) = &opts.cwd {
         app.cwd = PathBuf::from(d);
     }
     app.user = zcore::welcome::user_name();
+    app.buddy.progress = crate::buddy::Progress::load(&zcore::cli_home());
     app.cont(crate::logo::banner("cosmos", concat!("v", env!("CARGO_PKG_VERSION"))));
 
     let (mut skin, notes) = crate::skin::Watcher::start(&app.cwd);
@@ -2475,6 +2960,7 @@ fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender
         while let Ok(m) = rx.try_recv() {
             app.on_msg(m);
         }
+        app.drain_queue(cmd);
         // the look changed on disk (hand edit, /theme, /customise): swap it in
         // here, between frames — never while one is being drawn
         let reloaded = if std::mem::take(&mut app.skin_reload) { Some(skin.force()) } else { skin.poll() };
@@ -2485,6 +2971,24 @@ fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender
             app.dirty = true;
         }
         app.poll_jobs();
+        if let Some(id) = app.handoff.take() {
+            // the installer and the vendor's sign-in need the real terminal
+            let out = std::mem::take(&mut app.out);
+            screen.draw(&out, Frame { lines: &[], cursor: None })?;
+            screen.leave(&[]);
+            println!();
+            let res = zcore::acp_client::connect(&id, &mut |s| println!("[1m· {s}[0m"));
+            if let Err(e) = &res {
+                println!("
+✗ {e:#}
+Press Enter to go back to cosmostui.");
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+            }
+            *screen = Screen::enter()?;
+            app.after_handoff(&id, res.map_err(|e| format!("{e:#}")));
+            app.dirty = true;
+        }
         if app.replay_onboard {
             app.replay_onboard = false;
             if zcore::welcome::exe().is_none() {
@@ -2552,7 +3056,11 @@ fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender
         }
         if app.dirty {
             app.dirty = false;
-            let (lines, cursor) = view::live(app);
+            let (lines, cursor) = match &app.preview_skin {
+                // trying a draft on: draw the live region in its look
+                Some(sk) => crate::skin::scoped_skin(sk.clone(), || view::live(app)),
+                None => view::live(app),
+            };
             let out = std::mem::take(&mut app.out);
             screen.draw(&out, Frame { lines: &lines, cursor })?;
         }
@@ -2600,12 +3108,17 @@ fn run_loop(screen: &mut Screen, app: &mut App, rx: &Receiver<Msg>, cmd: &Sender
                     }
                     CEvent::FocusGained => {
                         app.focused = Some(true);
+                        app.welcome_back();
                         // back from elsewhere: the "done" title has been seen
                         if !app.busy && app.titled {
                             app.set_title("cosmostui");
                         }
                     }
-                    CEvent::FocusLost => app.focused = Some(false),
+                    CEvent::FocusLost => {
+                        app.focused = Some(false);
+                        let p = &app.buddy.progress;
+                        app.away = Some((Instant::now(), p.turns, p.fixes));
+                    }
                     _ => {}
                 }
                 if !event::poll(Duration::ZERO)? {
@@ -2817,7 +3330,7 @@ mod tests {
         a.on_msg(Msg::Event(ev("tool_call", serde_json::json!({"id": "x", "name": "devin:edit", "title": "Edit a.rs",
             "status": "completed", "output": "wrote a.rs", "source": "acp"}))));
         let rows: Vec<String> = a.out.iter().map(text).collect();
-        assert!(rows.iter().any(|r| r.contains("devin:edit") && r.contains("Edit a.rs")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("Edit a.rs") && r.contains("devin")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("wrote a.rs")), "{rows:?}");
     }
 
@@ -3100,6 +3613,269 @@ FAILED
         println!("\n==== {finish}: {:?} ====", a.notice.as_ref().map(|n| n.0.clone()));
         println!("{}", std::fs::read_to_string(home.join("ui.toml")).unwrap_or_default());
         println!("mod spend: ${:.4}", a.mod_usd);
+    }
+
+    #[test]
+    fn pettalk_round_trips_and_the_pet_acts() {
+        let _env = crate::env_lock();
+        let mut sk = crate::skin::Skin::default();
+        sk.buddy.species = "owl".into();
+        sk.buddy.name = "Hoot".into();
+        sk.buddy.images = "off".into();
+        crate::skin::scoped_skin(sk, || {
+            let mut a = app();
+            let home = tempfile::tempdir().unwrap();
+            std::env::set_var("COSMOS_CLI_HOME", home.path());
+            a.alias = "fixture".into();
+            let (cmd, _rx) = std::sync::mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            a.input = "/pettalk ping".chars().collect();
+            a.cursor = a.input.len();
+            a.on_key(key(KeyCode::Enter), &cmd, &stop);
+            assert!(a.pet_talk.is_some() && a.buddy.listening);
+            assert_eq!(a.buddy.mood(false), crate::buddy::Mood::Listening);
+            let t0 = Instant::now();
+            while a.pet_talk.is_some() && t0.elapsed() < Duration::from_secs(20) {
+                a.poll_pet();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let rows: Vec<String> = a.out.iter().map(text).collect();
+            assert!(rows.iter().any(|r| r.contains("you → Hoot: ping")), "{rows:#?}");
+            assert!(rows.iter().any(|r| r.contains("Hoot")) && rows.iter().any(|r| r.contains("pong")), "{rows:#?}");
+            assert!(rows.iter().any(|r| r.contains('▀') || r.contains('▄')), "its picture is drawn: {rows:#?}");
+            assert_eq!(a.buddy.progress.chats, 1);
+            assert_eq!(a.pet_chat.len(), 2, "it remembers the exchange");
+
+            // what the pet can do
+            a.pet_act(crate::pettalk::Action::Remind { mins: 1, text: "stretch".into() });
+            assert_eq!(a.reminders.len(), 1);
+            a.reminders[0].0 = Instant::now() - Duration::from_secs(1);
+            a.term_out.clear();
+            a.poll_pet();
+            assert!(a.reminders.is_empty());
+            assert!(a.buddy.current_quip(&crate::skin::current().buddy).is_some_and(|q| q.contains("stretch")));
+            assert!(String::from_utf8_lossy(&a.term_out).contains("⏰ stretch"), "title + bell");
+            a.pet_act(crate::pettalk::Action::Species("penguin".into()));
+            a.pet_act(crate::pettalk::Action::Rename("Waddles".into()));
+            let ui = std::fs::read_to_string(home.path().join("ui.toml")).unwrap();
+            assert!(ui.contains("species = \"penguin\"") && ui.contains("name = \"Waddles\""), "{ui}");
+            a.pet_act(crate::pettalk::Action::Customise("tool:ui_set {\"path\":\"spinner.style\",\"value\":\"moon\"}".into()));
+            assert!(a.customise.is_some(), "handed to /customise (with its boundaries)");
+            while a.customise.is_some() {
+                a.poll_customise();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+    }
+
+    #[test]
+    fn the_pet_welcomes_you_back_and_levels_up() {
+        let _env = crate::env_lock();
+        crate::skin::scoped_skin(crate::skin::Skin::default(), || {
+            let mut a = app();
+            a.away = Some((Instant::now() - Duration::from_secs(600), 0, 0));
+            a.buddy.progress.turns = 3;
+            a.buddy.progress.fixes = 1;
+            a.welcome_back();
+            let q = a.buddy.current_quip(&crate::skin::current().buddy).unwrap_or_default().to_string();
+            assert!(q.contains("3 turns done") && q.contains("1 red test fixed"), "{q}");
+            // a short absence says nothing
+            a.buddy.quip = None;
+            a.away = Some((Instant::now(), 0, 0));
+            a.welcome_back();
+            assert!(a.buddy.quip.is_none());
+            // enough XP announces the level
+            a.buddy.grant(500);
+            a.pet_progress();
+            assert!(a.notice.as_ref().is_some_and(|n| n.0.contains("reached level")), "{:?}", a.notice);
+        });
+    }
+
+    #[test]
+    fn ctrl_p_tries_a_draft_on() {
+        let _env = crate::env_lock();
+        crate::skin::scoped_skin(crate::skin::Skin::default(), || {
+            let mut a = app();
+            let home = tempfile::tempdir().unwrap();
+            std::env::set_var("COSMOS_CLI_HOME", home.path());
+            let p = crate::customise::Paths::new(home.path());
+            crate::customise::exec(&p, false, "ui_set", &serde_json::json!({"path": "spinner.style", "value": "hop"}));
+            a.draft_ready = true;
+            let (cmd, _rx) = std::sync::mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            a.on_key(ctrl('p'), &cmd, &stop);
+            assert_eq!(a.preview_skin.as_ref().map(|s| s.spinner.style.as_str()), Some("hop"));
+            let rows: Vec<String> = view::live(&a).0.iter().map(text).collect();
+            assert!(rows.iter().any(|r| r.contains("previewing the draft")), "{rows:#?}");
+            a.on_key(ctrl('p'), &cmd, &stop);
+            assert!(a.preview_skin.is_none(), "ctrl+p again goes back");
+            a.on_key(ctrl('p'), &cmd, &stop);
+            a.on_key(ctrl('y'), &cmd, &stop);
+            assert!(a.preview_skin.is_none() && !a.draft_ready, "applying ends the preview");
+            assert!(std::fs::read_to_string(home.path().join("ui.toml")).unwrap().contains("style = \"hop\""));
+        });
+    }
+
+    /// Live: talk to the pet on a real model, through the App, on the real
+    /// home. Ignored — `COSMOS_LIVE_MODEL=<alias> COSMOS_LIVE_SAY="<msg>"
+    /// cargo test -p ztui live_pettalk -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_pettalk() {
+        let _env = crate::env_lock();
+        let model = std::env::var("COSMOS_LIVE_MODEL").expect("set COSMOS_LIVE_MODEL");
+        let say = std::env::var("COSMOS_LIVE_SAY").expect("set COSMOS_LIVE_SAY");
+        let cwd = std::env::current_dir().unwrap();
+        let (_w, _) = crate::skin::Watcher::start(&cwd);
+        let mut a = App::new(&cwd, model_rows(), 100);
+        a.alias = model;
+        a.buddy.progress = crate::buddy::Progress::load(&zcore::cli_home());
+        a.history = vec!["fix the flaky markdown test".into(), "make the pets nicer".into()];
+        a.last_reply = "I replaced the ASCII pets with pixel art and added /pettalk.".into();
+        let (cmd, _rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        a.input = format!("/pettalk {say}").chars().collect();
+        a.cursor = a.input.len();
+        a.on_key(key(KeyCode::Enter), &cmd, &stop);
+        let t0 = Instant::now();
+        while a.pet_talk.is_some() && t0.elapsed() < Duration::from_secs(200) {
+            a.poll_pet();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!("answered in {:.1}s", t0.elapsed().as_secs_f32());
+        for l in &a.out {
+            println!("{}", l.spans.iter().map(|s| s.content.to_string()).collect::<String>());
+        }
+        println!("reminders: {:?}", a.reminders.iter().map(|(_, s)| s).collect::<Vec<_>>());
+        println!("bubble: {:?} · chats {} · pet spend ${:.4}", a.buddy.quip.as_ref().map(|q| q.0.clone()), a.buddy.progress.chats, a.pet_usd);
+    }
+
+    #[test]
+    fn subscription_tools_show_live_and_in_order() {
+        let _env = crate::env_lock();
+        crate::skin::scoped_skin(crate::skin::Skin::default(), || {
+            let mut a = app();
+            a.start_busy();
+            let ev = |kind: &str, data: Value| zproto::Event {
+                v: 1, id: "e".into(), parent: None, ts: String::new(), session: "s".into(),
+                harness: "cosmostui".into(), kind: kind.into(), data,
+            };
+            // text streams, then a tool starts: the text is committed first
+            a.on_msg(Msg::Delta("Writing the platform layer first.".into()));
+            a.on_msg(Msg::AcpTool(serde_json::json!({"id": "t1", "name": "devin:edit", "title": "Edit src/a.rs", "status": "in_progress"})));
+            let rows: Vec<String> = a.out.iter().map(text).collect();
+            assert!(rows.iter().any(|r| r.contains("Writing the platform layer first.")), "text first: {rows:#?}");
+            assert_eq!(a.tools.len(), 1, "the tool shows as running right away");
+            let live: Vec<String> = view::live(&a).0.iter().map(text).collect();
+            assert!(live.iter().any(|r| r.contains("Edit src/a.rs")), "{live:#?}");
+            // it finishes with a diff: +/- counts, folded or inline
+            a.on_msg(Msg::AcpTool(serde_json::json!({"id": "t1", "name": "devin:edit", "title": "Edit src/a.rs", "status": "completed",
+                "output": "edited src/a.rs", "diff": {"path": "src/a.rs", "old": "a\nb\n", "new": "a\nB\nc\n"}})));
+            assert!(a.tools.is_empty());
+            let rows: Vec<String> = a.out.iter().map(text).collect();
+            let head = rows.iter().position(|r| r.contains("Edit src/a.rs")).expect("committed");
+            assert!(rows[head].contains("+2") && rows[head].contains("−1") && rows[head].contains("devin"), "{rows:#?}");
+            assert!(a.outputs.back().is_some_and(|o| o.diff.is_some()), "ctrl+o shows the diff in colour");
+            // more text after the tool is its own block, after it
+            a.on_msg(Msg::Delta("Fixing two bugs.\n".into()));
+            a.on_msg(Msg::Event(ev("tool_call", serde_json::json!({"id": "t1", "name": "devin:edit", "title": "Edit src/a.rs",
+                "status": "completed", "output": "edited src/a.rs", "source": "acp"}))));
+            a.on_msg(Msg::Event(ev("assistant", serde_json::json!({"text": "Writing the platform layer first.\n\nFixing two bugs.", "tool_calls": []}))));
+            let rows: Vec<String> = a.out.iter().map(text).collect();
+            assert_eq!(rows.iter().filter(|r| r.contains("Edit src/a.rs")).count(), 1, "the log's copy isn't drawn twice: {rows:#?}");
+            assert_eq!(rows.iter().filter(|r| r.contains("Writing the platform layer first.")).count(), 1, "nor the reply: {rows:#?}");
+            let fix = rows.iter().position(|r| r.contains("Fixing two bugs.")).unwrap();
+            assert!(fix > head, "in order: {rows:#?}");
+        });
+    }
+
+    #[test]
+    fn big_diffs_fold_and_small_ones_show() {
+        crate::skin::scoped_skin(crate::skin::Skin::default(), || {
+            let input = serde_json::json!({"path": "a.rs"});
+            let big = crate::worker::diff_rows("", &"x\n".repeat(30)).0;
+            let d = Diff { path: "a.rs".into(), added: 30, removed: 0, created: true, lines: big };
+            let v = crate::toolview::ToolView { name: "write", input: &input, content: Some("ok"), err: false, diff: Some(&d), interrupted: false, elapsed: None };
+            let rows: Vec<String> = crate::toolview::render(&v, 80).iter().map(text).collect();
+            assert_eq!(rows.len(), 2, "{rows:#?}");
+            assert!(rows[1].contains("30 diff lines") && rows[1].contains("ctrl+o"), "{rows:#?}");
+            let small = crate::worker::diff_rows("a\n", "b\n").0;
+            let d = Diff { path: "a.rs".into(), added: 1, removed: 1, created: false, lines: small };
+            let v = crate::toolview::ToolView { name: "edit", input: &input, content: Some("ok"), err: false, diff: Some(&d), interrupted: false, elapsed: None };
+            assert!(crate::toolview::render(&v, 80).len() > 2, "small diffs stay inline");
+        });
+    }
+
+    #[test]
+    fn messages_typed_while_busy_queue_above_the_composer() {
+        let _env = crate::env_lock();
+        crate::skin::scoped_skin(crate::skin::Skin::default(), || {
+            let mut a = app();
+            let (cmd, rx) = std::sync::mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let enter = |a: &mut App, s: &str| {
+                a.input = s.chars().collect();
+                a.cursor = a.input.len();
+                a.on_key(key(KeyCode::Enter), &cmd, &stop);
+            };
+            enter(&mut a, "first task");
+            assert!(a.busy);
+            let committed = a.out.len();
+            enter(&mut a, "second");
+            enter(&mut a, "third");
+            assert_eq!(a.queue.len(), 2);
+            assert_eq!(a.out.len(), committed, "queued messages are not in the transcript yet");
+            let live: Vec<String> = view::live(&a).0.iter().map(text).collect();
+            let q = live.iter().position(|r| r.contains("2 queued")).expect("the queue shows");
+            let composer = live.iter().position(|r| r.starts_with("❯ ")).unwrap();
+            assert!(q < composer && live[q + 1].contains("second"), "{live:#?}");
+            // ↑ from the empty composer selects; e edits; x removes
+            a.on_key(key(KeyCode::Up), &cmd, &stop);
+            assert_eq!(a.queue_sel, Some(1));
+            let live: Vec<String> = view::live(&a).0.iter().map(text).collect();
+            assert!(live.iter().any(|r| r.contains("third") && r.contains("send now") && r.contains("✎") && r.contains("✕")), "{live:#?}");
+            a.on_key(key(KeyCode::Char('e')), &cmd, &stop);
+            assert_eq!(a.input.iter().collect::<String>(), "third");
+            a.input.push('!');
+            a.cursor = a.input.len();
+            a.on_key(key(KeyCode::Enter), &cmd, &stop);
+            assert_eq!(a.queue[1].0, "third!", "an edit goes back to its place");
+            a.on_key(key(KeyCode::Up), &cmd, &stop);
+            a.on_key(key(KeyCode::Up), &cmd, &stop);
+            a.on_key(key(KeyCode::Char('x')), &cmd, &stop);
+            assert_eq!(a.queue.iter().map(|q| q.0.as_str()).collect::<Vec<_>>(), vec!["third!"]);
+            // ↵ sends it now: into the running task, not after it
+            a.on_key(key(KeyCode::Enter), &cmd, &stop);
+            assert!(a.queue.is_empty());
+            assert_eq!(*a.steer.lock().unwrap(), vec!["third!".to_string()]);
+            // a steer the task ended before taking comes back, first in line
+            enter(&mut a, "later");
+            while rx.try_recv().is_ok() {}
+            a.on_msg(Msg::TurnDone);
+            assert_eq!(a.queue.iter().map(|q| q.0.as_str()).collect::<Vec<_>>(), vec!["third!", "later"]);
+            assert!(a.steer.lock().unwrap().is_empty());
+            // when the task ends, queued messages go out in order
+            a.drain_queue(&cmd);
+            assert!(a.busy && a.queue.len() == 1);
+            assert!(matches!(rx.try_recv(), Ok(Cmd::Prompt(t)) if t == "third!"));
+            a.on_msg(Msg::TurnDone);
+            a.drain_queue(&cmd);
+            assert!(matches!(rx.try_recv(), Ok(Cmd::Prompt(t)) if t == "later"));
+            assert!(a.out.iter().map(text).any(|r| r.contains("later")), "shown when it's actually sent");
+            // ↑ past the top of the queue reaches prompt history
+            enter(&mut a, "one more");
+            a.on_key(key(KeyCode::Up), &cmd, &stop);
+            assert_eq!(a.queue_sel, Some(0));
+            a.on_key(key(KeyCode::Up), &cmd, &stop);
+            assert!(a.queue_sel.is_none() && !a.input.is_empty(), "history recalled");
+            // ctrl keys aren't swallowed by the queue
+            a.input.clear();
+            a.cursor = 0;
+            a.on_key(key(KeyCode::Up), &cmd, &stop);
+            a.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL), &cmd, &stop);
+            assert!(matches!(a.popup, Some(Popup::Pager { .. }) | None));
+        });
     }
 
     #[test]

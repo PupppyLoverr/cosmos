@@ -127,9 +127,10 @@ composer, the status line, and `/` menus that open below it.
 - Markdown gets framed code blocks, callouts (`> [!NOTE]`), bordered tables
   that wrap, nested quotes and lists, and clickable OSC 8 links where the
   terminal supports them.
-- A buddy sits beside the composer and reacts as you work (see below). When a
-  turn ends or needs you while you're in another window, cosmostui sets the
-  terminal title, rings the bell, and shows a desktop notification.
+- A pixel-art pet sits beside the composer, reacts as you work, levels up
+  with you, and talks back with `/pettalk` (see below). When a turn ends or
+  needs you while you're in another window, cosmostui sets the terminal
+  title, rings the bell, and shows a desktop notification.
 - `/model` opens a fuzzy picker. `←`/`→` sets reasoning effort, which is sent as
   `reasoning_effort` to OpenAI-compatible providers.
 - `/usage`, `/context`, `/mode`, `/approve`, `/session`, `/tree`, `/compact`,
@@ -138,6 +139,12 @@ composer, the status line, and `/` menus that open below it.
   `↑`/`↓` scroll prompt history, which is saved to `history.jsonl`. Pastes
   over 8 lines collapse to a placeholder. `ctrl+c` interrupts, then clears the
   input, then quits on a second press.
+- Subscriptions: `/connect cursor`, `/connect devin` or `/connect codex` runs
+  that vendor's own agent on your plan. If its CLI isn't installed yet,
+  cosmostui runs the vendor's official installer (cursor.com/install,
+  static.devin.ai/cli/setup, or npm for Codex), then the vendor's sign-in,
+  and comes back with the plan's model list. `cosmostui auth login <id>`
+  does the same from a shell.
 - BYOK: `/connect` (or `cosmostui auth login <provider>`) stores keys for 30
   models.dev providers in the OS keychain. `/login` signs in with a ChatGPT
   Plus/Pro plan. Models are addressed as `provider/model`.
@@ -222,7 +229,8 @@ cheaper one. The customiser:
   `ui_apply`, `ui_reset`, `theme_save`, `provider_add`, `model_add`,
   `subscription_enable`, `command_add`.
 - **Writes a draft (`ui.draft.toml`).** When it finishes you see the draft
-  rendered in its own colours. `ctrl+y` applies it and `ctrl+n` discards it.
+  rendered in its own colours. `ctrl+p` tries it on the live UI (spinner,
+  pet, composer, status), `ctrl+y` applies it and `ctrl+n` discards it.
   Applying is a per-key three-way merge: if you changed a key yourself while it
   worked, your value is kept. `/customise undo` steps back through the backups.
   `[customise] auto_apply = true` applies each change as it validates.
@@ -237,16 +245,38 @@ cheaper one. The customiser:
   folder, and that file goes through the same checks. With no model connected,
   you get the picker.
 
-### Buddy and notifications
+### Pets, /pettalk and notifications
 
-Your buddy hatches from your name: one of 16 cosmic species, with a rarity tier
-and stats, shown with `/buddy`. It looks focused while a turn runs and pleased
-when the turn lands. It frowns at failed tools, worries at red tests and cheers
-when they go green. It waits with you at permission prompts and falls asleep
-when you're away. Quips are canned and cost no tokens; set your own in
-`[buddy.lines]`.
+Your pet is solid pixel art that sits on the composer's right edge. It hatches
+from your name as one of 10 creatures (fox, cat, axolotl, owl, penguin, dragon,
+slime, ghost, octopus, robot), with a rarity and stats. In terminals that can
+show real images (sixel: Windows Terminal 1.22+, WezTerm, iTerm2, foot; kitty
+protocol: kitty, Ghostty), the `/buddy` card and `/pettalk` replies draw it as
+an image. Elsewhere they draw it in coloured half-blocks.
 
-`/buddy pet | name <n> | reroll | mini | full | quiet | off`.
+- **It watches the task.** It looks focused while a turn runs and hops when
+  the turn lands. It frowns at failed tools, sweats at red tests and cheers
+  when they go green. It waits with you at permission prompts and falls asleep
+  when you're idle. Its eyes change with each mood.
+- **It grows.** Finished turns, red tests fixed, pats and chats earn XP, and
+  using cosmostui on consecutive days builds a streak (saved in `pet.json`).
+  Levels unlock rosy cheeks (3), a ✦ sparkle (5), a crown (10) and a shiny
+  coat (15).
+- **It helps.** It suggests a break after `break_mins` of work. When you come
+  back to the terminal it says what happened while you were away. It also
+  keeps reminders, which ring the bell and send a desktop notification.
+- **You can talk to it.** `/pettalk <anything>` answers in character with
+  the model you're using right now. It runs as its own side conversation, so
+  your main transcript and prompt cache never see it. It knows the session
+  (recent requests, the last reply, what's running, the cost) and the repo
+  (branch, changed files, last commit). It can act on what you say: set a
+  reminder ("remind me in 20 minutes to stretch"), do a trick, take a new name
+  or form, or hand a look-and-feel request to `/customise`, which applies all
+  of its boundaries. `/pettalk stop` cancels.
+
+`/buddy` shows the card. The subcommands are
+`/buddy pet | trick <hop|spin|sparkle|nap> | name <n> | species [name] | reroll | mini | full | quiet | off`.
+`[buddy.colors]` recolours any part of the pixel art.
 
 Notifications only interrupt when the terminal reports it has lost focus.
 Terminals that never report focus notify only for turns of at least
@@ -273,7 +303,7 @@ Generated from the code (`cargo test -p ztui dump_schema -- --ignored
   shimmer: bool = true — a highlight sweeping across the verb
   show_elapsed: bool = true — seconds in the busy line
   show_tokens: bool = true — streamed tokens in the busy line
-  style: string = "orb" — one of "orb" | "twinkle" | "braille" | "moon" | "comet" | "pulse" | "galaxy" | "dots" | "line" — the thinking spinner
+  style: string = "orb" — one of "orb" | "hop" | "sparkle" | "heart" | "twinkle" | "braille" | "moon" | "comet" | "pulse" | "galaxy" | "dots" | "line" — the thinking spinner
   tool_verbs.<tool>: string — verb shown while a tool runs (read, grep, glob, ls, bash, edit, write, task, …)
   verbs: list of strings = ["Cosmosing:Cosmosed","Plotting:Plotted","Cooking:Cooked","Orbiting:Orbited","Stargazin… — "Present:Past" thinking verbs, one picked per turn ("Cooking:Cooked")
 [motion]
@@ -310,14 +340,17 @@ Generated from the code (`cargo test -p ztui dump_schema -- --ignored
   tool: string = "◆" — glyph before each tool call
   wrap: string = "↳" — glyph on wrapped diff lines
 [buddy]
+  break_mins: integer = 50 — 0..=480 — nudge to take a break after this many minutes of work (0 = never)
+  colors.<part>: "#rrggbb"; parts: outline, body, shade, belly, accent, cheeks, details, eyes — recolour the pet's pixel art
   enabled: bool = true — show the companion
-  lines.<kind>: list of strings; kinds: hello, done, long_done, error, tests_pass, tests_fail, waiting, compact, pet, sleep, degraded — custom quips for a moment ({name} = the buddy)
+  images: string = "auto" — one of "auto" | "sixel" | "kitty" | "off" — real images of the pet where the terminal supports them (sixel/kitty)
+  lines.<kind>: list of strings; kinds: hello, done, long_done, error, tests_pass, tests_fail, waiting, compact, pet, sleep, degraded, break, level — custom quips for a moment ({name} = the pet)
   name: string = "" — "" = a generated name
   quip_secs: integer = 6 — 1..=60 — how long a quip stays up
   quips: string = "builtin" — one of "builtin" | "off" — one-liners when things happen
   seed: integer = 0 — 0..=1000000 — change to hatch a different buddy
   size: string = "full" — one of "full" | "mini" | "off" — full = sprite beside the input; mini = face in the status line
-  species: string = "" — one of "" | "comet" | "octopus" | "astrocat" | "owl" | "axolotl" | "robot" | "jellyfish" | "fox" | "ghost" | "moth" | "penguin" | "slime" | "dragon" | "alien" | "snail" | "star" — "" = hatched from the user's name
+  species: string = "" — one of "" | "fox" | "cat" | "axolotl" | "owl" | "penguin" | "dragon" | "slime" | "ghost" | "octopus" | "robot" — "" = hatched from the user's name
 [notify]
   bell: string = "unfocused" — one of "unfocused" | "always" | "never" — terminal bell
   desktop: string = "unfocused" — one of "unfocused" | "always" | "never" — desktop notification

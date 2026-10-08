@@ -75,6 +75,8 @@ pub enum Msg {
     Delta(String),
     /// File change made by an `edit`/`write` tool call (arrives before its result).
     Diff { id: String, diff: Diff },
+    /// A subscription agent's tool started or changed (live, as it happens).
+    AcpTool(serde_json::Value),
     /// The agent's `asker` fired — `reply`: 0 = no, 1 = yes, 2 = always.
     PermissionAsk {
         tool: String,
@@ -92,15 +94,23 @@ pub enum Msg {
     History(Vec<(bool, String)>),
 }
 
+/// Messages to slip into the running task ("send now" on a queued message).
+pub type Steer = zcore::agent::SteerQueue;
+
 pub fn spawn(
     opts: RunOpts,
     cwd: PathBuf,
     interrupt: Arc<AtomicBool>,
+    steer: Steer,
 ) -> (Sender<Cmd>, Receiver<Msg>) {
     let (ctx, crx) = channel::<Cmd>();
     let (mtx, mrx) = channel::<Msg>();
-    thread::spawn(move || worker(opts, cwd, interrupt, crx, mtx));
+    thread::spawn(move || worker(opts, cwd, interrupt, steer, crx, mtx));
     (ctx, mrx)
+}
+
+fn take_steer(steer: &Steer) -> Vec<String> {
+    std::mem::take(&mut *steer.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 fn send(tx: &Sender<Msg>, m: Msg) {
@@ -167,6 +177,10 @@ fn drain_always(agent: &mut Agent, always: &Arc<Mutex<Vec<String>>>) {
 
 /// Streamed text goes straight to the UI.
 fn install_delta(agent: &mut Agent, tx: &Sender<Msg>) {
+    let t2 = tx.clone();
+    agent.on_tool = Some(Box::new(move |v: &serde_json::Value| {
+        let _ = t2.send(Msg::AcpTool(v.clone()));
+    }));
     let tx = tx.clone();
     agent.on_delta = Some(Box::new(move |t: &str| {
         let _ = tx.send(Msg::Delta(t.to_string()));
@@ -274,9 +288,26 @@ fn run_task(
     interrupt: &AtomicBool,
     always: &Arc<Mutex<Vec<String>>>,
     tx: &Sender<Msg>,
+    steer: &Steer,
 ) {
     agent.send_user(task, emit);
-    run_turns(agent, emit, interrupt, always, tx);
+    run_turns(agent, emit, interrupt, always, tx, steer);
+    // "send now" arrived after the last step (or cut a subscription agent's
+    // prompt short): carry on in the same session, context intact. An Esc
+    // stops here — whatever's left goes back to the UI's queue.
+    loop {
+        if interrupt.load(Ordering::Relaxed) {
+            break;
+        }
+        let next = take_steer(steer);
+        if next.is_empty() {
+            break;
+        }
+        for t in next {
+            agent.send_user(&t, emit);
+        }
+        run_turns(agent, emit, interrupt, always, tx, steer);
+    }
 }
 
 /// Same turn/tool sequence as the line REPL, plus interrupt polling between
@@ -287,12 +318,17 @@ fn run_turns(
     interrupt: &AtomicBool,
     always: &Arc<Mutex<Vec<String>>>,
     tx: &Sender<Msg>,
+    steer: &Steer,
 ) {
     let max = agent.opts.max_turns.unwrap_or(32);
     for _ in 0..max {
         if interrupt.load(Ordering::Relaxed) {
             send(tx, Msg::Note("· interrupted".into()));
             return;
+        }
+        // messages sent while it works join before the next step
+        for t in take_steer(steer) {
+            agent.send_user(&t, emit);
         }
         match agent.turn(emit) {
             Ok(true) => break,
@@ -336,6 +372,7 @@ fn worker(
     opts: RunOpts,
     cwd: PathBuf,
     interrupt: Arc<AtomicBool>,
+    steer: Steer,
     rx: Receiver<Cmd>,
     tx: Sender<Msg>,
 ) {
@@ -351,6 +388,7 @@ fn worker(
     install_asker(&mut agent, &tx, &always);
     install_delta(&mut agent, &tx);
     agent.interrupt = Some(interrupt.clone());
+    agent.steer = Some(steer.clone());
     let mut effort: Option<String> = None;
 
     let tx2 = tx.clone();
@@ -368,7 +406,7 @@ fn worker(
     if let Some(p) = &opts.prompt {
         if p != "-" {
             interrupt.store(false, Ordering::Relaxed);
-            run_task(&mut agent, p, &mut emit, &interrupt, &always, &tx);
+            run_task(&mut agent, p, &mut emit, &interrupt, &always, &tx, &steer);
             send(&tx, Msg::TurnDone);
         }
     }
@@ -377,7 +415,7 @@ fn worker(
         match cmd {
             Cmd::Prompt(text) => {
                 interrupt.store(false, Ordering::Relaxed);
-                run_task(&mut agent, &text, &mut emit, &interrupt, &always, &tx);
+                run_task(&mut agent, &text, &mut emit, &interrupt, &always, &tx, &steer);
                 agent.stop_hook(if interrupt.load(Ordering::Relaxed) { "interrupted" } else { "done" });
                 send(&tx, Msg::TurnDone);
             }
@@ -399,7 +437,7 @@ fn worker(
             Cmd::Approve => {
                 interrupt.store(false, Ordering::Relaxed);
                 agent.approve_plan(&mut emit);
-                run_turns(&mut agent, &mut emit, &interrupt, &always, &tx);
+                run_turns(&mut agent, &mut emit, &interrupt, &always, &tx, &steer);
                 agent.stop_hook(if interrupt.load(Ordering::Relaxed) { "interrupted" } else { "done" });
                 send(&tx, Msg::TurnDone);
             }
@@ -424,6 +462,7 @@ fn worker(
                         install_asker(&mut a, &tx, &always);
                         install_delta(&mut a, &tx);
                         a.interrupt = Some(interrupt.clone());
+                        a.steer = Some(steer.clone());
                         a.provider.effort = effort.clone();
                         let ev = a.session.append(
                             "session_start",
@@ -453,6 +492,7 @@ fn worker(
                         install_asker(&mut a, &tx, &always);
                         install_delta(&mut a, &tx);
                         a.interrupt = Some(interrupt.clone());
+                        a.steer = Some(steer.clone());
                         a.provider.effort = effort.clone();
                         let ev = a.session.append(
                             "session_start",
@@ -488,8 +528,12 @@ fn worker(
                 agent
                     .session
                     .append("session_end", json!({"reason": "quit"}));
+                // shut the agent down *before* saying so: the UI exits on
+                // QuitDone, and a subscription agent (Cursor/Devin) must be
+                // stopped by our drop, not left running
+                drop(agent);
                 send(&tx, Msg::QuitDone);
-                return; // agent drops here → worktree cleanup
+                return;
             }
         }
     }
@@ -521,6 +565,93 @@ mod tests {
         assert_eq!(rows.last().unwrap().kind, '…');
     }
 
+    /// "send now": a message steered into a running task joins it before the
+    /// next step — same session, context intact.
+    #[test]
+    fn steered_messages_join_the_running_task() {
+        let _env = crate::env_lock();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("COSMOS_CLI_HOME", home.path());
+        let opts = RunOpts { model: Some("fixture".into()), no_sandbox: true, ..Default::default() };
+        let steer = Steer::default();
+        let (cmd, rx) = spawn(opts, home.path().to_path_buf(), Arc::new(AtomicBool::new(false)), steer.clone());
+        steer.lock().unwrap().push("ping".into());
+        cmd.send(Cmd::Prompt("tool:ls {}".into())).unwrap();
+        let mut users = Vec::new();
+        let mut replies = Vec::new();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(30)).expect("worker answers") {
+                Msg::Event(e) if e.kind == "user" => users.push(e.data["text"].as_str().unwrap_or("").to_string()),
+                Msg::Event(e) if e.kind == "assistant" => replies.push(e.data["text"].as_str().unwrap_or("").to_string()),
+                Msg::TurnDone => break,
+                _ => {}
+            }
+        }
+        assert_eq!(users, vec!["tool:ls {}".to_string(), "ping".to_string()], "one task, both messages");
+        assert!(replies.iter().any(|r| r == "pong"), "the model saw the steered message: {replies:?}");
+        assert!(steer.lock().unwrap().is_empty());
+        cmd.send(Cmd::Quit).unwrap();
+    }
+
+    /// Esc means stop, even with a "send now" waiting: the task ends and the
+    /// message stays for the UI to put back in its queue.
+    #[test]
+    fn an_interrupt_wins_over_a_pending_steer() {
+        let _env = crate::env_lock();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("COSMOS_CLI_HOME", home.path());
+        let opts = RunOpts { model: Some("fixture".into()), no_sandbox: true, ..Default::default() };
+        let mut agent = Agent::new(&opts, zcore::NAME, home.path()).unwrap();
+        let (tx, _rx) = channel();
+        let steer = Steer::default();
+        steer.lock().unwrap().push("ping".into());
+        let stop = AtomicBool::new(true); // Esc pressed
+        let always = Arc::new(Mutex::new(Vec::new()));
+        let mut users = 0;
+        run_task(&mut agent, "hello", &mut |e: &Event| users += usize::from(e.kind == "user"), &stop, &always, &tx, &steer);
+        assert_eq!(users, 1, "only the task itself — nothing ran after the stop");
+        assert_eq!(*steer.lock().unwrap(), vec!["ping".to_string()], "the message is kept for the queue");
+    }
+
+    /// Live: a subscription agent's tools reach the UI as they happen, in
+    /// order with its text. `COSMOS_LIVE_MODEL=cursor/… cargo test -p ztui
+    /// live_acp_streams_tools -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_acp_streams_tools() {
+        let _env = crate::env_lock();
+        let model = std::env::var("COSMOS_LIVE_MODEL").expect("set COSMOS_LIVE_MODEL");
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("notes.txt"), "one\ntwo\n").unwrap();
+        let opts = RunOpts { model: Some(model), yolo: true, ..Default::default() };
+        let (cmd, rx) = spawn(opts, ws.path().to_path_buf(), Arc::new(AtomicBool::new(false)), Steer::default());
+        cmd.send(Cmd::Prompt("Say 'Looking now.' first, then read notes.txt, then change 'two' to 'three' in it, then say 'Done.'".into())).unwrap();
+        let t0 = std::time::Instant::now();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(240)).expect("worker answers") {
+                Msg::Delta(d) => println!("[{:>5.1}s] text  {d:?}", t0.elapsed().as_secs_f32()),
+                Msg::AcpTool(v) => println!(
+                    "[{:>5.1}s] tool  {} {} {} diff={}",
+                    t0.elapsed().as_secs_f32(),
+                    v["status"],
+                    v["name"],
+                    v["title"],
+                    v.get("diff").is_some()
+                ),
+                Msg::Event(e) if e.kind == "tool_call" || e.kind == "assistant" => println!("[{:>5.1}s] event {}", t0.elapsed().as_secs_f32(), e.kind),
+                Msg::TurnDone => {
+                    println!("[{:>5.1}s] done", t0.elapsed().as_secs_f32());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        println!("notes.txt now: {:?}", std::fs::read_to_string(ws.path().join("notes.txt")).unwrap());
+        cmd.send(Cmd::Quit).unwrap();
+        // the agent is stopped before QuitDone arrives
+        while !matches!(rx.recv_timeout(std::time::Duration::from_secs(20)), Ok(Msg::QuitDone) | Err(_)) {}
+    }
+
     /// End-to-end worker protocol: Ready → Prompt("ping") → assistant "pong"
     /// (fixture provider) → TurnDone → Quit → QuitDone.
     #[test]
@@ -533,7 +664,7 @@ mod tests {
             no_sandbox: true,
             ..Default::default()
         };
-        let (cmd, rx) = spawn(opts, std::env::temp_dir(), Arc::new(AtomicBool::new(false)));
+        let (cmd, rx) = spawn(opts, std::env::temp_dir(), Arc::new(AtomicBool::new(false)), Steer::default());
         cmd.send(Cmd::Prompt("ping".into())).unwrap();
         let (mut ready, mut pong, mut done) = (false, false, false);
         for _ in 0..200 {

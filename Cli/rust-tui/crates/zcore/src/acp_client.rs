@@ -7,6 +7,13 @@
 //! it; Cosmos renders it, asks the operator about permissions and keeps the
 //! session log. Nothing is spoofed and no Cosmos-held key is involved.
 //!
+//! The CLI doesn't have to be there already: `connect` runs the vendor's own
+//! official installer (cursor.com/install, static.devin.ai/cli/setup, npm for
+//! Codex) with the terminal attached, then the vendor's sign-in, so a fresh
+//! machine goes from nothing to "on your plan" in one step. Installs land
+//! where the vendor's installer puts them; we look there as well as on PATH,
+//! because a PATH the installer just changed isn't visible to us until restart.
+//!
 //! JSON-RPC 2.0, one message per line on stdio:
 //! `initialize` → `session/new` → `session/prompt` (with `session/update`
 //! notifications streaming) → `session/cancel` on interrupt. The agent may
@@ -55,7 +62,7 @@ pub const PLUGINS: &[Plugin] = &[
         bins: &["cursor-agent", "agent"],
         args: &["acp"],
         login: &["cursor-agent", "login"],
-        install: "install the Cursor CLI (https://cursor.com/docs/cli/installation), then run `cursor-agent login`",
+        install: "/connect cursor installs the official Cursor CLI and signs you in (or: cosmostui auth login cursor)",
     },
     Plugin {
         id: "devin",
@@ -63,7 +70,7 @@ pub const PLUGINS: &[Plugin] = &[
         bins: &["devin"],
         args: &["acp"],
         login: &["devin", "auth", "login"],
-        install: "install the Devin CLI (Windows: irm https://static.devin.ai/cli/setup.ps1 | iex), then run `devin auth login`",
+        install: "/connect devin installs the official Devin CLI and signs you in (or: cosmostui auth login devin)",
     },
     Plugin {
         id: "codex",
@@ -71,7 +78,7 @@ pub const PLUGINS: &[Plugin] = &[
         bins: &["codex-acp"],
         args: &[],
         login: &["codex", "login"],
-        install: "install the Codex ACP adapter (npm i -g @zed-industries/codex-acp) and the Codex CLI, then run `codex login`",
+        install: "/connect codex installs the Codex ACP adapter and CLI with npm and signs you in (needs Node.js)",
     },
 ];
 
@@ -112,9 +119,99 @@ pub fn which(bin: &str) -> Option<PathBuf> {
     None
 }
 
+/// Where each vendor's official installer puts its CLI.
+pub fn install_dirs(id: &str) -> Vec<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from);
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let roaming = std::env::var_os("APPDATA").map(PathBuf::from);
+    let mut out = Vec::new();
+    match id {
+        "cursor" => {
+            out.extend(local.map(|l| l.join("cursor-agent")));
+            out.extend(home.map(|h| h.join(".local").join("bin")));
+        }
+        "devin" => {
+            out.extend(local.map(|l| l.join("devin").join("cli").join("bin")));
+            out.extend(home.map(|h| h.join(".local").join("bin")));
+        }
+        "codex" => {
+            out.extend(roaming.map(|r| r.join("npm")));
+            out.extend(home.map(|h| h.join(".npm-global").join("bin")));
+        }
+        _ => {}
+    }
+    out
+}
+
+/// `bin` inside `dir` (with the Windows launcher extensions).
+fn in_dir(dir: &Path, bin: &str) -> Option<PathBuf> {
+    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd", ".bat"] } else { &[""] };
+    exts.iter().map(|e| dir.join(format!("{bin}{e}"))).find(|p| p.is_file())
+}
+
+/// A program on PATH or in the vendor's install folder.
+fn find(id: &str, bin: &str) -> Option<PathBuf> {
+    which(bin).or_else(|| install_dirs(id).iter().find_map(|d| in_dir(d, bin)))
+}
+
 /// The plugin's executable, if installed.
 pub fn executable(p: &Plugin) -> Option<PathBuf> {
-    p.bins.iter().find_map(|b| which(b))
+    p.bins.iter().find_map(|b| find(p.id, b))
+}
+
+/// The vendor's official installer, as one command (None: can't here).
+pub fn install_command(id: &str) -> Option<Command> {
+    let shell = |script: &str| {
+        if cfg!(windows) {
+            let mut c = Command::new("powershell");
+            c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]);
+            c
+        } else {
+            let mut c = Command::new("bash");
+            c.args(["-c", script]);
+            c
+        }
+    };
+    match id {
+        "cursor" if cfg!(windows) => Some(shell("irm 'https://cursor.com/install?win32=true' | iex")),
+        "cursor" => Some(shell("curl -fsSL https://cursor.com/install | bash")),
+        "devin" if cfg!(windows) => Some(shell("irm https://static.devin.ai/cli/setup.ps1 | iex")),
+        "devin" => Some(shell("curl -fsSL https://static.devin.ai/cli/setup.sh | bash")),
+        "codex" => {
+            let npm = which("npm")?;
+            let mut c = command(&npm);
+            c.args(["install", "-g", "@zed-industries/codex-acp", "@openai/codex"]);
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
+/// Run the official installer with this terminal attached.
+pub fn install(id: &str) -> Result<PathBuf> {
+    let p = plugin(id).with_context(|| format!("unknown plugin {id}"))?;
+    let mut cmd = install_command(id).with_context(|| match id {
+        "codex" => "Codex installs with npm — install Node.js first (https://nodejs.org)".to_string(),
+        _ => format!("no installer for {} on this system", p.name),
+    })?;
+    let st = cmd.status().with_context(|| format!("running {}'s installer", p.name))?;
+    if !st.success() {
+        bail!("{}'s installer exited with {st}", p.name);
+    }
+    executable(p).with_context(|| format!("{}'s installer finished but its CLI isn't where it said it would be", p.name))
+}
+
+/// From nothing to signed in: install the CLI if it's missing, then the
+/// vendor's own sign-in. Both run with this terminal attached.
+pub fn connect(id: &str, say: &mut dyn FnMut(&str)) -> Result<()> {
+    let p = plugin(id).with_context(|| format!("unknown plugin {id}"))?;
+    if executable(p).is_none() {
+        say(&format!("Installing {}'s official CLI (one time)…", p.name));
+        let exe = install(id)?;
+        say(&format!("Installed: {}", exe.display()));
+    }
+    say(&format!("Signing in to {} — your browser will open; finish there and come back.", p.name));
+    login(id)
 }
 
 pub fn installed(id: &str) -> bool {
@@ -148,7 +245,7 @@ pub fn list_models(plugin_id: &str, cwd: &Path) -> Result<Vec<AcpModel>> {
 /// Run the vendor's own sign-in with this terminal attached.
 pub fn login(id: &str) -> Result<()> {
     let p = plugin(id).with_context(|| format!("unknown plugin {id}"))?;
-    let exe = which(p.login[0]).with_context(|| format!("{} not found — {}", p.login[0], p.install))?;
+    let exe = find(p.id, p.login[0]).with_context(|| format!("{} not found — {}", p.login[0], p.install))?;
     let st = command(&exe).args(&p.login[1..]).status().with_context(|| format!("running {}", p.login.join(" ")))?;
     if !st.success() {
         bail!("`{}` exited with {st}", p.login.join(" "));
@@ -172,8 +269,9 @@ fn command(exe: &Path) -> Command {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Update {
     Text(String),
-    /// a vendor tool started or changed: (id, kind, title, status, raw input, output text)
-    Tool { id: String, kind: String, title: String, status: String, input: Value, output: String },
+    /// a vendor tool started or changed: (id, kind, title, status, raw input,
+    /// output text, and the file change it made, if it reported one)
+    Tool { id: String, kind: String, title: String, status: String, input: Value, output: String, diff: Option<FileDiff> },
 }
 
 /// The operator's answer to a permission request.
@@ -341,7 +439,7 @@ impl AcpSession {
     /// A request with no streaming expected (setup calls).
     fn call_simple(&mut self, method: &str, params: Value) -> Result<Value> {
         let deadline = Instant::now() + self.setup_timeout;
-        self.call(method, params, &mut |_| {}, &mut |_, _| false, None, Some(deadline))
+        self.call(method, params, &mut |_| {}, &mut |_, _| false, &|| false, Some(deadline))
     }
 
     /// Send a request and pump messages until its response arrives.
@@ -351,7 +449,7 @@ impl AcpSession {
         params: Value,
         on_update: &mut dyn FnMut(&Value),
         decide: Decide,
-        interrupt: Option<&AtomicBool>,
+        stop: &dyn Fn() -> bool,
         deadline: Option<Instant>,
     ) -> Result<Value> {
         self.next_id += 1;
@@ -359,12 +457,10 @@ impl AcpSession {
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
         let mut cancelled = false;
         loop {
-            if let Some(flag) = interrupt {
-                if !cancelled && flag.load(Ordering::Relaxed) {
-                    cancelled = true;
-                    let sid = self.session_id.clone();
-                    self.send(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid}}))?;
-                }
+            if !cancelled && stop() {
+                cancelled = true;
+                let sid = self.session_id.clone();
+                self.send(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid}}))?;
             }
             if deadline.is_some_and(|d| Instant::now() > d) {
                 bail!("{} did not answer {method} in time", self.agent_name);
@@ -418,6 +514,17 @@ impl AcpSession {
         decide: Decide,
         interrupt: Option<&AtomicBool>,
     ) -> Result<String> {
+        self.prompt_until(text, on, decide, &|| interrupt.is_some_and(|f| f.load(Ordering::Relaxed)))
+    }
+
+    /// `prompt`, cancelled (`session/cancel`) as soon as `stop()` says so.
+    pub fn prompt_until(
+        &mut self,
+        text: &str,
+        on: &mut dyn FnMut(Update),
+        decide: Decide,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<String> {
         let sid = self.session_id.clone();
         let mut handle = |u: &Value| {
             if let Some(up) = parse_update(u) {
@@ -429,7 +536,7 @@ impl AcpSession {
             json!({"sessionId": sid, "prompt": [{"type": "text", "text": text}]}),
             &mut handle,
             decide,
-            interrupt,
+            stop,
             None,
         )?;
         Ok(r["stopReason"].as_str().unwrap_or("end_turn").to_string())
@@ -447,6 +554,25 @@ fn choose(params: &Value, allow: bool) -> Value {
         }
     }
     json!({"outcome": "cancelled"})
+}
+
+/// A file change an ACP tool reported (`{"type": "diff", path, oldText, newText}`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileDiff {
+    pub path: String,
+    /// None: a new file
+    pub old: Option<String>,
+    pub new: String,
+}
+
+fn content_diff(c: &Value) -> Option<FileDiff> {
+    c.as_array()?.iter().find(|i| i["type"].as_str() == Some("diff")).and_then(|i| {
+        Some(FileDiff {
+            path: i["path"].as_str()?.to_string(),
+            old: i["oldText"].as_str().map(str::to_string),
+            new: i["newText"].as_str().unwrap_or("").to_string(),
+        })
+    })
 }
 
 fn content_text(c: &Value) -> String {
@@ -527,6 +653,7 @@ pub fn parse_update(u: &Value) -> Option<Update> {
             status: u["status"].as_str().unwrap_or("").to_string(),
             input: u.get("rawInput").cloned().unwrap_or(Value::Null),
             output: content_text(&u["content"]),
+            diff: content_diff(&u["content"]),
         }),
         _ => None,
     }
@@ -544,6 +671,10 @@ mod tests {
             "content": [{"type": "content", "content": {"type": "text", "text": "3 files"}}, {"type": "diff", "path": "a.rs"}]}));
         let Some(Update::Tool { id, status, output, .. }) = u else { panic!() };
         assert_eq!((id.as_str(), status.as_str(), output.as_str()), ("c1", "completed", "3 files\nedited a.rs"));
+        let u = parse_update(&json!({"sessionUpdate": "tool_call_update", "toolCallId": "c2",
+            "content": [{"type": "diff", "path": "a.rs", "oldText": "a\n", "newText": "b\n"}]}));
+        let Some(Update::Tool { diff, .. }) = u else { panic!() };
+        assert_eq!(diff, Some(FileDiff { path: "a.rs".into(), old: Some("a\n".into()), new: "b\n".into() }));
         assert!(parse_update(&json!({"sessionUpdate": "plan", "entries": []})).is_none());
         let p = json!({"options": [{"optionId": "a", "kind": "allow_always"}, {"optionId": "r", "kind": "reject_once"}]});
         assert_eq!(choose(&p, true), json!({"outcome": "selected", "optionId": "a"}));
@@ -581,6 +712,18 @@ mod tests {
         let ms = listed_models(&d);
         assert_eq!(ms.iter().map(|m| (m.id.as_str(), m.name.as_str())).collect::<Vec<_>>(), [("swe-2-max", "SWE-2 Max"), ("adaptive", "Adaptive")]);
         assert_eq!(model_config(&d).unwrap().0, "model");
+    }
+
+    #[test]
+    fn every_plugin_has_an_official_installer() {
+        for p in PLUGINS {
+            assert!(!install_dirs(p.id).is_empty() || p.id == "codex", "{}", p.id);
+            assert!(p.install.contains("/connect"), "{}", p.id);
+        }
+        let shown = |id: &str| install_command(id).map(|c| format!("{:?}", c)).unwrap_or_default();
+        assert!(shown("cursor").contains("cursor.com/install"));
+        assert!(shown("devin").contains("static.devin.ai/cli/setup"));
+        assert!(install_command("nope").is_none());
     }
 
     #[test]

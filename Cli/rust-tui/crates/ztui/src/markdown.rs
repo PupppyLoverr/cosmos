@@ -842,6 +842,11 @@ fn boxed_table(rows: &[Vec<String>], w: usize) -> Option<Vec<Line<'static>>> {
     Some(out)
 }
 
+/// One paragraph of inline markdown wrapped to `w` with no margin.
+pub fn inline_wrapped(text: &str, w: usize) -> Vec<Line<'static>> {
+    wrap::wrap(&inline(text, Style::new()), w, &[], &[])
+}
+
 /// Render a whole (non-streamed) message.
 pub fn render(text: &str, w: usize) -> Vec<Line<'static>> {
     let mut md = Md::new();

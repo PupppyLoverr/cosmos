@@ -153,16 +153,32 @@ fn meta(v: &ToolView, body: &str) -> Vec<(String, Style)> {
 }
 
 /// ` ◆ Label arg · meta · meta`, fitted to `w`.
+/// `devin:execute` → Some(("devin", "execute")) for a subscription agent's tool.
+pub fn vendor(name: &str) -> Option<(&str, &str)> {
+    name.split_once(':').filter(|(v, _)| matches!(*v, "cursor" | "devin" | "codex"))
+}
+
 fn header(glyph: Span<'static>, name: &str, input: &Value, meta: &[(String, Style)], w: usize) -> Line<'static> {
-    let label = tool_label(name);
+    let mut meta: Vec<(String, Style)> = meta.to_vec();
+    let (label, arg_from) = match vendor(name) {
+        // the vendor's title already says what it did ("Ran python.exe")
+        Some((v, kind)) => {
+            meta.insert(0, (v.to_string(), DIM()));
+            let t = input["title"].as_str().map(str::trim).filter(|t| !t.is_empty());
+            (t.map(str::to_string).unwrap_or_else(|| kind.to_string()), false)
+        }
+        None => (tool_label(name), true),
+    };
     let meta_w: usize = meta.iter().map(|(s, _)| width_of(s) + 3).sum();
-    let room = w.saturating_sub(width_of(&label) + 5 + meta_w);
-    let arg = arg_summary(name, input, room.max(8));
+    let room = w.saturating_sub(5 + meta_w);
+    let label = ellipsize(&label.replace('\n', " "), room.max(12));
+    let room = room.saturating_sub(width_of(&label));
+    let arg = if arg_from { arg_summary(name, input, room.max(8)) } else { String::new() };
     let mut spans = vec![sp(" "), glyph, Span::styled(label, theme::bold(Style::new()))];
     if !arg.is_empty() {
         spans.push(Span::styled(format!(" {arg}"), Style::new().fg(crate::skin::palette().text)));
     }
-    for (s, st) in meta {
+    for (s, st) in &meta {
         spans.push(dim(" · "));
         spans.push(Span::styled(s.clone(), *st));
     }
@@ -223,7 +239,17 @@ pub fn render(v: &ToolView, w: usize) -> Vec<Line<'static>> {
         return out;
     }
     if let Some(d) = v.diff {
-        out.extend(diff(d, w));
+        let rows = d.lines.len();
+        if sk.diff.inline_rows > 0 && rows <= sk.diff.inline_rows {
+            out.extend(diff(d, w));
+        } else {
+            out.push(Line::from(vec![
+                dim(elbow(true)),
+                dim(format!("{rows} diff lines · ")),
+                Span::styled("ctrl+o", theme::fg(theme::ACCENT())),
+                dim(" to view"),
+            ]));
+        }
         return out;
     }
     match v.name {
@@ -321,7 +347,17 @@ pub fn diff(d: &Diff, w: usize) -> Vec<Line<'static>> {
     if sk.diff.style == "classic" {
         return crate::view::diff_rows(d, w);
     }
-    let (shown, more) = capped(&d.lines, sk.diff.max_rows);
+    diff_with(d, w, sk.diff.max_rows)
+}
+
+/// The whole diff, every row (the ctrl+o pager).
+pub fn diff_full(d: &Diff, w: usize) -> Vec<Line<'static>> {
+    diff_with(d, w, usize::MAX)
+}
+
+fn diff_with(d: &Diff, w: usize, max: usize) -> Vec<Line<'static>> {
+    let sk = crate::skin::current();
+    let (shown, more) = capped(&d.lines, max);
     let split = match sk.diff.layout.as_str() {
         "split" => w >= 80,
         "unified" => false,
